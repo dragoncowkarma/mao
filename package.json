@@ -4,9 +4,11 @@
   "description": "Electron-based Dev-Toolkit for AI-driven GitHub workflows",
   "main": "dist-electron/main.js",
   "private": true,
+  "author": "mgkwon",
   "scripts": {
     "dev": "vite",
-    "build": "vite build && electron-builder",
+    "build": "vite build && electron-builder --dir",
+    "dist": "vite build && electron-builder",
     "build:dir": "vite build && electron-builder --dir",
     "preview": "vite preview",
     "lint": "tsc --noEmit"
@@ -43,13 +45,15 @@
       "output": "release"
     },
     "mac": {
-      "target": "dir"
+      "target": ["dmg", "zip"],
+      "category": "public.app-category.developer-tools"
     },
     "win": {
-      "target": "dir"
+      "target": ["zip"]
     },
     "linux": {
-      "target": "dir"
+      "target": ["AppImage"],
+      "category": "Development"
     }
   }
 }

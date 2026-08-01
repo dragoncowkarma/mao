@@ -26,6 +26,11 @@ export default function WorkflowQueue() {
     setTasks(await window.electronAPI.workflow.list())
   }
 
+  async function retryTask(taskId: string) {
+    await window.electronAPI.workflow.retry(taskId)
+    setTasks(await window.electronAPI.workflow.list())
+  }
+
   return (
     <div className="rounded-lg border border-slate-700 bg-slate-800 p-4">
       <h2 className="mb-3 text-base font-semibold text-slate-100">Workflow Queue</h2>
@@ -97,7 +102,17 @@ export default function WorkflowQueue() {
                 ))}
               </ol>
             )}
-            {task.error && <p className="mt-2 text-xs text-red-400">{task.error}</p>}
+            {task.error && (
+              <div className="mt-2 flex items-center justify-between gap-2">
+                <p className="text-xs text-red-400">{task.error}</p>
+                <button
+                  onClick={() => retryTask(task.id)}
+                  className="shrink-0 rounded bg-slate-700 px-2 py-1 text-xs text-slate-100 hover:bg-slate-600"
+                >
+                  Retry
+                </button>
+              </div>
+            )}
           </div>
         ))}
         {tasks.length === 0 && <p className="text-xs text-slate-500">No workflow tasks yet.</p>}

@@ -9,6 +9,7 @@ export interface GithubTask {
   url: string
   updatedAt: string
   urgent: boolean
+  labels: string[]
 }
 
 export class GithubService {
@@ -31,18 +32,25 @@ export class GithubService {
       per_page: 50,
     })
 
-    return data.map((item) => ({
-      id: item.id,
-      number: item.number,
-      title: item.title,
-      type: item.pull_request ? 'pull_request' : 'issue',
-      state: item.state,
-      url: item.html_url,
-      updatedAt: item.updated_at,
-      urgent: item.labels.some((label) =>
-        (typeof label === 'string' ? label : (label.name ?? '')).toLowerCase().includes('urgent'),
-      ),
-    }))
+    return data.map((item) => {
+      const labels = item.labels.map((label) => (typeof label === 'string' ? label : (label.name ?? '')))
+      return {
+        id: item.id,
+        number: item.number,
+        title: item.title,
+        type: item.pull_request ? 'pull_request' : 'issue',
+        state: item.state,
+        url: item.html_url,
+        updatedAt: item.updated_at,
+        urgent: labels.some((label) => label.toLowerCase().includes('urgent')),
+        labels,
+      }
+    })
+  }
+
+  async addLabel(owner: string, repo: string, issueNumber: number, label: string) {
+    if (!this.octokit) throw new Error('GitHub token is not set')
+    await this.octokit.rest.issues.addLabels({ owner, repo, issue_number: issueNumber, labels: [label] })
   }
 
   async createIssue(owner: string, repo: string, title: string, body: string) {

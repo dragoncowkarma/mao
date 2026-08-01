@@ -20,6 +20,7 @@ declare global {
       workflow: {
         enqueue: (title: string) => Promise<QueuedTask>
         list: () => Promise<QueuedTask[]>
+        retry: (taskId: string) => Promise<QueuedTask>
       }
     }
   }

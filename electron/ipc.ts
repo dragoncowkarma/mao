@@ -3,6 +3,7 @@ import { store } from './store.ts'
 import { createAiProvider, type AiProviderConfig } from './ai/index.ts'
 import { GithubService } from './github-service.ts'
 import { WorkflowEngine } from './workflow-engine.ts'
+import { startAutoTrigger } from './auto-trigger.ts'
 
 const githubService = new GithubService()
 const workflowEngine = new WorkflowEngine(githubService)
@@ -12,6 +13,13 @@ export function registerIpcHandlers() {
   if (token) githubService.setToken(token)
   workflowEngine.setProviders(store.get('aiProviders'))
   workflowEngine.setRepo(store.get('githubOwner'), store.get('githubRepo'))
+  workflowEngine.setOnChange(() => store.set('workflowTasks', workflowEngine.getTasks()))
+  workflowEngine.restore(store.get('workflowTasks'))
+
+  startAutoTrigger(githubService, workflowEngine, () => ({
+    owner: store.get('githubOwner'),
+    repo: store.get('githubRepo'),
+  }))
 
   ipcMain.handle('ai:list', () => store.get('aiProviders'))
 
@@ -51,4 +59,6 @@ export function registerIpcHandlers() {
   ipcMain.handle('workflow:enqueue', (_event, title: string) => workflowEngine.enqueue(title))
 
   ipcMain.handle('workflow:list', () => workflowEngine.getTasks())
+
+  ipcMain.handle('workflow:retry', (_event, taskId: string) => workflowEngine.retry(taskId))
 }

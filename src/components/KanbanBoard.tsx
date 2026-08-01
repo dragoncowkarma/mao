@@ -28,11 +28,18 @@ function Column({ title, tasks }: { title: string; tasks: GithubTask[] }) {
             rel="noreferrer"
             className="block rounded bg-slate-900 p-2 text-xs hover:bg-slate-700"
           >
-            <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between gap-1">
               <span className="font-medium text-slate-100">#{task.number}</span>
-              {task.urgent && (
-                <span className="rounded bg-red-900/60 px-1.5 py-0.5 text-[10px] text-red-200">urgent</span>
-              )}
+              <span className="flex gap-1">
+                {task.labels.includes('workflow-active') && (
+                  <span className="rounded bg-indigo-900/60 px-1.5 py-0.5 text-[10px] text-indigo-200">
+                    in workflow
+                  </span>
+                )}
+                {task.urgent && (
+                  <span className="rounded bg-red-900/60 px-1.5 py-0.5 text-[10px] text-red-200">urgent</span>
+                )}
+              </span>
             </div>
             <p className="mt-1 truncate text-slate-300">{task.title}</p>
             <p className="mt-1 text-slate-500">{new Date(task.updatedAt).toLocaleString()}</p>

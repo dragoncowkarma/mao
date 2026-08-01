@@ -7,6 +7,9 @@ export type WorkflowStageName = 'issue' | 'pr' | 'review' | 'merge'
 
 const STAGE_ORDER: WorkflowStageName[] = ['issue', 'pr', 'review', 'merge']
 
+/** Applied to every issue that enters the workflow, so the auto-trigger poller never processes it twice. */
+export const WORKFLOW_ACTIVE_LABEL = 'workflow-active'
+
 export interface WorkflowStepResult {
   stage: WorkflowStageName
   agentId: string
@@ -54,6 +57,7 @@ export class WorkflowEngine {
   private repo = ''
   private processing = false
   private github: GithubService
+  private onChange?: () => void
 
   constructor(github: GithubService) {
     this.github = github
@@ -68,8 +72,36 @@ export class WorkflowEngine {
     this.repo = repo
   }
 
+  /** Called after every queue mutation, so the caller can persist state. */
+  setOnChange(callback: () => void) {
+    this.onChange = callback
+  }
+
+  private notify() {
+    this.onChange?.()
+  }
+
   getTasks(): QueuedTask[] {
     return this.queue
+  }
+
+  /** Loads previously-persisted tasks (e.g. after an app restart) and resumes any that are unfinished. */
+  restore(tasks: QueuedTask[]) {
+    this.queue = tasks.map((task) => (task.status === 'running' ? { ...task, status: 'pending' } : task))
+    void this.processQueue()
+  }
+
+  /** Re-attempts the current stage of a failed task. */
+  retry(taskId: string): QueuedTask {
+    const task = this.queue.find((t) => t.id === taskId)
+    if (!task) throw new Error(`Unknown task: ${taskId}`)
+    if (task.status !== 'error') throw new Error(`Task is not in an error state: ${task.status}`)
+
+    task.status = 'pending'
+    task.error = undefined
+    this.notify()
+    void this.processQueue()
+    return task
   }
 
   enqueue(title: string): QueuedTask {
@@ -82,6 +114,23 @@ export class WorkflowEngine {
       github: {},
     }
     this.queue.push(task)
+    this.notify()
+    void this.processQueue()
+    return task
+  }
+
+  /** Starts the pipeline at the 'pr' stage for an issue that already exists on GitHub (e.g. human-filed). */
+  enqueueFromIssue(issueNumber: number, issueUrl: string, title: string): QueuedTask {
+    const task: QueuedTask = {
+      id: randomUUID(),
+      title,
+      stage: 'pr',
+      history: [],
+      status: 'pending',
+      github: { issueNumber, issueUrl },
+    }
+    this.queue.push(task)
+    this.notify()
     void this.processQueue()
     return task
   }
@@ -114,6 +163,7 @@ export class WorkflowEngine {
 
   private async runStage(task: QueuedTask) {
     task.status = 'running'
+    this.notify()
     try {
       const agentConfig = this.selectAgent(task)
       const provider = createAiProvider(agentConfig)
@@ -139,6 +189,7 @@ export class WorkflowEngine {
       task.status = 'error'
       task.error = err instanceof Error ? err.message : String(err)
     }
+    this.notify()
   }
 
   private async applyGithubAction(task: QueuedTask, output: string) {
@@ -149,6 +200,7 @@ export class WorkflowEngine {
         const issue = await this.github.createIssue(this.owner, this.repo, task.title, output)
         task.github.issueNumber = issue.number
         task.github.issueUrl = issue.html_url
+        await this.github.addLabel(this.owner, this.repo, issue.number, WORKFLOW_ACTIVE_LABEL).catch(() => {})
         break
       }
       case 'pr': {

@@ -1,38 +1,127 @@
-import { useState } from 'react'
-import SettingsPanel from './components/SettingsPanel'
+import { useEffect, useState } from 'react'
+import Sidebar from './components/Sidebar'
 import KanbanBoard from './components/KanbanBoard'
 import WorkflowQueue from './components/WorkflowQueue'
+import ProjectSettings from './components/ProjectSettings'
+import GlobalSettings from './components/GlobalSettings'
 import type { RepoRef } from '../electron/workflow-engine'
+
+type ProjectTab = 'board' | 'queue' | 'settings'
+type View = 'project' | 'global-settings'
 
 export default function App() {
   const [repos, setRepos] = useState<RepoRef[]>([])
+  const [selectedIndex, setSelectedIndex] = useState<number | null>(null)
+  const [view, setView] = useState<View>('project')
+  const [projectTab, setProjectTab] = useState<ProjectTab>('board')
+
+  useEffect(() => {
+    window.electronAPI.github.getRepos().then((savedRepos) => {
+      setRepos(savedRepos)
+      if (savedRepos.length > 0) setSelectedIndex(0)
+    })
+  }, [])
+
+  useEffect(() => {
+    if (selectedIndex !== null && selectedIndex >= repos.length) {
+      setSelectedIndex(repos.length > 0 ? 0 : null)
+    }
+  }, [repos, selectedIndex])
+
+  async function persistRepos(next: RepoRef[]) {
+    setRepos(next)
+    await window.electronAPI.github.setRepos(next)
+  }
+
+  async function addRepo(repo: RepoRef) {
+    const exists = repos.some((r) => r.owner === repo.owner && r.repo === repo.repo)
+    if (exists) return
+    const next = [...repos, repo]
+    await persistRepos(next)
+    setSelectedIndex(next.length - 1)
+    setView('project')
+    setProjectTab('board')
+  }
+
+  async function updateSelectedRepo(patch: Partial<RepoRef>) {
+    if (selectedIndex === null) return
+    const next = repos.map((r, i) => (i === selectedIndex ? { ...r, ...patch } : r))
+    await persistRepos(next)
+  }
+
+  async function removeSelectedRepo() {
+    if (selectedIndex === null) return
+    const next = repos.filter((_, i) => i !== selectedIndex)
+    await persistRepos(next)
+    setSelectedIndex(next.length > 0 ? 0 : null)
+    setProjectTab('board')
+  }
+
+  function selectProject(index: number) {
+    setSelectedIndex(index)
+    setView('project')
+    setProjectTab('board')
+  }
+
+  const selected = selectedIndex !== null ? repos[selectedIndex] : undefined
 
   return (
-    <div className="min-h-screen w-screen">
-      <header className="nav">
-        <span className="nav-brand">MAO</span>
-        <a href="#board">Board</a>
-        <a href="#queue">Queue</a>
-        <a href="#settings">Settings</a>
-        <span className="text-muted ml-4 text-[13px]">AI-driven GitHub workflow toolkit</span>
-      </header>
+    <div className="min-h-screen w-screen flex">
+      <Sidebar
+        repos={repos}
+        selectedIndex={selectedIndex}
+        onSelect={selectProject}
+        onAddRepo={addRepo}
+        view={view}
+        onViewChange={setView}
+      />
 
-      <main className="mx-auto max-w-[1120px] px-6 py-8">
-        <section id="board">
-          <KanbanBoard repos={repos} />
-        </section>
+      <main className="flex-1 mx-auto w-full max-w-[1120px] px-6 py-8">
+        {view === 'global-settings' ? (
+          <GlobalSettings />
+        ) : !selected ? (
+          <div>
+            <h2>Welcome to MAO</h2>
+            <p className="text-muted mt-2 text-sm">
+              Add a repository from the sidebar to see its issues and pull requests here.
+            </p>
+          </div>
+        ) : (
+          <div>
+            <div className="mb-4 flex items-baseline justify-between gap-4">
+              <h2 className="!mb-0">
+                {selected.owner}/{selected.repo}
+              </h2>
+            </div>
 
-        <hr className="hr" />
+            <div className="tabs">
+              <button
+                className={`tab ${projectTab === 'board' ? 'active' : ''}`}
+                onClick={() => setProjectTab('board')}
+              >
+                Board
+              </button>
+              <button
+                className={`tab ${projectTab === 'queue' ? 'active' : ''}`}
+                onClick={() => setProjectTab('queue')}
+              >
+                Queue
+              </button>
+              <button
+                className={`tab ${projectTab === 'settings' ? 'active' : ''}`}
+                onClick={() => setProjectTab('settings')}
+              >
+                Settings
+              </button>
+            </div>
 
-        <section id="queue">
-          <WorkflowQueue repos={repos} />
-        </section>
-
-        <hr className="hr" />
-
-        <section id="settings">
-          <SettingsPanel repos={repos} onReposChange={setRepos} />
-        </section>
+            {projectTab === 'board' && <KanbanBoard repo={selected} />}
+            {projectTab === 'queue' && <WorkflowQueue repo={selected} />}
+            {projectTab === 'settings' && (
+              <ProjectSettings repo={selected} onChange={updateSelectedRepo} onRemove={removeSelectedRepo} />
+            )}
+          </div>
+        )}
       </main>
     </div>
   )

@@ -1,11 +1,5 @@
 import { useEffect, useState } from 'react'
 import type { AiProviderConfig } from '../../electron/ai/types'
-import type { RepoRef } from '../../electron/workflow-engine'
-
-interface SettingsPanelProps {
-  repos: RepoRef[]
-  onReposChange: (repos: RepoRef[]) => void
-}
 
 function emptyProvider(): AiProviderConfig {
   return { id: crypto.randomUUID(), name: '', kind: 'api', apiFormat: 'anthropic' }
@@ -34,30 +28,7 @@ function validateProviders(providers: AiProviderConfig[]): string[] {
   return errors
 }
 
-function resolveRepos(repoInputs: RepoRef[]): { valid: RepoRef[]; errors: string[] } {
-  const errors: string[] = []
-  const seen = new Set<string>()
-  const valid: RepoRef[] = []
-
-  for (const r of repoInputs) {
-    const owner = r.owner.trim()
-    const repo = r.repo.trim()
-    if (!owner || !repo) continue // a blank row the user hasn't filled in yet — just skip it
-
-    const key = `${owner}/${repo}`.toLowerCase()
-    if (seen.has(key)) {
-      errors.push(`Duplicate repository: ${owner}/${repo}.`)
-      continue
-    }
-    seen.add(key)
-    valid.push({ owner, repo })
-  }
-
-  return { valid, errors }
-}
-
-export default function SettingsPanel({ repos, onReposChange }: SettingsPanelProps) {
-  const [repoInputs, setRepoInputs] = useState<RepoRef[]>(repos)
+export default function GlobalSettings() {
   const [githubToken, setGithubToken] = useState('')
   const [providers, setProviders] = useState<AiProviderConfig[]>([])
   const [savedMessage, setSavedMessage] = useState('')
@@ -65,10 +36,6 @@ export default function SettingsPanel({ repos, onReposChange }: SettingsPanelPro
 
   useEffect(() => {
     window.electronAPI.ai.list().then(setProviders)
-    window.electronAPI.github.getRepos().then((savedRepos) => {
-      setRepoInputs(savedRepos)
-      onReposChange(savedRepos)
-    })
   }, [])
 
   function updateProvider(id: string, patch: Partial<AiProviderConfig>) {
@@ -83,23 +50,10 @@ export default function SettingsPanel({ repos, onReposChange }: SettingsPanelPro
     setProviders((prev) => prev.filter((p) => p.id !== id))
   }
 
-  function updateRepo(index: number, patch: Partial<RepoRef>) {
-    setRepoInputs((prev) => prev.map((r, i) => (i === index ? { ...r, ...patch } : r)))
-  }
-
-  function addRepo() {
-    setRepoInputs((prev) => [...prev, { owner: '', repo: '' }])
-  }
-
-  function removeRepo(index: number) {
-    setRepoInputs((prev) => prev.filter((_, i) => i !== index))
-  }
-
   async function saveAll() {
     setSaveError('')
 
-    const { valid: validRepos, errors: repoErrors } = resolveRepos(repoInputs)
-    const errors = [...validateProviders(providers), ...repoErrors]
+    const errors = validateProviders(providers)
     if (errors.length > 0) {
       setSaveError(errors.join(' '))
       return
@@ -108,8 +62,6 @@ export default function SettingsPanel({ repos, onReposChange }: SettingsPanelPro
     try {
       await window.electronAPI.ai.save(providers)
       if (githubToken) await window.electronAPI.github.setToken(githubToken)
-      await window.electronAPI.github.setRepos(validRepos)
-      onReposChange(validRepos)
       setSavedMessage('Saved')
       setTimeout(() => setSavedMessage(''), 1500)
     } catch (err) {
@@ -119,7 +71,8 @@ export default function SettingsPanel({ repos, onReposChange }: SettingsPanelPro
 
   return (
     <div>
-      <h2>Settings</h2>
+      <h2>Global settings</h2>
+      <p className="text-muted mb-4 text-sm">Applies across every registered project.</p>
 
       <div className="field mb-4 max-w-[420px]">
         <label>GitHub token</label>
@@ -130,36 +83,6 @@ export default function SettingsPanel({ repos, onReposChange }: SettingsPanelPro
           value={githubToken}
           onChange={(e) => setGithubToken(e.target.value)}
         />
-      </div>
-
-      <div className="mb-2 flex items-center justify-between">
-        <h3 className="!m-0">Repositories</h3>
-        <button onClick={addRepo} className="btn btn-secondary">
-          + Add repo
-        </button>
-      </div>
-
-      <div className="mb-4 flex flex-col gap-2">
-        {repoInputs.map((r, i) => (
-          <div key={i} className="card flex-row items-center gap-2">
-            <input
-              className="input"
-              placeholder="owner"
-              value={r.owner}
-              onChange={(e) => updateRepo(i, { owner: e.target.value })}
-            />
-            <input
-              className="input"
-              placeholder="repo"
-              value={r.repo}
-              onChange={(e) => updateRepo(i, { repo: e.target.value })}
-            />
-            <button onClick={() => removeRepo(i)} className="btn btn-ghost shrink-0">
-              Remove
-            </button>
-          </div>
-        ))}
-        {repoInputs.length === 0 && <p className="text-muted">No repositories registered yet.</p>}
       </div>
 
       <div className="mb-2 flex items-center justify-between">
@@ -213,6 +136,25 @@ export default function SettingsPanel({ repos, onReposChange }: SettingsPanelPro
                 onChange={(e) => updateProvider(p.id, { command: e.target.value })}
               />
             )}
+
+            <input
+              className="input w-[130px] flex-none"
+              placeholder="Model (optional)"
+              value={p.model ?? ''}
+              onChange={(e) => updateProvider(p.id, { model: e.target.value })}
+            />
+            <select
+              className="input w-[110px] flex-none"
+              value={p.effort ?? ''}
+              onChange={(e) =>
+                updateProvider(p.id, { effort: (e.target.value || undefined) as AiProviderConfig['effort'] })
+              }
+            >
+              <option value="">Effort: —</option>
+              <option value="low">Low</option>
+              <option value="medium">Medium</option>
+              <option value="high">High</option>
+            </select>
 
             <button onClick={() => removeProvider(p.id)} className="btn btn-ghost shrink-0">
               Remove

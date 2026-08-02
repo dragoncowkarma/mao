@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import type { QueuedTask, RepoRef } from '../../electron/workflow-engine'
 
 interface WorkflowQueueProps {
-  repos: RepoRef[]
+  repo: RepoRef
 }
 
 const STAGE_LABELS: Record<QueuedTask['stage'], string> = {
@@ -19,13 +19,144 @@ function statusTagClass(task: QueuedTask): string {
 }
 
 function statusLabel(task: QueuedTask): string {
-  return task.status === 'done' ? 'Done' : `${STAGE_LABELS[task.stage]} · ${task.status}`
+  if (task.status === 'done') return 'Done'
+  if (task.status === 'paused') return `${STAGE_LABELS[task.stage]} · paused`
+  return `${STAGE_LABELS[task.stage]} · ${task.status}`
 }
 
-export default function WorkflowQueue({ repos }: WorkflowQueueProps) {
+function AgentBadge({ name, model, effort }: { name: string; model?: string; effort?: string }) {
+  return (
+    <span className="tag tag-neutral inline-flex items-center gap-1">
+      {name}
+      {model && <span className="opacity-60">· {model}</span>}
+      {effort && <span className="opacity-60">· {effort} effort</span>}
+    </span>
+  )
+}
+
+function TaskCard({
+  task,
+  onRetry,
+  onAdvance,
+  onToggleAutoAdvance,
+}: {
+  task: QueuedTask
+  onRetry: (id: string) => void
+  onAdvance: (id: string) => void
+  onToggleAutoAdvance: (id: string, autoAdvance: boolean) => void
+}) {
+  const [expanded, setExpanded] = useState<number | null>(null)
+
+  return (
+    <div className="card elev-sm">
+      <div className="flex items-center justify-between gap-2">
+        <span className="card-title text-[15px]">{task.title}</span>
+        <div className="flex items-center gap-2">
+          {task.status === 'running' && <span className="live-dot" title="Currently working" />}
+          <span className={`tag ${statusTagClass(task)}`}>{statusLabel(task)}</span>
+        </div>
+      </div>
+
+      {(task.github.issueUrl || task.github.prUrl) && (
+        <div className="flex gap-3 text-xs">
+          {task.github.issueUrl && (
+            <a href={task.github.issueUrl} target="_blank" rel="noreferrer">
+              Issue #{task.github.issueNumber}
+            </a>
+          )}
+          {task.github.prUrl && (
+            <a href={task.github.prUrl} target="_blank" rel="noreferrer">
+              PR #{task.github.prNumber}
+            </a>
+          )}
+        </div>
+      )}
+
+      {task.status === 'running' && task.active && (
+        <div className="card gap-1 p-2">
+          <div className="flex items-center gap-2">
+            <span className="live-dot" />
+            <AgentBadge name={task.active.agentName} model={task.active.model} effort={task.active.effort} />
+            <span className="text-muted text-xs">running now</span>
+          </div>
+          <details>
+            <summary className="cursor-pointer text-xs text-muted">Prompt</summary>
+            <pre className="mt-1 whitespace-pre-wrap text-xs">{task.active.prompt}</pre>
+          </details>
+        </div>
+      )}
+
+      {task.history.length > 0 && (
+        <div className="flex flex-col gap-1.5">
+          {task.history.map((step, i) => (
+            <div key={i} className="flex flex-col gap-1">
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className="tag tag-neutral">{STAGE_LABELS[step.stage]}</span>
+                <AgentBadge name={step.agentName} model={step.model} effort={step.effort} />
+                <button
+                  onClick={() => setExpanded(expanded === i ? null : i)}
+                  className="btn btn-ghost px-1 text-xs"
+                >
+                  {expanded === i ? 'Hide details' : 'Show prompt/output'}
+                </button>
+              </div>
+              {expanded === i && (
+                <div className="flex flex-col gap-2 pl-1">
+                  <div>
+                    <p className="text-muted text-[10px] uppercase tracking-wide">Prompt</p>
+                    <pre className="whitespace-pre-wrap text-xs">{step.prompt}</pre>
+                  </div>
+                  <div>
+                    <p className="text-muted text-[10px] uppercase tracking-wide">Output</p>
+                    <pre className="whitespace-pre-wrap text-xs">{step.output}</pre>
+                  </div>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {task.status === 'paused' && (
+        <div className="flex items-center justify-between gap-2">
+          <p className="text-muted text-xs">
+            Waiting for manual advance before starting the {STAGE_LABELS[task.stage]} stage.
+          </p>
+          <button onClick={() => onAdvance(task.id)} className="btn btn-primary shrink-0 px-2.5 py-1 text-xs">
+            Run next stage
+          </button>
+        </div>
+      )}
+
+      {task.status !== 'done' && (
+        <label className="flex items-center gap-1.5 text-xs">
+          <input
+            type="checkbox"
+            checked={task.autoAdvance}
+            onChange={(e) => onToggleAutoAdvance(task.id, e.target.checked)}
+          />
+          Auto-advance through stages
+        </label>
+      )}
+
+      {task.error && (
+        <div className="mt-1 flex items-center justify-between gap-2">
+          <p className="text-xs" style={{ color: 'var(--color-accent-700)' }}>
+            {task.error}
+          </p>
+          <button onClick={() => onRetry(task.id)} className="btn btn-secondary shrink-0 px-2.5 py-1 text-xs">
+            Retry
+          </button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+export default function WorkflowQueue({ repo }: WorkflowQueueProps) {
   const [tasks, setTasks] = useState<QueuedTask[]>([])
   const [title, setTitle] = useState('')
-  const [repoIndex, setRepoIndex] = useState(0)
+  const [autoAdvanceNewTask, setAutoAdvanceNewTask] = useState(true)
 
   useEffect(() => {
     const load = () => window.electronAPI.workflow.list().then(setTasks)
@@ -34,14 +165,11 @@ export default function WorkflowQueue({ repos }: WorkflowQueueProps) {
     return () => clearInterval(interval)
   }, [])
 
-  useEffect(() => {
-    if (repoIndex >= repos.length) setRepoIndex(0)
-  }, [repos, repoIndex])
+  const repoTasks = tasks.filter((t) => t.repo.owner === repo.owner && t.repo.repo === repo.repo)
 
   async function startWorkflow() {
-    const repo = repos[repoIndex]
-    if (!title.trim() || !repo) return
-    await window.electronAPI.workflow.enqueue(title.trim(), repo)
+    if (!title.trim()) return
+    await window.electronAPI.workflow.enqueue(title.trim(), repo, autoAdvanceNewTask)
     setTitle('')
     setTasks(await window.electronAPI.workflow.list())
   }
@@ -51,12 +179,22 @@ export default function WorkflowQueue({ repos }: WorkflowQueueProps) {
     setTasks(await window.electronAPI.workflow.list())
   }
 
+  async function advanceTask(taskId: string) {
+    await window.electronAPI.workflow.advance(taskId)
+    setTasks(await window.electronAPI.workflow.list())
+  }
+
+  async function toggleAutoAdvance(taskId: string, autoAdvance: boolean) {
+    await window.electronAPI.workflow.setAutoAdvance(taskId, autoAdvance)
+    setTasks(await window.electronAPI.workflow.list())
+  }
+
   async function clearCompleted() {
     await window.electronAPI.workflow.clearCompleted()
     setTasks(await window.electronAPI.workflow.list())
   }
 
-  const finishedCount = tasks.filter((t) => t.status === 'done' || t.status === 'error').length
+  const finishedCount = repoTasks.filter((t) => t.status === 'done' || t.status === 'error').length
 
   return (
     <div>
@@ -69,20 +207,7 @@ export default function WorkflowQueue({ repos }: WorkflowQueueProps) {
         )}
       </div>
 
-      <div className="my-3 flex flex-wrap gap-2">
-        <select
-          className="input max-w-[220px]"
-          value={repoIndex}
-          onChange={(e) => setRepoIndex(Number(e.target.value))}
-          disabled={repos.length === 0}
-        >
-          {repos.length === 0 && <option>No repos configured</option>}
-          {repos.map((r, i) => (
-            <option key={i} value={i}>
-              {r.owner}/{r.repo}
-            </option>
-          ))}
-        </select>
+      <div className="my-3 flex flex-wrap items-center gap-2">
         <input
           className="input min-w-[220px] flex-1"
           placeholder="New task title"
@@ -90,63 +215,30 @@ export default function WorkflowQueue({ repos }: WorkflowQueueProps) {
           onChange={(e) => setTitle(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && startWorkflow()}
         />
-        <button onClick={startWorkflow} disabled={repos.length === 0} className="btn btn-primary shrink-0">
+        <label className="flex items-center gap-1.5 text-xs whitespace-nowrap">
+          <input
+            type="checkbox"
+            checked={autoAdvanceNewTask}
+            onChange={(e) => setAutoAdvanceNewTask(e.target.checked)}
+          />
+          Auto-advance
+        </label>
+        <button onClick={startWorkflow} className="btn btn-primary shrink-0">
           Start
         </button>
       </div>
 
       <div className="flex flex-col gap-2">
-        {tasks.map((task) => (
-          <div key={task.id} className="card elev-sm">
-            <div className="flex items-center justify-between gap-2">
-              <span className="card-title text-[15px]">{task.title}</span>
-              <span className={`tag ${statusTagClass(task)}`}>{statusLabel(task)}</span>
-            </div>
-            <p className="card-meta">
-              {task.repo.owner}/{task.repo.repo}
-            </p>
-
-            {(task.github.issueUrl || task.github.prUrl) && (
-              <div className="flex gap-3 text-xs">
-                {task.github.issueUrl && (
-                  <a href={task.github.issueUrl} target="_blank" rel="noreferrer">
-                    Issue #{task.github.issueNumber}
-                  </a>
-                )}
-                {task.github.prUrl && (
-                  <a href={task.github.prUrl} target="_blank" rel="noreferrer">
-                    PR #{task.github.prNumber}
-                  </a>
-                )}
-              </div>
-            )}
-
-            {task.history.length > 0 && (
-              <div className="flex flex-wrap gap-1.5">
-                {task.history.map((step, i) => (
-                  <span key={i} className="tag tag-neutral">
-                    {STAGE_LABELS[step.stage]} → {step.agentName}
-                  </span>
-                ))}
-              </div>
-            )}
-
-            {task.error && (
-              <div className="mt-1 flex items-center justify-between gap-2">
-                <p className="text-xs" style={{ color: 'var(--color-accent-700)' }}>
-                  {task.error}
-                </p>
-                <button
-                  onClick={() => retryTask(task.id)}
-                  className="btn btn-secondary shrink-0 px-2.5 py-1 text-xs"
-                >
-                  Retry
-                </button>
-              </div>
-            )}
-          </div>
+        {repoTasks.map((task) => (
+          <TaskCard
+            key={task.id}
+            task={task}
+            onRetry={retryTask}
+            onAdvance={advanceTask}
+            onToggleAutoAdvance={toggleAutoAdvance}
+          />
         ))}
-        {tasks.length === 0 && <p className="text-muted text-sm">No workflow tasks yet.</p>}
+        {repoTasks.length === 0 && <p className="text-muted text-sm">No workflow tasks yet.</p>}
       </div>
     </div>
   )

@@ -113,6 +113,33 @@ export class GithubService {
     await this.octokit.rest.issues.createComment({ owner, repo, issue_number: issueNumber, body })
   }
 
+  /** Combines GitHub Actions check-runs and legacy commit statuses on the PR's head commit. */
+  async getChecksStatus(
+    owner: string,
+    repo: string,
+    pullNumber: number,
+  ): Promise<'pending' | 'success' | 'failure' | 'none'> {
+    if (!this.octokit) throw new Error('GitHub token is not set')
+    const { data: pr } = await this.octokit.rest.pulls.get({ owner, repo, pull_number: pullNumber })
+    const ref = pr.head.sha
+
+    const [{ data: checks }, { data: combinedStatus }] = await Promise.all([
+      this.octokit.rest.checks.listForRef({ owner, repo, ref }),
+      this.octokit.rest.repos.getCombinedStatusForRef({ owner, repo, ref }),
+    ])
+
+    if (checks.check_runs.length === 0 && combinedStatus.statuses.length === 0) return 'none'
+
+    const anyPending =
+      checks.check_runs.some((run) => run.status !== 'completed') || combinedStatus.state === 'pending'
+    if (anyPending) return 'pending'
+
+    const anyFailed =
+      checks.check_runs.some((run) => !['success', 'neutral', 'skipped'].includes(run.conclusion ?? '')) ||
+      combinedStatus.state === 'failure'
+    return anyFailed ? 'failure' : 'success'
+  }
+
   async mergePullRequest(owner: string, repo: string, pullNumber: number, commitTitle: string) {
     if (!this.octokit) throw new Error('GitHub token is not set')
     await this.octokit.rest.pulls.merge({ owner, repo, pull_number: pullNumber, commit_title: commitTitle })

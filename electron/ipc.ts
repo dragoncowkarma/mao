@@ -3,7 +3,7 @@ import path from 'node:path'
 import { store } from './store.ts'
 import { createAiProvider, type AiProviderConfig } from './ai/index.ts'
 import { GithubService } from './github-service.ts'
-import { WorkflowEngine } from './workflow-engine.ts'
+import { WorkflowEngine, type RepoRef } from './workflow-engine.ts'
 import { startAutoTrigger } from './auto-trigger.ts'
 
 const githubService = new GithubService()
@@ -16,15 +16,11 @@ export function registerIpcHandlers() {
     workflowEngine.setGithubToken(token)
   }
   workflowEngine.setProviders(store.get('aiProviders'))
-  workflowEngine.setRepo(store.get('githubOwner'), store.get('githubRepo'))
   workflowEngine.setWorkspaceRoot(path.join(app.getPath('userData'), 'workspaces'))
   workflowEngine.setOnChange(() => store.set('workflowTasks', workflowEngine.getTasks()))
   workflowEngine.restore(store.get('workflowTasks'))
 
-  startAutoTrigger(githubService, workflowEngine, () => ({
-    owner: store.get('githubOwner'),
-    repo: store.get('githubRepo'),
-  }))
+  startAutoTrigger(githubService, workflowEngine, () => store.get('githubRepos'))
 
   ipcMain.handle('ai:list', () => store.get('aiProviders'))
 
@@ -51,18 +47,15 @@ export function registerIpcHandlers() {
     return githubService.fetchTasks(owner, repo)
   })
 
-  ipcMain.handle('github:setRepo', (_event, owner: string, repo: string) => {
-    store.set('githubOwner', owner)
-    store.set('githubRepo', repo)
-    workflowEngine.setRepo(owner, repo)
+  ipcMain.handle('github:setRepos', (_event, repos: RepoRef[]) => {
+    store.set('githubRepos', repos)
   })
 
-  ipcMain.handle('github:getConfig', () => ({
-    owner: store.get('githubOwner'),
-    repo: store.get('githubRepo'),
-  }))
+  ipcMain.handle('github:getRepos', () => store.get('githubRepos'))
 
-  ipcMain.handle('workflow:enqueue', (_event, title: string) => workflowEngine.enqueue(title))
+  ipcMain.handle('workflow:enqueue', (_event, title: string, repo: RepoRef) =>
+    workflowEngine.enqueue(title, repo),
+  )
 
   ipcMain.handle('workflow:list', () => workflowEngine.getTasks())
 

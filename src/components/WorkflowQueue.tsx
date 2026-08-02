@@ -1,5 +1,9 @@
 import { useEffect, useState } from 'react'
-import type { QueuedTask } from '../../electron/workflow-engine'
+import type { QueuedTask, RepoRef } from '../../electron/workflow-engine'
+
+interface WorkflowQueueProps {
+  repos: RepoRef[]
+}
 
 const STAGE_LABELS: Record<QueuedTask['stage'], string> = {
   issue: 'Issue',
@@ -8,9 +12,10 @@ const STAGE_LABELS: Record<QueuedTask['stage'], string> = {
   merge: 'Merge',
 }
 
-export default function WorkflowQueue() {
+export default function WorkflowQueue({ repos }: WorkflowQueueProps) {
   const [tasks, setTasks] = useState<QueuedTask[]>([])
   const [title, setTitle] = useState('')
+  const [repoIndex, setRepoIndex] = useState(0)
 
   useEffect(() => {
     const load = () => window.electronAPI.workflow.list().then(setTasks)
@@ -19,9 +24,14 @@ export default function WorkflowQueue() {
     return () => clearInterval(interval)
   }, [])
 
+  useEffect(() => {
+    if (repoIndex >= repos.length) setRepoIndex(0)
+  }, [repos, repoIndex])
+
   async function startWorkflow() {
-    if (!title.trim()) return
-    await window.electronAPI.workflow.enqueue(title.trim())
+    const repo = repos[repoIndex]
+    if (!title.trim() || !repo) return
+    await window.electronAPI.workflow.enqueue(title.trim(), repo)
     setTitle('')
     setTasks(await window.electronAPI.workflow.list())
   }
@@ -36,6 +46,19 @@ export default function WorkflowQueue() {
       <h2 className="mb-3 text-base font-semibold text-slate-100">Workflow Queue</h2>
 
       <div className="mb-4 flex gap-2">
+        <select
+          className="rounded bg-slate-900 px-2 py-1 text-sm text-slate-100"
+          value={repoIndex}
+          onChange={(e) => setRepoIndex(Number(e.target.value))}
+          disabled={repos.length === 0}
+        >
+          {repos.length === 0 && <option>No repos configured</option>}
+          {repos.map((r, i) => (
+            <option key={i} value={i}>
+              {r.owner}/{r.repo}
+            </option>
+          ))}
+        </select>
         <input
           className="flex-1 rounded bg-slate-900 px-2 py-1 text-sm text-slate-100"
           placeholder="New task title"
@@ -45,7 +68,8 @@ export default function WorkflowQueue() {
         />
         <button
           onClick={startWorkflow}
-          className="rounded bg-indigo-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-indigo-500"
+          disabled={repos.length === 0}
+          className="rounded bg-indigo-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-indigo-500 disabled:opacity-50"
         >
           Start
         </button>
@@ -69,6 +93,9 @@ export default function WorkflowQueue() {
                 {task.status === 'done' ? 'Done' : `${STAGE_LABELS[task.stage]} · ${task.status}`}
               </span>
             </div>
+            <p className="mt-0.5 text-xs text-slate-500">
+              {task.repo.owner}/{task.repo.repo}
+            </p>
             {(task.github.issueUrl || task.github.prUrl) && (
               <div className="mt-2 flex gap-3 text-xs">
                 {task.github.issueUrl && (

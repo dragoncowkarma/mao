@@ -2,10 +2,10 @@ import { useState } from 'react'
 import SettingsPanel from './components/SettingsPanel'
 import KanbanBoard from './components/KanbanBoard'
 import WorkflowQueue from './components/WorkflowQueue'
+import type { RepoRef } from '../electron/workflow-engine'
 
 export default function App() {
-  const [owner, setOwner] = useState('')
-  const [repo, setRepo] = useState('')
+  const [repos, setRepos] = useState<RepoRef[]>([])
 
   return (
     <div className="min-h-screen w-screen bg-slate-900 p-6 text-slate-100">
@@ -15,9 +15,9 @@ export default function App() {
       </header>
 
       <main className="mx-auto flex max-w-6xl flex-col gap-6">
-        <SettingsPanel owner={owner} repo={repo} onRepoChange={(o, r) => { setOwner(o); setRepo(r) }} />
-        <KanbanBoard owner={owner} repo={repo} />
-        <WorkflowQueue />
+        <SettingsPanel repos={repos} onReposChange={setRepos} />
+        <KanbanBoard repos={repos} />
+        <WorkflowQueue repos={repos} />
       </main>
     </div>
   )

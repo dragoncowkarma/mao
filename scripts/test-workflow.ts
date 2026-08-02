@@ -56,11 +56,10 @@ github.setToken(token)
 
 const engine = new WorkflowEngine(github)
 engine.setProviders(providers)
-engine.setRepo(owner, repo)
 engine.setGithubToken(token)
 engine.setWorkspaceRoot(process.env.TEST_WORKSPACE_ROOT || path.join(os.tmpdir(), 'mao-test-workspace'))
 
-const task = engine.enqueue(title)
+const task = engine.enqueue(title, { owner, repo })
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms))

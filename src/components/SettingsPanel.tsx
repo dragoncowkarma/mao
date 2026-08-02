@@ -1,29 +1,27 @@
 import { useEffect, useState } from 'react'
 import type { AiProviderConfig } from '../../electron/ai/types'
+import type { RepoRef } from '../../electron/workflow-engine'
 
 interface SettingsPanelProps {
-  owner: string
-  repo: string
-  onRepoChange: (owner: string, repo: string) => void
+  repos: RepoRef[]
+  onReposChange: (repos: RepoRef[]) => void
 }
 
 function emptyProvider(): AiProviderConfig {
   return { id: crypto.randomUUID(), name: '', kind: 'api', apiFormat: 'anthropic' }
 }
 
-export default function SettingsPanel({ owner, repo, onRepoChange }: SettingsPanelProps) {
-  const [ownerInput, setOwnerInput] = useState(owner)
-  const [repoInput, setRepoInput] = useState(repo)
+export default function SettingsPanel({ repos, onReposChange }: SettingsPanelProps) {
+  const [repoInputs, setRepoInputs] = useState<RepoRef[]>(repos)
   const [githubToken, setGithubToken] = useState('')
   const [providers, setProviders] = useState<AiProviderConfig[]>([])
   const [savedMessage, setSavedMessage] = useState('')
 
   useEffect(() => {
     window.electronAPI.ai.list().then(setProviders)
-    window.electronAPI.github.getConfig().then(({ owner: savedOwner, repo: savedRepo }) => {
-      setOwnerInput(savedOwner)
-      setRepoInput(savedRepo)
-      onRepoChange(savedOwner, savedRepo)
+    window.electronAPI.github.getRepos().then((savedRepos) => {
+      setRepoInputs(savedRepos)
+      onReposChange(savedRepos)
     })
   }, [])
 
@@ -39,11 +37,24 @@ export default function SettingsPanel({ owner, repo, onRepoChange }: SettingsPan
     setProviders((prev) => prev.filter((p) => p.id !== id))
   }
 
+  function updateRepo(index: number, patch: Partial<RepoRef>) {
+    setRepoInputs((prev) => prev.map((r, i) => (i === index ? { ...r, ...patch } : r)))
+  }
+
+  function addRepo() {
+    setRepoInputs((prev) => [...prev, { owner: '', repo: '' }])
+  }
+
+  function removeRepo(index: number) {
+    setRepoInputs((prev) => prev.filter((_, i) => i !== index))
+  }
+
   async function saveAll() {
     await window.electronAPI.ai.save(providers)
     if (githubToken) await window.electronAPI.github.setToken(githubToken)
-    await window.electronAPI.github.setRepo(ownerInput, repoInput)
-    onRepoChange(ownerInput, repoInput)
+    const validRepos = repoInputs.filter((r) => r.owner.trim() && r.repo.trim())
+    await window.electronAPI.github.setRepos(validRepos)
+    onReposChange(validRepos)
     setSavedMessage('Saved')
     setTimeout(() => setSavedMessage(''), 1500)
   }
@@ -52,26 +63,48 @@ export default function SettingsPanel({ owner, repo, onRepoChange }: SettingsPan
     <div className="rounded-lg border border-slate-700 bg-slate-800 p-4 text-sm">
       <h2 className="mb-3 text-base font-semibold text-slate-100">Settings</h2>
 
-      <div className="mb-4 grid grid-cols-3 gap-2">
-        <input
-          className="rounded bg-slate-900 px-2 py-1 text-slate-100"
-          placeholder="GitHub owner"
-          value={ownerInput}
-          onChange={(e) => setOwnerInput(e.target.value)}
-        />
-        <input
-          className="rounded bg-slate-900 px-2 py-1 text-slate-100"
-          placeholder="GitHub repo"
-          value={repoInput}
-          onChange={(e) => setRepoInput(e.target.value)}
-        />
-        <input
-          className="rounded bg-slate-900 px-2 py-1 text-slate-100"
-          placeholder="GitHub token"
-          type="password"
-          value={githubToken}
-          onChange={(e) => setGithubToken(e.target.value)}
-        />
+      <input
+        className="mb-4 w-full rounded bg-slate-900 px-2 py-1 text-slate-100"
+        placeholder="GitHub token"
+        type="password"
+        value={githubToken}
+        onChange={(e) => setGithubToken(e.target.value)}
+      />
+
+      <div className="mb-2 flex items-center justify-between">
+        <h3 className="font-medium text-slate-300">Repositories</h3>
+        <button
+          onClick={addRepo}
+          className="rounded bg-slate-700 px-2 py-1 text-xs text-slate-100 hover:bg-slate-600"
+        >
+          + Add repo
+        </button>
+      </div>
+
+      <div className="mb-4 space-y-2">
+        {repoInputs.map((r, i) => (
+          <div key={i} className="flex gap-2 rounded bg-slate-900 p-2">
+            <input
+              className="flex-1 rounded bg-slate-800 px-2 py-1 text-slate-100"
+              placeholder="owner"
+              value={r.owner}
+              onChange={(e) => updateRepo(i, { owner: e.target.value })}
+            />
+            <input
+              className="flex-1 rounded bg-slate-800 px-2 py-1 text-slate-100"
+              placeholder="repo"
+              value={r.repo}
+              onChange={(e) => updateRepo(i, { repo: e.target.value })}
+            />
+            <button
+              onClick={() => removeRepo(i)}
+              className="rounded bg-red-900/50 px-2 py-1 text-xs text-red-200 hover:bg-red-900"
+            >
+              Remove
+            </button>
+          </div>
+        ))}
+        {repoInputs.length === 0 && <p className="text-slate-500">No repositories registered yet.</p>}
       </div>
 
       <div className="mb-2 flex items-center justify-between">

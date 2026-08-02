@@ -1,9 +1,9 @@
 import { useEffect, useState } from 'react'
 import type { GithubTask } from '../../electron/github-service'
+import type { RepoRef } from '../../electron/workflow-engine'
 
 interface KanbanBoardProps {
-  owner: string
-  repo: string
+  repos: RepoRef[]
 }
 
 function sortTasks(tasks: GithubTask[]): GithubTask[] {
@@ -51,17 +51,24 @@ function Column({ title, tasks }: { title: string; tasks: GithubTask[] }) {
   )
 }
 
-export default function KanbanBoard({ owner, repo }: KanbanBoardProps) {
+export default function KanbanBoard({ repos }: KanbanBoardProps) {
+  const [selectedIndex, setSelectedIndex] = useState(0)
   const [tasks, setTasks] = useState<GithubTask[]>([])
   const [error, setError] = useState('')
 
+  const selected = repos[selectedIndex]
+
   useEffect(() => {
-    if (!owner || !repo) return
+    if (selectedIndex >= repos.length) setSelectedIndex(0)
+  }, [repos, selectedIndex])
+
+  useEffect(() => {
+    if (!selected) return
 
     let cancelled = false
     async function load() {
       try {
-        const result = await window.electronAPI.github.fetchTasks(owner, repo)
+        const result = await window.electronAPI.github.fetchTasks(selected.owner, selected.repo)
         if (!cancelled) {
           setTasks(result)
           setError('')
@@ -77,10 +84,10 @@ export default function KanbanBoard({ owner, repo }: KanbanBoardProps) {
       cancelled = true
       clearInterval(interval)
     }
-  }, [owner, repo])
+  }, [selected?.owner, selected?.repo])
 
-  if (!owner || !repo) {
-    return <p className="text-sm text-slate-500">Set a GitHub owner/repo in Settings to load the board.</p>
+  if (repos.length === 0) {
+    return <p className="text-sm text-slate-500">Add a repository in Settings to load the board.</p>
   }
 
   const sorted = sortTasks(tasks)
@@ -89,6 +96,17 @@ export default function KanbanBoard({ owner, repo }: KanbanBoardProps) {
 
   return (
     <div>
+      <select
+        className="mb-3 rounded bg-slate-800 px-2 py-1 text-sm text-slate-100"
+        value={selectedIndex}
+        onChange={(e) => setSelectedIndex(Number(e.target.value))}
+      >
+        {repos.map((r, i) => (
+          <option key={i} value={i}>
+            {r.owner}/{r.repo}
+          </option>
+        ))}
+      </select>
       {error && <p className="mb-2 text-xs text-red-400">{error}</p>}
       <div className="flex gap-3">
         <Column title="Issues" tasks={issues} />

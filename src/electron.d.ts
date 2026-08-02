@@ -1,6 +1,6 @@
 import type { AiProviderConfig } from '../electron/ai/types'
 import type { GithubTask } from '../electron/github-service'
-import type { QueuedTask } from '../electron/workflow-engine'
+import type { QueuedTask, RepoRef } from '../electron/workflow-engine'
 
 declare global {
   interface Window {
@@ -14,11 +14,11 @@ declare global {
       github: {
         setToken: (token: string) => Promise<void>
         fetchTasks: (owner: string, repo: string) => Promise<GithubTask[]>
-        setRepo: (owner: string, repo: string) => Promise<void>
-        getConfig: () => Promise<{ owner: string; repo: string }>
+        setRepos: (repos: RepoRef[]) => Promise<void>
+        getRepos: () => Promise<RepoRef[]>
       }
       workflow: {
-        enqueue: (title: string) => Promise<QueuedTask>
+        enqueue: (title: string, repo: RepoRef) => Promise<QueuedTask>
         list: () => Promise<QueuedTask[]>
         retry: (taskId: string) => Promise<QueuedTask>
       }

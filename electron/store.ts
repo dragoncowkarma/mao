@@ -1,11 +1,10 @@
 import Store from 'electron-store'
 import type { AiProviderConfig } from './ai/types.ts'
-import type { QueuedTask } from './workflow-engine.ts'
+import type { QueuedTask, RepoRef } from './workflow-engine.ts'
 
 interface StoreSchema {
   githubToken: string
-  githubOwner: string
-  githubRepo: string
+  githubRepos: RepoRef[]
   aiProviders: AiProviderConfig[]
   workflowTasks: QueuedTask[]
 }
@@ -13,8 +12,7 @@ interface StoreSchema {
 export const store = new Store<StoreSchema>({
   defaults: {
     githubToken: '',
-    githubOwner: '',
-    githubRepo: '',
+    githubRepos: [],
     aiProviders: [],
     workflowTasks: [],
   },

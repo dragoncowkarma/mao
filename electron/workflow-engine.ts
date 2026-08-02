@@ -11,6 +11,11 @@ const STAGE_ORDER: WorkflowStageName[] = ['issue', 'pr', 'review', 'merge']
 /** Applied to every issue that enters the workflow, so the auto-trigger poller never processes it twice. */
 export const WORKFLOW_ACTIVE_LABEL = 'workflow-active'
 
+export interface RepoRef {
+  owner: string
+  repo: string
+}
+
 export interface WorkflowStepResult {
   stage: WorkflowStageName
   agentId: string
@@ -21,6 +26,7 @@ export interface WorkflowStepResult {
 export interface QueuedTask {
   id: string
   title: string
+  repo: RepoRef
   stage: WorkflowStageName
   history: WorkflowStepResult[]
   status: 'pending' | 'running' | 'done' | 'error'
@@ -54,8 +60,6 @@ function slugify(text: string): string {
 export class WorkflowEngine {
   private queue: QueuedTask[] = []
   private providers: AiProviderConfig[] = []
-  private owner = ''
-  private repo = ''
   private processing = false
   private github: GithubService
   private onChange?: () => void
@@ -68,11 +72,6 @@ export class WorkflowEngine {
 
   setProviders(providers: AiProviderConfig[]) {
     this.providers = providers
-  }
-
-  setRepo(owner: string, repo: string) {
-    this.owner = owner
-    this.repo = repo
   }
 
   /** Needed (alongside setWorkspaceRoot) to clone/push over authenticated HTTPS for real code-edit PRs. */
@@ -117,10 +116,11 @@ export class WorkflowEngine {
     return task
   }
 
-  enqueue(title: string): QueuedTask {
+  enqueue(title: string, repo: RepoRef): QueuedTask {
     const task: QueuedTask = {
       id: randomUUID(),
       title,
+      repo,
       stage: STAGE_ORDER[0],
       history: [],
       status: 'pending',
@@ -133,10 +133,11 @@ export class WorkflowEngine {
   }
 
   /** Starts the pipeline at the 'pr' stage for an issue that already exists on GitHub (e.g. human-filed). */
-  enqueueFromIssue(issueNumber: number, issueUrl: string, title: string): QueuedTask {
+  enqueueFromIssue(issueNumber: number, issueUrl: string, title: string, repo: RepoRef): QueuedTask {
     const task: QueuedTask = {
       id: randomUUID(),
       title,
+      repo,
       stage: 'pr',
       history: [],
       status: 'pending',
@@ -212,16 +213,16 @@ export class WorkflowEngine {
 
   /** Lets a CLI agent make real file edits in a local clone, then pushes them as the PR branch. */
   private async runPrWithCodeEdits(task: QueuedTask, agentConfig: AiProviderConfig): Promise<string> {
-    if (!this.owner || !this.repo) throw new Error('GitHub owner/repo is not configured')
     if (!this.githubToken) throw new Error('GitHub token is not configured')
+    const { owner, repo } = task.repo
 
     const branch = `workflow/${task.github.issueNumber ?? task.id.slice(0, 8)}-${slugify(task.title)}`
-    const dir = await ensureClone(this.workspaceRoot, this.owner, this.repo, this.githubToken)
-    const base = await this.github.getDefaultBranch(this.owner, this.repo)
+    const dir = await ensureClone(this.workspaceRoot, owner, repo, this.githubToken)
+    const base = await this.github.getDefaultBranch(owner, repo)
     await checkoutBranch(dir, base, branch)
 
     const prompt =
-      `You are working inside a real local git checkout of ${this.owner}/${this.repo}, currently on a ` +
+      `You are working inside a real local git checkout of ${owner}/${repo}, currently on a ` +
       `fresh branch off ${base}. Implement the following issue by editing the actual project files in ` +
       `this directory. Do not commit or push — that is handled separately.\n\nIssue: ${task.title}` +
       (task.github.issueUrl ? `\n${task.github.issueUrl}` : '')
@@ -231,7 +232,7 @@ export class WorkflowEngine {
     if (await hasChanges(dir)) {
       await commitAndPush(dir, branch, `Implement: ${task.title}`)
       const body = task.github.issueNumber ? `${output}\n\nCloses #${task.github.issueNumber}` : output
-      const pr = await this.github.createPullRequest(this.owner, this.repo, branch, base, task.title, body)
+      const pr = await this.github.createPullRequest(owner, repo, branch, base, task.title, body)
       task.github.branch = branch
       task.github.prNumber = pr.number
       task.github.prUrl = pr.html_url
@@ -244,29 +245,29 @@ export class WorkflowEngine {
   }
 
   private async applyGithubAction(task: QueuedTask, output: string) {
-    if (!this.owner || !this.repo) throw new Error('GitHub owner/repo is not configured')
+    const { owner, repo } = task.repo
 
     switch (task.stage) {
       case 'issue': {
-        const issue = await this.github.createIssue(this.owner, this.repo, task.title, output)
+        const issue = await this.github.createIssue(owner, repo, task.title, output)
         task.github.issueNumber = issue.number
         task.github.issueUrl = issue.html_url
-        await this.github.addLabel(this.owner, this.repo, issue.number, WORKFLOW_ACTIVE_LABEL).catch(() => {})
+        await this.github.addLabel(owner, repo, issue.number, WORKFLOW_ACTIVE_LABEL).catch(() => {})
         break
       }
       case 'pr': {
         const branch = `workflow/${task.github.issueNumber ?? task.id.slice(0, 8)}-${slugify(task.title)}`
-        const { base } = await this.github.createBranch(this.owner, this.repo, branch)
+        const { base } = await this.github.createBranch(owner, repo, branch)
         await this.github.commitFile(
-          this.owner,
-          this.repo,
+          owner,
+          repo,
           branch,
           `workflow-notes/${task.github.issueNumber ?? task.id}.md`,
           output,
           `Add implementation notes for: ${task.title}`,
         )
         const body = task.github.issueNumber ? `${output}\n\nCloses #${task.github.issueNumber}` : output
-        const pr = await this.github.createPullRequest(this.owner, this.repo, branch, base, task.title, body)
+        const pr = await this.github.createPullRequest(owner, repo, branch, base, task.title, body)
         task.github.branch = branch
         task.github.prNumber = pr.number
         task.github.prUrl = pr.html_url
@@ -274,13 +275,13 @@ export class WorkflowEngine {
       }
       case 'review': {
         if (!task.github.prNumber) throw new Error('No pull request to review')
-        await this.github.reviewPullRequest(this.owner, this.repo, task.github.prNumber, output)
+        await this.github.reviewPullRequest(owner, repo, task.github.prNumber, output)
         break
       }
       case 'merge': {
         if (!task.github.prNumber) throw new Error('No pull request to merge')
-        await this.github.commentOnIssue(this.owner, this.repo, task.github.prNumber, output)
-        await this.github.mergePullRequest(this.owner, this.repo, task.github.prNumber, `Merge: ${task.title}`)
+        await this.github.commentOnIssue(owner, repo, task.github.prNumber, output)
+        await this.github.mergePullRequest(owner, repo, task.github.prNumber, `Merge: ${task.title}`)
         break
       }
     }

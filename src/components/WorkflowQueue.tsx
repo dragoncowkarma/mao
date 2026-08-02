@@ -81,7 +81,7 @@ function TaskCard({
           </div>
           <details>
             <summary className="cursor-pointer text-xs text-muted">Prompt</summary>
-            <pre className="mt-1 whitespace-pre-wrap text-xs">{task.active.prompt}</pre>
+            <pre className="mt-1 max-h-64 overflow-y-auto whitespace-pre-wrap text-xs">{task.active.prompt}</pre>
           </details>
         </div>
       )}
@@ -104,11 +104,11 @@ function TaskCard({
                 <div className="flex flex-col gap-2 pl-1">
                   <div>
                     <p className="text-muted text-[10px] uppercase tracking-wide">Prompt</p>
-                    <pre className="whitespace-pre-wrap text-xs">{step.prompt}</pre>
+                    <pre className="max-h-64 overflow-y-auto whitespace-pre-wrap text-xs">{step.prompt}</pre>
                   </div>
                   <div>
                     <p className="text-muted text-[10px] uppercase tracking-wide">Output</p>
-                    <pre className="whitespace-pre-wrap text-xs">{step.output}</pre>
+                    <pre className="max-h-64 overflow-y-auto whitespace-pre-wrap text-xs">{step.output}</pre>
                   </div>
                 </div>
               )}

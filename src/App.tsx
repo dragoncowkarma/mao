@@ -8,16 +8,31 @@ export default function App() {
   const [repos, setRepos] = useState<RepoRef[]>([])
 
   return (
-    <div className="min-h-screen w-screen bg-slate-900 p-6 text-slate-100">
-      <header className="mb-6">
-        <h1 className="text-2xl font-bold">MAO</h1>
-        <p className="text-sm text-slate-400">AI-driven GitHub workflow toolkit</p>
+    <div className="min-h-screen w-screen">
+      <header className="nav">
+        <span className="nav-brand">MAO</span>
+        <a href="#board">Board</a>
+        <a href="#queue">Queue</a>
+        <a href="#settings">Settings</a>
+        <span className="text-muted ml-4 text-[13px]">AI-driven GitHub workflow toolkit</span>
       </header>
 
-      <main className="mx-auto flex max-w-6xl flex-col gap-6">
-        <SettingsPanel repos={repos} onReposChange={setRepos} />
-        <KanbanBoard repos={repos} />
-        <WorkflowQueue repos={repos} />
+      <main className="mx-auto max-w-[1120px] px-6 py-8">
+        <section id="board">
+          <KanbanBoard repos={repos} />
+        </section>
+
+        <hr className="hr" />
+
+        <section id="queue">
+          <WorkflowQueue repos={repos} />
+        </section>
+
+        <hr className="hr" />
+
+        <section id="settings">
+          <SettingsPanel repos={repos} onReposChange={setRepos} />
+        </section>
       </main>
     </div>
   )

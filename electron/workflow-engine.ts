@@ -8,6 +8,9 @@ export type WorkflowStageName = 'issue' | 'pr' | 'review' | 'merge'
 
 const STAGE_ORDER: WorkflowStageName[] = ['issue', 'pr', 'review', 'merge']
 
+/** Cap on finished (done/error) tasks kept around, so the persisted queue doesn't grow forever. */
+const MAX_FINISHED_TASKS = 50
+
 /** Applied to every issue that enters the workflow, so the auto-trigger poller never processes it twice. */
 export const WORKFLOW_ACTIVE_LABEL = 'workflow-active'
 
@@ -97,9 +100,27 @@ export class WorkflowEngine {
     return this.queue
   }
 
+  /** Removes all finished (done/error) tasks immediately. */
+  clearCompleted() {
+    this.queue = this.queue.filter((t) => t.status !== 'done' && t.status !== 'error')
+    this.notify()
+  }
+
+  /** Keeps only the most recent MAX_FINISHED_TASKS done/error tasks, dropping older ones. */
+  private pruneFinishedTasks() {
+    const finishedIds = this.queue
+      .filter((t) => t.status === 'done' || t.status === 'error')
+      .map((t) => t.id)
+    const excess = finishedIds.length - MAX_FINISHED_TASKS
+    if (excess <= 0) return
+    const toDrop = new Set(finishedIds.slice(0, excess))
+    this.queue = this.queue.filter((t) => !toDrop.has(t.id))
+  }
+
   /** Loads previously-persisted tasks (e.g. after an app restart) and resumes any that are unfinished. */
   restore(tasks: QueuedTask[]) {
     this.queue = tasks.map((task) => (task.status === 'running' ? { ...task, status: 'pending' } : task))
+    this.pruneFinishedTasks()
     void this.processQueue()
   }
 
@@ -208,6 +229,7 @@ export class WorkflowEngine {
       task.status = 'error'
       task.error = err instanceof Error ? err.message : String(err)
     }
+    this.pruneFinishedTasks()
     this.notify()
   }
 

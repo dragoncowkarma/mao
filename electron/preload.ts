@@ -24,5 +24,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.invoke('workflow:enqueue', title, repo),
     list: (): Promise<QueuedTask[]> => ipcRenderer.invoke('workflow:list'),
     retry: (taskId: string): Promise<QueuedTask> => ipcRenderer.invoke('workflow:retry', taskId),
+    clearCompleted: (): Promise<void> => ipcRenderer.invoke('workflow:clearCompleted'),
   },
 })

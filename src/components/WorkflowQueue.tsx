@@ -41,9 +41,26 @@ export default function WorkflowQueue({ repos }: WorkflowQueueProps) {
     setTasks(await window.electronAPI.workflow.list())
   }
 
+  async function clearCompleted() {
+    await window.electronAPI.workflow.clearCompleted()
+    setTasks(await window.electronAPI.workflow.list())
+  }
+
+  const finishedCount = tasks.filter((t) => t.status === 'done' || t.status === 'error').length
+
   return (
     <div className="rounded-lg border border-slate-700 bg-slate-800 p-4">
-      <h2 className="mb-3 text-base font-semibold text-slate-100">Workflow Queue</h2>
+      <div className="mb-3 flex items-center justify-between">
+        <h2 className="text-base font-semibold text-slate-100">Workflow Queue</h2>
+        {finishedCount > 0 && (
+          <button
+            onClick={clearCompleted}
+            className="rounded bg-slate-700 px-2 py-1 text-xs text-slate-100 hover:bg-slate-600"
+          >
+            Clear completed ({finishedCount})
+          </button>
+        )}
+      </div>
 
       <div className="mb-4 flex gap-2">
         <select

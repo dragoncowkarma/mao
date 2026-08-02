@@ -21,6 +21,7 @@ declare global {
         enqueue: (title: string, repo: RepoRef) => Promise<QueuedTask>
         list: () => Promise<QueuedTask[]>
         retry: (taskId: string) => Promise<QueuedTask>
+        clearCompleted: () => Promise<void>
       }
     }
   }

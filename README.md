@@ -4,15 +4,18 @@ Electron dev-toolkit that lets AI agents drive a GitHub workflow — **issue →
 
 ## Features
 
-- **BYOK / CLI adapter** — plug in an API key (Anthropic or OpenAI-compatible) or a locally installed CLI (`claude`, `codex`, etc.) as an AI provider, via a common `AiProvider` interface.
+- **BYOK / CLI adapter** — plug in an API key (Anthropic or OpenAI-compatible) or a locally installed CLI (`claude`, `codex`, etc.) as an AI provider, via a common `AiProvider` interface. Each provider can optionally carry a `model` and an informational `effort` (low/medium/high) shown next to its work throughout the UI.
 - **Maker-checker cross-verification** — the AI that handled a task's previous pipeline stage is automatically excluded from the next one, so no agent reviews or merges its own work.
-- **Kanban board** — GitHub Issues/PRs synced live, sorted urgent-first then latest-updated.
+- **Project sidebar** — every registered `owner/repo` is a project in the left sidebar; selecting one opens straight into its Board (issues/PRs), with Queue and per-project Settings as tabs alongside it. Global settings (GitHub token, AI providers) live in their own section, separate from per-project config (auto-trigger on/off, poll interval).
+- **Kanban board** — GitHub Issues/PRs synced live (manual "Refresh" button plus a "synced Xs ago" indicator), sorted urgent-first then latest-updated. Cards driven by an active workflow task show their live pipeline stage/status (queued, running, paused, failed, done) at a glance.
 - **Automated pipeline** — `issue → pr → review → merge`, driven by registered AI agents:
   - **issue**: an agent drafts the issue body and files it on GitHub.
   - **pr**: a CLI agent gets a real local git checkout and edits actual project files; the diff is committed, pushed, and opened as a PR (falls back to a notes-only PR if the agent made no real edits, or if the provider is API-only).
   - **review**: an agent leaves a real PR review comment.
   - **merge**: blocked until GitHub Actions checks / commit statuses report success — merges and comments once they do.
-- **Auto-trigger** — polls every registered repo for new open issues and enqueues them automatically (tracked via a `workflow-active` label so nothing gets processed twice).
+- **Per-stage transparency** — the Queue view shows which agent/model/effort ran each completed stage plus its exact prompt and output (expandable), and while a stage is in flight shows a live "currently working" indicator with the in-progress prompt.
+- **Manual task control** — each task can run fully automatically or with "auto-advance" turned off, in which case it pauses after every stage until you click "Run next stage" — useful for reviewing a stage's output before letting the pipeline continue.
+- **Auto-trigger** — polls every registered repo for new open issues and enqueues them automatically (tracked via a `workflow-active` label so nothing gets processed twice). Each repo can independently disable auto-trigger or set its own poll interval from its project Settings tab.
 - **Multi-repo** — register any number of `owner/repo` pairs; each queued task carries its own repo.
 - **Persistence & retry** — the workflow queue survives app restarts (interrupted tasks resume), and failed tasks can be retried from the same stage with one click.
 - **Queue cleanup** — finished tasks are capped (oldest dropped past 50) and can be cleared manually.
@@ -49,15 +52,24 @@ All settings persist locally via `electron-store` (in the OS's app-data director
 ```
 electron/
   ai/               AiProvider adapter (api-provider.ts, cli-provider.ts) behind a common interface
-  github-service.ts GitHub REST calls: polling, issue/PR/branch/commit/review/merge/CI-status
+  github-service.ts GitHub REST calls: issue/PR fetch, branch/commit/review/merge/CI-status
   git-workspace.ts  Local git clone/branch/commit/push (child_process, no Electron dep)
-  workflow-engine.ts Core state machine: queue, stage progression, agent routing, CI gate
-  auto-trigger.ts   Polls registered repos, auto-enqueues new issues
+  workflow-engine.ts Core state machine: queue, stage progression, agent routing, CI gate,
+                    manual auto-advance/pause control
+  auto-trigger.ts   Per-repo polling scheduler; auto-enqueues new issues, tracks last-poll
+                    status, and exposes a manual pollNow() for on-demand refresh
   store.ts          electron-store schema (token, repos, providers, workflow queue)
   ipc.ts            IPC handlers wiring the above to the renderer
   main.ts / preload.ts  Electron entry points
 src/
-  App.tsx, components/  Kanban board, Settings, Workflow Queue (React + Tailwind)
+  App.tsx           Sidebar + project tabs (Board / Queue / Settings) shell
+  components/
+    Sidebar.tsx        Project list, add-repo, link to Global settings
+    KanbanBoard.tsx    Issues/PRs for the selected project, with live workflow status badges
+    WorkflowQueue.tsx  Task list for the selected project: agent/model/effort, prompts,
+                       manual advance/pause controls
+    ProjectSettings.tsx  Per-repo auto-trigger toggle, poll interval, remove
+    GlobalSettings.tsx   GitHub token, AI providers (model/effort)
 scripts/
   test-workflow.ts  Standalone harness — runs WorkflowEngine + GithubService outside Electron
 ```

@@ -1,5 +1,8 @@
 import type { AiProvider, AiProviderConfig } from './types.ts'
 
+/** Same rationale as CliProvider's timeout: one hung call would otherwise stall the whole queue. */
+const RUN_TIMEOUT_MS = 5 * 60 * 1000
+
 export class ApiProvider implements AiProvider {
   readonly id: string
   readonly name: string
@@ -29,6 +32,7 @@ export class ApiProvider implements AiProvider {
           max_tokens: 4096,
           messages: [{ role: 'user', content: prompt }],
         }),
+        signal: AbortSignal.timeout(RUN_TIMEOUT_MS),
       })
       if (!res.ok) throw new Error(`[${this.name}] API error ${res.status}: ${await res.text()}`)
       const data = await res.json()
@@ -45,6 +49,7 @@ export class ApiProvider implements AiProvider {
         model: model ?? 'gpt-4o',
         messages: [{ role: 'user', content: prompt }],
       }),
+      signal: AbortSignal.timeout(RUN_TIMEOUT_MS),
     })
     if (!res.ok) throw new Error(`[${this.name}] API error ${res.status}: ${await res.text()}`)
     const data = await res.json()

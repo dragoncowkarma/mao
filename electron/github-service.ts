@@ -14,7 +14,6 @@ export interface GithubTask {
 
 export class GithubService {
   private octokit: Octokit | null = null
-  private timer: NodeJS.Timeout | null = null
 
   setToken(token: string) {
     this.octokit = new Octokit({ auth: token })
@@ -146,25 +145,5 @@ export class GithubService {
   async mergePullRequest(owner: string, repo: string, pullNumber: number, commitTitle: string) {
     if (!this.octokit) throw new Error('GitHub token is not set')
     await this.octokit.rest.pulls.merge({ owner, repo, pull_number: pullNumber, commit_title: commitTitle })
-  }
-
-  startPolling(owner: string, repo: string, intervalMs: number, onUpdate: (tasks: GithubTask[]) => void) {
-    this.stopPolling()
-    const tick = async () => {
-      try {
-        onUpdate(await this.fetchTasks(owner, repo))
-      } catch (err) {
-        console.error('[github-service] poll failed', err)
-      }
-    }
-    tick()
-    this.timer = setInterval(tick, intervalMs)
-  }
-
-  stopPolling() {
-    if (this.timer) {
-      clearInterval(this.timer)
-      this.timer = null
-    }
   }
 }

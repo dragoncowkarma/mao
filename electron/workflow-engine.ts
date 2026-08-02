@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { createAiProvider } from './ai/index.ts'
-import type { AiProviderConfig } from './ai/types.ts'
+import type { AiEffort, AiProviderConfig } from './ai/types.ts'
 import type { GithubService } from './github-service.ts'
 import { ensureClone, checkoutBranch, hasChanges, commitAndPush } from './git-workspace.ts'
 
@@ -17,12 +17,19 @@ export const WORKFLOW_ACTIVE_LABEL = 'workflow-active'
 export interface RepoRef {
   owner: string
   repo: string
+  /** Whether auto-trigger should poll this repo for new issues. Defaults to true when unset. */
+  autoTrigger?: boolean
+  /** Auto-trigger poll interval for this repo, in milliseconds. Defaults to the global auto-trigger interval. */
+  pollIntervalMs?: number
 }
 
 export interface WorkflowStepResult {
   stage: WorkflowStageName
   agentId: string
   agentName: string
+  model?: string
+  effort?: AiEffort
+  prompt: string
   output: string
 }
 
@@ -32,8 +39,18 @@ export interface QueuedTask {
   repo: RepoRef
   stage: WorkflowStageName
   history: WorkflowStepResult[]
-  status: 'pending' | 'running' | 'done' | 'error'
+  status: 'pending' | 'running' | 'done' | 'error' | 'paused'
   error?: string
+  /** When false, a finished stage parks the task in 'paused' instead of auto-continuing to the next stage. */
+  autoAdvance: boolean
+  /** Set while status === 'running' so the UI can show which agent/prompt is currently in flight. */
+  active?: {
+    agentId: string
+    agentName: string
+    model?: string
+    effort?: AiEffort
+    prompt: string
+  }
   github: {
     issueNumber?: number
     issueUrl?: string
@@ -119,7 +136,12 @@ export class WorkflowEngine {
 
   /** Loads previously-persisted tasks (e.g. after an app restart) and resumes any that are unfinished. */
   restore(tasks: QueuedTask[]) {
-    this.queue = tasks.map((task) => (task.status === 'running' ? { ...task, status: 'pending' } : task))
+    this.queue = tasks.map((task) => ({
+      ...task,
+      autoAdvance: task.autoAdvance ?? true,
+      active: undefined,
+      status: task.status === 'running' ? 'pending' : task.status,
+    }))
     this.pruneFinishedTasks()
     void this.processQueue()
   }
@@ -137,7 +159,28 @@ export class WorkflowEngine {
     return task
   }
 
-  enqueue(title: string, repo: RepoRef): QueuedTask {
+  /** Manually runs the current stage of a task that is parked in 'paused' (autoAdvance === false). */
+  advance(taskId: string): QueuedTask {
+    const task = this.queue.find((t) => t.id === taskId)
+    if (!task) throw new Error(`Unknown task: ${taskId}`)
+    if (task.status !== 'paused') throw new Error(`Task is not paused: ${task.status}`)
+
+    task.status = 'pending'
+    this.notify()
+    void this.processQueue()
+    return task
+  }
+
+  /** Toggles whether a task auto-continues to the next stage on its own, or waits for a manual advance(). */
+  setAutoAdvance(taskId: string, autoAdvance: boolean): QueuedTask {
+    const task = this.queue.find((t) => t.id === taskId)
+    if (!task) throw new Error(`Unknown task: ${taskId}`)
+    task.autoAdvance = autoAdvance
+    this.notify()
+    return task
+  }
+
+  enqueue(title: string, repo: RepoRef, autoAdvance = true): QueuedTask {
     const task: QueuedTask = {
       id: randomUUID(),
       title,
@@ -145,6 +188,7 @@ export class WorkflowEngine {
       stage: STAGE_ORDER[0],
       history: [],
       status: 'pending',
+      autoAdvance,
       github: {},
     }
     this.queue.push(task)
@@ -162,6 +206,7 @@ export class WorkflowEngine {
       stage: 'pr',
       history: [],
       status: 'pending',
+      autoAdvance: true,
       github: { issueNumber, issueUrl },
     }
     this.queue.push(task)
@@ -201,13 +246,27 @@ export class WorkflowEngine {
     this.notify()
     try {
       const agentConfig = this.selectAgent(task)
-      let output: string
+      const usesCodeEdits = task.stage === 'pr' && agentConfig.kind === 'cli' && !!this.workspaceRoot
+      task.active = {
+        agentId: agentConfig.id,
+        agentName: agentConfig.name,
+        model: agentConfig.model,
+        effort: agentConfig.effort,
+        prompt: usesCodeEdits ? 'Preparing local checkout…' : buildPromptForStage(task),
+      }
+      this.notify()
 
-      if (task.stage === 'pr' && agentConfig.kind === 'cli' && this.workspaceRoot) {
-        output = await this.runPrWithCodeEdits(task, agentConfig)
+      let output: string
+      let prompt = task.active.prompt
+
+      if (usesCodeEdits) {
+        const result = await this.runPrWithCodeEdits(task, agentConfig)
+        output = result.output
+        prompt = result.prompt
       } else {
+        prompt = buildPromptForStage(task)
         const provider = createAiProvider(agentConfig)
-        output = await provider.run(buildPromptForStage(task))
+        output = await provider.run(prompt)
         await this.applyGithubAction(task, output)
       }
 
@@ -215,13 +274,16 @@ export class WorkflowEngine {
         stage: task.stage,
         agentId: agentConfig.id,
         agentName: agentConfig.name,
+        model: agentConfig.model,
+        effort: agentConfig.effort,
+        prompt,
         output,
       })
 
       const nextStage = STAGE_ORDER[STAGE_ORDER.indexOf(task.stage) + 1]
       if (nextStage) {
         task.stage = nextStage
-        task.status = 'pending'
+        task.status = task.autoAdvance ? 'pending' : 'paused'
       } else {
         task.status = 'done'
       }
@@ -229,12 +291,16 @@ export class WorkflowEngine {
       task.status = 'error'
       task.error = err instanceof Error ? err.message : String(err)
     }
+    task.active = undefined
     this.pruneFinishedTasks()
     this.notify()
   }
 
   /** Lets a CLI agent make real file edits in a local clone, then pushes them as the PR branch. */
-  private async runPrWithCodeEdits(task: QueuedTask, agentConfig: AiProviderConfig): Promise<string> {
+  private async runPrWithCodeEdits(
+    task: QueuedTask,
+    agentConfig: AiProviderConfig,
+  ): Promise<{ output: string; prompt: string }> {
     if (!this.githubToken) throw new Error('GitHub token is not configured')
     const { owner, repo } = task.repo
 
@@ -248,6 +314,8 @@ export class WorkflowEngine {
       `fresh branch off ${base}. Implement the following issue by editing the actual project files in ` +
       `this directory. Do not commit or push — that is handled separately.\n\nIssue: ${task.title}` +
       (task.github.issueUrl ? `\n${task.github.issueUrl}` : '')
+    if (task.active) task.active.prompt = prompt
+    this.notify()
 
     const output = await createAiProvider(agentConfig).run(prompt, { cwd: dir, allowToolUse: true })
 
@@ -263,7 +331,7 @@ export class WorkflowEngine {
       await this.applyGithubAction(task, output)
     }
 
-    return output
+    return { output, prompt }
   }
 
   private async applyGithubAction(task: QueuedTask, output: string) {

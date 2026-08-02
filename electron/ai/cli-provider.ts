@@ -18,6 +18,12 @@ const TOOL_USE_FLAGS_BY_COMMAND: Record<string, string[]> = {
   codex: ['-s', 'workspace-write'],
 }
 
+/**
+ * A hung/stuck CLI agent would otherwise block the entire workflow queue forever — WorkflowEngine
+ * processes one stage at a time, across every registered repo. 15 minutes covers real code-edit runs.
+ */
+const RUN_TIMEOUT_MS = 15 * 60 * 1000
+
 export class CliProvider implements AiProvider {
   readonly id: string
   readonly name: string
@@ -51,6 +57,21 @@ export class CliProvider implements AiProvider {
       const child = spawn(command, finalArgs, { shell: false, cwd: options?.cwd })
       let stdout = ''
       let stderr = ''
+      let settled = false
+
+      const timer = setTimeout(() => {
+        if (settled) return
+        settled = true
+        child.kill('SIGKILL')
+        reject(new Error(`[${this.name}] CLI timed out after ${RUN_TIMEOUT_MS / 1000}s`))
+      }, RUN_TIMEOUT_MS)
+
+      const settle = (fn: () => void) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        fn()
+      }
 
       child.stdout.on('data', (chunk) => {
         stdout += chunk.toString()
@@ -59,13 +80,15 @@ export class CliProvider implements AiProvider {
         stderr += chunk.toString()
       })
 
-      child.on('error', reject)
+      child.on('error', (err) => settle(() => reject(err)))
       child.on('close', (code) => {
-        if (code !== 0) {
-          reject(new Error(`[${this.name}] CLI exited with code ${code}: ${stderr}`))
-          return
-        }
-        resolve(stdout.trim())
+        settle(() => {
+          if (code !== 0) {
+            reject(new Error(`[${this.name}] CLI exited with code ${code}: ${stderr}`))
+            return
+          }
+          resolve(stdout.trim())
+        })
       })
 
       child.stdin.write(stdinInput)

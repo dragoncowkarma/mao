@@ -20,7 +20,7 @@ export function registerIpcHandlers() {
   workflowEngine.setOnChange(() => store.set('workflowTasks', workflowEngine.getTasks()))
   workflowEngine.restore(store.get('workflowTasks'))
 
-  startAutoTrigger(githubService, workflowEngine, () => store.get('githubRepos'))
+  const autoTrigger = startAutoTrigger(githubService, workflowEngine, () => store.get('githubRepos'))
 
   ipcMain.handle('ai:list', () => store.get('aiProviders'))
 
@@ -53,13 +53,30 @@ export function registerIpcHandlers() {
 
   ipcMain.handle('github:getRepos', () => store.get('githubRepos'))
 
-  ipcMain.handle('workflow:enqueue', (_event, title: string, repo: RepoRef) =>
-    workflowEngine.enqueue(title, repo),
+  ipcMain.handle('github:autoTriggerStatus', (_event, owner: string, repo: string) =>
+    autoTrigger.getStatus(owner, repo),
+  )
+
+  ipcMain.handle('github:refreshRepo', async (_event, owner: string, repo: string) => {
+    const repos = store.get('githubRepos')
+    const repoRef = repos.find((r) => r.owner === owner && r.repo === repo) ?? { owner, repo }
+    await autoTrigger.pollNow(repoRef)
+    return githubService.fetchTasks(owner, repo)
+  })
+
+  ipcMain.handle('workflow:enqueue', (_event, title: string, repo: RepoRef, autoAdvance?: boolean) =>
+    workflowEngine.enqueue(title, repo, autoAdvance),
   )
 
   ipcMain.handle('workflow:list', () => workflowEngine.getTasks())
 
   ipcMain.handle('workflow:retry', (_event, taskId: string) => workflowEngine.retry(taskId))
+
+  ipcMain.handle('workflow:advance', (_event, taskId: string) => workflowEngine.advance(taskId))
+
+  ipcMain.handle('workflow:setAutoAdvance', (_event, taskId: string, autoAdvance: boolean) =>
+    workflowEngine.setAutoAdvance(taskId, autoAdvance),
+  )
 
   ipcMain.handle('workflow:clearCompleted', () => workflowEngine.clearCompleted())
 }

@@ -34,6 +34,14 @@ function workflowBadgeLabel(task: QueuedTask): string {
   return `${STAGE_LABELS[task.stage]} queued`
 }
 
+/** The agent currently working the task, or the most recent one that touched it — for an at-a-glance "who". */
+function currentAgentLabel(task: QueuedTask): string | undefined {
+  const agent = task.active ?? task.history[task.history.length - 1]
+  if (!agent) return undefined
+  const parts = [agent.agentName, agent.model, agent.effort ? `${agent.effort} effort` : undefined].filter(Boolean)
+  return parts.join(' · ')
+}
+
 function sortTasks(tasks: GithubTask[]): GithubTask[] {
   return [...tasks].sort((a, b) => {
     if (a.urgent !== b.urgent) return a.urgent ? -1 : 1
@@ -82,6 +90,9 @@ function Column({ title, tasks, workflowTasks }: { title: string; tasks: GithubT
               </div>
               <p className="card-title text-[15px]">{task.title}</p>
               <p className="card-meta">{new Date(task.updatedAt).toLocaleString()}</p>
+              {workflowTask && currentAgentLabel(workflowTask) && (
+                <p className="card-meta">{currentAgentLabel(workflowTask)}</p>
+              )}
             </a>
           )
         })}

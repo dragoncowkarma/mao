@@ -15,37 +15,31 @@ function sortTasks(tasks: GithubTask[]): GithubTask[] {
 
 function Column({ title, tasks }: { title: string; tasks: GithubTask[] }) {
   return (
-    <div className="min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-800 p-3">
-      <h3 className="mb-2 text-sm font-semibold text-slate-200">
-        {title} <span className="text-slate-500">({tasks.length})</span>
-      </h3>
-      <div className="space-y-2">
+    <div>
+      <h4 className="mb-2">
+        {title} <span className="text-muted">({tasks.length})</span>
+      </h4>
+      <div className="flex flex-col gap-2">
         {tasks.map((task) => (
           <a
             key={task.id}
             href={task.url}
             target="_blank"
             rel="noreferrer"
-            className="block rounded bg-slate-900 p-2 text-xs hover:bg-slate-700"
+            className="card elev-sm no-underline text-inherit"
           >
-            <div className="flex items-center justify-between gap-1">
-              <span className="font-medium text-slate-100">#{task.number}</span>
-              <span className="flex gap-1">
-                {task.labels.includes('workflow-active') && (
-                  <span className="rounded bg-indigo-900/60 px-1.5 py-0.5 text-[10px] text-indigo-200">
-                    in workflow
-                  </span>
-                )}
-                {task.urgent && (
-                  <span className="rounded bg-red-900/60 px-1.5 py-0.5 text-[10px] text-red-200">urgent</span>
-                )}
-              </span>
+            <div className="flex items-center justify-between gap-2">
+              <span className="card-kicker">#{task.number}</span>
+              <div className="flex gap-1.5">
+                {task.labels.includes('workflow-active') && <span className="tag tag-outline">in workflow</span>}
+                {task.urgent && <span className="tag tag-accent">urgent</span>}
+              </div>
             </div>
-            <p className="mt-1 truncate text-slate-300">{task.title}</p>
-            <p className="mt-1 text-slate-500">{new Date(task.updatedAt).toLocaleString()}</p>
+            <p className="card-title text-[15px]">{task.title}</p>
+            <p className="card-meta">{new Date(task.updatedAt).toLocaleString()}</p>
           </a>
         ))}
-        {tasks.length === 0 && <p className="text-xs text-slate-500">No items</p>}
+        {tasks.length === 0 && <p className="text-muted text-sm">No items</p>}
       </div>
     </div>
   )
@@ -86,32 +80,40 @@ export default function KanbanBoard({ repos }: KanbanBoardProps) {
     }
   }, [selected?.owner, selected?.repo])
 
-  if (repos.length === 0) {
-    return <p className="text-sm text-slate-500">Add a repository in Settings to load the board.</p>
-  }
-
   const sorted = sortTasks(tasks)
   const issues = sorted.filter((t) => t.type === 'issue')
   const pullRequests = sorted.filter((t) => t.type === 'pull_request')
 
   return (
     <div>
-      <select
-        className="mb-3 rounded bg-slate-800 px-2 py-1 text-sm text-slate-100"
-        value={selectedIndex}
-        onChange={(e) => setSelectedIndex(Number(e.target.value))}
-      >
-        {repos.map((r, i) => (
-          <option key={i} value={i}>
-            {r.owner}/{r.repo}
-          </option>
-        ))}
-      </select>
-      {error && <p className="mb-2 text-xs text-red-400">{error}</p>}
-      <div className="flex gap-3">
-        <Column title="Issues" tasks={issues} />
-        <Column title="Pull Requests" tasks={pullRequests} />
+      <div className="flex flex-wrap items-baseline justify-between gap-4">
+        <h2>Board</h2>
+        {repos.length > 0 && (
+          <select
+            className="input max-w-[260px]"
+            value={selectedIndex}
+            onChange={(e) => setSelectedIndex(Number(e.target.value))}
+          >
+            {repos.map((r, i) => (
+              <option key={i} value={i}>
+                {r.owner}/{r.repo}
+              </option>
+            ))}
+          </select>
+        )}
       </div>
+
+      {repos.length === 0 ? (
+        <p className="text-muted mt-4 text-sm">Add a repository in Settings to load the board.</p>
+      ) : (
+        <>
+          {error && <p className="mt-2 text-xs text-[var(--color-accent)]">{error}</p>}
+          <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2">
+            <Column title="Issues" tasks={issues} />
+            <Column title="Pull Requests" tasks={pullRequests} />
+          </div>
+        </>
+      )}
     </div>
   )
 }

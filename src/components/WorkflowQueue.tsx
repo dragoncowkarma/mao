@@ -12,6 +12,16 @@ const STAGE_LABELS: Record<QueuedTask['stage'], string> = {
   merge: 'Merge',
 }
 
+function statusTagClass(task: QueuedTask): string {
+  if (task.status === 'error') return 'tag-accent'
+  if (task.status === 'done') return 'tag-neutral'
+  return 'tag-outline'
+}
+
+function statusLabel(task: QueuedTask): string {
+  return task.status === 'done' ? 'Done' : `${STAGE_LABELS[task.stage]} · ${task.status}`
+}
+
 export default function WorkflowQueue({ repos }: WorkflowQueueProps) {
   const [tasks, setTasks] = useState<QueuedTask[]>([])
   const [title, setTitle] = useState('')
@@ -42,12 +52,12 @@ export default function WorkflowQueue({ repos }: WorkflowQueueProps) {
   }
 
   return (
-    <div className="rounded-lg border border-slate-700 bg-slate-800 p-4">
-      <h2 className="mb-3 text-base font-semibold text-slate-100">Workflow Queue</h2>
+    <div>
+      <h2>Workflow Queue</h2>
 
-      <div className="mb-4 flex gap-2">
+      <div className="my-3 flex flex-wrap gap-2">
         <select
-          className="rounded bg-slate-900 px-2 py-1 text-sm text-slate-100"
+          className="input max-w-[220px]"
           value={repoIndex}
           onChange={(e) => setRepoIndex(Number(e.target.value))}
           disabled={repos.length === 0}
@@ -60,81 +70,61 @@ export default function WorkflowQueue({ repos }: WorkflowQueueProps) {
           ))}
         </select>
         <input
-          className="flex-1 rounded bg-slate-900 px-2 py-1 text-sm text-slate-100"
+          className="input min-w-[220px] flex-1"
           placeholder="New task title"
           value={title}
           onChange={(e) => setTitle(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && startWorkflow()}
         />
-        <button
-          onClick={startWorkflow}
-          disabled={repos.length === 0}
-          className="rounded bg-indigo-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-indigo-500 disabled:opacity-50"
-        >
+        <button onClick={startWorkflow} disabled={repos.length === 0} className="btn btn-primary shrink-0">
           Start
         </button>
       </div>
 
-      <div className="space-y-2">
+      <div className="flex flex-col gap-2">
         {tasks.map((task) => (
-          <div key={task.id} className="rounded bg-slate-900 p-3 text-sm">
-            <div className="flex items-center justify-between">
-              <span className="font-medium text-slate-100">{task.title}</span>
-              <span
-                className={
-                  'rounded px-2 py-0.5 text-xs ' +
-                  (task.status === 'error'
-                    ? 'bg-red-900/60 text-red-200'
-                    : task.status === 'done'
-                      ? 'bg-emerald-900/60 text-emerald-200'
-                      : 'bg-slate-700 text-slate-200')
-                }
-              >
-                {task.status === 'done' ? 'Done' : `${STAGE_LABELS[task.stage]} · ${task.status}`}
-              </span>
+          <div key={task.id} className="card elev-sm">
+            <div className="flex items-center justify-between gap-2">
+              <span className="card-title text-[15px]">{task.title}</span>
+              <span className={`tag ${statusTagClass(task)}`}>{statusLabel(task)}</span>
             </div>
-            <p className="mt-0.5 text-xs text-slate-500">
+            <p className="card-meta">
               {task.repo.owner}/{task.repo.repo}
             </p>
+
             {(task.github.issueUrl || task.github.prUrl) && (
-              <div className="mt-2 flex gap-3 text-xs">
+              <div className="flex gap-3 text-xs">
                 {task.github.issueUrl && (
-                  <a
-                    href={task.github.issueUrl}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="text-indigo-300 hover:underline"
-                  >
+                  <a href={task.github.issueUrl} target="_blank" rel="noreferrer">
                     Issue #{task.github.issueNumber}
                   </a>
                 )}
                 {task.github.prUrl && (
-                  <a
-                    href={task.github.prUrl}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="text-indigo-300 hover:underline"
-                  >
+                  <a href={task.github.prUrl} target="_blank" rel="noreferrer">
                     PR #{task.github.prNumber}
                   </a>
                 )}
               </div>
             )}
+
             {task.history.length > 0 && (
-              <ol className="mt-2 flex flex-wrap gap-2 text-xs text-slate-400">
+              <div className="flex flex-wrap gap-1.5">
                 {task.history.map((step, i) => (
-                  <li key={i} className="rounded bg-slate-800 px-2 py-0.5">
-                    {STAGE_LABELS[step.stage]} → <span className="text-indigo-300">{step.agentName}</span>
-                  </li>
+                  <span key={i} className="tag tag-neutral">
+                    {STAGE_LABELS[step.stage]} → {step.agentName}
+                  </span>
                 ))}
-              </ol>
+              </div>
             )}
+
             {task.error && (
-              <div className="mt-2 flex items-center justify-between gap-2">
-                <p className="text-xs text-red-400">{task.error}</p>
+              <div className="mt-1 flex items-center justify-between gap-2">
+                <p className="text-xs" style={{ color: 'var(--color-accent-700)' }}>
+                  {task.error}
+                </p>
                 <button
                   onClick={() => retryTask(task.id)}
-                  className="shrink-0 rounded bg-slate-700 px-2 py-1 text-xs text-slate-100 hover:bg-slate-600"
+                  className="btn btn-secondary shrink-0 px-2.5 py-1 text-xs"
                 >
                   Retry
                 </button>
@@ -142,7 +132,7 @@ export default function WorkflowQueue({ repos }: WorkflowQueueProps) {
             )}
           </div>
         ))}
-        {tasks.length === 0 && <p className="text-xs text-slate-500">No workflow tasks yet.</p>}
+        {tasks.length === 0 && <p className="text-muted text-sm">No workflow tasks yet.</p>}
       </div>
     </div>
   )

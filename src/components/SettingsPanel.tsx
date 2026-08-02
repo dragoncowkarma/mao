@@ -60,74 +60,68 @@ export default function SettingsPanel({ repos, onReposChange }: SettingsPanelPro
   }
 
   return (
-    <div className="rounded-lg border border-slate-700 bg-slate-800 p-4 text-sm">
-      <h2 className="mb-3 text-base font-semibold text-slate-100">Settings</h2>
+    <div>
+      <h2>Settings</h2>
 
-      <input
-        className="mb-4 w-full rounded bg-slate-900 px-2 py-1 text-slate-100"
-        placeholder="GitHub token"
-        type="password"
-        value={githubToken}
-        onChange={(e) => setGithubToken(e.target.value)}
-      />
+      <div className="field mb-4 max-w-[420px]">
+        <label>GitHub token</label>
+        <input
+          className="input"
+          placeholder="ghp_..."
+          type="password"
+          value={githubToken}
+          onChange={(e) => setGithubToken(e.target.value)}
+        />
+      </div>
 
       <div className="mb-2 flex items-center justify-between">
-        <h3 className="font-medium text-slate-300">Repositories</h3>
-        <button
-          onClick={addRepo}
-          className="rounded bg-slate-700 px-2 py-1 text-xs text-slate-100 hover:bg-slate-600"
-        >
+        <h3 className="!m-0">Repositories</h3>
+        <button onClick={addRepo} className="btn btn-secondary">
           + Add repo
         </button>
       </div>
 
-      <div className="mb-4 space-y-2">
+      <div className="mb-4 flex flex-col gap-2">
         {repoInputs.map((r, i) => (
-          <div key={i} className="flex gap-2 rounded bg-slate-900 p-2">
+          <div key={i} className="card flex-row items-center gap-2">
             <input
-              className="flex-1 rounded bg-slate-800 px-2 py-1 text-slate-100"
+              className="input"
               placeholder="owner"
               value={r.owner}
               onChange={(e) => updateRepo(i, { owner: e.target.value })}
             />
             <input
-              className="flex-1 rounded bg-slate-800 px-2 py-1 text-slate-100"
+              className="input"
               placeholder="repo"
               value={r.repo}
               onChange={(e) => updateRepo(i, { repo: e.target.value })}
             />
-            <button
-              onClick={() => removeRepo(i)}
-              className="rounded bg-red-900/50 px-2 py-1 text-xs text-red-200 hover:bg-red-900"
-            >
+            <button onClick={() => removeRepo(i)} className="btn btn-ghost shrink-0">
               Remove
             </button>
           </div>
         ))}
-        {repoInputs.length === 0 && <p className="text-slate-500">No repositories registered yet.</p>}
+        {repoInputs.length === 0 && <p className="text-muted">No repositories registered yet.</p>}
       </div>
 
       <div className="mb-2 flex items-center justify-between">
-        <h3 className="font-medium text-slate-300">AI Providers</h3>
-        <button
-          onClick={addProvider}
-          className="rounded bg-slate-700 px-2 py-1 text-xs text-slate-100 hover:bg-slate-600"
-        >
+        <h3 className="!m-0">AI Providers</h3>
+        <button onClick={addProvider} className="btn btn-secondary">
           + Add provider
         </button>
       </div>
 
-      <div className="space-y-2">
+      <div className="mb-4 flex flex-col gap-2">
         {providers.map((p) => (
-          <div key={p.id} className="grid grid-cols-6 gap-2 rounded bg-slate-900 p-2">
+          <div key={p.id} className="card flex-row flex-wrap items-center gap-2">
             <input
-              className="col-span-2 rounded bg-slate-800 px-2 py-1 text-slate-100"
+              className="input min-w-[140px] flex-1"
               placeholder="Name"
               value={p.name}
               onChange={(e) => updateProvider(p.id, { name: e.target.value })}
             />
             <select
-              className="rounded bg-slate-800 px-2 py-1 text-slate-100"
+              className="input w-[130px] flex-none"
               value={p.kind}
               onChange={(e) => updateProvider(p.id, { kind: e.target.value as 'api' | 'cli' })}
             >
@@ -138,7 +132,7 @@ export default function SettingsPanel({ repos, onReposChange }: SettingsPanelPro
             {p.kind === 'api' ? (
               <>
                 <select
-                  className="rounded bg-slate-800 px-2 py-1 text-slate-100"
+                  className="input w-[150px] flex-none"
                   value={p.apiFormat ?? 'anthropic'}
                   onChange={(e) => updateProvider(p.id, { apiFormat: e.target.value as 'anthropic' | 'openai' })}
                 >
@@ -146,7 +140,7 @@ export default function SettingsPanel({ repos, onReposChange }: SettingsPanelPro
                   <option value="openai">OpenAI-compatible</option>
                 </select>
                 <input
-                  className="col-span-2 rounded bg-slate-800 px-2 py-1 text-slate-100"
+                  className="input min-w-[140px] flex-1"
                   placeholder="API key"
                   type="password"
                   value={p.apiKey ?? ''}
@@ -155,32 +149,26 @@ export default function SettingsPanel({ repos, onReposChange }: SettingsPanelPro
               </>
             ) : (
               <input
-                className="col-span-3 rounded bg-slate-800 px-2 py-1 text-slate-100"
+                className="input min-w-[180px] flex-1"
                 placeholder="Command (e.g. claude)"
                 value={p.command ?? ''}
                 onChange={(e) => updateProvider(p.id, { command: e.target.value })}
               />
             )}
 
-            <button
-              onClick={() => removeProvider(p.id)}
-              className="rounded bg-red-900/50 px-2 py-1 text-xs text-red-200 hover:bg-red-900"
-            >
+            <button onClick={() => removeProvider(p.id)} className="btn btn-ghost shrink-0">
               Remove
             </button>
           </div>
         ))}
-        {providers.length === 0 && <p className="text-slate-500">No AI providers registered yet.</p>}
+        {providers.length === 0 && <p className="text-muted">No AI providers registered yet.</p>}
       </div>
 
-      <div className="mt-3 flex items-center gap-3">
-        <button
-          onClick={saveAll}
-          className="rounded bg-indigo-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-indigo-500"
-        >
-          Save
+      <div className="flex items-center gap-3">
+        <button onClick={saveAll} className="btn btn-primary">
+          Save changes
         </button>
-        {savedMessage && <span className="text-xs text-emerald-400">{savedMessage}</span>}
+        {savedMessage && <span className="text-xs" style={{ color: 'var(--color-accent)' }}>{savedMessage}</span>}
       </div>
     </div>
   )

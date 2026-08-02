@@ -1,6 +1,7 @@
 import type { AiProviderConfig } from '../electron/ai/types'
 import type { GithubTask } from '../electron/github-service'
 import type { QueuedTask, RepoRef } from '../electron/workflow-engine'
+import type { AutoTriggerStatus } from '../electron/auto-trigger'
 
 declare global {
   interface Window {
@@ -16,11 +17,15 @@ declare global {
         fetchTasks: (owner: string, repo: string) => Promise<GithubTask[]>
         setRepos: (repos: RepoRef[]) => Promise<void>
         getRepos: () => Promise<RepoRef[]>
+        autoTriggerStatus: (owner: string, repo: string) => Promise<AutoTriggerStatus>
+        refreshRepo: (owner: string, repo: string) => Promise<GithubTask[]>
       }
       workflow: {
-        enqueue: (title: string, repo: RepoRef) => Promise<QueuedTask>
+        enqueue: (title: string, repo: RepoRef, autoAdvance?: boolean) => Promise<QueuedTask>
         list: () => Promise<QueuedTask[]>
         retry: (taskId: string) => Promise<QueuedTask>
+        advance: (taskId: string) => Promise<QueuedTask>
+        setAutoAdvance: (taskId: string, autoAdvance: boolean) => Promise<QueuedTask>
         clearCompleted: () => Promise<void>
       }
     }

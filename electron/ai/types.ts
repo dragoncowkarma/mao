@@ -1,5 +1,7 @@
 export type AiProviderKind = 'api' | 'cli'
 
+export type AiEffort = 'low' | 'medium' | 'high'
+
 export interface AiProviderConfig {
   id: string
   name: string
@@ -12,6 +14,8 @@ export interface AiProviderConfig {
   // cli
   command?: string
   args?: string[]
+  /** Reasoning effort shown alongside this provider's work — informational only, not sent to every backend. */
+  effort?: AiEffort
 }
 
 export interface AiRunOptions {

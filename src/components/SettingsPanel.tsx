@@ -11,11 +11,57 @@ function emptyProvider(): AiProviderConfig {
   return { id: crypto.randomUUID(), name: '', kind: 'api', apiFormat: 'anthropic' }
 }
 
+function validateProviders(providers: AiProviderConfig[]): string[] {
+  const errors: string[] = []
+  const seenNames = new Set<string>()
+
+  for (const p of providers) {
+    const name = p.name.trim()
+    const label = name || 'Unnamed provider'
+
+    if (!name) {
+      errors.push('Every AI provider needs a name.')
+    } else {
+      const key = name.toLowerCase()
+      if (seenNames.has(key)) errors.push(`Duplicate provider name: "${name}".`)
+      seenNames.add(key)
+    }
+
+    if (p.kind === 'api' && !p.apiKey?.trim()) errors.push(`"${label}" is an API provider but has no API key.`)
+    if (p.kind === 'cli' && !p.command?.trim()) errors.push(`"${label}" is a CLI provider but has no command.`)
+  }
+
+  return errors
+}
+
+function resolveRepos(repoInputs: RepoRef[]): { valid: RepoRef[]; errors: string[] } {
+  const errors: string[] = []
+  const seen = new Set<string>()
+  const valid: RepoRef[] = []
+
+  for (const r of repoInputs) {
+    const owner = r.owner.trim()
+    const repo = r.repo.trim()
+    if (!owner || !repo) continue // a blank row the user hasn't filled in yet — just skip it
+
+    const key = `${owner}/${repo}`.toLowerCase()
+    if (seen.has(key)) {
+      errors.push(`Duplicate repository: ${owner}/${repo}.`)
+      continue
+    }
+    seen.add(key)
+    valid.push({ owner, repo })
+  }
+
+  return { valid, errors }
+}
+
 export default function SettingsPanel({ repos, onReposChange }: SettingsPanelProps) {
   const [repoInputs, setRepoInputs] = useState<RepoRef[]>(repos)
   const [githubToken, setGithubToken] = useState('')
   const [providers, setProviders] = useState<AiProviderConfig[]>([])
   const [savedMessage, setSavedMessage] = useState('')
+  const [saveError, setSaveError] = useState('')
 
   useEffect(() => {
     window.electronAPI.ai.list().then(setProviders)
@@ -50,13 +96,25 @@ export default function SettingsPanel({ repos, onReposChange }: SettingsPanelPro
   }
 
   async function saveAll() {
-    await window.electronAPI.ai.save(providers)
-    if (githubToken) await window.electronAPI.github.setToken(githubToken)
-    const validRepos = repoInputs.filter((r) => r.owner.trim() && r.repo.trim())
-    await window.electronAPI.github.setRepos(validRepos)
-    onReposChange(validRepos)
-    setSavedMessage('Saved')
-    setTimeout(() => setSavedMessage(''), 1500)
+    setSaveError('')
+
+    const { valid: validRepos, errors: repoErrors } = resolveRepos(repoInputs)
+    const errors = [...validateProviders(providers), ...repoErrors]
+    if (errors.length > 0) {
+      setSaveError(errors.join(' '))
+      return
+    }
+
+    try {
+      await window.electronAPI.ai.save(providers)
+      if (githubToken) await window.electronAPI.github.setToken(githubToken)
+      await window.electronAPI.github.setRepos(validRepos)
+      onReposChange(validRepos)
+      setSavedMessage('Saved')
+      setTimeout(() => setSavedMessage(''), 1500)
+    } catch (err) {
+      setSaveError(err instanceof Error ? err.message : String(err))
+    }
   }
 
   return (
@@ -182,6 +240,7 @@ export default function SettingsPanel({ repos, onReposChange }: SettingsPanelPro
         </button>
         {savedMessage && <span className="text-xs text-emerald-400">{savedMessage}</span>}
       </div>
+      {saveError && <p className="mt-2 text-xs text-red-400">{saveError}</p>}
     </div>
   )
 }

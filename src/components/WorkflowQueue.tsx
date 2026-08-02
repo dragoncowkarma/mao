@@ -51,9 +51,23 @@ export default function WorkflowQueue({ repos }: WorkflowQueueProps) {
     setTasks(await window.electronAPI.workflow.list())
   }
 
+  async function clearCompleted() {
+    await window.electronAPI.workflow.clearCompleted()
+    setTasks(await window.electronAPI.workflow.list())
+  }
+
+  const finishedCount = tasks.filter((t) => t.status === 'done' || t.status === 'error').length
+
   return (
     <div>
-      <h2>Workflow Queue</h2>
+      <div className="flex items-center justify-between">
+        <h2>Workflow Queue</h2>
+        {finishedCount > 0 && (
+          <button onClick={clearCompleted} className="btn btn-secondary">
+            Clear completed ({finishedCount})
+          </button>
+        )}
+      </div>
 
       <div className="my-3 flex flex-wrap gap-2">
         <select

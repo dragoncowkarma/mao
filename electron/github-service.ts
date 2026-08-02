@@ -123,20 +123,23 @@ export class GithubService {
     const { data: pr } = await this.octokit.rest.pulls.get({ owner, repo, pull_number: pullNumber })
     const ref = pr.head.sha
 
-    const [{ data: checks }, { data: combinedStatus }] = await Promise.all([
-      this.octokit.rest.checks.listForRef({ owner, repo, ref }),
+    const [checkRuns, { data: combinedStatus }] = await Promise.all([
+      this.octokit.paginate(this.octokit.rest.checks.listForRef, { owner, repo, ref, per_page: 100 }),
       this.octokit.rest.repos.getCombinedStatusForRef({ owner, repo, ref }),
     ])
 
-    if (checks.check_runs.length === 0 && combinedStatus.statuses.length === 0) return 'none'
+    const hasLegacyStatuses = combinedStatus.statuses.length > 0
+    if (checkRuns.length === 0 && !hasLegacyStatuses) return 'none'
 
+    // getCombinedStatusForRef reports state: 'pending' by default even with zero legacy statuses,
+    // so its state only means anything when there are actual statuses to back it up.
     const anyPending =
-      checks.check_runs.some((run) => run.status !== 'completed') || combinedStatus.state === 'pending'
+      checkRuns.some((run) => run.status !== 'completed') || (hasLegacyStatuses && combinedStatus.state === 'pending')
     if (anyPending) return 'pending'
 
     const anyFailed =
-      checks.check_runs.some((run) => !['success', 'neutral', 'skipped'].includes(run.conclusion ?? '')) ||
-      combinedStatus.state === 'failure'
+      checkRuns.some((run) => !['success', 'neutral', 'skipped'].includes(run.conclusion ?? '')) ||
+      (hasLegacyStatuses && combinedStatus.state === 'failure')
     return anyFailed ? 'failure' : 'success'
   }
 

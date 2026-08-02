@@ -60,4 +60,6 @@ export function registerIpcHandlers() {
   ipcMain.handle('workflow:list', () => workflowEngine.getTasks())
 
   ipcMain.handle('workflow:retry', (_event, taskId: string) => workflowEngine.retry(taskId))
+
+  ipcMain.handle('workflow:clearCompleted', () => workflowEngine.clearCompleted())
 }

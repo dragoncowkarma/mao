@@ -11,7 +11,8 @@
     "dist": "vite build && electron-builder",
     "build:dir": "vite build && electron-builder --dir",
     "preview": "vite preview",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "test": "vitest run"
   },
   "dependencies": {
     "electron-store": "^10.0.0",
@@ -32,7 +33,8 @@
     "typescript": "^5.7.2",
     "vite": "^6.0.7",
     "vite-plugin-electron": "^0.29.0",
-    "vite-plugin-electron-renderer": "^0.14.6"
+    "vite-plugin-electron-renderer": "^0.14.6",
+    "vitest": "^4.1.10"
   },
   "build": {
     "appId": "com.mao.app",
@@ -45,14 +47,21 @@
       "output": "release"
     },
     "mac": {
-      "target": ["dmg", "zip"],
+      "target": [
+        "dmg",
+        "zip"
+      ],
       "category": "public.app-category.developer-tools"
     },
     "win": {
-      "target": ["zip"]
+      "target": [
+        "zip"
+      ]
     },
     "linux": {
-      "target": ["AppImage"],
+      "target": [
+        "AppImage"
+      ],
       "category": "Development"
     }
   }

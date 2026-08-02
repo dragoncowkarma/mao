@@ -243,17 +243,19 @@ export class WorkflowEngine {
 
   private async runStage(task: QueuedTask) {
     task.status = 'running'
-    const agentConfig = this.selectAgent(task)
-    const usesCodeEdits = task.stage === 'pr' && agentConfig.kind === 'cli' && !!this.workspaceRoot
-    task.active = {
-      agentId: agentConfig.id,
-      agentName: agentConfig.name,
-      model: agentConfig.model,
-      effort: agentConfig.effort,
-      prompt: usesCodeEdits ? 'Preparing local checkout…' : buildPromptForStage(task),
-    }
     this.notify()
     try {
+      const agentConfig = this.selectAgent(task)
+      const usesCodeEdits = task.stage === 'pr' && agentConfig.kind === 'cli' && !!this.workspaceRoot
+      task.active = {
+        agentId: agentConfig.id,
+        agentName: agentConfig.name,
+        model: agentConfig.model,
+        effort: agentConfig.effort,
+        prompt: usesCodeEdits ? 'Preparing local checkout…' : buildPromptForStage(task),
+      }
+      this.notify()
+
       let output: string
       let prompt = task.active.prompt
 

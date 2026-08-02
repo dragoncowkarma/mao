@@ -76,6 +76,13 @@ scripts/
 
 `WorkflowEngine` and `GithubService` have zero Electron dependencies, so `scripts/test-workflow.ts` can drive the whole pipeline directly under plain Node (see below) — useful for testing without the UI.
 
+## Unit tests
+
+```bash
+npm run test        # vitest run — WorkflowEngine stage progression, maker-checker,
+                     # retry, CI gating, and manual pause/advance, all against fakes
+```
+
 ## Testing against a real repo
 
 Copy the env template and fill in a **throwaway test repo** (the pipeline creates real issues/branches/PRs and can merge them):

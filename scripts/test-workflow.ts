@@ -1,3 +1,5 @@
+import os from 'node:os'
+import path from 'node:path'
 import { GithubService } from '../electron/github-service.ts'
 import { WorkflowEngine } from '../electron/workflow-engine.ts'
 import type { AiProviderConfig } from '../electron/ai/types.ts'
@@ -55,6 +57,8 @@ github.setToken(token)
 const engine = new WorkflowEngine(github)
 engine.setProviders(providers)
 engine.setRepo(owner, repo)
+engine.setGithubToken(token)
+engine.setWorkspaceRoot(process.env.TEST_WORKSPACE_ROOT || path.join(os.tmpdir(), 'mao-test-workspace'))
 
 const task = engine.enqueue(title)
 

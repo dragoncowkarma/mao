@@ -1,4 +1,5 @@
-import { ipcMain } from 'electron'
+import { app, ipcMain } from 'electron'
+import path from 'node:path'
 import { store } from './store.ts'
 import { createAiProvider, type AiProviderConfig } from './ai/index.ts'
 import { GithubService } from './github-service.ts'
@@ -10,9 +11,13 @@ const workflowEngine = new WorkflowEngine(githubService)
 
 export function registerIpcHandlers() {
   const token = store.get('githubToken')
-  if (token) githubService.setToken(token)
+  if (token) {
+    githubService.setToken(token)
+    workflowEngine.setGithubToken(token)
+  }
   workflowEngine.setProviders(store.get('aiProviders'))
   workflowEngine.setRepo(store.get('githubOwner'), store.get('githubRepo'))
+  workflowEngine.setWorkspaceRoot(path.join(app.getPath('userData'), 'workspaces'))
   workflowEngine.setOnChange(() => store.set('workflowTasks', workflowEngine.getTasks()))
   workflowEngine.restore(store.get('workflowTasks'))
 
@@ -39,6 +44,7 @@ export function registerIpcHandlers() {
   ipcMain.handle('github:setToken', (_event, token: string) => {
     store.set('githubToken', token)
     githubService.setToken(token)
+    workflowEngine.setGithubToken(token)
   })
 
   ipcMain.handle('github:fetchTasks', (_event, owner: string, repo: string) => {

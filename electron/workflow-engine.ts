@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { createAiProvider } from './ai/index.ts'
 import type { AiProviderConfig } from './ai/types.ts'
 import type { GithubService } from './github-service.ts'
+import { ensureClone, checkoutBranch, hasChanges, commitAndPush } from './git-workspace.ts'
 
 export type WorkflowStageName = 'issue' | 'pr' | 'review' | 'merge'
 
@@ -58,6 +59,8 @@ export class WorkflowEngine {
   private processing = false
   private github: GithubService
   private onChange?: () => void
+  private githubToken = ''
+  private workspaceRoot = ''
 
   constructor(github: GithubService) {
     this.github = github
@@ -70,6 +73,16 @@ export class WorkflowEngine {
   setRepo(owner: string, repo: string) {
     this.owner = owner
     this.repo = repo
+  }
+
+  /** Needed (alongside setWorkspaceRoot) to clone/push over authenticated HTTPS for real code-edit PRs. */
+  setGithubToken(token: string) {
+    this.githubToken = token
+  }
+
+  /** Local directory where repos get cloned so CLI agents can make real file edits. Unset = notes-only PRs. */
+  setWorkspaceRoot(root: string) {
+    this.workspaceRoot = root
   }
 
   /** Called after every queue mutation, so the caller can persist state. */
@@ -166,10 +179,15 @@ export class WorkflowEngine {
     this.notify()
     try {
       const agentConfig = this.selectAgent(task)
-      const provider = createAiProvider(agentConfig)
-      const output = await provider.run(buildPromptForStage(task))
+      let output: string
 
-      await this.applyGithubAction(task, output)
+      if (task.stage === 'pr' && agentConfig.kind === 'cli' && this.workspaceRoot) {
+        output = await this.runPrWithCodeEdits(task, agentConfig)
+      } else {
+        const provider = createAiProvider(agentConfig)
+        output = await provider.run(buildPromptForStage(task))
+        await this.applyGithubAction(task, output)
+      }
 
       task.history.push({
         stage: task.stage,
@@ -190,6 +208,39 @@ export class WorkflowEngine {
       task.error = err instanceof Error ? err.message : String(err)
     }
     this.notify()
+  }
+
+  /** Lets a CLI agent make real file edits in a local clone, then pushes them as the PR branch. */
+  private async runPrWithCodeEdits(task: QueuedTask, agentConfig: AiProviderConfig): Promise<string> {
+    if (!this.owner || !this.repo) throw new Error('GitHub owner/repo is not configured')
+    if (!this.githubToken) throw new Error('GitHub token is not configured')
+
+    const branch = `workflow/${task.github.issueNumber ?? task.id.slice(0, 8)}-${slugify(task.title)}`
+    const dir = await ensureClone(this.workspaceRoot, this.owner, this.repo, this.githubToken)
+    const base = await this.github.getDefaultBranch(this.owner, this.repo)
+    await checkoutBranch(dir, base, branch)
+
+    const prompt =
+      `You are working inside a real local git checkout of ${this.owner}/${this.repo}, currently on a ` +
+      `fresh branch off ${base}. Implement the following issue by editing the actual project files in ` +
+      `this directory. Do not commit or push — that is handled separately.\n\nIssue: ${task.title}` +
+      (task.github.issueUrl ? `\n${task.github.issueUrl}` : '')
+
+    const output = await createAiProvider(agentConfig).run(prompt, { cwd: dir, allowToolUse: true })
+
+    if (await hasChanges(dir)) {
+      await commitAndPush(dir, branch, `Implement: ${task.title}`)
+      const body = task.github.issueNumber ? `${output}\n\nCloses #${task.github.issueNumber}` : output
+      const pr = await this.github.createPullRequest(this.owner, this.repo, branch, base, task.title, body)
+      task.github.branch = branch
+      task.github.prNumber = pr.number
+      task.github.prUrl = pr.html_url
+    } else {
+      // Agent made no real edits (declined, or nothing to change) — fall back to a notes-only PR.
+      await this.applyGithubAction(task, output)
+    }
+
+    return output
   }
 
   private async applyGithubAction(task: QueuedTask, output: string) {

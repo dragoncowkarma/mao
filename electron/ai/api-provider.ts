@@ -11,6 +11,7 @@ export class ApiProvider implements AiProvider {
     this.config = config
   }
 
+  // API providers only ever return text, so cwd/allowToolUse (real file edits) don't apply here.
   async run(prompt: string): Promise<string> {
     const { apiFormat = 'openai', apiKey, baseUrl, model } = this.config
     if (!apiKey) throw new Error(`[${this.name}] API key is not set`)

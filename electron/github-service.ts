@@ -59,6 +59,12 @@ export class GithubService {
     return data
   }
 
+  async getDefaultBranch(owner: string, repo: string): Promise<string> {
+    if (!this.octokit) throw new Error('GitHub token is not set')
+    const { data } = await this.octokit.rest.repos.get({ owner, repo })
+    return data.default_branch
+  }
+
   async createBranch(owner: string, repo: string, branchName: string) {
     if (!this.octokit) throw new Error('GitHub token is not set')
     const { data: repoData } = await this.octokit.rest.repos.get({ owner, repo })

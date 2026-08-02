@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process'
-import type { AiProvider, AiProviderConfig } from './types.ts'
+import type { AiProvider, AiProviderConfig, AiRunOptions } from './types.ts'
 
 const DEFAULT_SYSTEM_PROMPT =
   'You are being invoked as a single-shot, non-interactive text-generation subtask inside an ' +
@@ -10,6 +10,12 @@ const DEFAULT_SYSTEM_PROMPT =
 /** CLIs that accept a dedicated system-prompt flag; others get the directive prepended to stdin instead. */
 const SYSTEM_PROMPT_FLAG_BY_COMMAND: Record<string, string> = {
   claude: '--append-system-prompt',
+}
+
+/** Extra flags that let a CLI actually write files when allowToolUse is requested. */
+const TOOL_USE_FLAGS_BY_COMMAND: Record<string, string[]> = {
+  claude: ['--dangerously-skip-permissions'],
+  codex: ['-s', 'workspace-write'],
 }
 
 export class CliProvider implements AiProvider {
@@ -23,17 +29,26 @@ export class CliProvider implements AiProvider {
     this.config = config
   }
 
-  run(prompt: string): Promise<string> {
+  run(prompt: string, options?: AiRunOptions): Promise<string> {
     const { command, args = [] } = this.config
     if (!command) throw new Error(`[${this.name}] CLI command is not set`)
 
     const commandName = command.split('/').pop() ?? command
-    const systemPromptFlag = SYSTEM_PROMPT_FLAG_BY_COMMAND[commandName]
-    const finalArgs = systemPromptFlag ? [systemPromptFlag, DEFAULT_SYSTEM_PROMPT, ...args] : args
-    const stdinInput = systemPromptFlag ? prompt : `${DEFAULT_SYSTEM_PROMPT}\n\n---\n\n${prompt}`
+
+    let finalArgs: string[]
+    let stdinInput: string
+
+    if (options?.allowToolUse) {
+      finalArgs = [...args, ...(TOOL_USE_FLAGS_BY_COMMAND[commandName] ?? [])]
+      stdinInput = prompt
+    } else {
+      const systemPromptFlag = SYSTEM_PROMPT_FLAG_BY_COMMAND[commandName]
+      finalArgs = systemPromptFlag ? [systemPromptFlag, DEFAULT_SYSTEM_PROMPT, ...args] : args
+      stdinInput = systemPromptFlag ? prompt : `${DEFAULT_SYSTEM_PROMPT}\n\n---\n\n${prompt}`
+    }
 
     return new Promise((resolve, reject) => {
-      const child = spawn(command, finalArgs, { shell: false })
+      const child = spawn(command, finalArgs, { shell: false, cwd: options?.cwd })
       let stdout = ''
       let stderr = ''
 

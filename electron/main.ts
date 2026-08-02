@@ -1,4 +1,4 @@
-import { app, BrowserWindow } from 'electron'
+import { app, BrowserWindow, shell } from 'electron'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { registerIpcHandlers } from './ipc.ts'
@@ -18,6 +18,15 @@ function createWindow() {
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
     },
+  })
+
+  // Board/Queue cards link to GitHub with target="_blank" — Electron denies new-window requests by
+  // default, so without this handler those links would silently do nothing. Route them to the OS browser.
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    if (url.startsWith('https://') || url.startsWith('http://')) {
+      void shell.openExternal(url)
+    }
+    return { action: 'deny' }
   })
 
   if (VITE_DEV_SERVER_URL) {

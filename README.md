@@ -1,5 +1,7 @@
 # MAO
 
+[![CI](https://github.com/dragoncowkarma/mao/actions/workflows/ci.yml/badge.svg)](https://github.com/dragoncowkarma/mao/actions/workflows/ci.yml)
+
 Electron dev-toolkit that lets AI agents drive a GitHub workflow — **issue → PR → review → merge** — end to end, with a maker-checker safeguard so the same AI never reviews its own work.
 
 ## Features

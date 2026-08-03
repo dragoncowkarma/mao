@@ -1,8 +1,8 @@
 import os from 'node:os'
 import path from 'node:path'
-import { GithubService } from '../electron/github-service.ts'
-import { WorkflowEngine } from '../electron/workflow-engine.ts'
-import type { AiProviderConfig } from '../electron/ai/types.ts'
+import { GithubService } from '../core/github-service.ts'
+import { WorkflowEngine } from '../core/workflow-engine.ts'
+import type { AiProviderConfig } from '../core/ai/types.ts'
 
 const owner = process.env.TEST_GITHUB_OWNER
 const repo = process.env.TEST_GITHUB_REPO

@@ -1,8 +1,8 @@
 import { contextBridge, ipcRenderer } from 'electron'
-import type { AiProviderConfig } from './ai/types.ts'
-import type { GithubTask } from './github-service.ts'
-import type { QueuedTask, RepoRef } from './workflow-engine.ts'
-import type { AutoTriggerStatus } from './auto-trigger.ts'
+import type { AiProviderConfig } from '../core/ai/types.ts'
+import type { GithubTask } from '../core/github-service.ts'
+import type { QueuedTask, RepoRef } from '../core/workflow-engine.ts'
+import type { AutoTriggerStatus } from '../core/auto-trigger.ts'
 
 contextBridge.exposeInMainWorld('electronAPI', {
   platform: process.platform,

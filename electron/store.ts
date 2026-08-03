@@ -1,19 +1,6 @@
 import Store from 'electron-store'
-import type { AiProviderConfig } from './ai/types.ts'
-import type { QueuedTask, RepoRef } from './workflow-engine.ts'
+import { MAO_STORE_DEFAULTS, type MaoStoreSchema } from '../core/store.ts'
 
-interface StoreSchema {
-  githubToken: string
-  githubRepos: RepoRef[]
-  aiProviders: AiProviderConfig[]
-  workflowTasks: QueuedTask[]
-}
-
-export const store = new Store<StoreSchema>({
-  defaults: {
-    githubToken: '',
-    githubRepos: [],
-    aiProviders: [],
-    workflowTasks: [],
-  },
+export const store = new Store<MaoStoreSchema>({
+  defaults: MAO_STORE_DEFAULTS,
 })

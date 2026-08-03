@@ -15,5 +15,5 @@
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["src", "electron"]
+  "include": ["src", "electron", "core", "cli"]
 }

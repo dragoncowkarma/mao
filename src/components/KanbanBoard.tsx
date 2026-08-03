@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
-import type { GithubTask } from '../../electron/github-service'
-import type { QueuedTask, RepoRef } from '../../electron/workflow-engine'
+import type { GithubTask } from '../../core/github-service'
+import type { QueuedTask, RepoRef } from '../../core/workflow-engine'
 
 interface KanbanBoardProps {
   repo: RepoRef

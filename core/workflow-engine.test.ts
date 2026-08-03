@@ -3,11 +3,16 @@ import { WorkflowEngine, type RepoRef } from './workflow-engine.ts'
 import type { AiProviderConfig } from './ai/types.ts'
 import type { GithubService } from './github-service.ts'
 
+const providerConfigsUsed: AiProviderConfig[] = []
+
 vi.mock('./ai/index.ts', () => ({
   createAiProvider: (config: AiProviderConfig) => ({
     id: config.id,
     name: config.name,
-    run: vi.fn(async () => `output-from-${config.id}`),
+    run: vi.fn(async () => {
+      providerConfigsUsed.push(config)
+      return `output-from-${config.id}`
+    }),
   }),
 }))
 
@@ -43,6 +48,33 @@ async function waitFor(predicate: () => boolean, timeoutMs = 2000) {
 }
 
 describe('WorkflowEngine', () => {
+  it('uses a validated task override before round-robin selection and applies model and effort to every stage', async () => {
+    const engine = new WorkflowEngine(makeFakeGithub())
+    engine.setProviders([makeProvider('agent-a'), makeProvider('agent-b')])
+    providerConfigsUsed.length = 0
+
+    const task = engine.enqueue('Pinned task', repo, true, {
+      providerId: 'agent-b',
+      model: 'claude-opus-5',
+      effort: 'high',
+    })
+    await waitFor(() => engine.getTasks().find((entry) => entry.id === task.id)?.status === 'done')
+
+    const finished = engine.getTasks().find((entry) => entry.id === task.id)!
+    expect(finished.history.map((step) => step.agentId)).toEqual(['agent-b', 'agent-b', 'agent-b', 'agent-b'])
+    expect(finished.history.map((step) => step.model)).toEqual(Array(4).fill('claude-opus-5'))
+    expect(finished.history.map((step) => step.effort)).toEqual(Array(4).fill('high'))
+    expect(providerConfigsUsed).toHaveLength(4)
+    expect(providerConfigsUsed.every((config) => config.model === 'claude-opus-5' && config.effort === 'high')).toBe(true)
+  })
+
+  it('rejects invalid task overrides before queueing them', () => {
+    const engine = new WorkflowEngine(makeFakeGithub())
+    engine.setProviders([makeProvider('agent-a')])
+    expect(() => engine.enqueue('Unknown provider', repo, true, { providerId: 'missing' })).toThrow(/Unknown override provider/)
+    expect(() => engine.enqueue('Bad model', repo, true, { model: 'model name with spaces' })).toThrow(/Invalid override model/)
+  })
+
   it('runs a task through all four stages, alternating agents (maker-checker)', async () => {
     const github = makeFakeGithub()
     const engine = new WorkflowEngine(github)

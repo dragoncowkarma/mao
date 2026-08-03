@@ -1,7 +1,7 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import type { AiProviderConfig } from '../core/ai/types.ts'
 import type { GithubTask } from '../core/github-service.ts'
-import type { QueuedTask, RepoRef } from '../core/workflow-engine.ts'
+import type { QueuedTask, RepoRef, TaskAiOverride } from '../core/workflow-engine.ts'
 import type { AutoTriggerStatus } from '../core/auto-trigger.ts'
 
 contextBridge.exposeInMainWorld('electronAPI', {
@@ -25,8 +25,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.invoke('github:refreshRepo', owner, repo),
   },
   workflow: {
-    enqueue: (title: string, repo: RepoRef, autoAdvance?: boolean): Promise<QueuedTask> =>
-      ipcRenderer.invoke('workflow:enqueue', title, repo, autoAdvance),
+    enqueue: (title: string, repo: RepoRef, autoAdvance?: boolean, override?: TaskAiOverride): Promise<QueuedTask> =>
+      ipcRenderer.invoke('workflow:enqueue', title, repo, autoAdvance, override),
     list: (): Promise<QueuedTask[]> => ipcRenderer.invoke('workflow:list'),
     retry: (taskId: string): Promise<QueuedTask> => ipcRenderer.invoke('workflow:retry', taskId),
     advance: (taskId: string): Promise<QueuedTask> => ipcRenderer.invoke('workflow:advance', taskId),

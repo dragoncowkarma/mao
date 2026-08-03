@@ -6,8 +6,8 @@ import { createMaoApp, type MaoApp } from '../core/app.ts'
 import { startAutoTrigger } from '../core/auto-trigger.ts'
 import { FileStore } from '../core/store.ts'
 import { defaultDataDir } from '../core/paths.ts'
-import type { AiProviderConfig } from '../core/ai/types.ts'
-import type { QueuedTask, RepoRef } from '../core/workflow-engine.ts'
+import type { AiEffort, AiProviderConfig } from '../core/ai/types.ts'
+import type { QueuedTask, RepoRef, TaskAiOverride } from '../core/workflow-engine.ts'
 
 function log(...args: unknown[]) {
   console.log('[mao]', ...args)
@@ -136,10 +136,21 @@ workflow
   .description('Queue a new task starting at the issue stage')
   .requiredOption('--owner <owner>')
   .requiredOption('--repo <repo>')
+  .option('--provider <id>', 'pin a configured provider ID for every stage')
+  .option('--model <model>', 'override the provider model for every stage')
+  .option('--effort <low|medium|high>', 'override reasoning effort for every stage')
   .option('--no-auto-advance', 'pause after each stage instead of running the pipeline unattended')
-  .action((title: string, opts: { owner: string; repo: string; autoAdvance: boolean }) => {
+  .action((title: string, opts: {
+    owner: string
+    repo: string
+    autoAdvance: boolean
+    provider?: string
+    model?: string
+    effort?: AiEffort
+  }) => {
     const { workflowEngine } = loadApp()
-    const task = workflowEngine.enqueue(title, { owner: opts.owner, repo: opts.repo }, opts.autoAdvance)
+    const override: TaskAiOverride = { providerId: opts.provider, model: opts.model, effort: opts.effort }
+    const task = workflowEngine.enqueue(title, { owner: opts.owner, repo: opts.repo }, opts.autoAdvance, override)
     log(`Enqueued task ${task.id} (stage=${task.stage})`)
   })
 

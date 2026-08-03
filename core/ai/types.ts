@@ -14,7 +14,7 @@ export interface AiProviderConfig {
   // cli
   command?: string
   args?: string[]
-  /** Reasoning effort shown alongside this provider's work — informational only, not sent to every backend. */
+  /** Default reasoning effort. Individual workflow tasks may override this. */
   effort?: AiEffort
 }
 

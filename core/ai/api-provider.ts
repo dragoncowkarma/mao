@@ -16,7 +16,7 @@ export class ApiProvider implements AiProvider {
 
   // API providers only ever return text, so cwd/allowToolUse (real file edits) don't apply here.
   async run(prompt: string): Promise<string> {
-    const { apiFormat = 'openai', apiKey, baseUrl, model } = this.config
+    const { apiFormat = 'openai', apiKey, baseUrl, model, effort } = this.config
     if (!apiKey) throw new Error(`[${this.name}] API key is not set`)
 
     if (apiFormat === 'anthropic') {
@@ -48,6 +48,7 @@ export class ApiProvider implements AiProvider {
       body: JSON.stringify({
         model: model ?? 'gpt-4o',
         messages: [{ role: 'user', content: prompt }],
+        ...(effort ? { reasoning_effort: effort } : {}),
       }),
       signal: AbortSignal.timeout(RUN_TIMEOUT_MS),
     })

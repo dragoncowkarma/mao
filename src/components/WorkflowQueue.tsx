@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import type { QueuedTask, RepoRef } from '../../core/workflow-engine'
+import type { AiEffort, AiProviderConfig } from '../../core/ai/types'
 
 interface WorkflowQueueProps {
   repo: RepoRef
@@ -157,10 +158,15 @@ export default function WorkflowQueue({ repo }: WorkflowQueueProps) {
   const [tasks, setTasks] = useState<QueuedTask[]>([])
   const [title, setTitle] = useState('')
   const [autoAdvanceNewTask, setAutoAdvanceNewTask] = useState(true)
+  const [providers, setProviders] = useState<AiProviderConfig[]>([])
+  const [providerId, setProviderId] = useState('')
+  const [model, setModel] = useState('')
+  const [effort, setEffort] = useState<AiEffort | ''>('')
 
   useEffect(() => {
     const load = () => window.electronAPI.workflow.list().then(setTasks)
     load()
+    window.electronAPI.ai.list().then(setProviders)
     const interval = setInterval(load, 2000)
     return () => clearInterval(interval)
   }, [])
@@ -169,7 +175,11 @@ export default function WorkflowQueue({ repo }: WorkflowQueueProps) {
 
   async function startWorkflow() {
     if (!title.trim()) return
-    await window.electronAPI.workflow.enqueue(title.trim(), repo, autoAdvanceNewTask)
+    await window.electronAPI.workflow.enqueue(title.trim(), repo, autoAdvanceNewTask, {
+      providerId: providerId || undefined,
+      model: model || undefined,
+      effort: effort || undefined,
+    })
     setTitle('')
     setTasks(await window.electronAPI.workflow.list())
   }
@@ -223,6 +233,35 @@ export default function WorkflowQueue({ repo }: WorkflowQueueProps) {
           />
           Auto-advance
         </label>
+        <select
+          className="input w-[160px]"
+          aria-label="Task provider override"
+          value={providerId}
+          onChange={(e) => setProviderId(e.target.value)}
+        >
+          <option value="">Provider: round-robin</option>
+          {providers.map((provider) => (
+            <option key={provider.id} value={provider.id}>{provider.name || provider.id}</option>
+          ))}
+        </select>
+        <input
+          className="input w-[170px]"
+          aria-label="Task model override"
+          placeholder="Model override"
+          value={model}
+          onChange={(e) => setModel(e.target.value)}
+        />
+        <select
+          className="input w-[130px]"
+          aria-label="Task effort override"
+          value={effort}
+          onChange={(e) => setEffort(e.target.value as AiEffort | '')}
+        >
+          <option value="">Effort: default</option>
+          <option value="low">Low</option>
+          <option value="medium">Medium</option>
+          <option value="high">High</option>
+        </select>
         <button onClick={startWorkflow} className="btn btn-primary shrink-0">
           Start
         </button>
@@ -230,13 +269,21 @@ export default function WorkflowQueue({ repo }: WorkflowQueueProps) {
 
       <div className="flex flex-col gap-2">
         {repoTasks.map((task) => (
-          <TaskCard
-            key={task.id}
-            task={task}
-            onRetry={retryTask}
-            onAdvance={advanceTask}
-            onToggleAutoAdvance={toggleAutoAdvance}
-          />
+          <div key={task.id} className="flex flex-col gap-1">
+            {task.override && (task.override.providerId || task.override.model || task.override.effort) && (
+              <p className="text-muted text-xs">
+                Override: {[task.override.providerId, task.override.model, task.override.effort && `${task.override.effort} effort`]
+                  .filter(Boolean)
+                  .join(' · ')}
+              </p>
+            )}
+            <TaskCard
+              task={task}
+              onRetry={retryTask}
+              onAdvance={advanceTask}
+              onToggleAutoAdvance={toggleAutoAdvance}
+            />
+          </div>
         ))}
         {repoTasks.length === 0 && <p className="text-muted text-sm">No workflow tasks yet.</p>}
       </div>

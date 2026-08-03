@@ -34,6 +34,13 @@ export interface WorkflowStepResult {
   output: string
 }
 
+/** Optional task-specific settings that take precedence over a provider's defaults. */
+export interface TaskAiOverride {
+  providerId?: string
+  model?: string
+  effort?: AiEffort
+}
+
 export interface QueuedTask {
   id: string
   title: string
@@ -44,6 +51,8 @@ export interface QueuedTask {
   error?: string
   /** When false, a finished stage parks the task in 'paused' instead of auto-continuing to the next stage. */
   autoAdvance: boolean
+  /** Requested AI settings for every stage of this task. */
+  override?: TaskAiOverride
   /** Set while status === 'running' so the UI can show which agent/prompt is currently in flight. */
   active?: {
     agentId: string
@@ -193,7 +202,7 @@ export class WorkflowEngine extends EventEmitter {
     return task
   }
 
-  enqueue(title: string, repo: RepoRef, autoAdvance = true): QueuedTask {
+  enqueue(title: string, repo: RepoRef, autoAdvance = true, override?: TaskAiOverride): QueuedTask {
     const task: QueuedTask = {
       id: randomUUID(),
       title,
@@ -202,6 +211,7 @@ export class WorkflowEngine extends EventEmitter {
       history: [],
       status: 'pending',
       autoAdvance,
+      override: this.validateOverride(override),
       github: {},
     }
     this.queue.push(task)
@@ -211,7 +221,13 @@ export class WorkflowEngine extends EventEmitter {
   }
 
   /** Starts the pipeline at the 'pr' stage for an issue that already exists on GitHub (e.g. human-filed). */
-  enqueueFromIssue(issueNumber: number, issueUrl: string, title: string, repo: RepoRef): QueuedTask {
+  enqueueFromIssue(
+    issueNumber: number,
+    issueUrl: string,
+    title: string,
+    repo: RepoRef,
+    override?: TaskAiOverride,
+  ): QueuedTask {
     const task: QueuedTask = {
       id: randomUUID(),
       title,
@@ -220,6 +236,7 @@ export class WorkflowEngine extends EventEmitter {
       history: [],
       status: 'pending',
       autoAdvance: true,
+      override: this.validateOverride(override),
       github: { issueNumber, issueUrl },
     }
     this.queue.push(task)
@@ -228,12 +245,39 @@ export class WorkflowEngine extends EventEmitter {
     return task
   }
 
-  /** Prevents the AI that handled the previous stage from being assigned the next one (Maker-Checker). */
+  private validateOverride(override?: TaskAiOverride): TaskAiOverride | undefined {
+    if (!override) return undefined
+    const providerId = override.providerId?.trim()
+    const model = override.model?.trim()
+    const effort = override.effort
+
+    if (override.providerId !== undefined && !providerId) throw new Error('Override provider ID cannot be empty')
+    if (providerId && !this.providers.some((provider) => provider.id === providerId)) {
+      throw new Error(`Unknown override provider: ${providerId}`)
+    }
+    if (override.model !== undefined && !model) throw new Error('Override model cannot be empty')
+    if (model && !/^[A-Za-z0-9][A-Za-z0-9._:/-]*$/.test(model)) {
+      throw new Error(`Invalid override model: ${model}`)
+    }
+    if (effort && !['low', 'medium', 'high'].includes(effort)) {
+      throw new Error(`Invalid override effort: ${effort}`)
+    }
+
+    return providerId || model || effort ? { providerId, model, effort } : undefined
+  }
+
+  /** Honors task overrides, otherwise prevents the previous stage's AI from being reused (Maker-Checker). */
   private selectAgent(task: QueuedTask): AiProviderConfig {
     if (this.providers.length === 0) throw new Error('No AI providers registered')
-    const previousAgentId = task.history[task.history.length - 1]?.agentId
-    const candidates = this.providers.filter((p) => p.id !== previousAgentId)
-    return candidates[0] ?? this.providers[0]
+    const override = this.validateOverride(task.override)
+    const selected = override?.providerId
+      ? this.providers.find((provider) => provider.id === override.providerId)!
+      : (() => {
+          const previousAgentId = task.history[task.history.length - 1]?.agentId
+          const candidates = this.providers.filter((provider) => provider.id !== previousAgentId)
+          return candidates[0] ?? this.providers[0]
+        })()
+    return { ...selected, model: override?.model ?? selected.model, effort: override?.effort ?? selected.effort }
   }
 
   private async processQueue() {

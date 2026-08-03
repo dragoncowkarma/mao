@@ -4,7 +4,7 @@ import { store } from './store.ts'
 import { createMaoApp } from '../core/app.ts'
 import { startAutoTrigger } from '../core/auto-trigger.ts'
 import { createAiProvider, type AiProviderConfig } from '../core/ai/index.ts'
-import type { RepoRef } from '../core/workflow-engine.ts'
+import type { RepoRef, TaskAiOverride } from '../core/workflow-engine.ts'
 
 export function registerIpcHandlers() {
   const { githubService, workflowEngine } = createMaoApp({
@@ -56,8 +56,8 @@ export function registerIpcHandlers() {
     return githubService.fetchTasks(owner, repo)
   })
 
-  ipcMain.handle('workflow:enqueue', (_event, title: string, repo: RepoRef, autoAdvance?: boolean) =>
-    workflowEngine.enqueue(title, repo, autoAdvance),
+  ipcMain.handle('workflow:enqueue', (_event, title: string, repo: RepoRef, autoAdvance?: boolean, override?: TaskAiOverride) =>
+    workflowEngine.enqueue(title, repo, autoAdvance, override),
   )
 
   ipcMain.handle('workflow:list', () => workflowEngine.getTasks())

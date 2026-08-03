@@ -1,25 +1,17 @@
 import { app, ipcMain } from 'electron'
 import path from 'node:path'
 import { store } from './store.ts'
-import { createAiProvider, type AiProviderConfig } from './ai/index.ts'
-import { GithubService } from './github-service.ts'
-import { WorkflowEngine, type RepoRef } from './workflow-engine.ts'
-import { startAutoTrigger } from './auto-trigger.ts'
-
-const githubService = new GithubService()
-const workflowEngine = new WorkflowEngine(githubService)
+import { createMaoApp } from '../core/app.ts'
+import { startAutoTrigger } from '../core/auto-trigger.ts'
+import { createAiProvider, type AiProviderConfig } from '../core/ai/index.ts'
+import type { RepoRef } from '../core/workflow-engine.ts'
 
 export function registerIpcHandlers() {
-  const token = store.get('githubToken')
-  if (token) {
-    githubService.setToken(token)
-    workflowEngine.setGithubToken(token)
-  }
-  workflowEngine.setProviders(store.get('aiProviders'))
-  workflowEngine.setWorkspaceRoot(path.join(app.getPath('userData'), 'workspaces'))
-  workflowEngine.setOnChange(() => store.set('workflowTasks', workflowEngine.getTasks()))
-  workflowEngine.restore(store.get('workflowTasks'))
-
+  const { githubService, workflowEngine } = createMaoApp({
+    store,
+    workspaceRoot: path.join(app.getPath('userData'), 'workspaces'),
+    resume: true,
+  })
   const autoTrigger = startAutoTrigger(githubService, workflowEngine, () => store.get('githubRepos'))
 
   ipcMain.handle('ai:list', () => store.get('aiProviders'))

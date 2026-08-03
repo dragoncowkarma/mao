@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import type { RepoRef } from '../../electron/workflow-engine'
+import type { RepoRef } from '../../core/workflow-engine'
 
 interface SidebarProps {
   repos: RepoRef[]

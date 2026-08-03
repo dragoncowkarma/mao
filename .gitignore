@@ -82,6 +82,7 @@ out
 .nuxt
 dist
 dist-electron
+dist-cli
 release
 .output
 

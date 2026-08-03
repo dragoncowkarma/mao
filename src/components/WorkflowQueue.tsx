@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import type { QueuedTask, RepoRef } from '../../electron/workflow-engine'
+import type { QueuedTask, RepoRef } from '../../core/workflow-engine'
 
 interface WorkflowQueueProps {
   repo: RepoRef

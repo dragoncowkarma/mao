@@ -5,6 +5,9 @@
   "main": "dist-electron/main.js",
   "private": true,
   "author": "mgkwon",
+  "bin": {
+    "mao": "dist-cli/index.cjs"
+  },
   "scripts": {
     "dev": "vite",
     "build": "vite build && electron-builder --dir",
@@ -12,9 +15,12 @@
     "build:dir": "vite build && electron-builder --dir",
     "preview": "vite preview",
     "lint": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "cli": "tsx cli/index.ts",
+    "build:cli": "esbuild cli/index.ts --bundle --platform=node --format=cjs --target=node18 --outfile=dist-cli/index.cjs && chmod +x dist-cli/index.cjs"
   },
   "dependencies": {
+    "commander": "^12.1.0",
     "electron-store": "^10.0.0",
     "octokit": "^4.1.0",
     "react": "^18.3.1",
@@ -28,8 +34,10 @@
     "autoprefixer": "^10.4.20",
     "electron": "^33.2.1",
     "electron-builder": "^25.1.8",
+    "esbuild": "^0.25.12",
     "postcss": "^8.4.49",
     "tailwindcss": "^3.4.17",
+    "tsx": "^4.19.2",
     "typescript": "^5.7.2",
     "vite": "^6.0.7",
     "vite-plugin-electron": "^0.29.0",

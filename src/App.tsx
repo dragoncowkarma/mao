@@ -4,7 +4,7 @@ import KanbanBoard from './components/KanbanBoard'
 import WorkflowQueue from './components/WorkflowQueue'
 import ProjectSettings from './components/ProjectSettings'
 import GlobalSettings from './components/GlobalSettings'
-import type { RepoRef } from '../electron/workflow-engine'
+import type { RepoRef } from '../core/workflow-engine'
 
 type ProjectTab = 'board' | 'queue' | 'settings'
 type View = 'project' | 'global-settings'

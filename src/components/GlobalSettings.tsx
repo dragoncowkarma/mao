@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import type { AiProviderConfig } from '../../electron/ai/types'
+import type { AiProviderConfig } from '../../core/ai/types'
 
 function emptyProvider(): AiProviderConfig {
   return { id: crypto.randomUUID(), name: '', kind: 'api', apiFormat: 'anthropic' }

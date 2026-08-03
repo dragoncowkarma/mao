@@ -1,7 +1,7 @@
-import type { AiProviderConfig } from '../electron/ai/types'
-import type { GithubTask } from '../electron/github-service'
-import type { QueuedTask, RepoRef } from '../electron/workflow-engine'
-import type { AutoTriggerStatus } from '../electron/auto-trigger'
+import type { AiProviderConfig } from '../core/ai/types'
+import type { GithubTask } from '../core/github-service'
+import type { QueuedTask, RepoRef } from '../core/workflow-engine'
+import type { AutoTriggerStatus } from '../core/auto-trigger'
 
 declare global {
   interface Window {

@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { EventEmitter } from 'node:events'
 import { createAiProvider } from './ai/index.ts'
 import type { AiEffort, AiProviderConfig } from './ai/types.ts'
 import type { GithubService } from './github-service.ts'
@@ -77,16 +78,22 @@ function slugify(text: string): string {
   return text.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '').slice(0, 40) || 'task'
 }
 
-export class WorkflowEngine {
+/**
+ * Emits a `'change'` event (with the current task list) after every queue mutation. Both the
+ * Electron main process and the headless CLI subscribe independently — one to persist state via a
+ * MaoStore, the other to stream stage transitions to stdout — without either needing to know the
+ * other exists.
+ */
+export class WorkflowEngine extends EventEmitter {
   private queue: QueuedTask[] = []
   private providers: AiProviderConfig[] = []
   private processing = false
   private github: GithubService
-  private onChange?: () => void
   private githubToken = ''
   private workspaceRoot = ''
 
   constructor(github: GithubService) {
+    super()
     this.github = github
   }
 
@@ -104,13 +111,8 @@ export class WorkflowEngine {
     this.workspaceRoot = root
   }
 
-  /** Called after every queue mutation, so the caller can persist state. */
-  setOnChange(callback: () => void) {
-    this.onChange = callback
-  }
-
   private notify() {
-    this.onChange?.()
+    this.emit('change', this.queue)
   }
 
   getTasks(): QueuedTask[] {
@@ -134,8 +136,14 @@ export class WorkflowEngine {
     this.queue = this.queue.filter((t) => !toDrop.has(t.id))
   }
 
-  /** Loads previously-persisted tasks (e.g. after an app restart) and resumes any that are unfinished. */
-  restore(tasks: QueuedTask[]) {
+  /**
+   * Loads previously-persisted tasks (e.g. after an app restart). Does NOT resume processing on its
+   * own — callers that are only inspecting or reconfiguring state (e.g. a one-shot CLI command like
+   * `mao config show`) must not have that trigger real GitHub/AI-provider calls as a side effect.
+   * Pass resume: true (or call resumeProcessing() once ready) for long-lived processes that should
+   * pick back up where they left off, such as the Electron main process or `mao run`.
+   */
+  restore(tasks: QueuedTask[], options: { resume?: boolean } = {}) {
     this.queue = tasks.map((task) => ({
       ...task,
       autoAdvance: task.autoAdvance ?? true,
@@ -143,6 +151,11 @@ export class WorkflowEngine {
       status: task.status === 'running' ? 'pending' : task.status,
     }))
     this.pruneFinishedTasks()
+    if (options.resume) this.resumeProcessing()
+  }
+
+  /** Kicks off processing of any 'pending' tasks currently in the queue. Safe to call when already processing. */
+  resumeProcessing() {
     void this.processQueue()
   }
 

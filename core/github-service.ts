@@ -10,6 +10,7 @@ export interface GithubTask {
   updatedAt: string
   urgent: boolean
   labels: string[]
+  body?: string
 }
 
 export class GithubService {
@@ -43,8 +44,23 @@ export class GithubService {
         updatedAt: item.updated_at,
         urgent: labels.some((label) => label.toLowerCase().includes('urgent')),
         labels,
+        body: item.body ?? undefined,
       }
     })
+  }
+
+  /** Returns the newest issue comment body, if any, for auto-trigger directives. */
+  async getLatestIssueComment(owner: string, repo: string, issueNumber: number): Promise<string | undefined> {
+    if (!this.octokit) throw new Error('GitHub token is not set')
+    const { data } = await this.octokit.rest.issues.listComments({
+      owner,
+      repo,
+      issue_number: issueNumber,
+      sort: 'created',
+      direction: 'desc',
+      per_page: 1,
+    })
+    return data[0]?.body ?? undefined
   }
 
   async addLabel(owner: string, repo: string, issueNumber: number, label: string) {

@@ -139,4 +139,31 @@ describe('WorkflowEngine', () => {
     const current = engine.getTasks().find((t) => t.id === task.id)!
     expect(current.error).toMatch(/No AI providers registered/)
   })
+
+  it('honors a task provider/model/effort override without changing saved providers', async () => {
+    const engine = new WorkflowEngine(makeFakeGithub())
+    const providerA = makeProvider('agent-a')
+    const providerB = makeProvider('agent-b')
+    engine.setProviders([providerA, providerB])
+
+    const task = engine.enqueueFromIssue(1, 'https://github.com/acme/widgets/issues/1', 'Target model', repo, {
+      providerId: 'agent-b', model: 'gpt-5.6', effort: 'high',
+    })
+    engine.setAutoAdvance(task.id, false)
+    await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'paused')
+
+    const current = engine.getTasks().find((t) => t.id === task.id)!
+    expect(current.history[0]).toMatchObject({ agentId: 'agent-b', model: 'gpt-5.6', effort: 'high' })
+    expect(providerB).toMatchObject({ model: 'agent-b-model' })
+  })
+
+  it('fails clearly when a task selects an unknown provider', async () => {
+    const engine = new WorkflowEngine(makeFakeGithub())
+    engine.setProviders([makeProvider('agent-a')])
+    const task = engine.enqueueFromIssue(1, 'https://github.com/acme/widgets/issues/1', 'Unknown provider', repo, {
+      providerId: 'missing',
+    })
+    await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'error')
+    expect(engine.getTasks().find((t) => t.id === task.id)?.error).toMatch(/Unknown AI provider override: missing/)
+  })
 })

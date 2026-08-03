@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { createAiProvider } from './ai/index.ts'
-import type { AiEffort, AiProviderConfig } from './ai/types.ts'
+import type { AiAgentOverride, AiEffort, AiProviderConfig } from './ai/types.ts'
 import type { GithubService } from './github-service.ts'
 import { ensureClone, checkoutBranch, hasChanges, commitAndPush } from './git-workspace.ts'
 
@@ -44,6 +44,8 @@ export interface QueuedTask {
   error?: string
   /** When false, a finished stage parks the task in 'paused' instead of auto-continuing to the next stage. */
   autoAdvance: boolean
+  /** Optional per-task provider/model/effort selection. It never mutates saved provider settings. */
+  override?: AiAgentOverride
   /** Set while status === 'running' so the UI can show which agent/prompt is currently in flight. */
   active?: {
     agentId: string
@@ -193,7 +195,7 @@ export class WorkflowEngine extends EventEmitter {
     return task
   }
 
-  enqueue(title: string, repo: RepoRef, autoAdvance = true): QueuedTask {
+  enqueue(title: string, repo: RepoRef, autoAdvance = true, override?: AiAgentOverride): QueuedTask {
     const task: QueuedTask = {
       id: randomUUID(),
       title,
@@ -202,6 +204,7 @@ export class WorkflowEngine extends EventEmitter {
       history: [],
       status: 'pending',
       autoAdvance,
+      override,
       github: {},
     }
     this.queue.push(task)
@@ -211,7 +214,13 @@ export class WorkflowEngine extends EventEmitter {
   }
 
   /** Starts the pipeline at the 'pr' stage for an issue that already exists on GitHub (e.g. human-filed). */
-  enqueueFromIssue(issueNumber: number, issueUrl: string, title: string, repo: RepoRef): QueuedTask {
+  enqueueFromIssue(
+    issueNumber: number,
+    issueUrl: string,
+    title: string,
+    repo: RepoRef,
+    override?: AiAgentOverride,
+  ): QueuedTask {
     const task: QueuedTask = {
       id: randomUUID(),
       title,
@@ -220,6 +229,7 @@ export class WorkflowEngine extends EventEmitter {
       history: [],
       status: 'pending',
       autoAdvance: true,
+      override,
       github: { issueNumber, issueUrl },
     }
     this.queue.push(task)
@@ -231,9 +241,23 @@ export class WorkflowEngine extends EventEmitter {
   /** Prevents the AI that handled the previous stage from being assigned the next one (Maker-Checker). */
   private selectAgent(task: QueuedTask): AiProviderConfig {
     if (this.providers.length === 0) throw new Error('No AI providers registered')
-    const previousAgentId = task.history[task.history.length - 1]?.agentId
-    const candidates = this.providers.filter((p) => p.id !== previousAgentId)
-    return candidates[0] ?? this.providers[0]
+    let provider: AiProviderConfig
+    const override = task.override
+    if (override?.providerId) {
+      const selected = this.providers.find((candidate) => candidate.id === override.providerId)
+      if (!selected) throw new Error(`Unknown AI provider override: ${override.providerId}`)
+      provider = selected
+    } else {
+      const previousAgentId = task.history[task.history.length - 1]?.agentId
+      const candidates = this.providers.filter((p) => p.id !== previousAgentId)
+      provider = candidates[0] ?? this.providers[0]
+    }
+
+    return {
+      ...provider,
+      model: task.override?.model ?? provider.model,
+      effort: task.override?.effort ?? provider.effort,
+    }
   }
 
   private async processQueue() {

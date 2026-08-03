@@ -2,6 +2,16 @@ export type AiProviderKind = 'api' | 'cli'
 
 export type AiEffort = 'low' | 'medium' | 'high'
 
+/** A one-task selection request, normally supplied by an issue directive. */
+export interface AiAgentOverride {
+  /** ID of a configured provider. When omitted, normal maker-checker selection still applies. */
+  providerId?: string
+  /** Model to use for this task without changing the saved provider configuration. */
+  model?: string
+  /** Reasoning effort to use for this task where the selected backend supports it. */
+  effort?: AiEffort
+}
+
 export interface AiProviderConfig {
   id: string
   name: string
@@ -14,7 +24,7 @@ export interface AiProviderConfig {
   // cli
   command?: string
   args?: string[]
-  /** Reasoning effort shown alongside this provider's work — informational only, not sent to every backend. */
+  /** Reasoning effort used by backends that support it and shown alongside this provider's work. */
   effort?: AiEffort
 }
 

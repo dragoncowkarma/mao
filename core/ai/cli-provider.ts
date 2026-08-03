@@ -18,6 +18,12 @@ const TOOL_USE_FLAGS_BY_COMMAND: Record<string, string[]> = {
   codex: ['-s', 'workspace-write'],
 }
 
+/** CLI-specific effort flags; only added for tools that expose a compatible setting. */
+const EFFORT_ARGS_BY_COMMAND: Record<string, (effort: string) => string[]> = {
+  claude: (effort) => ['--effort', effort],
+  codex: (effort) => ['-c', `model_reasoning_effort=${effort}`],
+}
+
 /**
  * A hung/stuck CLI agent would otherwise block the entire workflow queue forever — WorkflowEngine
  * processes one stage at a time, across every registered repo. 15 minutes covers real code-edit runs.
@@ -36,7 +42,7 @@ export class CliProvider implements AiProvider {
   }
 
   run(prompt: string, options?: AiRunOptions): Promise<string> {
-    const { command, args = [] } = this.config
+    const { command, args = [], effort } = this.config
     if (!command) throw new Error(`[${this.name}] CLI command is not set`)
 
     const commandName = command.split('/').pop() ?? command
@@ -44,12 +50,13 @@ export class CliProvider implements AiProvider {
     let finalArgs: string[]
     let stdinInput: string
 
+    const effortArgs = effort ? (EFFORT_ARGS_BY_COMMAND[commandName]?.(effort) ?? []) : []
     if (options?.allowToolUse) {
-      finalArgs = [...args, ...(TOOL_USE_FLAGS_BY_COMMAND[commandName] ?? [])]
+      finalArgs = [...args, ...effortArgs, ...(TOOL_USE_FLAGS_BY_COMMAND[commandName] ?? [])]
       stdinInput = prompt
     } else {
       const systemPromptFlag = SYSTEM_PROMPT_FLAG_BY_COMMAND[commandName]
-      finalArgs = systemPromptFlag ? [systemPromptFlag, DEFAULT_SYSTEM_PROMPT, ...args] : args
+      finalArgs = systemPromptFlag ? [systemPromptFlag, DEFAULT_SYSTEM_PROMPT, ...args, ...effortArgs] : [...args, ...effortArgs]
       stdinInput = systemPromptFlag ? prompt : `${DEFAULT_SYSTEM_PROMPT}\n\n---\n\n${prompt}`
     }
 

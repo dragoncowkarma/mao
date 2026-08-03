@@ -16,7 +16,7 @@ export class ApiProvider implements AiProvider {
 
   // API providers only ever return text, so cwd/allowToolUse (real file edits) don't apply here.
   async run(prompt: string): Promise<string> {
-    const { apiFormat = 'openai', apiKey, baseUrl, model } = this.config
+    const { apiFormat = 'openai', apiKey, baseUrl, model, effort } = this.config
     if (!apiKey) throw new Error(`[${this.name}] API key is not set`)
 
     if (apiFormat === 'anthropic') {
@@ -39,6 +39,9 @@ export class ApiProvider implements AiProvider {
       return data.content?.[0]?.text ?? ''
     }
 
+    // `reasoning_effort` is rejected by non-reasoning chat-completions models, so only send it
+    // for OpenAI model families which support the setting. Other backends still retain it in task history.
+    const supportsReasoningEffort = /^(?:o[134]|gpt-5)/i.test(model ?? '')
     const res = await fetch(baseUrl ?? 'https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -48,6 +51,7 @@ export class ApiProvider implements AiProvider {
       body: JSON.stringify({
         model: model ?? 'gpt-4o',
         messages: [{ role: 'user', content: prompt }],
+        ...(effort && supportsReasoningEffort ? { reasoning_effort: effort } : {}),
       }),
       signal: AbortSignal.timeout(RUN_TIMEOUT_MS),
     })

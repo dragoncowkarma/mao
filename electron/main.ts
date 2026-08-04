@@ -3,6 +3,17 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { registerIpcHandlers } from './ipc.ts'
 
+// Suppress EGL "Bad attribute" noise from Chromium's GPU process.
+// eglQueryDeviceAttribEXT is queried during EGL initialisation but the
+// extension is not always supported by the host driver, causing a harmless
+// but noisy error.  Disabling the GPU sandbox avoids the problematic query
+// path without affecting rendering quality on macOS (Metal is used instead).
+if (process.platform !== 'darwin') {
+  app.commandLine.appendSwitch('disable-gpu-sandbox')
+}
+app.commandLine.appendSwitch('disable-features', 'UseEcoQoSForBackgroundProcess')
+app.commandLine.appendSwitch('log-level', '3') // suppress INFO/WARNING logs from Chromium
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 process.env.APP_ROOT = path.join(__dirname, '..')

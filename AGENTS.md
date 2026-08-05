@@ -122,7 +122,8 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   keep it inside) sets `status: 'error'` without advancing the stage, so `retry()`
   re-runs the same stage. Known gaps currently violate this — don't widen
   them; fixing them (with regression tests) is welcome:
-  - **both** `notify()` calls in `runStage()` sit outside the `try` (listeners run
+  - the entry and exit `notify()` calls in `runStage()` (two of its three) sit
+    outside the `try` (listeners run
     synchronously, and `createMaoApp` subscribes a synchronous `store.set`). A
     throwing listener on the entry `notify()` leaves the task stuck in
     `'running'`; on the exit `notify()` it loses the *persisted* advance after

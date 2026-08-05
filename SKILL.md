@@ -149,14 +149,24 @@ Two traps:
 ### Ship a change (PR workflow)
 
 1. Branch from `main` (`feature/<topic>` or `claude/<topic>-<hex>`).
-2. Commit per AGENTS.md Git conventions (imperative subject, why-focused body).
-3. Run the full verification workflow above.
-4. Never stage: `.env*`, `dist/`, `dist-electron/`, `dist-cli/`, `release/`,
-   store/config files, or anything containing a token.
-5. Open a PR against `main` (pushing and opening a PR are external writes —
-   only do this when the task calls for it). Wait for and verify green CI
-   (lint, test, vite build) before merging — as of 2026-08 `main` has no branch
-   protection, so CI is convention, not GitHub-enforced.
+2. Stage only the paths the task intended — check `git status --short` and
+   `git diff --check` first, and avoid `git add -A` in a worktree that may hold
+   unrelated changes. Never stage: `.env*`, `dist/`, `dist-electron/`,
+   `dist-cli/`, `release/`, store/config files, or anything containing a token.
+3. Commit per AGENTS.md Git conventions (imperative subject, why-focused body).
+4. Run the full verification workflow above at the committed head.
+5. Push with upstream tracking (pushing and opening a PR are external writes —
+   only do this when the task calls for it). Authorization to push or open a PR
+   is **not** authorization to force-push: never rewrite history (`--force*`)
+   unless the user explicitly approves history replacement.
+6. Open the PR against `main` as a **draft** unless the user asked for
+   ready-for-review or an existing PR already carries an intentional review
+   state. Wait for and verify green CI (lint, test, vite build) before merging —
+   as of 2026-08 `main` has no branch protection, so CI is convention, not
+   GitHub-enforced.
+7. Releases are a separate authorization: never tag, publish, sign, notarize,
+   or announce without an explicit request and platform-appropriate evidence —
+   `npm run build` / `npm run dist` are local packaging, not deployment proof.
 
 ### Review a PR (checker role)
 

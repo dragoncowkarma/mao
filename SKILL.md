@@ -1,189 +1,143 @@
----
-name: mao
-description: Operate and contribute to the MAO Electron and headless CLI repository. Use when analyzing, implementing, testing, reviewing, or publishing MAO changes, especially workflow-engine, GitHub automation, AI provider, IPC, renderer, packaging, CLI, or repository-guidance work.
----
+# SKILL.md — MAO Operational Playbook
 
-# MAO development workflow
+Commands, verification workflows, and step-by-step recipes for working in this repo.
+Architecture rules, invariants, and conventions live in [AGENTS.md](AGENTS.md) — read
+that first; this file assumes you have.
 
-Read `AGENTS.md` first. Use this file for executable commands and repeatable
-procedures; keep architectural rules in `AGENTS.md`.
+> ⚠️ Paths may contain spaces (the working copy can live on a volume like
+> `NO NAME`) — always quote paths in shell commands.
 
-## Start every task
-
-1. Run `git status --short --branch` and identify the exact base commit, current
-   branch or detached state, and pre-existing changes.
-2. Read the requested code path and its tests before editing. Verify README
-   claims against the current tree when they disagree.
-3. Classify the change as documentation, core/domain, Electron/IPC, renderer,
-   CLI, packaging, or external workflow work.
-4. Identify any command that can mutate GitHub, a target repository, persisted
-   MAO state, credentials, or release artifacts. Obtain authorization before
-   expanding the requested external side effects.
-5. Keep unrelated working-tree changes out of the diff and staging area.
-
-## Install and runtime baseline
-
-Match CI with Node.js 22 when possible. The CLI bundle targets Node.js 18, but
-the repository does not currently declare an `engines` field.
-
-Install the locked dependency graph in a fresh checkout:
+## Setup
 
 ```bash
-npm ci
+npm install        # Node 22 is what CI uses; the CLI bundle targets node18
 ```
 
-Use `npm install` only when intentionally changing dependencies and the lockfile.
-Do not diagnose broad missing-module errors until dependencies are installed.
+## Command reference
 
-## Command catalog
-
-| Purpose | Command | Notes |
-| --- | --- | --- |
-| Start Electron development | `npm run dev` | Runs Vite with Electron main/preload and renderer hot reload. |
-| Type-check | `npm run lint` | Runs `tsc --noEmit`; this is not ESLint. |
-| Run unit tests | `npm test` | Runs Vitest in Node for `core/**/*.test.ts`. |
-| Build CI application bundles | `npx vite build` | Matches the build step in `.github/workflows/ci.yml`. |
-| Build CLI | `npm run build:cli` | Bundles `cli/index.ts` to `dist-cli/index.cjs`. |
-| Smoke-test CLI surface | `node dist-cli/index.cjs --help` | Run after `npm run build:cli`. |
-| Start CLI through npm | `npm run cli -- --help` | Rebuilds the CLI before passing arguments. |
-| Build unpacked desktop app | `npm run build` | Runs Vite and `electron-builder --dir`; platform-sensitive. |
-| Build distributables | `npm run dist` | Produces platform artifacts; run only for packaging work. |
-| Preview renderer build | `npm run preview` | Serves the built Vite renderer. |
-
-Do not stage generated `dist*` or `release/` output.
-
-## Validate by change surface
-
-Always run:
-
-```bash
-git diff --check
-git status --short
-```
-
-Then use the smallest sufficient matrix:
-
-| Change surface | Required checks |
+| Command | What it does |
 | --- | --- |
-| Documentation or agent configuration only | Validate Markdown/TOML/frontmatter and links, then run `npm run lint`, `npm test`, and `npx vite build` when dependencies are available. |
-| `core/` domain, persistence, GitHub, git, polling, or AI provider | Run focused Vitest coverage, then `npm run lint`, `npm test`, and `npx vite build`. |
-| `electron/`, preload, IPC, or `src/` | Run `npm run lint`, `npm test`, and `npx vite build`; manually verify every changed IPC contract surface. |
-| `cli/` or shared CLI behavior | Run `npm run lint`, `npm test`, `npm run build:cli`, `node dist-cli/index.cjs --help`, and `npx vite build`. |
-| Packaging configuration | Run the checks above, then the relevant `npm run build` or `npm run dist` only on an appropriate host. |
+| `npm run dev` | Electron + Vite dev server with hot reload |
+| `npm run lint` | `tsc --noEmit` — the only automated style/type gate (no ESLint/Prettier) |
+| `npm run test` | `vitest run` — node env, `core/**/*.test.ts` only |
+| `npm run build` | `vite build` + `electron-builder --dir` (fast unpacked build → `release/`) |
+| `npm run dist` | Full distributable (dmg/zip on mac) |
+| `npm run build:cli` | esbuild-bundle `cli/index.ts` → `dist-cli/index.cjs` (CJS, node18) |
+| `npm run cli -- <args>` | Build the CLI bundle, then run it (e.g. `npm run cli -- config show`) |
+| `npm run preview` | Vite preview of the built renderer |
 
-For a focused workflow-engine run, use:
+**Never run the CLI via `tsx`** — it fails on `@octokit/app`
+(`ERR_PACKAGE_PATH_NOT_EXPORTED`). Always go through the esbuild bundle
+(`npm run cli` / `npm run build:cli`).
 
-```bash
-npx vitest run core/workflow-engine.test.ts
-```
+## Verification workflow (run before every commit)
 
-Do not report a platform package as verified when only the Vite bundles built.
-
-## Operate the headless CLI safely
-
-Use an isolated data directory when inspecting or experimenting so personal MAO
-state is not overwritten:
+CI runs exactly this on Node 22 for pushes to `main` and all PRs:
 
 ```bash
-MAO_DATA_DIR=/path/to/isolated-mao-data npm run cli -- config show
-MAO_DATA_DIR=/path/to/isolated-mao-data npm run cli -- repos list
-MAO_DATA_DIR=/path/to/isolated-mao-data npm run cli -- workflow list
+npm run lint && npm run test && npx vite build
 ```
 
-Treat these commands according to their side effects:
+Additionally, because CI does **not** cover them:
 
-- `config show`, `repos list`, and `workflow list` are one-shot inspection paths;
-  they load the app with `resume: false`.
-- `config import-providers`, repo mutations, queue mutations, retry, and advance
-  persist local state and may start work.
-- `config set-token <token>` also persists state, but its positional token can be
-  exposed through argv, process listings, or shell history. Prefer the trusted
-  Electron settings UI; do not run it with a real token from an agent terminal.
-- `mao run` is a long-lived foreground process. It restores pending work, polls
-  configured repositories, invokes providers, and can progress real GitHub
-  operations until interrupted.
-- Queue registration or a running process is not proof that a PR, review, CI
-  result, or merge exists. Query persisted state and GitHub separately.
+- Touched `cli/` or `core/`? → also run `npm run build:cli` (CLI bundle breakage
+  is invisible to CI).
+- Touched `scripts/`? → note `scripts/` is not in `tsconfig.json`'s `include`, so
+  tsc/CI never typechecks it — verify by actually running the harness.
+- Touched the IPC surface? → **nothing automated** checks that
+  `electron/preload.ts` and `src/electron.d.ts` stay consistent (`contextBridge`
+  takes an untyped object, so tsc checks each file only against core types, not
+  against each other). Diff the two by eye and smoke-test with `npm run dev` —
+  channel-string typos and preload/d.ts drift both fail only at runtime.
 
-Never place real tokens in shell history, examples, committed provider JSON, or
-logs. Treat MAO's data directory and cloned workspace `.git/config` files as
-secret-bearing because authenticated origin URLs may persist there. Use a
-durable user-controlled terminal for long-running `mao run` work.
+## Headless CLI usage
 
-## Run the real integration harness only when authorized
+State lives at `$MAO_DATA_DIR/config.json` (default: the platform data dir from
+`core/paths.ts`, e.g. `~/Library/Application Support/mao` on macOS); clones go to
+`$MAO_DATA_DIR/workspaces`. Set `MAO_DATA_DIR` to isolate test state.
 
-The following is not a unit test:
+```bash
+npm run cli -- config set-token <token>          # store GitHub token
+npm run cli -- config import-providers <file>    # JSON array of AiProviderConfig
+npm run cli -- config show                       # secrets redacted as '[set]'
+npm run cli -- repos add <owner> <repo> [--no-auto-trigger] [--poll-interval-ms <ms>]
+npm run cli -- repos list
+npm run cli -- github check <owner> <repo>       # open issues/PRs as JSON
+npm run cli -- workflow enqueue "<title>" --owner <o> --repo <r> [--no-auto-advance]
+npm run cli -- workflow list | retry <taskId> | advance <taskId> | clear-completed
+npm run cli -- run                               # foreground: auto-trigger + resume queue
+```
+
+⚠️ `workflow enqueue` without `--no-auto-advance` runs the **entire pipeline
+unattended** (real GitHub writes) in the foreground with no progress output; only
+`run` streams status. Use `--no-auto-advance` + `workflow advance` to step through
+stages one at a time.
+
+## End-to-end pipeline test (real GitHub repo)
+
+Use a **throwaway repo** — the harness creates real issues/branches/PRs and can
+merge them. Create `.env.test` (gitignored; the template is the inline block in
+README.md — there is no `.env.example` file):
 
 ```bash
 node --experimental-strip-types --env-file=.env.test scripts/test-workflow.ts
 ```
 
-Before running it:
+Required: `TEST_GITHUB_OWNER`, `TEST_GITHUB_REPO`, `TEST_GITHUB_TOKEN`, plus at
+least one provider — either `TEST_AI_API_KEY` (with optional `TEST_AI_API_FORMAT`
+`anthropic|openai`, `TEST_AI_MODEL`) or `TEST_AI_CLI_COMMAND` (+
+`TEST_AI_CLI_ARGS`, space-split). A second provider uses the `TEST_AI2_*` prefix —
+register two so maker-checker has somewhere to route. Optional:
+`TEST_TASK_TITLE`, `TEST_WORKSPACE_ROOT`.
 
-1. Obtain explicit authorization for external GitHub writes.
-2. Confirm `.env.test` is ignored and contains a throwaway repository.
-3. Confirm the configured providers, branch permissions, and CI behavior.
-4. Expect creation of issues, branches, commits, PRs, reviews, and possibly a
-   merge.
-5. Verify the resulting GitHub state and exact SHAs after the process exits.
+## Recipes
 
-Never use a production repository as an implicit test fixture.
+### Add an IPC channel (renderer ↔ main)
 
-## Review a pull request
+1. Implement the logic in `core/` (engine/service method), not in the shell.
+2. `electron/ipc.ts` — `ipcMain.handle('<domain>:<camelCaseAction>', …)` as a
+   one-line delegation (domains: `ai`, `github`, `workflow`).
+3. `electron/preload.ts` — same channel string, same namespace, positional args.
+4. `src/electron.d.ts` — mirror the method signature.
+5. If the CLI should have parity, add the matching subcommand in `cli/index.ts`.
+6. `npm run lint`, then smoke-test in `npm run dev` (typos fail only at runtime).
 
-1. Resolve the repository and PR number explicitly.
-2. Inspect metadata and the exact head before reviewing:
+### Add a store field
 
-   ```bash
-   gh pr view <number> --json number,title,state,isDraft,baseRefName,headRefName,headRefOid,reviewDecision,statusCheckRollup,url
-   gh pr diff <number>
-   ```
+1. Add to **both** `MaoStoreSchema` and `MAO_STORE_DEFAULTS` in `core/store.ts`.
+2. Backends (`electron/store.ts`, `FileStore`) pick it up automatically.
+3. Renderer needs it? Add get/set IPC channels (recipe above). CLI needs it?
+   Extend `cli/index.ts` (keep `config show` redaction for anything secret).
 
-3. Trace changed behavior through `core/`, adapters, persistence, and tests.
-4. Run the applicable validation matrix at the reviewed head.
-5. Report findings in severity order with file/line evidence. Distinguish an
-   independent review from self-review and local test evidence.
-6. Do not approve, request changes, comment, or merge unless the task authorizes
-   that GitHub write.
+### Add a pipeline stage
 
-## Publish a change
+1. `core/workflow-engine.ts`: `STAGE_ORDER`, `buildPromptForStage`,
+   `applyGithubAction` (+ `runPrWithCodeEdits`-style special-casing if needed).
+2. Update `STAGE_LABELS` in **both** `src/components/KanbanBoard.tsx` and
+   `src/components/WorkflowQueue.tsx` (duplicated by convention).
+3. Extend `core/workflow-engine.test.ts` — stage progression, maker-checker
+   alternation, and error/retry behavior against the existing fakes.
 
-Publish only when requested.
+### Add an AI provider integration
 
-1. Recheck `git status --short --branch`, the base SHA, remote, and existing PRs
-   for the intended head branch. Reuse an existing same-scope PR instead of
-   creating a duplicate.
-2. Inspect `git diff --stat`, `git diff`, and `git diff --check`.
-3. Stage only intended paths; avoid `git add -A` in a mixed worktree.
-4. Use a Conventional Commit such as:
+- New HTTP API shape → extend `core/ai/api-provider.ts`.
+- New local CLI → extend the per-CLI flag tables in `core/ai/cli-provider.ts`
+  (system-prompt and tool-use flags). Keep the 15-min SIGKILL timeout; keep
+  `allowToolUse` flags scoped to the `pr` stage path only.
 
-   ```bash
-   git commit -m "chore(ai): improve AI agent configuration"
-   ```
+### Ship a change (PR workflow)
 
-5. Run the validation matrix at the committed head.
-6. Push with upstream tracking. Never force-push unless the user explicitly
-   authorizes history replacement; prefer a normal fast-forward push.
-7. Open a draft PR unless the user requests ready-for-review or an existing PR
-   already has an intentional review state.
-8. Include these PR sections:
+1. Branch from `main` (`feature/<topic>` or `claude/<topic>-<hex>`).
+2. Commit per AGENTS.md Git conventions (imperative subject, why-focused body).
+3. Run the full verification workflow above.
+4. Never stage: `.env*`, `dist/`, `dist-electron/`, `dist-cli/`, `release/`,
+   store/config files, or anything containing a token.
+5. Open a PR against `main`; CI (lint, test, vite build) gates the merge.
 
-   - why the change is needed;
-   - what changed, with each file's role;
-   - how agents should use the configuration;
-   - validation commands and results;
-   - risks, limitations, and intentionally unrun external checks.
+### Review a PR (checker role)
 
-9. Verify the PR URL, base branch, head branch, head SHA, draft state, and checks
-   from GitHub after creation or update.
-
-Do not equate commit, push, PR creation, passing CI, approval, and merge; report
-each state separately.
-
-## Package and release
-
-MAO currently has CI for type-check, unit tests, and Vite build, but no automated
-release or deployment workflow in this repository. Treat `npm run build` and
-`npm run dist` as local packaging commands, not deployment proof. Do not tag,
-publish, sign, notarize, or announce a release without explicit authorization
-and platform-appropriate evidence.
+Per AGENTS.md, the reviewer should be a different agent than the implementer.
+Check, in order: architecture rules (core Electron-free? logic in shells?),
+lockstep files all updated (IPC 3-file chain, store pair, STAGE_LABELS × 2),
+domain invariants (maker-checker, CI gate, timeouts, error-not-crash), secrets
+hygiene, then style (match surrounding code — there is no autoformatter).

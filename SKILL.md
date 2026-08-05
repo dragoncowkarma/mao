@@ -170,14 +170,20 @@ Two traps:
    Confirm the identity of **`origin` itself** before fetching or branching —
    not the GH CLI's notion of the repo: `gh repo set-default` can point a bare
    `gh repo view` at a different repository than `origin`, so it is no
-   evidence of where you will branch from and push to. Parse the remote
-   without echoing the raw URL (it can embed a token):
+   evidence of where you will branch from and push to. A field-split
+   one-liner is not enough either: it blesses deceptive paths
+   (`https://evil.example/github.com/<owner>/<repo>.git`), can echo
+   credentials from malformed URLs, and never sees a divergent
+   `remote.origin.pushurl` (git pushes to **every** configured push URL).
+   Use the tested helper, which enumerates all effective fetch/push URLs,
+   isolates userinfo/query without printing them, and anchored-matches
+   scheme, real authority, and exact path — failing closed on anything else:
 
    ```bash
-   git remote get-url origin | awk -F'[@/:]+' '{gsub(/\.git$/, "", $NF); print $(NF-2), $(NF-1) "/" $NF}'
+   MAO_EXPECTED_REMOTE="github.com/<owner>/<repo>" node scripts/check-origin.mjs
    ```
 
-   The printed host and `owner/repo` must match the intended target, and
+   It must print `OK` (exit 0) before any fetch/branch/push, and
    every subsequent `gh` command must pin `--repo <owner>/<repo>` explicitly.
    Then `git fetch origin` and branch from the **current** `origin/main` — a
    local `main` ref can lag the remote by many commits. Note the exact base
@@ -240,12 +246,25 @@ Two traps:
    require it to equal the preflight base SHA: `baseRefOid` is the base ref's
    *current* tip, which legitimately moves when `main` advances after
    branching. Verify lineage instead — `git merge-base --is-ancestor
-   <recorded-base-sha> <head-sha>` must succeed — and if the base has
-   advanced, re-check mergeability and CI against the current base. Then wait
-   for and verify green CI (lint, test, vite build) before merging — as of
-   2026-08 `main` has no branch protection, so CI is convention, not
-   GitHub-enforced. Report commit, push, PR creation, CI, review, and merge
-   as separate states — never equate one with another.
+   <recorded-base-sha> <head-sha>` must succeed.
+
+   If the base **has** advanced past the recorded SHA, do not credit the
+   existing green rollup as current-base evidence: CI here uses a bare
+   `pull_request` trigger (runs on opened/synchronize/reopened), so a
+   base-only move starts **no** new run, and the old run's `GITHUB_SHA` was
+   the merge commit against the *then-current* base. Cross-check which SHA a
+   run actually validated before crediting it. For real current-base
+   evidence, either (with explicit authorization — it rewrites the published
+   head) update the head branch against the current base so a `synchronize`
+   run re-validates the true merge, or build the current base+head merge in
+   an isolated worktree, run the verification matrix there, and report that
+   as **local** evidence, explicitly distinct from GitHub CI. With neither,
+   report current-base CI as unverified and stop before merging.
+
+   Then wait for and verify green CI (lint, test, vite build) before
+   merging — as of 2026-08 `main` has no branch protection, so CI is
+   convention, not GitHub-enforced. Report commit, push, PR creation, CI,
+   review, and merge as separate states — never equate one with another.
 9. Releases are a separate authorization: never tag, publish, sign, notarize,
    or announce without an explicit request and platform-appropriate evidence —
    `npm run build` / `npm run dist` are local packaging, not deployment proof.

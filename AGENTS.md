@@ -42,6 +42,7 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
 | `src/` | React 18 renderer (Vite + Tailwind); `App.tsx` owns all cross-view state |
 | `cli/index.ts` | Commander CLI: `config` / `repos` / `github` / `workflow` / `run` |
 | `scripts/test-workflow.ts` | Standalone e2e harness against a real (throwaway) repo |
+| `scripts/check-origin.mjs` | Publish-preflight guard: validates every effective `origin` fetch/push URL against an expected host/owner/repo without printing credentials (see SKILL.md) |
 
 ## Non-negotiable architecture rules
 

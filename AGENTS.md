@@ -2,8 +2,8 @@
 
 This file is the **single source of truth** for every AI agent (Claude Code, Codex,
 Antigravity, or any other tool) working in this repository. The tool-specific entry
-files (`CLAUDE.md`, `.antigravity/rules.md`, `codex.md`) intentionally contain nothing
-but a pointer here — keep it that way to avoid context fragmentation.
+files (`CLAUDE.md`, `.agents/rules/mao-ssot.md`, `codex.md`) intentionally contain
+nothing but a pointer here — keep it that way to avoid context fragmentation.
 
 Operational knowledge (commands, verification steps, recipes) lives in
 [SKILL.md](SKILL.md). Read **both** files before starting any task.
@@ -11,8 +11,10 @@ Operational knowledge (commands, verification steps, recipes) lives in
 ## What this project is
 
 MAO is a dev-toolkit that lets AI agents drive a GitHub workflow — **issue → PR →
-review → merge** — end to end, with a **maker-checker** safeguard so the same AI never
-reviews its own work. One Electron-free core powers two frontends:
+review → merge** — end to end, with a **maker-checker** safeguard so the same AI does
+not review its own work — effective only when two or more distinct providers are
+registered; a single-provider setup falls back to the same agent. One Electron-free
+core powers two frontends:
 
 - **Electron GUI** (`electron/` + `src/`): project sidebar, kanban board, workflow
   queue, settings.
@@ -108,13 +110,23 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   `task.history` entry; falls back to the sole provider if only one is registered.
   Preserve this in any routing change.
 - **Single-flight queue**: `processQueue()` runs one stage at a time globally.
-  Therefore every external call must be time-bounded — the API provider aborts
-  after 5 min, the CLI provider SIGKILLs after 15 min. Timeouts must surface as
-  task errors, never silent stalls.
-- **Failures are retryable states, not crashes**: any throw inside `runStage()`
-  (including synchronous setup like `selectAgent()` — keep it inside the
-  `try/catch`) sets `status: 'error'` without advancing the stage, so `retry()`
-  re-runs the same stage.
+  Therefore every external call must be time-bounded. Today only the AI-provider
+  calls are: the API provider aborts after 5 min, the CLI provider SIGKILLs after
+  15 min. **Octokit calls (`core/github-service.ts`) and git operations
+  (`core/git-workspace.ts`) have no timeout** — a hang there stalls the whole
+  queue indefinitely. Don't add more unbounded calls; adding timeouts to the
+  existing gaps is welcome. Timeouts must surface as task errors, never silent
+  stalls.
+- **Failures should be retryable states, not crashes**: any throw inside
+  `runStage()`'s `try/catch` (including synchronous setup like `selectAgent()` —
+  keep it inside) sets `status: 'error'` without advancing the stage, so `retry()`
+  re-runs the same stage. Two known gaps currently violate this — don't widen
+  them; fixing them (with regression tests) is welcome:
+  - the first `notify()` in `runStage()` runs **before** the `try`, so a throwing
+    `'change'` listener leaves the task stuck in `'running'`;
+  - `core/ai/cli-provider.ts` never handles `child.stdin` `'error'` events, so
+    writing a large prompt to a fast-exiting CLI crashes the process with an
+    unhandled `EPIPE` instead of failing the task.
 - **CI gate**: the merge stage only proceeds when `getChecksStatus` reports
   `'success'` or `'none'`; `'pending'` and `'failure'` throw (retryable). No CI
   configured on the target repo means "nothing to wait for".
@@ -142,6 +154,15 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   `.env.test`), never print `githubToken` or provider `apiKey` values (follow
   `config show`'s `'[set]'` redaction). The GitHub token is stored in plain text by
   the store backends — never log or commit store files.
+- **Known token-exposure path**: `ensureClone` (`core/git-workspace.ts`) embeds
+  the GitHub token in the HTTPS remote URL
+  (`https://x-access-token:<token>@github.com/…`). That URL persists in each
+  workspace clone's `.git/config`, and when a git command fails, the `execFile`
+  error message echoes the credential URL — which lands in `task.error`, the
+  persisted queue, and `mao run` stderr / the UI. Treat task errors, the queue
+  store, and workspace `.git/config` files as secret-bearing: never paste them
+  into issues, PRs, or logs. Removing the credential from the URL (or redacting
+  git errors) would be a welcome fix.
 
 ## Code conventions
 
@@ -181,9 +202,14 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   Non-trivial commits carry a ~72-char-wrapped body explaining root cause and why.
 - **Branches**: historically `claude/<kebab-topic>-<hex>`; feature branches like
   `feature/<topic>` are also fine. PRs merge into `main` via merge commits.
-- **CI gates every PR** (Node 22): `npm ci && npm run lint && npm run test &&
-  npx vite build`. Note CI does **not** build the CLI bundle — run
-  `npm run build:cli` yourself when touching `cli/` or `core/`.
+- **CI runs on every PR and push to `main`** (Node 22): `npm ci`, `npm run lint`,
+  `npm run test`, `npx vite build`. As of 2026-08 `main` has **no branch
+  protection** (no required checks, no rulesets), so a green CI is convention,
+  not a GitHub-enforced merge gate — treat it as required anyway. (Separate
+  concept: the *app's own* merge stage checks the target repo's CI via
+  `getChecksStatus` — that gate lives in the workflow engine, not in this repo's
+  settings.) CI does **not** build the CLI bundle — run `npm run build:cli`
+  yourself when touching `cli/` or `core/`.
 
 ## Agent roles & division of labor
 

@@ -28,11 +28,15 @@ npm install        # Node 22 is what CI uses; the CLI bundle targets node18
 
 **Never run the CLI via `tsx`** — it fails on `@octokit/app`
 (`ERR_PACKAGE_PATH_NOT_EXPORTED`). Always go through the esbuild bundle
-(`npm run cli` / `npm run build:cli`).
+(`npm run cli` / `npm run build:cli`). Note `build:cli` ends with `chmod +x`,
+which fails under Windows' default npm shell — on Windows run the esbuild step
+manually (the bundle is invoked via `node` anyway) or use Git Bash/WSL.
 
 ## Verification workflow (run before every commit)
 
-CI runs exactly this on Node 22 for pushes to `main` and all PRs:
+CI runs, in order, `npm ci` → `npm run lint` → `npm run test` → `npx vite build`
+on Node 22 for pushes to `main` and all PRs. Locally (dependencies already
+installed):
 
 ```bash
 npm run lint && npm run test && npx vite build
@@ -64,7 +68,10 @@ npm run cli -- repos add <owner> <repo> [--no-auto-trigger] [--poll-interval-ms 
 npm run cli -- repos list
 npm run cli -- github check <owner> <repo>       # open issues/PRs as JSON
 npm run cli -- workflow enqueue "<title>" --owner <o> --repo <r> [--no-auto-advance]
-npm run cli -- workflow list | retry <taskId> | advance <taskId> | clear-completed
+npm run cli -- workflow list
+npm run cli -- workflow retry <taskId>
+npm run cli -- workflow advance <taskId>
+npm run cli -- workflow clear-completed
 npm run cli -- run                               # foreground: auto-trigger + resume queue
 ```
 
@@ -90,6 +97,14 @@ least one provider — either `TEST_AI_API_KEY` (with optional `TEST_AI_API_FORM
 register two so maker-checker has somewhere to route. Optional:
 `TEST_TASK_TITLE`, `TEST_WORKSPACE_ROOT`.
 
+Two traps:
+
+- **Omit unused optional vars entirely** — don't leave them blank as in the
+  README's inline template: `TEST_AI_MODEL=` sends an empty-string model, and
+  `TEST_AI_CLI_ARGS=` becomes a `['']` argv.
+- **The harness exits 0 even when the task ends in `error`** — judge the run by
+  the printed final task JSON, not the exit code (don't gate automation on it).
+
 ## Recipes
 
 ### Add an IPC channel (renderer ↔ main)
@@ -111,8 +126,9 @@ register two so maker-checker has somewhere to route. Optional:
 
 ### Add a pipeline stage
 
-1. `core/workflow-engine.ts`: `STAGE_ORDER`, `buildPromptForStage`,
-   `applyGithubAction` (+ `runPrWithCodeEdits`-style special-casing if needed).
+1. `core/workflow-engine.ts`: the `WorkflowStageName` union, `STAGE_ORDER`,
+   `buildPromptForStage`, `applyGithubAction` (+ `runPrWithCodeEdits`-style
+   special-casing if needed).
 2. Update `STAGE_LABELS` in **both** `src/components/KanbanBoard.tsx` and
    `src/components/WorkflowQueue.tsx` (duplicated by convention).
 3. Extend `core/workflow-engine.test.ts` — stage progression, maker-checker
@@ -120,7 +136,9 @@ register two so maker-checker has somewhere to route. Optional:
 
 ### Add an AI provider integration
 
-- New HTTP API shape → extend `core/ai/api-provider.ts`.
+- New HTTP API shape → extend `core/ai/api-provider.ts`, the `apiFormat` union
+  in `core/ai/types.ts`, and the format picker in
+  `src/components/GlobalSettings.tsx`.
 - New local CLI → extend the per-CLI flag tables in `core/ai/cli-provider.ts`
   (system-prompt and tool-use flags). Keep the 15-min SIGKILL timeout; keep
   `allowToolUse` flags scoped to the `pr` stage path only.

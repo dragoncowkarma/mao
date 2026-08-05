@@ -1,6 +1,25 @@
 export type AiProviderKind = 'api' | 'cli'
 
-export type AiEffort = 'low' | 'medium' | 'high'
+/** Known CLI tool identifiers — used to drive model/effort option sets in the UI. */
+export type ProviderKindId = 'antigravity' | 'claude' | 'codex' | 'custom'
+
+export type AiEffort =
+  | 'low'
+  | 'medium'
+  | 'high'
+  | 'xhigh'
+  | 'max'
+  | 'ultracode'
+  | 'extra high'
+  | 'ultra'
+
+/** A single model + effort preset entry stored per provider. */
+export interface ModelEffortPreset {
+  id: string
+  model: string
+  /** undefined means this preset carries no effort flag */
+  effort?: AiEffort
+}
 
 export interface AiProviderConfig {
   id: string
@@ -13,9 +32,13 @@ export interface AiProviderConfig {
   model?: string
   // cli
   command?: string
+  /** Identifies the CLI tool for model/effort option resolution. */
+  providerKindId?: ProviderKindId
   args?: string[]
   /** Reasoning effort shown alongside this provider's work — informational only, not sent to every backend. */
   effort?: AiEffort
+  /** Ordered list of model+effort presets available for this provider. */
+  presets?: ModelEffortPreset[]
 }
 
 export interface AiRunOptions {

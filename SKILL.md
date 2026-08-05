@@ -167,12 +167,22 @@ Two traps:
    `git status --short --branch` (current branch or detached HEAD, and any
    pre-existing changes — note them now, because a dirty checkout's edits
    follow the new branch and their provenance is lost afterwards). Then
-   `git fetch origin` and branch from the **current** `origin/main` — a local
-   `main` ref can lag the remote by many commits. Confirm the remote's
-   identity **without printing its URL** (MAO workspace clones can carry
-   token-bearing remotes): `gh repo view --json nameWithOwner` must match the
-   intended `owner/repo`. Note the exact base SHA, and check for an existing
-   same-scope PR to reuse (`gh pr list`) instead of opening a duplicate.
+   Confirm the identity of **`origin` itself** before fetching or branching —
+   not the GH CLI's notion of the repo: `gh repo set-default` can point a bare
+   `gh repo view` at a different repository than `origin`, so it is no
+   evidence of where you will branch from and push to. Parse the remote
+   without echoing the raw URL (it can embed a token):
+
+   ```bash
+   git remote get-url origin | awk -F'[@/:]+' '{gsub(/\.git$/, "", $NF); print $(NF-2), $(NF-1) "/" $NF}'
+   ```
+
+   The printed host and `owner/repo` must match the intended target, and
+   every subsequent `gh` command must pin `--repo <owner>/<repo>` explicitly.
+   Then `git fetch origin` and branch from the **current** `origin/main` — a
+   local `main` ref can lag the remote by many commits. Note the exact base
+   SHA, and check for an existing same-scope PR to reuse
+   (`gh pr list --repo <owner>/<repo>`) instead of opening a duplicate.
    Branch names: `feature/<topic>` or `claude/<topic>-<hex>`.
 2. Stage only the paths the task intended — avoid `git add -A` in a worktree
    that may hold unrelated changes. Never stage: `.env*`, `dist/`,
@@ -183,19 +193,27 @@ Two traps:
    already-staged content entirely):
    1. `git diff --cached --name-status` — every listed path must be one the
       task intended; unstage anything else.
-   2. A staged-secret scan with a **vetted scanner** that reports only
-      rule/path/line and redacts values (e.g. `gitleaks protect --staged
-      --redact`, where installed and verified). A keyword grep is **not** a
-      secret gate: generic terms miss real credential formats (`sk-proj-…`,
-      `AKIA…`) while flagging legitimate code that merely says `token`, its
-      exit code inverts on a clean result, and `grep` is absent from Windows'
-      default shell. If no vetted scanner is available, do **not** print the
-      content diff to hunt for secrets — stop and have a human confirm the
-      staged paths.
-   3. Only once the paths are approved and the scan is clean:
-      `git diff --cached --check` and the content diff of those paths. Never
-      treat a scan result — least of all a keyword-grep zero — as permission
-      to dump unrestricted content diffs.
+   2. A staged-secret scan with a **vetted, version-pinned scanner** that
+      reports only rule/path/line and redacts values. The current gitleaks
+      staged invocation is `gitleaks git --pre-commit --staged --redact
+      --verbose` (`protect` is deprecated/hidden since v8.19 — verify the
+      installed, pinned version actually supports the flags before trusting
+      its exit code; an uninstalled scanner exits 127, which is not "clean").
+      A keyword grep is **not** a secret gate: generic terms miss real
+      credential formats (`sk-proj-…`, `AKIA…`) while flagging legitimate
+      code that merely says `token`, its exit code inverts on a clean result,
+      and `grep` is absent from Windows' default shell. If no vetted scanner
+      is available, do **not** print the content diff to hunt for secrets —
+      hand off to a human: they review the staged **content** (not just the
+      path list) in a safe local viewer that doesn't persist to shared
+      terminal/agent logs, and explicitly attest it contains no secrets.
+      That attestation substitutes for a clean scan; with neither a scanner
+      result nor an attestation, stop — the workflow does not resume.
+   3. Only once the paths are approved and the scan is clean (or a human has
+      attested the content per step 2): `git diff --cached --check` and the
+      content diff of those paths. Never treat a scan result — least of all
+      a keyword-grep zero — as permission to dump unrestricted content
+      diffs.
 4. Commit per AGENTS.md Git conventions (imperative subject, why-focused body).
 5. Run the full verification workflow above at the committed head. A blank
    `git status --short` vouches only for non-ignored files — for strong
@@ -216,13 +234,18 @@ Two traps:
    gh pr view <number> --repo <owner>/<repo> --json url,state,baseRefName,baseRefOid,headRefName,headRefOid,isDraft,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup
    ```
 
-   The result must match the intended base branch **and recorded base SHA**
-   (`baseRefOid`), head branch, **exact head SHA** (`headRefOid`), and draft
-   state — green CI alone proves none of these. Then wait for and verify green
-   CI (lint, test, vite build) before merging — as of 2026-08 `main` has no
-   branch protection, so CI is convention, not GitHub-enforced. Report commit,
-   push, PR creation, CI, review, and merge as separate states — never equate
-   one with another.
+   The result must match the intended base branch, head branch, **exact head
+   SHA** (`headRefOid`), and draft state — green CI alone proves none of
+   these. Record the returned `baseRefOid` as a snapshot, but do **not**
+   require it to equal the preflight base SHA: `baseRefOid` is the base ref's
+   *current* tip, which legitimately moves when `main` advances after
+   branching. Verify lineage instead — `git merge-base --is-ancestor
+   <recorded-base-sha> <head-sha>` must succeed — and if the base has
+   advanced, re-check mergeability and CI against the current base. Then wait
+   for and verify green CI (lint, test, vite build) before merging — as of
+   2026-08 `main` has no branch protection, so CI is convention, not
+   GitHub-enforced. Report commit, push, PR creation, CI, review, and merge
+   as separate states — never equate one with another.
 9. Releases are a separate authorization: never tag, publish, sign, notarize,
    or announce without an explicit request and platform-appropriate evidence —
    `npm run build` / `npm run dist` are local packaging, not deployment proof.

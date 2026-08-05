@@ -36,9 +36,12 @@ manually (the bundle is invoked via `node` anyway) or use Git Bash/WSL.
 
 ## Verification workflow
 
-Run this on the exact tree you intend to share — before the commit or at the
-committed head, either verifies the same tree; just ensure nothing changes
-between verification and push.
+Verification runs the current **filesystem**, not a Git object: its results
+vouch for a commit only when the worktree exactly matches that commit
+(`git status --short` prints nothing). In a dirty/mixed worktree, unstaged or
+untracked edits can make validation pass for code the commit doesn't contain —
+verify in an isolated worktree of the exact SHA instead
+(`git worktree add <dir> <sha>`).
 
 CI runs, in order, `npm ci` → `npm run lint` → `npm run test` → `npx vite build`
 on Node 22 for pushes to `main` and all PRs. Locally (dependencies already
@@ -152,32 +155,52 @@ Two traps:
 
 ### Ship a change (PR workflow)
 
-1. Preflight: `git fetch origin` and branch from the **current** `origin/main`
-   — a local `main` ref can lag the remote by many commits. Note the exact base
-   SHA, and check for an existing same-scope PR to reuse (`gh pr list`) instead
-   of opening a duplicate. Branch names: `feature/<topic>` or
+1. Preflight — **before creating any branch**, record the starting state:
+   `git status --short --branch` (current branch or detached HEAD, and any
+   pre-existing changes — note them now, because a dirty checkout's edits
+   follow the new branch and their provenance is lost afterwards). Then
+   `git fetch origin` and branch from the **current** `origin/main` — a local
+   `main` ref can lag the remote by many commits. Note the exact base SHA, and
+   check for an existing same-scope PR to reuse (`gh pr list`) instead of
+   opening a duplicate. Branch names: `feature/<topic>` or
    `claude/<topic>-<hex>`.
-2. Stage only the paths the task intended — check `git status --short` and
-   `git diff --check` first, and avoid `git add -A` in a worktree that may hold
-   unrelated changes. Never stage: `.env*`, `dist/`, `dist-electron/`,
-   `dist-cli/`, `release/`, store/config files, or anything containing a token.
-3. Before committing, verify what is actually staged — `git diff --cached
-   --stat`, `git diff --cached --check`, and read `git diff --cached` for
-   anything unexpected. Plain `git diff` compares worktree↔index and misses
-   already-staged content, so it cannot catch a stray staged secret or
-   unrelated file.
+2. Stage only the paths the task intended — avoid `git add -A` in a worktree
+   that may hold unrelated changes. Never stage: `.env*`, `dist/`,
+   `dist-electron/`, `dist-cli/`, `release/`, store/config files, or anything
+   containing a token.
+3. Verify the staged scope **without printing potential secret values**, in
+   this order (plain `git diff` compares worktree↔index and misses
+   already-staged content entirely):
+   1. `git diff --cached --name-status` — every listed path must be one the
+      task intended; unstage anything else.
+   2. A redacting secret scan that counts matches instead of echoing them,
+      e.g. `git diff --cached | grep -icE 'token|secret|api[_-]?key|password|ghp_|github_pat_|sk-ant-'`
+      — nonzero means unstage and investigate; never dump the full cached
+      diff to "find" a suspected secret, that prints the value into durable
+      terminal/agent logs.
+   3. Only once the paths are approved and the scan is clean:
+      `git diff --cached --check` and the content diff of those paths.
 4. Commit per AGENTS.md Git conventions (imperative subject, why-focused body).
-5. Run the full verification workflow above at the committed head.
+5. Run the full verification workflow above at the committed head with a
+   **clean worktree** (`git status --short` prints nothing) — or in an
+   isolated worktree of that exact SHA (see the verification section's
+   caveat about dirty worktrees).
 6. Push with upstream tracking (pushing and opening a PR are external writes —
    only do this when the task calls for it). Authorization to push or open a PR
    is **not** authorization to force-push: never rewrite history (`--force*`)
    unless the user explicitly approves history replacement.
 7. Open the PR against `main` as a **draft** unless the user asked for
    ready-for-review or an existing PR already carries an intentional review
-   state. Wait for and verify green CI (lint, test, vite build) before merging —
-   as of 2026-08 `main` has no branch protection, so CI is convention, not
-   GitHub-enforced.
-8. Releases are a separate authorization: never tag, publish, sign, notarize,
+   state.
+8. Postflight — re-query what was actually published:
+   `gh pr view --json url,baseRefName,headRefName,headRefOid,isDraft` must
+   match the intended base, head branch, **exact head SHA**, and draft state
+   (green CI alone proves none of these). Then wait for and verify green CI
+   (lint, test, vite build) before merging — as of 2026-08 `main` has no
+   branch protection, so CI is convention, not GitHub-enforced. Report commit,
+   push, PR creation, CI, review, and merge as separate states — never equate
+   one with another.
+9. Releases are a separate authorization: never tag, publish, sign, notarize,
    or announce without an explicit request and platform-appropriate evidence —
    `npm run build` / `npm run dist` are local packaging, not deployment proof.
 

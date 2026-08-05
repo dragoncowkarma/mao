@@ -5,6 +5,13 @@
  * URL or anything derived from one (host, path, userinfo, query) — malformed
  * or hostile remotes can smuggle credentials into any of those parts.
  *
+ * Identity is compared on Git's terms, not on a lenient normalization: Git
+ * hands the *path* through to the server (trailing whitespace, `?`/`#`
+ * characters, absolute or doubled slashes all reach `git-upload-pack`), so a
+ * URL is accepted only when its raw form is whitespace-clean and ?/#-free and
+ * its path has exactly the canonical shape — URL form `/owner/repo[.git]`,
+ * SCP form the relative `owner/repo[.git]`. Anything else fails closed.
+ *
  * Usage (any shell, no env syntax needed):
  *   node scripts/check-origin.mjs "github.com/<owner>/<repo>"
  * (MAO_EXPECTED_REMOTE is honored as a fallback when no argument is given.)
@@ -15,9 +22,13 @@
  *   `FAIL(url 2): mismatch` — never any remote-derived string. Child git
  *   stderr is captured and discarded for the same reason.
  * Exit codes: 0 all match; 1 any failure (fail-closed); 2 bad invocation.
- * The committed negative matrix (scripts/check-origin.test.mjs, run via
- * `npm run test:origin` and in CI) asserts both the verdicts and the
- * no-leak contract on combined stdout+stderr.
+ * The committed matrix (scripts/check-origin.test.mjs, `npm run test:origin`,
+ * also in CI) asserts verdicts, an exact output grammar, and empty stderr.
+ *
+ * Scope note: this vouches for `origin` at the moment it runs. Branch-scoped
+ * config (`includeIf "onbranch:…"`) can change `origin.pushurl` the moment a
+ * branch is created or switched — re-run the guard after the final branch
+ * switch, immediately before pushing (see SKILL.md).
  */
 import { execFileSync } from 'node:child_process'
 
@@ -34,12 +45,14 @@ try {
   // remote.origin.pushurl (git pushes to every configured push URL) is
   // invisible to a fetch-URL-only check, so both must be enumerated. stderr
   // is piped and discarded: git error text must not reach the log either.
+  // Lines are kept RAW (no trim): whitespace in a configured URL is part of
+  // the path Git would send, so it must fail the check, not be groomed away.
   for (const extra of [[], ['--push']]) {
     const out = execFileSync('git', ['remote', 'get-url', ...extra, '--all', 'origin'], {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
     })
-    for (const line of out.split('\n')) if (line.trim() && !urls.includes(line.trim())) urls.push(line.trim())
+    for (const line of out.split('\n')) if (line !== '' && !urls.includes(line)) urls.push(line)
   }
 } catch {
   console.log('FAIL: could not enumerate origin URLs')
@@ -54,8 +67,15 @@ urls.forEach((raw, i) => {
     ok = false
     console.log(`FAIL(url ${i + 1}): ${category}`)
   }
+  // Raw-level gates, before any parser gets to normalize the evidence away:
+  // surrounding whitespace and ?/# delimiters (even empty ones — WHATWG
+  // reports `?`-with-nothing-after as an empty search) are all forwarded to
+  // the server as part of the address, so they are identity-relevant.
+  if (raw !== raw.trim()) return fail('whitespace in remote URL')
+  if (raw.includes('?') || raw.includes('#')) return fail('disallowed scheme, port, query, or fragment')
+
   let host = ''
-  let path = ''
+  let pathMatch = null
   if (/^[a-z][\w+.-]*:\/\//i.test(raw)) {
     let u
     try {
@@ -63,21 +83,23 @@ urls.forEach((raw, i) => {
     } catch {
       return fail('unparseable')
     }
-    // Fail closed on anything beyond plain https/ssh with default port and no
-    // query/fragment — each of those changes (or hides) the real authority.
     if ((u.protocol !== 'https:' && u.protocol !== 'ssh:') || u.port || u.search || u.hash) {
       return fail('disallowed scheme, port, query, or fragment')
     }
     host = u.hostname
-    path = u.pathname
+    // Exactly one leading slash and exactly two non-empty segments — a
+    // doubled slash (`//owner/repo`) is a different address on the wire.
+    pathMatch = /^\/([^/]+)\/([^/]+?)(?:\.git)?$/.exec(u.pathname)
   } else {
-    const scp = /^(?:[\w.-]+@)?([\w.-]+):(?!\/\/)(.+)$/.exec(raw)
+    const scp = /^(?:[\w.-]+@)?([\w.-]+):(.+)$/.exec(raw)
     if (!scp) return fail('unrecognized format')
-    if (/[?#]/.test(scp[2])) return fail('disallowed scheme, port, query, or fragment')
     host = scp[1]
-    path = scp[2]
+    // SCP paths are relative on the wire; a leading slash is an absolute
+    // path on the server and therefore a different repository address.
+    pathMatch = /^([^/]+)\/([^/]+?)(?:\.git)?$/.exec(scp[2])
   }
-  const got = `${host}/${path.replace(/^\/+/, '').replace(/\.git$/, '')}`.toLowerCase()
+  if (!pathMatch) return fail('invalid path shape')
+  const got = `${host}/${pathMatch[1]}/${pathMatch[2]}`.toLowerCase()
   if (got !== expected) fail('mismatch')
 })
 

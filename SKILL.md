@@ -230,10 +230,16 @@ Two traps:
    `git status --short` vouches only for non-ignored files — for strong
    exact-SHA evidence use the verification section's isolated-worktree path
    (`git worktree add --detach` + `npm ci` + controlled environment).
-6. Push with the remote and ref pinned explicitly —
+6. **Re-run the origin guard immediately before pushing, on the final
+   branch** — `node scripts/check-origin.mjs "github.com/<owner>/<repo>"`
+   must print `OK` again: branch-scoped config
+   (`includeIf "onbranch:…"`) can swap `origin.pushurl` the moment the
+   branch exists, so the pre-branch preflight is stale evidence by push
+   time (the committed matrix includes this exact regression). Then push
+   with the remote and ref pinned explicitly —
    `git push --set-upstream origin <branch>` — never a bare `git push`:
    `remote.pushDefault` (and `branch.<name>.pushRemote`) can silently point an
-   argument-less push at a remote the preflight never validated. Pushing and
+   argument-less push at a remote the guard never validated. Pushing and
    opening a PR are external writes — only do this when the task calls for
    it. Authorization to push or open a PR is **not** authorization to
    force-push: never rewrite history (`--force*`) unless the user explicitly
@@ -270,8 +276,8 @@ Two traps:
    as **local** evidence, explicitly distinct from GitHub CI. With neither,
    report current-base CI as unverified and stop before merging.
 
-   Then wait for and verify green CI (lint, test, vite build) before
-   merging — as of 2026-08 `main` has no branch protection, so CI is
+   Then wait for and verify green CI (lint, test, test:origin, vite build)
+   before merging — as of 2026-08 `main` has no branch protection, so CI is
    convention, not GitHub-enforced. Report commit, push, PR creation, CI,
    review, and merge as separate states — never equate one with another.
 9. Releases are a separate authorization: never tag, publish, sign, notarize,

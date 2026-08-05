@@ -3,13 +3,18 @@
  * Negative/positive matrix for scripts/check-origin.mjs, runnable anywhere
  * plain Node + git exist (`npm run test:origin`; wired into CI).
  *
- * Beyond verdicts (exit codes), every case asserts the no-leak contract:
- * the helper's combined stdout+stderr must never contain the credential
- * sentinel, a hostile host, userinfo, or any other remote-derived string —
- * only fixed categories, URL indexes, and the operator-supplied expectation.
+ * Three oracles per invocation, so a regression in any prior review finding
+ * actually fails the run:
+ * - verdict: exact expected exit code;
+ * - output grammar: every stdout line must match the helper's fixed-category
+ *   grammar (success lines must equal the exact OK line), so a stray
+ *   remote-derived string cannot hide in an otherwise-passing case;
+ * - silence: stderr must be exactly empty — child git stderr passthrough was
+ *   a real leak once;
+ * plus a denylist of sentinel strings over combined output.
  */
 import { execFileSync, spawnSync } from 'node:child_process'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -18,13 +23,41 @@ const HELPER = join(dirname(fileURLToPath(import.meta.url)), 'check-origin.mjs')
 const EXPECTED = 'github.com/example-owner/example-repo'
 const GOOD = 'https://github.com/example-owner/example-repo.git'
 const SENTINEL = 'FAKE_SENTINEL_123'
-// Strings that must never appear in any helper output, success or failure.
 const FORBIDDEN = [SENTINEL, 'evil.example', 'x-access-token', 'attacker']
+
+const OK_LINE = `OK: every origin fetch/push URL is ${EXPECTED}`
+const LINE_GRAMMAR = new RegExp(
+  '^(' +
+    [
+      OK_LINE.replace(/[/.]/g, '\\$&'),
+      'FAIL\\(url \\d+\\): (whitespace in remote URL|disallowed scheme, port, query, or fragment|unparseable|unrecognized format|invalid path shape|mismatch)',
+      'FAIL: (could not enumerate origin URLs|origin has no URLs)',
+      'ORIGIN CHECK FAILED — do not fetch/branch/push',
+    ].join('|') +
+    ')$'
+)
 
 const git = (dir, ...args) =>
   execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
 
-/** Each case sets up remotes in a fresh repo and states the expected verdict. */
+/** Runs the helper in `dir` and returns problems vs the three oracles. */
+function checkRun(dir, want) {
+  const r = spawnSync(process.execPath, [HELPER, EXPECTED], { cwd: dir, encoding: 'utf8' })
+  const problems = []
+  if (r.status !== want) problems.push(`exit ${r.status}, want ${want}`)
+  if ((r.stderr ?? '') !== '') problems.push('stderr not empty')
+  const lines = (r.stdout ?? '').split('\n').filter((l) => l !== '')
+  for (const line of lines) {
+    if (!LINE_GRAMMAR.test(line)) problems.push(`off-grammar stdout line`)
+  }
+  if (want === 0 && !lines.includes(OK_LINE)) problems.push('missing exact OK line')
+  const combined = `${r.stdout ?? ''}${r.stderr ?? ''}`.toLowerCase()
+  for (const bad of FORBIDDEN) {
+    if (combined.includes(bad.toLowerCase())) problems.push(`output leaks "${bad}"`)
+  }
+  return problems
+}
+
 const CASES = [
   { name: 'https with .git', want: 0, setup: (d) => git(d, 'remote', 'add', 'origin', GOOD) },
   { name: 'scp-style', want: 0, setup: (d) => git(d, 'remote', 'add', 'origin', 'git@github.com:example-owner/example-repo.git') },
@@ -61,6 +94,13 @@ const CASES = [
   { name: 'nonstandard port', want: 1, setup: (d) => git(d, 'remote', 'add', 'origin', 'https://github.com:8443/example-owner/example-repo.git') },
   { name: 'query string', want: 1, setup: (d) => git(d, 'remote', 'add', 'origin', `${GOOD}?x=1`) },
   { name: 'fragment', want: 1, setup: (d) => git(d, 'remote', 'add', 'origin', `${GOOD}#frag`) },
+  // Canonicalization bypasses: Git forwards each of these paths verbatim to
+  // git-upload-pack, so none of them is the same address as the clean form.
+  { name: 'empty query delimiter', want: 1, setup: (d) => git(d, 'remote', 'add', 'origin', 'ssh://git@github.com/example-owner/example-repo.git?') },
+  { name: 'empty fragment delimiter', want: 1, setup: (d) => git(d, 'remote', 'add', 'origin', 'ssh://git@github.com/example-owner/example-repo.git#') },
+  { name: 'scp absolute path', want: 1, setup: (d) => git(d, 'remote', 'add', 'origin', 'git@github.com:/example-owner/example-repo.git') },
+  { name: 'url double-slash path', want: 1, setup: (d) => git(d, 'remote', 'add', 'origin', 'ssh://git@github.com//example-owner/example-repo.git') },
+  { name: 'trailing whitespace', want: 1, setup: (d) => git(d, 'remote', 'add', 'origin', 'git@github.com:example-owner/example-repo.git ') },
   { name: 'no origin remote', want: 1, setup: () => {} },
   {
     // remote.pushDefault redirects a bare `git push` elsewhere; the helper
@@ -78,31 +118,50 @@ const CASES = [
 ]
 
 let failures = 0
+const report = (name, problems) => {
+  if (problems.length) {
+    failures++
+    console.log(`not ok - ${name}: ${problems.join('; ')}`)
+  } else {
+    console.log(`ok - ${name}`)
+  }
+}
+
 for (const c of CASES) {
   const dir = mkdtempSync(join(tmpdir(), 'origin-test-'))
   try {
-    git(dir, 'init', '-q')
+    git(dir, 'init', '-q', '-b', 'main')
     c.setup(dir)
-    const r = spawnSync(process.execPath, [HELPER, EXPECTED], { cwd: dir, encoding: 'utf8' })
-    const combined = `${r.stdout ?? ''}${r.stderr ?? ''}`
-    const problems = []
-    if (r.status !== c.want) problems.push(`exit ${r.status}, want ${c.want}`)
-    for (const bad of FORBIDDEN) {
-      if (combined.toLowerCase().includes(bad.toLowerCase())) problems.push(`output leaks "${bad}"`)
-    }
-    if (problems.length) {
-      failures++
-      console.log(`not ok - ${c.name}: ${problems.join('; ')}`)
-    } else {
-      console.log(`ok - ${c.name}`)
-    }
+    report(c.name, checkRun(dir, c.want))
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
 }
 
+// Branch-conditional config: an `includeIf "onbranch:feature/**"` section can
+// swap origin.pushurl the moment the branch exists, so a pre-branch preflight
+// is stale evidence. The guard must pass on main and fail after the switch —
+// which is exactly why SKILL.md requires re-running it right before push.
+{
+  const dir = mkdtempSync(join(tmpdir(), 'origin-test-'))
+  try {
+    git(dir, 'init', '-q', '-b', 'main')
+    git(dir, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '--allow-empty', '-m', 'x')
+    git(dir, 'remote', 'add', 'origin', GOOD)
+    writeFileSync(join(dir, '.git', 'evil.inc'), '[remote "origin"]\n\tpushurl = https://evil.example/steal/repo.git\n')
+    appendFileSync(join(dir, '.git', 'config'), '\n[includeIf "onbranch:feature/**"]\n\tpath = evil.inc\n')
+    const before = checkRun(dir, 0).map((p) => `pre-switch ${p}`)
+    git(dir, 'switch', '-q', '-c', 'feature/probe')
+    const after = checkRun(dir, 1).map((p) => `post-switch ${p}`)
+    report('onbranch includeIf activates hostile pushurl', [...before, ...after])
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+const total = CASES.length + 1
 if (failures) {
-  console.log(`check-origin matrix: ${failures}/${CASES.length} case(s) FAILED`)
+  console.log(`check-origin matrix: ${failures}/${total} case(s) FAILED`)
   process.exit(1)
 }
-console.log(`check-origin matrix: all ${CASES.length} cases passed, no leaks`)
+console.log(`check-origin matrix: all ${total} cases passed, no leaks`)

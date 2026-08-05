@@ -34,7 +34,11 @@ Use `npm install` only when intentionally changing dependencies + lockfile.
 which fails under Windows' default npm shell — on Windows run the esbuild step
 manually (the bundle is invoked via `node` anyway) or use Git Bash/WSL.
 
-## Verification workflow (run before every commit)
+## Verification workflow
+
+Run this on the exact tree you intend to share — before the commit or at the
+committed head, either verifies the same tree; just ensure nothing changes
+between verification and push.
 
 CI runs, in order, `npm ci` → `npm run lint` → `npm run test` → `npx vite build`
 on Node 22 for pushes to `main` and all PRs. Locally (dependencies already
@@ -148,23 +152,32 @@ Two traps:
 
 ### Ship a change (PR workflow)
 
-1. Branch from `main` (`feature/<topic>` or `claude/<topic>-<hex>`).
+1. Preflight: `git fetch origin` and branch from the **current** `origin/main`
+   — a local `main` ref can lag the remote by many commits. Note the exact base
+   SHA, and check for an existing same-scope PR to reuse (`gh pr list`) instead
+   of opening a duplicate. Branch names: `feature/<topic>` or
+   `claude/<topic>-<hex>`.
 2. Stage only the paths the task intended — check `git status --short` and
    `git diff --check` first, and avoid `git add -A` in a worktree that may hold
    unrelated changes. Never stage: `.env*`, `dist/`, `dist-electron/`,
    `dist-cli/`, `release/`, store/config files, or anything containing a token.
-3. Commit per AGENTS.md Git conventions (imperative subject, why-focused body).
-4. Run the full verification workflow above at the committed head.
-5. Push with upstream tracking (pushing and opening a PR are external writes —
+3. Before committing, verify what is actually staged — `git diff --cached
+   --stat`, `git diff --cached --check`, and read `git diff --cached` for
+   anything unexpected. Plain `git diff` compares worktree↔index and misses
+   already-staged content, so it cannot catch a stray staged secret or
+   unrelated file.
+4. Commit per AGENTS.md Git conventions (imperative subject, why-focused body).
+5. Run the full verification workflow above at the committed head.
+6. Push with upstream tracking (pushing and opening a PR are external writes —
    only do this when the task calls for it). Authorization to push or open a PR
    is **not** authorization to force-push: never rewrite history (`--force*`)
    unless the user explicitly approves history replacement.
-6. Open the PR against `main` as a **draft** unless the user asked for
+7. Open the PR against `main` as a **draft** unless the user asked for
    ready-for-review or an existing PR already carries an intentional review
    state. Wait for and verify green CI (lint, test, vite build) before merging —
    as of 2026-08 `main` has no branch protection, so CI is convention, not
    GitHub-enforced.
-7. Releases are a separate authorization: never tag, publish, sign, notarize,
+8. Releases are a separate authorization: never tag, publish, sign, notarize,
    or announce without an explicit request and platform-appropriate evidence —
    `npm run build` / `npm run dist` are local packaging, not deployment proof.
 

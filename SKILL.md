@@ -29,6 +29,12 @@ The following commands are defined in `package.json` and should be used during d
   ```
   Bundles the CLI tool to `dist-cli/index.cjs`.
 
+- **Run CLI Tool:**
+  ```bash
+  npm run cli
+  ```
+  Executes the built CLI tool (`dist-cli/index.cjs`).
+
 - **Run Tests:**
   ```bash
   npm run test
@@ -48,8 +54,8 @@ When working on a feature or fixing a bug, agents should simulate the pipeline u
 1. **Issue Creation:** Ensure an issue exists on GitHub for the task being worked on.
 2. **Branching:** Check out a new branch related to the issue (e.g., `feature/ai-agent-setup`).
 3. **Implementation & Testing:**
-   - Write code focusing on the separation of concerns between `electron/` and `src/`.
-   - Add or update unit tests to verify changes.
+   - Write code adhering to the separation of concerns between `electron/`, `src/`, `cli/`, and `core/`.
+   - Add or update unit tests to verify changes. **Note:** Tests must be placed in `core/` (e.g., `core/*.test.ts`) because `vitest.config.ts` is configured to only collect `core/**/*.test.ts`.
    - Run `npm run test` and `npm run lint`.
 4. **Committing:**
    - Use Conventional Commits formatting (e.g., `feat(ui): add new kanban component`, `fix(core): resolve state race condition`).
@@ -64,7 +70,7 @@ For testing the core workflow engine without the UI, you can run the standalone 
 ```bash
 node --experimental-strip-types --env-file=.env.test scripts/test-workflow.ts
 ```
-*Note: This requires a `.env.test` file with valid configuration (test repository and API keys) as described in the main `README.md`.*
+*Note: This requires **Node >= 22.6** (for the `--experimental-strip-types` flag) and a `.env.test` file with valid configuration (test repository and API keys) as described in the main `README.md`.*
 
 ## AI Rules Reminder
 Always cross-reference with `AGENTS.md` for architectural rules and constraints.

@@ -153,7 +153,10 @@ Two traps:
 3. Run the full verification workflow above.
 4. Never stage: `.env*`, `dist/`, `dist-electron/`, `dist-cli/`, `release/`,
    store/config files, or anything containing a token.
-5. Open a PR against `main`; CI (lint, test, vite build) gates the merge.
+5. Open a PR against `main` (pushing and opening a PR are external writes —
+   only do this when the task calls for it). Wait for and verify green CI
+   (lint, test, vite build) before merging — as of 2026-08 `main` has no branch
+   protection, so CI is convention, not GitHub-enforced.
 
 ### Review a PR (checker role)
 
@@ -162,3 +165,7 @@ Check, in order: architecture rules (core Electron-free? logic in shells?),
 lockstep files all updated (IPC 3-file chain, store pair, STAGE_LABELS × 2),
 domain invariants (maker-checker, CI gate, timeouts, error-not-crash), secrets
 hygiene, then style (match surrounding code — there is no autoformatter).
+
+This checklist is **local verification**. Posting an actual GitHub review
+(comment, approval) or merging requires explicit authorization from the user —
+a "review this" request alone does not grant it (see AGENTS.md safety rails).

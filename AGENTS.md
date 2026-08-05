@@ -2,7 +2,7 @@
 
 This file is the **single source of truth** for every AI agent (Claude Code, Codex,
 Antigravity, or any other tool) working in this repository. The tool-specific entry
-files (`CLAUDE.md`, `.agents/rules/mao-ssot.md`, `codex.md`) intentionally contain
+files (`CLAUDE.md`, `.agents/rules/pointers.md`, `codex.md`) intentionally contain
 nothing but a pointer here — keep it that way to avoid context fragmentation.
 
 Operational knowledge (commands, verification steps, recipes) lives in
@@ -120,13 +120,24 @@ There is no codegen — these couplings are maintained by hand and only `npm run
 - **Failures should be retryable states, not crashes**: any throw inside
   `runStage()`'s `try/catch` (including synchronous setup like `selectAgent()` —
   keep it inside) sets `status: 'error'` without advancing the stage, so `retry()`
-  re-runs the same stage. Two known gaps currently violate this — don't widen
+  re-runs the same stage. Known gaps currently violate this — don't widen
   them; fixing them (with regression tests) is welcome:
-  - the first `notify()` in `runStage()` runs **before** the `try`, so a throwing
-    `'change'` listener leaves the task stuck in `'running'`;
+  - **both** `notify()` calls in `runStage()` sit outside the `try` (listeners run
+    synchronously, and `createMaoApp` subscribes a synchronous `store.set`). A
+    throwing listener on the entry `notify()` leaves the task stuck in
+    `'running'`; on the exit `notify()` it loses the *persisted* advance after
+    the stage's GitHub writes already succeeded — after a restart the stage
+    re-runs and duplicates those writes;
   - `core/ai/cli-provider.ts` never handles `child.stdin` `'error'` events, so
     writing a large prompt to a fast-exiting CLI crashes the process with an
     unhandled `EPIPE` instead of failing the task.
+- **`retry()` re-runs the stage, but stage actions are not idempotent**: the
+  notes-only `pr` path runs branch → commit → PR, and `createBranch` rejects an
+  existing ref — so a failure after branch creation leaves retry permanently
+  stuck on `Reference already exists`; the merge stage comments before merging,
+  so a failed merge means retry posts a duplicate comment. "Retryable" describes
+  the state machine, not side-effect safety — making these actions idempotent
+  (with regression tests) is welcome.
 - **CI gate**: the merge stage only proceeds when `getChecksStatus` reports
   `'success'` or `'none'`; `'pending'` and `'failure'` throw (retryable). No CI
   configured on the target repo means "nothing to wait for". Note the check
@@ -150,6 +161,13 @@ There is no codegen — these couplings are maintained by hand and only `npm run
 
 ## Safety rails — this app performs real GitHub writes
 
+- **External writes need explicit task authorization.** A request to analyze,
+  review, or verify something never authorizes GitHub writes. Do not create or
+  close issues, push branches, open/comment/approve/merge PRs, create releases,
+  or delete refs — on this repo or any target repo — unless the user's task
+  explicitly calls for that specific write. Enqueueing a workflow task, `mao
+  run`, `refreshRepo`, and the e2e harness all count: they drive the pipeline,
+  which performs those writes unattended.
 - The pipeline creates real issues, branches, PRs, reviews, and merges. Test only
   against throwaway repos (see SKILL.md).
 - `github:refreshRepo` is **not a pure read**: it calls `autoTrigger.pollNow()`

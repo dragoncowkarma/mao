@@ -10,8 +10,10 @@ that first; this file assumes you have.
 ## Setup
 
 ```bash
-npm install        # Node 22 is what CI uses; the CLI bundle targets node18
+npm ci             # locked graph, same as CI; Node 22 is what CI uses (CLI bundle targets node18)
 ```
+
+Use `npm install` only when intentionally changing dependencies + lockfile.
 
 ## Command reference
 
@@ -44,8 +46,9 @@ npm run lint && npm run test && npx vite build
 
 Additionally, because CI does **not** cover them:
 
-- Touched `cli/` or `core/`? → also run `npm run build:cli` (CLI bundle breakage
-  is invisible to CI).
+- Touched `cli/` or `core/`? → also run `npm run build:cli` and smoke-test
+  `node dist-cli/index.cjs --help` (CLI bundle breakage is invisible to CI).
+- Iterating on the engine? → focused run: `npx vitest run core/workflow-engine.test.ts`.
 - Touched `scripts/`? → note `scripts/` is not in `tsconfig.json`'s `include`, so
   tsc/CI never typechecks it — verify by actually running the harness.
 - Touched the IPC surface? → **nothing automated** checks that

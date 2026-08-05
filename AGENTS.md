@@ -129,13 +129,21 @@ There is no codegen — these couplings are maintained by hand and only `npm run
     unhandled `EPIPE` instead of failing the task.
 - **CI gate**: the merge stage only proceeds when `getChecksStatus` reports
   `'success'` or `'none'`; `'pending'` and `'failure'` throw (retryable). No CI
-  configured on the target repo means "nothing to wait for".
+  configured on the target repo means "nothing to wait for". Note the check
+  inspects the then-current PR head and the merge call doesn't pin an expected
+  SHA — head movement between check and merge is a known race, not a guarantee.
+- **Entry points differ by origin**: MAO-created tasks start at `issue`
+  (`enqueue()`); already-existing GitHub issues (human-filed or auto-triggered)
+  enter at `pr` via `enqueueFromIssue()`.
+- **`restore()` replaces and normalizes the queue without emitting `'change'`**
+  — account for that before changing startup persistence.
 - **`allowToolUse` elevation** (`claude --dangerously-skip-permissions`,
   `codex -s workspace-write`) applies **only** to the `pr` stage's real-checkout
   path with a CLI provider. Never extend it to API providers or other stages.
 - Issues entering the workflow get the `workflow-active` label, which is the
   **only** duplicate-enqueue protection (auto-trigger never checks the queue
-  itself) — and both label writes swallow failures via `.catch(() => {})`, so a
+  itself; the poller also enqueues **before** labeling) — and both label writes
+  swallow failures via `.catch(() => {})`, so a
   failed label write means the same issue re-enqueues on every poll. Treat the
   label as best-effort, not a guarantee. Finished tasks are capped at 50 (oldest
   dropped).
@@ -154,6 +162,16 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   `.env.test`), never print `githubToken` or provider `apiKey` values (follow
   `config show`'s `'[set]'` redaction). The GitHub token is stored in plain text by
   the store backends — never log or commit store files.
+- **`mao config set-token <token>` passes the token through argv** — it can land
+  in shell history and process listings. Prefer the Electron settings UI for real
+  tokens; never run it with a real token from an agent terminal or paste one
+  into examples.
+- **The real-edit `pr` path stages everything and force-pushes**: `commitAndPush`
+  runs `git add -A` + `push --force` on the workflow branch. Never point
+  `workspaceRoot` at a checkout holding unrelated work.
+- **Keep child processes shell-free**: git and CLI providers use argument-array
+  `execFile`/`spawn` with no shell — never introduce shell interpolation for
+  user-controlled values.
 - **Known token-exposure path**: `ensureClone` (`core/git-workspace.ts`) embeds
   the GitHub token in the HTTPS remote URL
   (`https://x-access-token:<token>@github.com/…`). That URL persists in each

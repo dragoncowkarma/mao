@@ -1,189 +1,297 @@
----
-name: mao
-description: Operate and contribute to the MAO Electron and headless CLI repository. Use when analyzing, implementing, testing, reviewing, or publishing MAO changes, especially workflow-engine, GitHub automation, AI provider, IPC, renderer, packaging, CLI, or repository-guidance work.
----
+# SKILL.md — MAO Operational Playbook
 
-# MAO development workflow
+Commands, verification workflows, and step-by-step recipes for working in this repo.
+Architecture rules, invariants, and conventions live in [AGENTS.md](AGENTS.md) — read
+that first; this file assumes you have.
 
-Read `AGENTS.md` first. Use this file for executable commands and repeatable
-procedures; keep architectural rules in `AGENTS.md`.
+> ⚠️ Paths may contain spaces (the working copy can live on a volume like
+> `NO NAME`) — always quote paths in shell commands.
 
-## Start every task
-
-1. Run `git status --short --branch` and identify the exact base commit, current
-   branch or detached state, and pre-existing changes.
-2. Read the requested code path and its tests before editing. Verify README
-   claims against the current tree when they disagree.
-3. Classify the change as documentation, core/domain, Electron/IPC, renderer,
-   CLI, packaging, or external workflow work.
-4. Identify any command that can mutate GitHub, a target repository, persisted
-   MAO state, credentials, or release artifacts. Obtain authorization before
-   expanding the requested external side effects.
-5. Keep unrelated working-tree changes out of the diff and staging area.
-
-## Install and runtime baseline
-
-Match CI with Node.js 22 when possible. The CLI bundle targets Node.js 18, but
-the repository does not currently declare an `engines` field.
-
-Install the locked dependency graph in a fresh checkout:
+## Setup
 
 ```bash
-npm ci
+npm ci             # locked graph, same as CI; Node 22 is what CI uses (CLI bundle targets node18)
 ```
 
-Use `npm install` only when intentionally changing dependencies and the lockfile.
-Do not diagnose broad missing-module errors until dependencies are installed.
+Use `npm install` only when intentionally changing dependencies + lockfile.
 
-## Command catalog
+## Command reference
 
-| Purpose | Command | Notes |
-| --- | --- | --- |
-| Start Electron development | `npm run dev` | Runs Vite with Electron main/preload and renderer hot reload. |
-| Type-check | `npm run lint` | Runs `tsc --noEmit`; this is not ESLint. |
-| Run unit tests | `npm test` | Runs Vitest in Node for `core/**/*.test.ts`. |
-| Build CI application bundles | `npx vite build` | Matches the build step in `.github/workflows/ci.yml`. |
-| Build CLI | `npm run build:cli` | Bundles `cli/index.ts` to `dist-cli/index.cjs`. |
-| Smoke-test CLI surface | `node dist-cli/index.cjs --help` | Run after `npm run build:cli`. |
-| Start CLI through npm | `npm run cli -- --help` | Rebuilds the CLI before passing arguments. |
-| Build unpacked desktop app | `npm run build` | Runs Vite and `electron-builder --dir`; platform-sensitive. |
-| Build distributables | `npm run dist` | Produces platform artifacts; run only for packaging work. |
-| Preview renderer build | `npm run preview` | Serves the built Vite renderer. |
-
-Do not stage generated `dist*` or `release/` output.
-
-## Validate by change surface
-
-Always run:
-
-```bash
-git diff --check
-git status --short
-```
-
-Then use the smallest sufficient matrix:
-
-| Change surface | Required checks |
+| Command | What it does |
 | --- | --- |
-| Documentation or agent configuration only | Validate Markdown/TOML/frontmatter and links, then run `npm run lint`, `npm test`, and `npx vite build` when dependencies are available. |
-| `core/` domain, persistence, GitHub, git, polling, or AI provider | Run focused Vitest coverage, then `npm run lint`, `npm test`, and `npx vite build`. |
-| `electron/`, preload, IPC, or `src/` | Run `npm run lint`, `npm test`, and `npx vite build`; manually verify every changed IPC contract surface. |
-| `cli/` or shared CLI behavior | Run `npm run lint`, `npm test`, `npm run build:cli`, `node dist-cli/index.cjs --help`, and `npx vite build`. |
-| Packaging configuration | Run the checks above, then the relevant `npm run build` or `npm run dist` only on an appropriate host. |
+| `npm run dev` | Electron + Vite dev server with hot reload |
+| `npm run lint` | `tsc --noEmit` — the only automated style/type gate (no ESLint/Prettier) |
+| `npm run test` | `vitest run` — node env, `core/**/*.test.ts` only |
+| `npm run test:origin` | Standalone matrix for `scripts/check-origin.mjs` (verdicts + no-credential-leak contract) |
+| `npm run build` | `vite build` + `electron-builder --dir` (fast unpacked build → `release/`) |
+| `npm run dist` | Full distributable (dmg/zip on mac) |
+| `npm run build:cli` | esbuild-bundle `cli/index.ts` → `dist-cli/index.cjs` (CJS, node18) |
+| `npm run cli -- <args>` | Build the CLI bundle, then run it (e.g. `npm run cli -- config show`) |
+| `npm run preview` | Vite preview of the built renderer |
 
-For a focused workflow-engine run, use:
+**Never run the CLI via `tsx`** — it fails on `@octokit/app`
+(`ERR_PACKAGE_PATH_NOT_EXPORTED`). Always go through the esbuild bundle
+(`npm run cli` / `npm run build:cli`). Note `build:cli` ends with `chmod +x`,
+which fails under Windows' default npm shell — on Windows run the esbuild step
+manually (the bundle is invoked via `node` anyway) or use Git Bash/WSL.
+
+## Verification workflow
+
+Verification runs the current **filesystem**, not a Git object. A blank
+`git status --short` proves only that there are no **non-ignored** source
+changes — ignored artifacts (`dist/`, `dist-electron/`, `dist-cli/`,
+`node_modules/`) and `.env*` files or ambient environment variables still
+influence the commands, and in a dirty/mixed worktree unstaged edits can make
+validation pass for code the commit doesn't contain. When you need strong
+evidence that an exact SHA passes, use an isolated detached worktree with a
+fresh install and a controlled environment:
 
 ```bash
-npx vitest run core/workflow-engine.test.ts
+git worktree add --detach "<dir>" "<sha>"
 ```
 
-Do not report a platform package as verified when only the Vite bundles built.
+then run `npm ci` and the matrix below inside `<dir>`.
 
-## Operate the headless CLI safely
-
-Use an isolated data directory when inspecting or experimenting so personal MAO
-state is not overwritten:
+CI runs, in order, `npm ci` → `npm run lint` → `npm run test` →
+`npm run test:origin` → `npx vite build` on Node 22 for pushes to `main` and
+all PRs. Locally (dependencies already installed):
 
 ```bash
-MAO_DATA_DIR=/path/to/isolated-mao-data npm run cli -- config show
-MAO_DATA_DIR=/path/to/isolated-mao-data npm run cli -- repos list
-MAO_DATA_DIR=/path/to/isolated-mao-data npm run cli -- workflow list
+npm run lint && npm run test && npm run test:origin && npx vite build
 ```
 
-Treat these commands according to their side effects:
+Additionally, because CI does **not** cover them:
 
-- `config show`, `repos list`, and `workflow list` are one-shot inspection paths;
-  they load the app with `resume: false`.
-- `config import-providers`, repo mutations, queue mutations, retry, and advance
-  persist local state and may start work.
-- `config set-token <token>` also persists state, but its positional token can be
-  exposed through argv, process listings, or shell history. Prefer the trusted
-  Electron settings UI; do not run it with a real token from an agent terminal.
-- `mao run` is a long-lived foreground process. It restores pending work, polls
-  configured repositories, invokes providers, and can progress real GitHub
-  operations until interrupted.
-- Queue registration or a running process is not proof that a PR, review, CI
-  result, or merge exists. Query persisted state and GitHub separately.
+- Touched `cli/` or `core/`? → also run `npm run build:cli` and smoke-test
+  `node dist-cli/index.cjs --help` (CLI bundle breakage is invisible to CI).
+- Iterating on the engine? → focused run: `npx vitest run core/workflow-engine.test.ts`.
+- Touched `scripts/`? → note `scripts/` is not in `tsconfig.json`'s `include`, so
+  tsc/CI never typechecks it — verify by actually running the harness.
+- Touched the IPC surface? → **nothing automated** checks that
+  `electron/preload.ts` and `src/electron.d.ts` stay consistent (`contextBridge`
+  takes an untyped object, so tsc checks each file only against core types, not
+  against each other). Diff the two by eye and smoke-test with `npm run dev` —
+  channel-string typos and preload/d.ts drift both fail only at runtime.
 
-Never place real tokens in shell history, examples, committed provider JSON, or
-logs. Treat MAO's data directory and cloned workspace `.git/config` files as
-secret-bearing because authenticated origin URLs may persist there. Use a
-durable user-controlled terminal for long-running `mao run` work.
+## Headless CLI usage
 
-## Run the real integration harness only when authorized
+State lives at `$MAO_DATA_DIR/config.json` (default: the platform data dir from
+`core/paths.ts`, e.g. `~/Library/Application Support/mao` on macOS); clones go to
+`$MAO_DATA_DIR/workspaces`. Set `MAO_DATA_DIR` to isolate test state.
 
-The following is not a unit test:
+```bash
+npm run cli -- config set-token <token>          # store GitHub token
+npm run cli -- config import-providers <file>    # JSON array of AiProviderConfig
+npm run cli -- config show                       # secrets redacted as '[set]'
+npm run cli -- repos add <owner> <repo> [--no-auto-trigger] [--poll-interval-ms <ms>]
+npm run cli -- repos list
+npm run cli -- github check <owner> <repo>       # open issues/PRs as JSON
+npm run cli -- workflow enqueue "<title>" --owner <o> --repo <r> [--no-auto-advance]
+npm run cli -- workflow list
+npm run cli -- workflow retry <taskId>
+npm run cli -- workflow advance <taskId>
+npm run cli -- workflow clear-completed
+npm run cli -- run                               # foreground: auto-trigger + resume queue
+```
+
+⚠️ `workflow enqueue` without `--no-auto-advance` runs the **entire pipeline
+unattended** (real GitHub writes) in the foreground with no progress output; only
+`run` streams status. Use `--no-auto-advance` + `workflow advance` to step through
+stages one at a time.
+
+## End-to-end pipeline test (real GitHub repo)
+
+Use a **throwaway repo** — the harness creates real issues/branches/PRs and can
+merge them. Create `.env.test` (gitignored; the template is the inline block in
+README.md — there is no `.env.example` file):
 
 ```bash
 node --experimental-strip-types --env-file=.env.test scripts/test-workflow.ts
 ```
 
-Before running it:
+Required: `TEST_GITHUB_OWNER`, `TEST_GITHUB_REPO`, `TEST_GITHUB_TOKEN`, plus at
+least one provider — either `TEST_AI_API_KEY` (with optional `TEST_AI_API_FORMAT`
+`anthropic|openai`, `TEST_AI_MODEL`) or `TEST_AI_CLI_COMMAND` (+
+`TEST_AI_CLI_ARGS`, space-split). A second provider uses the `TEST_AI2_*` prefix —
+register two so maker-checker has somewhere to route. Optional:
+`TEST_TASK_TITLE`, `TEST_WORKSPACE_ROOT`.
 
-1. Obtain explicit authorization for external GitHub writes.
-2. Confirm `.env.test` is ignored and contains a throwaway repository.
-3. Confirm the configured providers, branch permissions, and CI behavior.
-4. Expect creation of issues, branches, commits, PRs, reviews, and possibly a
-   merge.
-5. Verify the resulting GitHub state and exact SHAs after the process exits.
+Two traps:
 
-Never use a production repository as an implicit test fixture.
+- **Omit unused optional vars entirely** — don't leave them blank as in the
+  README's inline template: `TEST_AI_MODEL=` sends an empty-string model, and
+  `TEST_AI_CLI_ARGS=` becomes a `['']` argv.
+- **The harness exits 0 even when the task ends in `error`** — judge the run by
+  the printed final task JSON, not the exit code (don't gate automation on it).
 
-## Review a pull request
+## Recipes
 
-1. Resolve the repository and PR number explicitly.
-2. Inspect metadata and the exact head before reviewing:
+### Add an IPC channel (renderer ↔ main)
+
+1. Implement the logic in `core/` (engine/service method), not in the shell.
+2. `electron/ipc.ts` — `ipcMain.handle('<domain>:<camelCaseAction>', …)` as a
+   one-line delegation (domains: `ai`, `github`, `workflow`).
+3. `electron/preload.ts` — same channel string, same namespace, positional args.
+4. `src/electron.d.ts` — mirror the method signature.
+5. If the CLI should have parity, add the matching subcommand in `cli/index.ts`.
+6. `npm run lint`, then smoke-test in `npm run dev` (typos fail only at runtime).
+
+### Add a store field
+
+1. Add to **both** `MaoStoreSchema` and `MAO_STORE_DEFAULTS` in `core/store.ts`.
+2. Backends (`electron/store.ts`, `FileStore`) pick it up automatically.
+3. Renderer needs it? Add get/set IPC channels (recipe above). CLI needs it?
+   Extend `cli/index.ts` (keep `config show` redaction for anything secret).
+
+### Add a pipeline stage
+
+1. `core/workflow-engine.ts`: the `WorkflowStageName` union, `STAGE_ORDER`,
+   `buildPromptForStage`, `applyGithubAction` (+ `runPrWithCodeEdits`-style
+   special-casing if needed).
+2. Update `STAGE_LABELS` in **both** `src/components/KanbanBoard.tsx` and
+   `src/components/WorkflowQueue.tsx` (duplicated by convention).
+3. Extend `core/workflow-engine.test.ts` — stage progression, maker-checker
+   alternation, and error/retry behavior against the existing fakes.
+
+### Add an AI provider integration
+
+- New HTTP API shape → extend `core/ai/api-provider.ts`, the `apiFormat` union
+  in `core/ai/types.ts`, and the format picker in
+  `src/components/GlobalSettings.tsx`.
+- New local CLI → extend the per-CLI flag tables in `core/ai/cli-provider.ts`
+  (system-prompt and tool-use flags). Keep the 15-min SIGKILL timeout; keep
+  `allowToolUse` flags scoped to the `pr` stage path only.
+
+### Ship a change (PR workflow)
+
+1. Preflight — **before creating any branch**, record the starting state:
+   `git status --short --branch` (current branch or detached HEAD, and any
+   pre-existing changes — note them now, because a dirty checkout's edits
+   follow the new branch and their provenance is lost afterwards). Then
+   Confirm the identity of **`origin` itself** before fetching or branching —
+   not the GH CLI's notion of the repo: `gh repo set-default` can point a bare
+   `gh repo view` at a different repository than `origin`, so it is no
+   evidence of where you will branch from and push to. A field-split
+   one-liner is not enough either: it blesses deceptive paths
+   (`https://evil.example/github.com/<owner>/<repo>.git`), can echo
+   credentials from malformed URLs, and never sees a divergent
+   `remote.origin.pushurl` (git pushes to **every** configured push URL).
+   Use the tested helper, which enumerates all effective fetch/push URLs,
+   isolates userinfo/query without printing them, and anchored-matches
+   scheme, real authority, and exact path — failing closed on anything else:
 
    ```bash
-   gh pr view <number> --json number,title,state,isDraft,baseRefName,headRefName,headRefOid,reviewDecision,statusCheckRollup,url
-   gh pr diff <number>
+   node scripts/check-origin.mjs "github.com/<owner>/<repo>"
    ```
 
-3. Trace changed behavior through `core/`, adapters, persistence, and tests.
-4. Run the applicable validation matrix at the reviewed head.
-5. Report findings in severity order with file/line evidence. Distinguish an
-   independent review from self-review and local test evidence.
-6. Do not approve, request changes, comment, or merge unless the task authorizes
-   that GitHub write.
-
-## Publish a change
-
-Publish only when requested.
-
-1. Recheck `git status --short --branch`, the base SHA, remote, and existing PRs
-   for the intended head branch. Reuse an existing same-scope PR instead of
-   creating a duplicate.
-2. Inspect `git diff --stat`, `git diff`, and `git diff --check`.
-3. Stage only intended paths; avoid `git add -A` in a mixed worktree.
-4. Use a Conventional Commit such as:
+   (The argument form works in every shell — PowerShell/cmd have no inline
+   env syntax; `MAO_EXPECTED_REMOTE` remains a fallback.) Its failure output
+   is deliberately fixed-category-only, never remote-derived strings, and its
+   committed matrix runs as `npm run test:origin` locally and in CI. It must
+   print `OK` (exit 0) before any fetch/branch/push, and
+   every subsequent `gh` command must pin `--repo <owner>/<repo>` explicitly.
+   Then `git fetch origin` and branch from the **current** `origin/main` — a
+   local `main` ref can lag the remote by many commits. Note the exact base
+   SHA, and check for an existing same-scope PR to reuse
+   (`gh pr list --repo <owner>/<repo>`) instead of opening a duplicate.
+   Branch names: `feature/<topic>` or `claude/<topic>-<hex>`.
+2. Stage only the paths the task intended — avoid `git add -A` in a worktree
+   that may hold unrelated changes. Never stage: `.env*`, `dist/`,
+   `dist-electron/`, `dist-cli/`, `release/`, store/config files, or anything
+   containing a token.
+3. Verify the staged scope **without printing potential secret values**, in
+   this order (plain `git diff` compares worktree↔index and misses
+   already-staged content entirely):
+   1. `git diff --cached --name-status` — every listed path must be one the
+      task intended; unstage anything else.
+   2. A staged-secret scan with a **vetted, version-pinned scanner** that
+      reports only rule/path/line and redacts values. The current gitleaks
+      staged invocation is `gitleaks git --pre-commit --staged --redact
+      --verbose` (`protect` is deprecated/hidden since v8.19 — verify the
+      installed, pinned version actually supports the flags before trusting
+      its exit code; an uninstalled scanner exits 127, which is not "clean").
+      A keyword grep is **not** a secret gate: generic terms miss real
+      credential formats (`sk-proj-…`, `AKIA…`) while flagging legitimate
+      code that merely says `token`, its exit code inverts on a clean result,
+      and `grep` is absent from Windows' default shell. If no vetted scanner
+      is available, do **not** print the content diff to hunt for secrets —
+      hand off to a human: they review the staged **content** (not just the
+      path list) in a safe local viewer that doesn't persist to shared
+      terminal/agent logs, and explicitly attest it contains no secrets.
+      That attestation substitutes for a clean scan; with neither a scanner
+      result nor an attestation, stop — the workflow does not resume.
+   3. Only once the paths are approved and the scan is clean (or a human has
+      attested the content per step 2): `git diff --cached --check` and the
+      content diff of those paths. Never treat a scan result — least of all
+      a keyword-grep zero — as permission to dump unrestricted content
+      diffs.
+4. Commit per AGENTS.md Git conventions (imperative subject, why-focused body).
+5. Run the full verification workflow above at the committed head. A blank
+   `git status --short` vouches only for non-ignored files — for strong
+   exact-SHA evidence use the verification section's isolated-worktree path
+   (`git worktree add --detach` + `npm ci` + controlled environment).
+6. **Re-run the origin guard immediately before pushing, on the final
+   branch** — `node scripts/check-origin.mjs "github.com/<owner>/<repo>"`
+   must print `OK` again: branch-scoped config
+   (`includeIf "onbranch:…"`) can swap `origin.pushurl` the moment the
+   branch exists, so the pre-branch preflight is stale evidence by push
+   time (the committed matrix includes this exact regression). Then push
+   with the remote and ref pinned explicitly —
+   `git push --set-upstream origin <branch>` — never a bare `git push`:
+   `remote.pushDefault` (and `branch.<name>.pushRemote`) can silently point an
+   argument-less push at a remote the guard never validated. Pushing and
+   opening a PR are external writes — only do this when the task calls for
+   it. Authorization to push or open a PR is **not** authorization to
+   force-push: never rewrite history (`--force*`) unless the user explicitly
+   approves history replacement.
+7. Open the PR against `main` as a **draft** unless the user asked for
+   ready-for-review or an existing PR already carries an intentional review
+   state.
+8. Postflight — re-query what was actually published, pinning the repo and PR
+   number explicitly (never rely on current-branch inference; it exits 1 on a
+   detached checkout):
 
    ```bash
-   git commit -m "chore(ai): improve AI agent configuration"
+   gh pr view <number> --repo <owner>/<repo> --json url,state,baseRefName,baseRefOid,headRefName,headRefOid,isDraft,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup
    ```
 
-5. Run the validation matrix at the committed head.
-6. Push with upstream tracking. Never force-push unless the user explicitly
-   authorizes history replacement; prefer a normal fast-forward push.
-7. Open a draft PR unless the user requests ready-for-review or an existing PR
-   already has an intentional review state.
-8. Include these PR sections:
+   The result must match the intended base branch, head branch, **exact head
+   SHA** (`headRefOid`), and draft state — green CI alone proves none of
+   these. Record the returned `baseRefOid` as a snapshot, but do **not**
+   require it to equal the preflight base SHA: `baseRefOid` is the base ref's
+   *current* tip, which legitimately moves when `main` advances after
+   branching. Verify lineage instead — `git merge-base --is-ancestor
+   <recorded-base-sha> <head-sha>` must succeed.
 
-   - why the change is needed;
-   - what changed, with each file's role;
-   - how agents should use the configuration;
-   - validation commands and results;
-   - risks, limitations, and intentionally unrun external checks.
+   If the base **has** advanced past the recorded SHA, do not credit the
+   existing green rollup as current-base evidence: CI here uses a bare
+   `pull_request` trigger (runs on opened/synchronize/reopened), so a
+   base-only move starts **no** new run, and the old run's `GITHUB_SHA` was
+   the merge commit against the *then-current* base. Cross-check which SHA a
+   run actually validated before crediting it. For real current-base
+   evidence, either (with explicit authorization — it rewrites the published
+   head) update the head branch against the current base so a `synchronize`
+   run re-validates the true merge, or build the current base+head merge in
+   an isolated worktree, run the verification matrix there, and report that
+   as **local** evidence, explicitly distinct from GitHub CI. With neither,
+   report current-base CI as unverified and stop before merging.
 
-9. Verify the PR URL, base branch, head branch, head SHA, draft state, and checks
-   from GitHub after creation or update.
+   Then wait for and verify green CI (lint, test, test:origin, vite build)
+   before merging — as of 2026-08 `main` has no branch protection, so CI is
+   convention, not GitHub-enforced. Report commit, push, PR creation, CI,
+   review, and merge as separate states — never equate one with another.
+9. Releases are a separate authorization: never tag, publish, sign, notarize,
+   or announce without an explicit request and platform-appropriate evidence —
+   `npm run build` / `npm run dist` are local packaging, not deployment proof.
 
-Do not equate commit, push, PR creation, passing CI, approval, and merge; report
-each state separately.
+### Review a PR (checker role)
 
-## Package and release
+Per AGENTS.md, the reviewer should be a different agent than the implementer.
+Check, in order: architecture rules (core Electron-free? logic in shells?),
+lockstep files all updated (IPC 3-file chain, store pair, STAGE_LABELS × 2),
+domain invariants (maker-checker, CI gate, timeouts, error-not-crash), secrets
+hygiene, then style (match surrounding code — there is no autoformatter).
 
-MAO currently has CI for type-check, unit tests, and Vite build, but no automated
-release or deployment workflow in this repository. Treat `npm run build` and
-`npm run dist` as local packaging commands, not deployment proof. Do not tag,
-publish, sign, notarize, or announce a release without explicit authorization
-and platform-appropriate evidence.
+This checklist is **local verification**. Posting an actual GitHub review
+(comment, approval) or merging requires explicit authorization from the user —
+a "review this" request alone does not grant it (see AGENTS.md safety rails).

@@ -36,12 +36,20 @@ manually (the bundle is invoked via `node` anyway) or use Git Bash/WSL.
 
 ## Verification workflow
 
-Verification runs the current **filesystem**, not a Git object: its results
-vouch for a commit only when the worktree exactly matches that commit
-(`git status --short` prints nothing). In a dirty/mixed worktree, unstaged or
-untracked edits can make validation pass for code the commit doesn't contain —
-verify in an isolated worktree of the exact SHA instead
-(`git worktree add <dir> <sha>`).
+Verification runs the current **filesystem**, not a Git object. A blank
+`git status --short` proves only that there are no **non-ignored** source
+changes — ignored artifacts (`dist/`, `dist-electron/`, `dist-cli/`,
+`node_modules/`) and `.env*` files or ambient environment variables still
+influence the commands, and in a dirty/mixed worktree unstaged edits can make
+validation pass for code the commit doesn't contain. When you need strong
+evidence that an exact SHA passes, use an isolated detached worktree with a
+fresh install and a controlled environment:
+
+```bash
+git worktree add --detach "<dir>" "<sha>"
+```
+
+then run `npm ci` and the matrix below inside `<dir>`.
 
 CI runs, in order, `npm ci` → `npm run lint` → `npm run test` → `npx vite build`
 on Node 22 for pushes to `main` and all PRs. Locally (dependencies already
@@ -160,10 +168,12 @@ Two traps:
    pre-existing changes — note them now, because a dirty checkout's edits
    follow the new branch and their provenance is lost afterwards). Then
    `git fetch origin` and branch from the **current** `origin/main` — a local
-   `main` ref can lag the remote by many commits. Note the exact base SHA, and
-   check for an existing same-scope PR to reuse (`gh pr list`) instead of
-   opening a duplicate. Branch names: `feature/<topic>` or
-   `claude/<topic>-<hex>`.
+   `main` ref can lag the remote by many commits. Confirm the remote's
+   identity **without printing its URL** (MAO workspace clones can carry
+   token-bearing remotes): `gh repo view --json nameWithOwner` must match the
+   intended `owner/repo`. Note the exact base SHA, and check for an existing
+   same-scope PR to reuse (`gh pr list`) instead of opening a duplicate.
+   Branch names: `feature/<topic>` or `claude/<topic>-<hex>`.
 2. Stage only the paths the task intended — avoid `git add -A` in a worktree
    that may hold unrelated changes. Never stage: `.env*`, `dist/`,
    `dist-electron/`, `dist-cli/`, `release/`, store/config files, or anything
@@ -173,18 +183,24 @@ Two traps:
    already-staged content entirely):
    1. `git diff --cached --name-status` — every listed path must be one the
       task intended; unstage anything else.
-   2. A redacting secret scan that counts matches instead of echoing them,
-      e.g. `git diff --cached | grep -icE 'token|secret|api[_-]?key|password|ghp_|github_pat_|sk-ant-'`
-      — nonzero means unstage and investigate; never dump the full cached
-      diff to "find" a suspected secret, that prints the value into durable
-      terminal/agent logs.
+   2. A staged-secret scan with a **vetted scanner** that reports only
+      rule/path/line and redacts values (e.g. `gitleaks protect --staged
+      --redact`, where installed and verified). A keyword grep is **not** a
+      secret gate: generic terms miss real credential formats (`sk-proj-…`,
+      `AKIA…`) while flagging legitimate code that merely says `token`, its
+      exit code inverts on a clean result, and `grep` is absent from Windows'
+      default shell. If no vetted scanner is available, do **not** print the
+      content diff to hunt for secrets — stop and have a human confirm the
+      staged paths.
    3. Only once the paths are approved and the scan is clean:
-      `git diff --cached --check` and the content diff of those paths.
+      `git diff --cached --check` and the content diff of those paths. Never
+      treat a scan result — least of all a keyword-grep zero — as permission
+      to dump unrestricted content diffs.
 4. Commit per AGENTS.md Git conventions (imperative subject, why-focused body).
-5. Run the full verification workflow above at the committed head with a
-   **clean worktree** (`git status --short` prints nothing) — or in an
-   isolated worktree of that exact SHA (see the verification section's
-   caveat about dirty worktrees).
+5. Run the full verification workflow above at the committed head. A blank
+   `git status --short` vouches only for non-ignored files — for strong
+   exact-SHA evidence use the verification section's isolated-worktree path
+   (`git worktree add --detach` + `npm ci` + controlled environment).
 6. Push with upstream tracking (pushing and opening a PR are external writes —
    only do this when the task calls for it). Authorization to push or open a PR
    is **not** authorization to force-push: never rewrite history (`--force*`)
@@ -192,11 +208,18 @@ Two traps:
 7. Open the PR against `main` as a **draft** unless the user asked for
    ready-for-review or an existing PR already carries an intentional review
    state.
-8. Postflight — re-query what was actually published:
-   `gh pr view --json url,baseRefName,headRefName,headRefOid,isDraft` must
-   match the intended base, head branch, **exact head SHA**, and draft state
-   (green CI alone proves none of these). Then wait for and verify green CI
-   (lint, test, vite build) before merging — as of 2026-08 `main` has no
+8. Postflight — re-query what was actually published, pinning the repo and PR
+   number explicitly (never rely on current-branch inference; it exits 1 on a
+   detached checkout):
+
+   ```bash
+   gh pr view <number> --repo <owner>/<repo> --json url,state,baseRefName,baseRefOid,headRefName,headRefOid,isDraft,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup
+   ```
+
+   The result must match the intended base branch **and recorded base SHA**
+   (`baseRefOid`), head branch, **exact head SHA** (`headRefOid`), and draft
+   state — green CI alone proves none of these. Then wait for and verify green
+   CI (lint, test, vite build) before merging — as of 2026-08 `main` has no
    branch protection, so CI is convention, not GitHub-enforced. Report commit,
    push, PR creation, CI, review, and merge as separate states — never equate
    one with another.

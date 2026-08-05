@@ -22,6 +22,7 @@ Use `npm install` only when intentionally changing dependencies + lockfile.
 | `npm run dev` | Electron + Vite dev server with hot reload |
 | `npm run lint` | `tsc --noEmit` — the only automated style/type gate (no ESLint/Prettier) |
 | `npm run test` | `vitest run` — node env, `core/**/*.test.ts` only |
+| `npm run test:origin` | Standalone matrix for `scripts/check-origin.mjs` (verdicts + no-credential-leak contract) |
 | `npm run build` | `vite build` + `electron-builder --dir` (fast unpacked build → `release/`) |
 | `npm run dist` | Full distributable (dmg/zip on mac) |
 | `npm run build:cli` | esbuild-bundle `cli/index.ts` → `dist-cli/index.cjs` (CJS, node18) |
@@ -51,12 +52,12 @@ git worktree add --detach "<dir>" "<sha>"
 
 then run `npm ci` and the matrix below inside `<dir>`.
 
-CI runs, in order, `npm ci` → `npm run lint` → `npm run test` → `npx vite build`
-on Node 22 for pushes to `main` and all PRs. Locally (dependencies already
-installed):
+CI runs, in order, `npm ci` → `npm run lint` → `npm run test` →
+`npm run test:origin` → `npx vite build` on Node 22 for pushes to `main` and
+all PRs. Locally (dependencies already installed):
 
 ```bash
-npm run lint && npm run test && npx vite build
+npm run lint && npm run test && npm run test:origin && npx vite build
 ```
 
 Additionally, because CI does **not** cover them:
@@ -180,10 +181,14 @@ Two traps:
    scheme, real authority, and exact path — failing closed on anything else:
 
    ```bash
-   MAO_EXPECTED_REMOTE="github.com/<owner>/<repo>" node scripts/check-origin.mjs
+   node scripts/check-origin.mjs "github.com/<owner>/<repo>"
    ```
 
-   It must print `OK` (exit 0) before any fetch/branch/push, and
+   (The argument form works in every shell — PowerShell/cmd have no inline
+   env syntax; `MAO_EXPECTED_REMOTE` remains a fallback.) Its failure output
+   is deliberately fixed-category-only, never remote-derived strings, and its
+   committed matrix runs as `npm run test:origin` locally and in CI. It must
+   print `OK` (exit 0) before any fetch/branch/push, and
    every subsequent `gh` command must pin `--repo <owner>/<repo>` explicitly.
    Then `git fetch origin` and branch from the **current** `origin/main` — a
    local `main` ref can lag the remote by many commits. Note the exact base
@@ -225,10 +230,14 @@ Two traps:
    `git status --short` vouches only for non-ignored files — for strong
    exact-SHA evidence use the verification section's isolated-worktree path
    (`git worktree add --detach` + `npm ci` + controlled environment).
-6. Push with upstream tracking (pushing and opening a PR are external writes —
-   only do this when the task calls for it). Authorization to push or open a PR
-   is **not** authorization to force-push: never rewrite history (`--force*`)
-   unless the user explicitly approves history replacement.
+6. Push with the remote and ref pinned explicitly —
+   `git push --set-upstream origin <branch>` — never a bare `git push`:
+   `remote.pushDefault` (and `branch.<name>.pushRemote`) can silently point an
+   argument-less push at a remote the preflight never validated. Pushing and
+   opening a PR are external writes — only do this when the task calls for
+   it. Authorization to push or open a PR is **not** authorization to
+   force-push: never rewrite history (`--force*`) unless the user explicitly
+   approves history replacement.
 7. Open the PR against `main` as a **draft** unless the user asked for
    ready-for-review or an existing PR already carries an intentional review
    state.

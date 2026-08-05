@@ -42,7 +42,8 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
 | `src/` | React 18 renderer (Vite + Tailwind); `App.tsx` owns all cross-view state |
 | `cli/index.ts` | Commander CLI: `config` / `repos` / `github` / `workflow` / `run` |
 | `scripts/test-workflow.ts` | Standalone e2e harness against a real (throwaway) repo |
-| `scripts/check-origin.mjs` | Publish-preflight guard: validates every effective `origin` fetch/push URL against an expected host/owner/repo without printing credentials (see SKILL.md) |
+| `scripts/check-origin.mjs` | Publish-preflight guard: validates every effective `origin` fetch/push URL against an expected host/owner/repo; failure output is fixed-category-only, never remote-derived strings (see SKILL.md) |
+| `scripts/check-origin.test.mjs` | Committed negative/positive matrix for the guard incl. its no-leak contract — `npm run test:origin`, also run in CI |
 
 ## Non-negotiable architecture rules
 
@@ -78,7 +79,9 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
    routing http/https to `shell.openExternal`.
 8. **Tests must stay runnable under plain Node.** `vitest.config.ts` is deliberately
    separate from `vite.config.ts` (the electron/renderer plugins shim node builtins
-   and break `core/` under Node). Tests live in `core/**/*.test.ts` only.
+   and break `core/` under Node). Vitest tests live in `core/**/*.test.ts` only;
+   the one exception to the vitest layout is `scripts/check-origin.test.mjs`, a
+   dependency-free standalone matrix invoked as `npm run test:origin`.
 
 ## Files that must change together
 
@@ -241,7 +244,7 @@ There is no codegen — these couplings are maintained by hand and only `npm run
 - **Branches**: historically `claude/<kebab-topic>-<hex>`; feature branches like
   `feature/<topic>` are also fine. PRs merge into `main` via merge commits.
 - **CI runs on every PR and push to `main`** (Node 22): `npm ci`, `npm run lint`,
-  `npm run test`, `npx vite build`. As of 2026-08 `main` has **no branch
+  `npm run test`, `npm run test:origin`, `npx vite build`. As of 2026-08 `main` has **no branch
   protection** (no required checks, no rulesets), so a green CI is convention,
   not a GitHub-enforced merge gate — treat it as required anyway. (Separate
   concept: the *app's own* merge stage checks the target repo's CI via

@@ -52,6 +52,13 @@ export class GithubService {
     await this.octokit.rest.issues.addLabels({ owner, repo, issue_number: issueNumber, labels: [label] })
   }
 
+  /** Fetches a single issue (or PR, since GitHub treats PRs as issues) by number. */
+  async getIssue(owner: string, repo: string, issueNumber: number): Promise<{ number: number; title: string; url: string }> {
+    if (!this.octokit) throw new Error('GitHub token is not set')
+    const { data } = await this.octokit.rest.issues.get({ owner, repo, issue_number: issueNumber })
+    return { number: data.number, title: data.title, url: data.html_url }
+  }
+
   async createIssue(owner: string, repo: string, title: string, body: string) {
     if (!this.octokit) throw new Error('GitHub token is not set')
     const { data } = await this.octokit.rest.issues.create({ owner, repo, title, body })

@@ -60,6 +60,14 @@ export function registerIpcHandlers() {
     workflowEngine.enqueue(title, repo, autoAdvance),
   )
 
+  ipcMain.handle(
+    'workflow:enqueueFromIssue',
+    async (_event, owner: string, repo: string, issueNumber: number, autoAdvance?: boolean) => {
+      const issue = await githubService.getIssue(owner, repo, issueNumber)
+      return workflowEngine.enqueueFromIssue(issue.number, issue.url, issue.title, { owner, repo }, autoAdvance)
+    },
+  )
+
   ipcMain.handle('workflow:list', () => workflowEngine.getTasks())
 
   ipcMain.handle('workflow:retry', (_event, taskId: string) => workflowEngine.retry(taskId))

@@ -22,6 +22,12 @@ declare global {
       }
       workflow: {
         enqueue: (title: string, repo: RepoRef, autoAdvance?: boolean) => Promise<QueuedTask>
+        enqueueFromIssue: (
+          owner: string,
+          repo: string,
+          issueNumber: number,
+          autoAdvance?: boolean,
+        ) => Promise<QueuedTask>
         list: () => Promise<QueuedTask[]>
         retry: (taskId: string) => Promise<QueuedTask>
         advance: (taskId: string) => Promise<QueuedTask>

@@ -144,6 +144,25 @@ workflow
   })
 
 workflow
+  .command('enqueue-existing <issueNumber>')
+  .description('Start the pr -> review -> merge pipeline for an issue that already exists on GitHub')
+  .requiredOption('--owner <owner>')
+  .requiredOption('--repo <repo>')
+  .option('--no-auto-advance', 'pause after each stage instead of running the pipeline unattended')
+  .action(async (issueNumber: string, opts: { owner: string; repo: string; autoAdvance: boolean }) => {
+    const { githubService, workflowEngine } = loadApp()
+    const issue = await githubService.getIssue(opts.owner, opts.repo, parseInt(issueNumber, 10))
+    const task = workflowEngine.enqueueFromIssue(
+      issue.number,
+      issue.url,
+      issue.title,
+      { owner: opts.owner, repo: opts.repo },
+      opts.autoAdvance,
+    )
+    log(`Enqueued task ${task.id} from issue #${issue.number} (stage=${task.stage})`)
+  })
+
+workflow
   .command('list')
   .description('List all queued tasks')
   .action(() => {

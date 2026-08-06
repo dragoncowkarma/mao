@@ -2,6 +2,7 @@ import type { AiProviderConfig } from '../core/ai/types'
 import type { GithubTask } from '../core/github-service'
 import type { QueuedTask, RepoRef } from '../core/workflow-engine'
 import type { AutoTriggerStatus } from '../core/auto-trigger'
+import type { ThemePreference } from '../core/store'
 
 declare global {
   interface Window {
@@ -27,6 +28,10 @@ declare global {
         advance: (taskId: string) => Promise<QueuedTask>
         setAutoAdvance: (taskId: string, autoAdvance: boolean) => Promise<QueuedTask>
         clearCompleted: () => Promise<void>
+      }
+      ui: {
+        getTheme: () => Promise<ThemePreference>
+        setTheme: (theme: ThemePreference) => Promise<void>
       }
     }
   }

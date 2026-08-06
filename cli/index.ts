@@ -6,8 +6,9 @@ import { createMaoApp, type MaoApp } from '../core/app.ts'
 import { startAutoTrigger } from '../core/auto-trigger.ts'
 import { FileStore } from '../core/store.ts'
 import { defaultDataDir } from '../core/paths.ts'
-import type { AiProviderConfig } from '../core/ai/types.ts'
+import type { AiEffort, AiProviderConfig } from '../core/ai/types.ts'
 import type { QueuedTask, RepoRef } from '../core/workflow-engine.ts'
+import type { ThemePreference } from '../core/store.ts'
 
 function log(...args: unknown[]) {
   console.log('[mao]', ...args)
@@ -70,6 +71,18 @@ config
   })
 
 config
+  .command('set-theme <theme>')
+  .description('Set the UI color scheme preference (light, dark, or system) — read by the Electron GUI')
+  .action((theme: string) => {
+    if (theme !== 'light' && theme !== 'dark' && theme !== 'system') {
+      throw new Error(`Invalid theme "${theme}" — expected one of: light, dark, system`)
+    }
+    const { store } = loadApp()
+    store.set('theme', theme as ThemePreference)
+    log(`Theme preference set to ${theme}`)
+  })
+
+config
   .command('show')
   .description('Print the current stored config (secrets redacted)')
   .action(() => {
@@ -78,6 +91,7 @@ config
       githubToken: store.get('githubToken') ? '[set]' : '[unset]',
       githubRepos: store.get('githubRepos'),
       aiProviders: store.get('aiProviders').map((p) => ({ ...p, apiKey: p.apiKey ? '[set]' : undefined })),
+      theme: store.get('theme'),
     })
   })
 
@@ -127,6 +141,14 @@ github
     printJson(await githubService.fetchTasks(owner, repo))
   })
 
+github
+  .command('view <owner> <repo> <number>')
+  .description('Show the full body + comment thread for one issue or PR')
+  .action(async (owner: string, repo: string, number: string) => {
+    const { githubService } = loadApp()
+    printJson(await githubService.fetchTaskDetail(owner, repo, parseInt(number, 10)))
+  })
+
 // --- workflow -----------------------------------------------------------------
 
 const workflow = program.command('workflow').description('Drive the issue -> PR -> review -> merge pipeline')
@@ -137,11 +159,32 @@ workflow
   .requiredOption('--owner <owner>')
   .requiredOption('--repo <repo>')
   .option('--no-auto-advance', 'pause after each stage instead of running the pipeline unattended')
-  .action((title: string, opts: { owner: string; repo: string; autoAdvance: boolean }) => {
-    const { workflowEngine } = loadApp()
-    const task = workflowEngine.enqueue(title, { owner: opts.owner, repo: opts.repo }, opts.autoAdvance)
-    log(`Enqueued task ${task.id} (stage=${task.stage})`)
-  })
+  .option(
+    '--provider <id>',
+    'preferred provider id for this task — still subject to maker-checker, so a stage never reuses ' +
+      'the provider that handled the one before it',
+  )
+  .option('--model <model>', 'model override applied to whichever provider is selected for each stage')
+  .option('--effort <effort>', 'reasoning-effort override (low|medium|high) applied to each selected provider')
+  .action(
+    (
+      title: string,
+      opts: { owner: string; repo: string; autoAdvance: boolean; provider?: string; model?: string; effort?: string },
+    ) => {
+      const { workflowEngine } = loadApp()
+      const hasOverride = opts.provider !== undefined || opts.model !== undefined || opts.effort !== undefined
+      const providerOverride = hasOverride
+        ? { providerId: opts.provider, model: opts.model, effort: opts.effort as AiEffort | undefined }
+        : undefined
+      const task = workflowEngine.enqueue(
+        title,
+        { owner: opts.owner, repo: opts.repo },
+        opts.autoAdvance,
+        providerOverride,
+      )
+      log(`Enqueued task ${task.id} (stage=${task.stage})`)
+    },
+  )
 
 workflow
   .command('enqueue-existing <issueNumber>')

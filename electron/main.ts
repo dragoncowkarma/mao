@@ -20,8 +20,9 @@ function createWindow() {
     },
   })
 
-  // Board/Queue cards link to GitHub with target="_blank" — Electron denies new-window requests by
-  // default, so without this handler those links would silently do nothing. Route them to the OS browser.
+  // Issue/PR cards open in-app (TaskDetailModal); only its "View on GitHub" link still uses
+  // target="_blank". Electron denies new-window requests by default, so without this handler that
+  // link would silently do nothing — route it to the OS browser instead.
   win.webContents.setWindowOpenHandler(({ url }) => {
     if (url.startsWith('https://') || url.startsWith('http://')) {
       void shell.openExternal(url)

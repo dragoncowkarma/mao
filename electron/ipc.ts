@@ -5,6 +5,7 @@ import { createMaoApp } from '../core/app.ts'
 import { startAutoTrigger } from '../core/auto-trigger.ts'
 import { createAiProvider, type AiProviderConfig } from '../core/ai/index.ts'
 import type { RepoRef } from '../core/workflow-engine.ts'
+import type { ThemePreference } from '../core/store.ts'
 
 export function registerIpcHandlers() {
   const { githubService, workflowEngine } = createMaoApp({
@@ -37,6 +38,10 @@ export function registerIpcHandlers() {
 
   ipcMain.handle('github:fetchTasks', (_event, owner: string, repo: string) => {
     return githubService.fetchTasks(owner, repo)
+  })
+
+  ipcMain.handle('github:fetchTaskDetail', (_event, owner: string, repo: string, number: number) => {
+    return githubService.fetchTaskDetail(owner, repo, number)
   })
 
   ipcMain.handle('github:setRepos', (_event, repos: RepoRef[]) => {
@@ -79,4 +84,10 @@ export function registerIpcHandlers() {
   )
 
   ipcMain.handle('workflow:clearCompleted', () => workflowEngine.clearCompleted())
+
+  ipcMain.handle('ui:getTheme', () => store.get('theme'))
+
+  ipcMain.handle('ui:setTheme', (_event, theme: ThemePreference) => {
+    store.set('theme', theme)
+  })
 }

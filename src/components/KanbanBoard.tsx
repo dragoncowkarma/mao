@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import type { GithubTask } from '../../core/github-service'
 import type { QueuedTask, RepoRef } from '../../core/workflow-engine'
+import TaskDetailModal from './TaskDetailModal'
 
 interface KanbanBoardProps {
   repo: RepoRef
@@ -59,7 +60,17 @@ function timeAgo(ms: number): string {
   return `${hours}h ago`
 }
 
-function Column({ title, tasks, workflowTasks }: { title: string; tasks: GithubTask[]; workflowTasks: QueuedTask[] }) {
+function Column({
+  title,
+  tasks,
+  workflowTasks,
+  onSelectTask,
+}: {
+  title: string
+  tasks: GithubTask[]
+  workflowTasks: QueuedTask[]
+  onSelectTask: (task: GithubTask) => void
+}) {
   return (
     <div>
       <h4 className="mb-2">
@@ -69,12 +80,18 @@ function Column({ title, tasks, workflowTasks }: { title: string; tasks: GithubT
         {tasks.map((task) => {
           const workflowTask = findWorkflowTask(task, workflowTasks)
           return (
-            <a
+            <div
               key={task.id}
-              href={task.url}
-              target="_blank"
-              rel="noreferrer"
-              className="card elev-sm no-underline text-inherit"
+              role="button"
+              tabIndex={0}
+              onClick={() => onSelectTask(task)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault()
+                  onSelectTask(task)
+                }
+              }}
+              className="card elev-sm cursor-pointer"
             >
               <div className="flex items-center justify-between gap-2">
                 <span className="card-kicker">#{task.number}</span>
@@ -93,7 +110,7 @@ function Column({ title, tasks, workflowTasks }: { title: string; tasks: GithubT
               {workflowTask && currentAgentLabel(workflowTask) && (
                 <p className="card-meta">{currentAgentLabel(workflowTask)}</p>
               )}
-            </a>
+            </div>
           )
         })}
         {tasks.length === 0 && <p className="text-muted text-sm">No items</p>}
@@ -109,6 +126,7 @@ export default function KanbanBoard({ repo }: KanbanBoardProps) {
   const [lastSyncedAt, setLastSyncedAt] = useState<number | null>(null)
   const [refreshing, setRefreshing] = useState(false)
   const [, forceTick] = useState(0)
+  const [selectedTask, setSelectedTask] = useState<GithubTask | null>(null)
 
   useEffect(() => {
     const load = () =>
@@ -185,9 +203,23 @@ export default function KanbanBoard({ repo }: KanbanBoardProps) {
 
       {error && <p className="mt-2 text-xs" style={{ color: 'var(--color-accent-700)' }}>{error}</p>}
       <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2">
-        <Column title="Issues" tasks={issues} workflowTasks={workflowTasks} />
-        <Column title="Pull Requests" tasks={pullRequests} workflowTasks={workflowTasks} />
+        <Column title="Issues" tasks={issues} workflowTasks={workflowTasks} onSelectTask={setSelectedTask} />
+        <Column
+          title="Pull Requests"
+          tasks={pullRequests}
+          workflowTasks={workflowTasks}
+          onSelectTask={setSelectedTask}
+        />
       </div>
+
+      {selectedTask && (
+        <TaskDetailModal
+          repo={repo}
+          number={selectedTask.number}
+          type={selectedTask.type}
+          onClose={() => setSelectedTask(null)}
+        />
+      )}
     </div>
   )
 }

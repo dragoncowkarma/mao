@@ -5,6 +5,7 @@ import WorkflowQueue from './components/WorkflowQueue'
 import ProjectSettings from './components/ProjectSettings'
 import GlobalSettings from './components/GlobalSettings'
 import type { RepoRef } from '../core/workflow-engine'
+import type { ThemePreference } from '../core/store'
 
 type ProjectTab = 'board' | 'queue' | 'settings'
 type View = 'project' | 'global-settings'
@@ -14,6 +15,7 @@ export default function App() {
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null)
   const [view, setView] = useState<View>('project')
   const [projectTab, setProjectTab] = useState<ProjectTab>('board')
+  const [theme, setThemeState] = useState<ThemePreference>('system')
 
   useEffect(() => {
     window.electronAPI.github.getRepos().then((savedRepos) => {
@@ -21,6 +23,38 @@ export default function App() {
       if (savedRepos.length > 0) setSelectedIndex(0)
     })
   }, [])
+
+  useEffect(() => {
+    window.electronAPI.ui.getTheme().then(setThemeState)
+  }, [])
+
+  // Applies the effective light/dark scheme to <html data-theme>, which src/index.css keys its dark
+  // token overrides off of. 'system' has no fixed effective value, so it tracks the OS-level media
+  // query live instead of resolving once — the app should flip immediately if the OS theme changes
+  // while it's open, without requiring a restart or a settings round-trip.
+  useEffect(() => {
+    const media = window.matchMedia('(prefers-color-scheme: dark)')
+
+    function applyEffectiveTheme() {
+      const effective = theme === 'system' ? (media.matches ? 'dark' : 'light') : theme
+      if (effective === 'dark') {
+        document.documentElement.setAttribute('data-theme', 'dark')
+      } else {
+        document.documentElement.removeAttribute('data-theme')
+      }
+    }
+
+    applyEffectiveTheme()
+
+    if (theme !== 'system') return
+    media.addEventListener('change', applyEffectiveTheme)
+    return () => media.removeEventListener('change', applyEffectiveTheme)
+  }, [theme])
+
+  async function setTheme(next: ThemePreference) {
+    setThemeState(next)
+    await window.electronAPI.ui.setTheme(next)
+  }
 
   useEffect(() => {
     if (selectedIndex !== null && selectedIndex >= repos.length) {
@@ -78,7 +112,7 @@ export default function App() {
 
       <main className="flex-1 mx-auto w-full max-w-[1120px] px-6 py-8">
         {view === 'global-settings' ? (
-          <GlobalSettings />
+          <GlobalSettings theme={theme} onThemeChange={setTheme} />
         ) : !selected ? (
           <div>
             <h2>Welcome to MAO</h2>

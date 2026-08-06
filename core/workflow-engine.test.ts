@@ -161,4 +161,75 @@ describe('WorkflowEngine', () => {
     expect(current.stage).toBe('review')
     expect(current.history).toHaveLength(1)
   })
+
+  describe('provider override', () => {
+    it('honors the preferred provider except when it would violate maker-checker, across all stages', async () => {
+      const github = makeFakeGithub()
+      const engine = new WorkflowEngine(github)
+      engine.setProviders([makeProvider('agent-a'), makeProvider('agent-b')])
+
+      const task = engine.enqueue('Add feature P', repo, true, { providerId: 'agent-a' })
+      await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'done')
+
+      const finished = engine.getTasks().find((t) => t.id === task.id)!
+      expect(finished.history.map((h) => h.stage)).toEqual(['issue', 'pr', 'review', 'merge'])
+
+      // Preference wins whenever honoring it wouldn't hand a stage back to the prior stage's agent;
+      // maker-checker wins (falls back to the other provider) whenever it would.
+      expect(finished.history.map((h) => h.agentId)).toEqual(['agent-a', 'agent-b', 'agent-a', 'agent-b'])
+
+      // No two consecutive stages ever reuse the same agent, override or not.
+      for (let i = 1; i < finished.history.length; i++) {
+        expect(finished.history[i].agentId).not.toBe(finished.history[i - 1].agentId)
+      }
+    })
+
+    it('applies model/effort overrides to the selected provider without mutating the saved provider config', async () => {
+      const github = makeFakeGithub()
+      const engine = new WorkflowEngine(github)
+      const providerA = makeProvider('agent-a')
+      const providerB = makeProvider('agent-b')
+      engine.setProviders([providerA, providerB])
+
+      const task = engine.enqueue('Add feature Q', repo, false, { model: 'custom-model', effort: 'high' })
+      await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'paused')
+
+      const current = engine.getTasks().find((t) => t.id === task.id)!
+      expect(current.history[0].model).toBe('custom-model')
+      expect(current.history[0].effort).toBe('high')
+
+      // The stored provider configs themselves must be untouched.
+      expect(providerA.model).toBe('agent-a-model')
+      expect(providerA.effort).toBeUndefined()
+      expect(providerB.model).toBe('agent-b-model')
+    })
+
+    it('fails clearly when an explicit provider override has no distinct provider for a maker-checker stage', async () => {
+      const github = makeFakeGithub()
+      const engine = new WorkflowEngine(github)
+      engine.setProviders([makeProvider('agent-a')])
+
+      const task = engine.enqueue('Add feature R', repo, true, { providerId: 'agent-a' })
+      await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'error')
+
+      const current = engine.getTasks().find((t) => t.id === task.id)!
+      // The issue stage (no predecessor) succeeds using the preferred provider...
+      expect(current.history).toHaveLength(1)
+      expect(current.stage).toBe('pr')
+      // ...but the pr stage can't honor maker-checker without a second provider, and fails clearly.
+      expect(current.error).toMatch(/no other provider is registered/i)
+      expect(github.createPullRequest).not.toHaveBeenCalled()
+    })
+
+    it('rejects an override that references an unregistered provider id', async () => {
+      const engine = new WorkflowEngine(makeFakeGithub())
+      engine.setProviders([makeProvider('agent-a'), makeProvider('agent-b')])
+
+      const task = engine.enqueue('Add feature S', repo, true, { providerId: 'nonexistent' })
+      await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'error')
+
+      const current = engine.getTasks().find((t) => t.id === task.id)!
+      expect(current.error).toMatch(/unknown provider/i)
+    })
+  })
 })

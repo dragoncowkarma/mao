@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import type { QueuedTask, RepoRef } from '../../core/workflow-engine'
+import TaskDetailModal from './TaskDetailModal'
 
 interface WorkflowQueueProps {
   repo: RepoRef
@@ -39,11 +40,13 @@ function TaskCard({
   onRetry,
   onAdvance,
   onToggleAutoAdvance,
+  onOpenTask,
 }: {
   task: QueuedTask
   onRetry: (id: string) => void
   onAdvance: (id: string) => void
   onToggleAutoAdvance: (id: string, autoAdvance: boolean) => void
+  onOpenTask: (number: number, type: 'issue' | 'pull_request') => void
 }) {
   const [expanded, setExpanded] = useState<number | null>(null)
 
@@ -57,17 +60,25 @@ function TaskCard({
         </div>
       </div>
 
-      {(task.github.issueUrl || task.github.prUrl) && (
+      {(task.github.issueNumber !== undefined || task.github.prNumber !== undefined) && (
         <div className="flex gap-3 text-xs">
-          {task.github.issueUrl && (
-            <a href={task.github.issueUrl} target="_blank" rel="noreferrer">
+          {task.github.issueNumber !== undefined && (
+            <button
+              type="button"
+              className="link-button"
+              onClick={() => onOpenTask(task.github.issueNumber!, 'issue')}
+            >
               Issue #{task.github.issueNumber}
-            </a>
+            </button>
           )}
-          {task.github.prUrl && (
-            <a href={task.github.prUrl} target="_blank" rel="noreferrer">
+          {task.github.prNumber !== undefined && (
+            <button
+              type="button"
+              className="link-button"
+              onClick={() => onOpenTask(task.github.prNumber!, 'pull_request')}
+            >
               PR #{task.github.prNumber}
-            </a>
+            </button>
           )}
         </div>
       )}
@@ -157,6 +168,7 @@ export default function WorkflowQueue({ repo }: WorkflowQueueProps) {
   const [tasks, setTasks] = useState<QueuedTask[]>([])
   const [title, setTitle] = useState('')
   const [autoAdvanceNewTask, setAutoAdvanceNewTask] = useState(true)
+  const [openTask, setOpenTask] = useState<{ number: number; type: 'issue' | 'pull_request' } | null>(null)
 
   useEffect(() => {
     const load = () => window.electronAPI.workflow.list().then(setTasks)
@@ -236,10 +248,20 @@ export default function WorkflowQueue({ repo }: WorkflowQueueProps) {
             onRetry={retryTask}
             onAdvance={advanceTask}
             onToggleAutoAdvance={toggleAutoAdvance}
+            onOpenTask={(number, type) => setOpenTask({ number, type })}
           />
         ))}
         {repoTasks.length === 0 && <p className="text-muted text-sm">No workflow tasks yet.</p>}
       </div>
+
+      {openTask && (
+        <TaskDetailModal
+          repo={repo}
+          number={openTask.number}
+          type={openTask.type}
+          onClose={() => setOpenTask(null)}
+        />
+      )}
     </div>
   )
 }

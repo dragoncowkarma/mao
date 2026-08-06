@@ -24,6 +24,19 @@ export interface RepoRef {
   pollIntervalMs?: number
 }
 
+export interface ProviderOverride {
+  /**
+   * Preferred provider id for this task's stages. Only ever influences *which* provider is picked —
+   * maker-checker still wins: a preferred provider that handled the immediately preceding stage is
+   * skipped in favor of another registered provider, same as with no preference at all.
+   */
+  providerId?: string
+  /** Applied to whichever provider ends up selected, without mutating that provider's saved config. */
+  model?: string
+  /** Applied to whichever provider ends up selected, without mutating that provider's saved config. */
+  effort?: AiEffort
+}
+
 export interface WorkflowStepResult {
   stage: WorkflowStageName
   agentId: string
@@ -44,6 +57,8 @@ export interface QueuedTask {
   error?: string
   /** When false, a finished stage parks the task in 'paused' instead of auto-continuing to the next stage. */
   autoAdvance: boolean
+  /** Optional task-level provider/model/effort preference — always subordinate to maker-checker. */
+  providerOverride?: ProviderOverride
   /** Set while status === 'running' so the UI can show which agent/prompt is currently in flight. */
   active?: {
     agentId: string
@@ -193,7 +208,7 @@ export class WorkflowEngine extends EventEmitter {
     return task
   }
 
-  enqueue(title: string, repo: RepoRef, autoAdvance = true): QueuedTask {
+  enqueue(title: string, repo: RepoRef, autoAdvance = true, providerOverride?: ProviderOverride): QueuedTask {
     const task: QueuedTask = {
       id: randomUUID(),
       title,
@@ -202,6 +217,7 @@ export class WorkflowEngine extends EventEmitter {
       history: [],
       status: 'pending',
       autoAdvance,
+      providerOverride,
       github: {},
     }
     this.queue.push(task)
@@ -216,7 +232,14 @@ export class WorkflowEngine extends EventEmitter {
    * to pause after each stage (see `advance()`/`setAutoAdvance()`) instead of running straight through
    * to an unattended merge.
    */
-  enqueueFromIssue(issueNumber: number, issueUrl: string, title: string, repo: RepoRef, autoAdvance = true): QueuedTask {
+  enqueueFromIssue(
+    issueNumber: number,
+    issueUrl: string,
+    title: string,
+    repo: RepoRef,
+    autoAdvance = true,
+    providerOverride?: ProviderOverride,
+  ): QueuedTask {
     const task: QueuedTask = {
       id: randomUUID(),
       title,
@@ -225,6 +248,7 @@ export class WorkflowEngine extends EventEmitter {
       history: [],
       status: 'pending',
       autoAdvance,
+      providerOverride,
       github: { issueNumber, issueUrl },
     }
     this.queue.push(task)
@@ -233,12 +257,48 @@ export class WorkflowEngine extends EventEmitter {
     return task
   }
 
-  /** Prevents the AI that handled the previous stage from being assigned the next one (Maker-Checker). */
+  /**
+   * Prevents the AI that handled the previous stage from being assigned the next one (Maker-Checker).
+   * A task-level provider preference (`providerOverride.providerId`) may steer which provider gets
+   * picked, but never at the expense of that guarantee: if the preferred provider is the one that just
+   * ran, it is passed over for another registered provider exactly as if no preference had been set. It
+   * is only an error if honoring maker-checker would require a distinct provider that doesn't exist.
+   * `model`/`effort` overrides are applied on top of whichever provider is selected, on a copy — the
+   * caller's stored provider config is never mutated.
+   */
   private selectAgent(task: QueuedTask): AiProviderConfig {
     if (this.providers.length === 0) throw new Error('No AI providers registered')
     const previousAgentId = task.history[task.history.length - 1]?.agentId
-    const candidates = this.providers.filter((p) => p.id !== previousAgentId)
-    return candidates[0] ?? this.providers[0]
+    const override = task.providerOverride
+
+    let base: AiProviderConfig
+    if (override?.providerId) {
+      const preferred = this.providers.find((p) => p.id === override.providerId)
+      if (!preferred) throw new Error(`Provider override references unknown provider: ${override.providerId}`)
+
+      if (preferred.id !== previousAgentId) {
+        base = preferred
+      } else {
+        const alternative = this.providers.find((p) => p.id !== previousAgentId)
+        if (!alternative) {
+          throw new Error(
+            `Provider override "${override.providerId}" handled the immediately preceding stage and no other ` +
+              `provider is registered to check its own work — maker-checker requires a distinct provider here.`,
+          )
+        }
+        base = alternative
+      }
+    } else {
+      const candidates = this.providers.filter((p) => p.id !== previousAgentId)
+      base = candidates[0] ?? this.providers[0]
+    }
+
+    if (override?.model === undefined && override?.effort === undefined) return base
+    return {
+      ...base,
+      ...(override.model !== undefined ? { model: override.model } : {}),
+      ...(override.effort !== undefined ? { effort: override.effort } : {}),
+    }
   }
 
   private async processQueue() {

@@ -12,6 +12,21 @@ export interface GithubTask {
   labels: string[]
 }
 
+export interface GithubComment {
+  id: number
+  author: string
+  body: string
+  createdAt: string
+  url: string
+}
+
+/** Full issue/PR body + comment thread, fetched on demand when a card is opened in-app. */
+export interface GithubTaskDetail extends GithubTask {
+  body: string
+  author: string
+  comments: GithubComment[]
+}
+
 export class GithubService {
   private octokit: Octokit | null = null
 
@@ -45,6 +60,41 @@ export class GithubService {
         labels,
       }
     })
+  }
+
+  /**
+   * Fetches the full body + comment thread for an issue or PR (the `fetchTasks` list only carries
+   * summary fields). GitHub's issues endpoints cover PRs too — they're issues with a `pull_request`
+   * key attached — so one call shape serves both card types the UI opens in-app.
+   */
+  async fetchTaskDetail(owner: string, repo: string, number: number): Promise<GithubTaskDetail> {
+    if (!this.octokit) throw new Error('GitHub token is not set')
+    const [{ data: issue }, comments] = await Promise.all([
+      this.octokit.rest.issues.get({ owner, repo, issue_number: number }),
+      this.octokit.paginate(this.octokit.rest.issues.listComments, { owner, repo, issue_number: number, per_page: 100 }),
+    ])
+
+    const labels = issue.labels.map((label) => (typeof label === 'string' ? label : (label.name ?? '')))
+    return {
+      id: issue.id,
+      number: issue.number,
+      title: issue.title,
+      type: issue.pull_request ? 'pull_request' : 'issue',
+      state: issue.state,
+      url: issue.html_url,
+      updatedAt: issue.updated_at,
+      urgent: labels.some((label) => label.toLowerCase().includes('urgent')),
+      labels,
+      body: issue.body ?? '',
+      author: issue.user?.login ?? 'unknown',
+      comments: comments.map((comment) => ({
+        id: comment.id,
+        author: comment.user?.login ?? 'unknown',
+        body: comment.body ?? '',
+        createdAt: comment.created_at,
+        url: comment.html_url,
+      })),
+    }
   }
 
   async addLabel(owner: string, repo: string, issueNumber: number, label: string) {

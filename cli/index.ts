@@ -127,6 +127,14 @@ github
     printJson(await githubService.fetchTasks(owner, repo))
   })
 
+github
+  .command('view <owner> <repo> <number>')
+  .description('Show the full body + comment thread for one issue or PR')
+  .action(async (owner: string, repo: string, number: string) => {
+    const { githubService } = loadApp()
+    printJson(await githubService.fetchTaskDetail(owner, repo, parseInt(number, 10)))
+  })
+
 // --- workflow -----------------------------------------------------------------
 
 const workflow = program.command('workflow').description('Drive the issue -> PR -> review -> merge pipeline')

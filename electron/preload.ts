@@ -3,6 +3,7 @@ import type { AiProviderConfig } from '../core/ai/types.ts'
 import type { GithubTask } from '../core/github-service.ts'
 import type { QueuedTask, RepoRef } from '../core/workflow-engine.ts'
 import type { AutoTriggerStatus } from '../core/auto-trigger.ts'
+import type { ThemePreference } from '../core/store.ts'
 
 contextBridge.exposeInMainWorld('electronAPI', {
   platform: process.platform,
@@ -33,5 +34,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
     setAutoAdvance: (taskId: string, autoAdvance: boolean): Promise<QueuedTask> =>
       ipcRenderer.invoke('workflow:setAutoAdvance', taskId, autoAdvance),
     clearCompleted: (): Promise<void> => ipcRenderer.invoke('workflow:clearCompleted'),
+  },
+  ui: {
+    getTheme: (): Promise<ThemePreference> => ipcRenderer.invoke('ui:getTheme'),
+    setTheme: (theme: ThemePreference): Promise<void> => ipcRenderer.invoke('ui:setTheme', theme),
   },
 })

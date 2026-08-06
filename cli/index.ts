@@ -8,6 +8,7 @@ import { FileStore } from '../core/store.ts'
 import { defaultDataDir } from '../core/paths.ts'
 import type { AiProviderConfig } from '../core/ai/types.ts'
 import type { QueuedTask, RepoRef } from '../core/workflow-engine.ts'
+import type { ThemePreference } from '../core/store.ts'
 
 function log(...args: unknown[]) {
   console.log('[mao]', ...args)
@@ -70,6 +71,18 @@ config
   })
 
 config
+  .command('set-theme <theme>')
+  .description('Set the UI color scheme preference (light, dark, or system) — read by the Electron GUI')
+  .action((theme: string) => {
+    if (theme !== 'light' && theme !== 'dark' && theme !== 'system') {
+      throw new Error(`Invalid theme "${theme}" — expected one of: light, dark, system`)
+    }
+    const { store } = loadApp()
+    store.set('theme', theme as ThemePreference)
+    log(`Theme preference set to ${theme}`)
+  })
+
+config
   .command('show')
   .description('Print the current stored config (secrets redacted)')
   .action(() => {
@@ -78,6 +91,7 @@ config
       githubToken: store.get('githubToken') ? '[set]' : '[unset]',
       githubRepos: store.get('githubRepos'),
       aiProviders: store.get('aiProviders').map((p) => ({ ...p, apiKey: p.apiKey ? '[set]' : undefined })),
+      theme: store.get('theme'),
     })
   })
 

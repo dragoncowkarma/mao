@@ -3,11 +3,18 @@ import path from 'node:path'
 import type { AiProviderConfig } from './ai/types.ts'
 import type { QueuedTask, RepoRef } from './workflow-engine.ts'
 
+/**
+ * UI color scheme preference. 'system' follows the OS-level `prefers-color-scheme` media query and
+ * is the default — it's the only option that doesn't require the user to make a choice up front.
+ */
+export type ThemePreference = 'light' | 'dark' | 'system'
+
 export interface MaoStoreSchema {
   githubToken: string
   githubRepos: RepoRef[]
   aiProviders: AiProviderConfig[]
   workflowTasks: QueuedTask[]
+  theme: ThemePreference
 }
 
 export const MAO_STORE_DEFAULTS: MaoStoreSchema = {
@@ -15,6 +22,7 @@ export const MAO_STORE_DEFAULTS: MaoStoreSchema = {
   githubRepos: [],
   aiProviders: [],
   workflowTasks: [],
+  theme: 'system',
 }
 
 /**

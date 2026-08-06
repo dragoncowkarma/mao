@@ -1,5 +1,17 @@
 import { useEffect, useState } from 'react'
 import type { AiProviderConfig } from '../../core/ai/types'
+import type { ThemePreference } from '../../core/store'
+
+interface GlobalSettingsProps {
+  theme: ThemePreference
+  onThemeChange: (theme: ThemePreference) => void
+}
+
+const THEME_OPTIONS: { value: ThemePreference; label: string }[] = [
+  { value: 'light', label: 'Light' },
+  { value: 'dark', label: 'Dark' },
+  { value: 'system', label: 'System' },
+]
 
 function emptyProvider(): AiProviderConfig {
   return { id: crypto.randomUUID(), name: '', kind: 'api', apiFormat: 'anthropic' }
@@ -28,7 +40,7 @@ function validateProviders(providers: AiProviderConfig[]): string[] {
   return errors
 }
 
-export default function GlobalSettings() {
+export default function GlobalSettings({ theme, onThemeChange }: GlobalSettingsProps) {
   const [githubToken, setGithubToken] = useState('')
   const [providers, setProviders] = useState<AiProviderConfig[]>([])
   const [savedMessage, setSavedMessage] = useState('')
@@ -73,6 +85,24 @@ export default function GlobalSettings() {
     <div>
       <h2>Global settings</h2>
       <p className="text-muted mb-4 text-sm">Applies across every registered project.</p>
+
+      <div className="mb-4">
+        <h3 className="!mb-2">Appearance</h3>
+        <div className="tabs">
+          {THEME_OPTIONS.map((opt) => (
+            <button
+              key={opt.value}
+              className={`tab ${theme === opt.value ? 'active' : ''}`}
+              onClick={() => onThemeChange(opt.value)}
+            >
+              {opt.label}
+            </button>
+          ))}
+        </div>
+        <p className="text-muted -mt-2 text-xs">
+          "System" follows your OS light/dark setting and updates automatically if it changes.
+        </p>
+      </div>
 
       <div className="field mb-4 max-w-[420px]">
         <label>GitHub token</label>

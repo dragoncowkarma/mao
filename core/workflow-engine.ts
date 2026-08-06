@@ -226,12 +226,18 @@ export class WorkflowEngine extends EventEmitter {
     return task
   }
 
-  /** Starts the pipeline at the 'pr' stage for an issue that already exists on GitHub (e.g. human-filed). */
+  /**
+   * Starts the pipeline at the 'pr' stage for an issue that already exists on GitHub (e.g. human-filed).
+   * `autoAdvance` defaults to true to preserve auto-trigger's existing unattended behavior — pass false
+   * to pause after each stage (see `advance()`/`setAutoAdvance()`) instead of running straight through
+   * to an unattended merge.
+   */
   enqueueFromIssue(
     issueNumber: number,
     issueUrl: string,
     title: string,
     repo: RepoRef,
+    autoAdvance = true,
     providerOverride?: ProviderOverride,
   ): QueuedTask {
     const task: QueuedTask = {
@@ -241,7 +247,7 @@ export class WorkflowEngine extends EventEmitter {
       stage: 'pr',
       history: [],
       status: 'pending',
-      autoAdvance: true,
+      autoAdvance,
       providerOverride,
       github: { issueNumber, issueUrl },
     }

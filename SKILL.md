@@ -86,6 +86,7 @@ npm run cli -- config show                       # secrets redacted as '[set]'
 npm run cli -- repos add <owner> <repo> [--no-auto-trigger] [--poll-interval-ms <ms>]
 npm run cli -- repos list
 npm run cli -- github check <owner> <repo>       # open issues/PRs as JSON
+npm run cli -- github view <owner> <repo> <number>  # full body + comments for one issue/PR as JSON
 npm run cli -- workflow enqueue "<title>" --owner <o> --repo <r> [--no-auto-advance]
 npm run cli -- workflow list
 npm run cli -- workflow retry <taskId>

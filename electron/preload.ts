@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import type { AiProviderConfig } from '../core/ai/types.ts'
-import type { GithubTask } from '../core/github-service.ts'
+import type { GithubTask, GithubTaskDetail } from '../core/github-service.ts'
 import type { QueuedTask, RepoRef } from '../core/workflow-engine.ts'
 import type { AutoTriggerStatus } from '../core/auto-trigger.ts'
 import type { ThemePreference } from '../core/store.ts'
@@ -18,6 +18,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     setToken: (token: string): Promise<void> => ipcRenderer.invoke('github:setToken', token),
     fetchTasks: (owner: string, repo: string): Promise<GithubTask[]> =>
       ipcRenderer.invoke('github:fetchTasks', owner, repo),
+    fetchTaskDetail: (owner: string, repo: string, number: number): Promise<GithubTaskDetail> =>
+      ipcRenderer.invoke('github:fetchTaskDetail', owner, repo, number),
     setRepos: (repos: RepoRef[]): Promise<void> => ipcRenderer.invoke('github:setRepos', repos),
     getRepos: (): Promise<RepoRef[]> => ipcRenderer.invoke('github:getRepos'),
     autoTriggerStatus: (owner: string, repo: string): Promise<AutoTriggerStatus> =>

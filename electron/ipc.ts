@@ -40,6 +40,10 @@ export function registerIpcHandlers() {
     return githubService.fetchTasks(owner, repo)
   })
 
+  ipcMain.handle('github:fetchTaskDetail', (_event, owner: string, repo: string, number: number) => {
+    return githubService.fetchTaskDetail(owner, repo, number)
+  })
+
   ipcMain.handle('github:setRepos', (_event, repos: RepoRef[]) => {
     store.set('githubRepos', repos)
   })

@@ -1,0 +1,112 @@
+name: "\U0001F41B Bug Report"
+description: Report a bug in MAO (Electron GUI, CLI, or workflow engine)
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug! Please fill out the sections below
+        so we can reproduce and fix the issue.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug description
+      description: A clear and concise description of what the bug is.
+      placeholder: Describe the bug…
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Step-by-step instructions to reproduce the behavior.
+      placeholder: |
+        1. Open the app / run `mao …`
+        2. Navigate to …
+        3. Click on / run …
+        4. See error
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What you expected to happen.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What actually happened instead.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: frontend
+    attributes:
+      label: Frontend
+      description: Which frontend were you using?
+      options:
+        - Electron GUI
+        - Headless CLI (`mao`)
+        - Both
+        - N/A (core engine / library)
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      description: e.g. macOS 15.1, Windows 11, Ubuntu 24.04
+      placeholder: macOS 15.1
+    validations:
+      required: true
+
+  - type: input
+    id: node-version
+    attributes:
+      label: Node.js version
+      description: Output of `node --version`
+      placeholder: v22.0.0
+    validations:
+      required: false
+
+  - type: input
+    id: app-version
+    attributes:
+      label: MAO version
+      description: App version from Settings or `mao --version`
+      placeholder: "0.1.0"
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: Paste any relevant log output or error messages. **Redact tokens and API keys.**
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots
+      description: If applicable, add screenshots to help explain the problem.
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Any other context about the problem (AI provider in use, repo configuration, etc.).
+    validations:
+      required: false

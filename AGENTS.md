@@ -238,11 +238,16 @@ There is no codegen — these couplings are maintained by hand and only `npm run
 
 ## Git conventions
 
-- **Commits**: imperative subject, sentence case, no trailing period, often
-  stating the consequence ("Fix external links being silently swallowed").
+- **Full rules**: see `.agents/rules/git-conventions.md` for the complete
+  specification covering branches, commits, PRs, and tags.
+- **Commits**: Conventional Commits format — `<type>(<scope>): <subject>`.
+  Imperative subject, sentence case, no trailing period, 50-char limit.
   Non-trivial commits carry a ~72-char-wrapped body explaining root cause and why.
-- **Branches**: historically `claude/<kebab-topic>-<hex>`; feature branches like
-  `feature/<topic>` are also fine. PRs merge into `main` via merge commits.
+  Types: `feat`, `fix`, `chore`, `docs`, `refactor`, `test`, `style`, `perf`, `ci`.
+  Scopes: `core`, `cli`, `electron`, `ui`, `ai`, `workflow`, `github`.
+- **Branches**: `<type>/<issue-number>-<kebab-description>` for manual branches.
+  AI-agent branches (`claude/`, `codex/`) and engine branches (`workflow/`)
+  keep their automated patterns. PRs merge into `main` via merge commits.
 - **CI runs on every PR and push to `main`** (Node 22): `npm ci`, `npm run lint`,
   `npm run test`, `npm run test:origin`, `npx vite build`. As of 2026-08 `main` has **no branch
   protection** (no required checks, no rulesets), so a green CI is convention,

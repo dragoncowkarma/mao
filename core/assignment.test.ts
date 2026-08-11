@@ -36,6 +36,41 @@ describe('parseAssignmentTags', () => {
   it('ignores malformed tags (missing colon, empty id, unknown role keyword)', () => {
     expect(parseAssignmentTags('[Worker] [Reviewer:] [Owner: agent-a]')).toEqual({})
   })
+
+  it('accepts ids containing characters other than letters/digits/dot/underscore/hyphen, e.g. a slash', () => {
+    expect(parseAssignmentTags('[Worker: openai/gpt-4]')).toEqual({ worker: 'openai/gpt-4' })
+    expect(parseAssignmentTags('[Reviewer: team@bot]')).toEqual({ reviewer: 'team@bot' })
+  })
+
+  it('does not match an id containing a space (ambiguous — cannot tell where the id ends)', () => {
+    expect(parseAssignmentTags('[Worker: my provider]')).toEqual({})
+    // a malformed tag doesn't swallow or corrupt a well-formed sibling tag
+    expect(parseAssignmentTags('[Worker: my provider] [Reviewer: agent-b]')).toEqual({ reviewer: 'agent-b' })
+  })
+
+  it('ignores a tag written inside a fenced code block', () => {
+    const body = 'Here is the format:\n```\n[Worker: example-id]\n```\nDon\'t assign anyone yet.'
+    expect(parseAssignmentTags(body)).toEqual({})
+  })
+
+  it('ignores a tag written inside an inline code span', () => {
+    expect(parseAssignmentTags('Use the tag like `[Worker: example-id]` in your issue.')).toEqual({})
+  })
+
+  it('ignores a tag hidden inside an HTML comment', () => {
+    expect(parseAssignmentTags('<!-- [Worker: hidden-id] -->\nActual issue body here.')).toEqual({})
+  })
+
+  it('ignores a tag inside a blockquoted line', () => {
+    expect(parseAssignmentTags('> Someone quoted: [Worker: quoted-id]')).toEqual({})
+  })
+
+  it('still matches a real tag that merely sits alongside quoted example text', () => {
+    const body =
+      'Format reference: `[Worker: example-id]` (just an example).\n\n' +
+      'Real assignment:\n[Worker: agent-real] [Reviewer: agent-real-2]'
+    expect(parseAssignmentTags(body)).toEqual({ worker: 'agent-real', reviewer: 'agent-real-2' })
+  })
 })
 
 describe('hasAssignment', () => {

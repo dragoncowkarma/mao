@@ -61,9 +61,10 @@ export interface ProviderOverride {
   /**
    * Per-role provider pins that take priority over `providerId` for the stage(s) they name. A Worker
    * pin is exempt from the maker-checker guard when it re-selects itself across the `issue -> pr`
-   * boundary (same role, not a check on its own work) — but a Reviewer or Maintainer pin that would
-   * hand a stage back to the agent that ran the immediately preceding stage is still guarded exactly
-   * like a plain `providerId` override: the guard is skipped, never silently weakened.
+   * boundary (same role, not a check on its own work) — that is the *only* exemption. A Reviewer or
+   * Maintainer pin that would hand a stage back to the agent that ran the immediately preceding stage
+   * is guarded exactly like a plain `providerId` override: passed over for another registered
+   * provider, or the stage fails clearly if none exists — never silently weakened.
    */
   roles?: WorkflowRoleAssignment
 }

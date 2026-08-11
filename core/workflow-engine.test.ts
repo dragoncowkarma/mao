@@ -210,4 +210,84 @@ describe('WorkflowEngine', () => {
       expect(current.error).toMatch(/unknown provider/i)
     })
   })
+
+  describe('role assignment (swarm_orchestrator-style Worker/Reviewer/Maintainer pins)', () => {
+    it('lets a Worker pin handle issue+pr with the same agent, and falls back to providerId for unpinned roles', async () => {
+      const github = makeFakeGithub()
+      const engine = new WorkflowEngine(github)
+      engine.setProviders([makeProvider('agent-a'), makeProvider('agent-b')])
+
+      const task = engine.enqueue('Add feature T', repo, true, {
+        providerId: 'agent-b',
+        roles: { worker: 'agent-a' },
+      })
+      await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'done')
+
+      const finished = engine.getTasks().find((t) => t.id === task.id)!
+      expect(finished.history.map((h) => h.stage)).toEqual(['issue', 'pr', 'review', 'merge'])
+      // Worker pin reuses itself across issue -> pr (same role, not a maker-checker violation); review
+      // and merge have no role pin, so they fall back to providerId ('agent-b'), still maker-checker-guarded.
+      expect(finished.history.map((h) => h.agentId)).toEqual(['agent-a', 'agent-a', 'agent-b', 'agent-a'])
+    })
+
+    it('assigns all three roles to distinct agents end to end', async () => {
+      const github = makeFakeGithub()
+      const engine = new WorkflowEngine(github)
+      engine.setProviders([makeProvider('agent-a'), makeProvider('agent-b')])
+
+      const task = engine.enqueue('Add feature U', repo, true, {
+        roles: { worker: 'agent-a', reviewer: 'agent-b', maintainer: 'agent-a' },
+      })
+      await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'done')
+
+      const finished = engine.getTasks().find((t) => t.id === task.id)!
+      expect(finished.history.map((h) => h.agentId)).toEqual(['agent-a', 'agent-a', 'agent-b', 'agent-a'])
+    })
+
+    it('still guards a Reviewer/Maintainer pin across a role boundary, falling back to another provider', async () => {
+      const github = makeFakeGithub()
+      const engine = new WorkflowEngine(github)
+      engine.setProviders([makeProvider('agent-a'), makeProvider('agent-b')])
+
+      // Reviewer is pinned to the same agent as Worker — a real maker-checker conflict at the 'pr' ->
+      // 'review' boundary — so it must be passed over for the other registered provider. Maintainer has
+      // no pin, so 'merge' falls back to the default rotation, excluding review's agent ('agent-b').
+      const task = engine.enqueue('Add feature V', repo, true, {
+        roles: { worker: 'agent-a', reviewer: 'agent-a' },
+      })
+      await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'done')
+
+      const finished = engine.getTasks().find((t) => t.id === task.id)!
+      expect(finished.history.map((h) => h.agentId)).toEqual(['agent-a', 'agent-a', 'agent-b', 'agent-a'])
+    })
+
+    it('fails clearly when a Reviewer pin conflicts with the previous stage and no alternative provider exists', async () => {
+      const github = makeFakeGithub()
+      const engine = new WorkflowEngine(github)
+      engine.setProviders([makeProvider('agent-a')])
+
+      const task = engine.enqueue('Add feature W2', repo, true, {
+        roles: { worker: 'agent-a', reviewer: 'agent-a' },
+      })
+      await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'error')
+
+      const current = engine.getTasks().find((t) => t.id === task.id)!
+      // issue + pr succeed under the Worker pin (same role, no guard needed)...
+      expect(current.history).toHaveLength(2)
+      expect(current.stage).toBe('review')
+      // ...but review can't honor the Reviewer pin without a second provider, and fails clearly.
+      expect(current.error).toMatch(/no other provider is registered/i)
+    })
+
+    it('rejects a role pin that references an unregistered provider id', async () => {
+      const engine = new WorkflowEngine(makeFakeGithub())
+      engine.setProviders([makeProvider('agent-a'), makeProvider('agent-b')])
+
+      const task = engine.enqueue('Add feature X2', repo, true, { roles: { worker: 'nonexistent' } })
+      await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'error')
+
+      const current = engine.getTasks().find((t) => t.id === task.id)!
+      expect(current.error).toMatch(/unknown provider/i)
+    })
+  })
 })

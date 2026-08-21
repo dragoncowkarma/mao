@@ -264,10 +264,7 @@ class ProcessTracker:
     def _reclassify_deferred_failures(self):
         """Upgrade historical transient failures so a restart can recover them."""
         for record in self._history:
-            if record.status not in (
-                ProcessStatus.FAILED,
-                ProcessStatus.COMPLETED,
-            ):
+            if record.status != ProcessStatus.FAILED:
                 continue
             output_tail = self._read_log_tail(record.log_file, 2000)
             retry_after = self._provider_retry_after(output_tail, record.ended_at)
@@ -289,7 +286,7 @@ class ProcessTracker:
         for record in self._history:
             if record.status != ProcessStatus.RUNNING:
                 continue
-            if self.check_pid_alive(record.pid):
+            if self.check_pid_alive(record.pid, record.command):
                 continue
             record.status = ProcessStatus.UNKNOWN
             record.ended_at = record.ended_at or datetime.now(timezone.utc).isoformat()
@@ -402,15 +399,32 @@ class ProcessTracker:
         if finished_pids:
             self._save_registry()
 
-    def check_pid_alive(self, pid: int) -> bool:
-        """Check if a PID is still alive via OS signal 0."""
+    def check_pid_alive(self, pid: int, command: Optional[str] = None) -> bool:
+        """Check if a PID is still alive via OS signal 0 and matches command if provided."""
         try:
             os.kill(pid, 0)
-            return True
         except ProcessLookupError:
             return False
         except PermissionError:
             return True  # Alive, just can't signal it
+
+        if command:
+            try:
+                # ps -p <pid> -o command=
+                result = subprocess.run(
+                    ["ps", "-p", str(pid), "-o", "command="],
+                    capture_output=True, text=True, check=False
+                )
+                if result.returncode == 0:
+                    ps_command = result.stdout.strip().lower()
+                    # Extract binary name from command
+                    exe_name = command.split()[0].split("/")[-1].lower()
+                    return exe_name in ps_command
+            except Exception:
+                # Fallback to True if ps fails
+                return True
+            return False
+        return True
 
     # --- Queries ---
 
@@ -730,6 +744,21 @@ def gh(args: list[str], check: bool = True) -> str:
     return result.stdout.strip()
 
 
+_CURRENT_GH_USER: Optional[str] = None
+
+
+def get_gh_user() -> str:
+    """Fetch and cache the currently authenticated GitHub user login."""
+    global _CURRENT_GH_USER
+    if _CURRENT_GH_USER is None:
+        try:
+            _CURRENT_GH_USER = gh(["api", "user", "-q", ".login"]).strip()
+        except Exception as e:
+            log.error("Failed to get current GitHub user login: %s", e)
+            _CURRENT_GH_USER = ""
+    return _CURRENT_GH_USER
+
+
 def fetch_open_issues() -> list[dict]:
     """Fetch every open Issue so the startup scan cannot hide malformed tasks."""
     raw = gh([
@@ -800,7 +829,7 @@ def parse_role(pattern: re.Pattern, text: str) -> Optional[RoleAssignment]:
 
 def extract_issue_number_from_pr_title(title: str) -> Optional[int]:
     """Extract issue number from PR title like '[PR] 12 - ...'"""
-    m = re.search(r"\[PR\]\s*(\d+)", title)
+    m = re.match(r"^\s*\[PR\]\s*(\d+)", title)
     return int(m.group(1)) if m else None
 
 
@@ -899,10 +928,10 @@ def create_worktree(issue_number: int, branch_name: str) -> Path:
 
     WORKTREE_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Create branch from current HEAD if it doesn't exist
+    # Create branch from origin/main if it doesn't exist
     if not local_branch_exists(branch_name):
         subprocess.run(
-            ["git", "branch", branch_name],
+            ["git", "branch", branch_name, "origin/main"],
             cwd=REPO_ROOT, check=True,
         )
 
@@ -1074,22 +1103,12 @@ def sync_main_branch(dry_run: bool = False):
                 level=logging.WARNING,
             )
     elif ahead and not behind:
-        if dry_run:
-            log.info("[DRY RUN] Would push local main %s -> origin/main", local_sha[:8])
-            return
-        push = subprocess.run(
-            ["git", "push", "origin", "main"],
-            cwd=REPO_ROOT, capture_output=True, text=True, check=False,
+        log_blocker(
+            "main-sync:ahead",
+            "Local main is ahead of origin/main; refusing to push directly "
+            "(manual review required).",
+            level=logging.WARNING,
         )
-        if push.returncode == 0:
-            log.info("⬆️ Pushed local main %s -> origin", local_sha[:8])
-        else:
-            log_blocker(
-                "main-sync:push",
-                "Failed to push main: %s",
-                push.stderr.strip(),
-                level=logging.WARNING,
-            )
     else:
         log_blocker(
             "main-sync:diverged",
@@ -1127,6 +1146,30 @@ def create_log_files(role: str, task_ref: str, ai_name: str) -> tuple[Path, "IO"
     return log_path, log_file, log_file
 
 
+def cleanup_old_prompts(retention_days: int = TASK_LOG_RETENTION_DAYS):
+    """Delete prompt temp files older than retention_days.
+
+    Since prompts can contain full issue/PR bodies, we should delete them
+    after a retention period so they don't accumulate indefinitely.
+    """
+    if not PROMPT_DIR.exists():
+        return
+    cutoff = time.time() - retention_days * 86400
+    removed = 0
+    for path in PROMPT_DIR.glob("*"):
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+                removed += 1
+        except OSError:
+            continue
+    if removed:
+        log.info(
+            "🧹 Removed %d prompt file(s) older than %d day(s).",
+            removed, retention_days,
+        )
+
+
 def cleanup_old_task_logs(retention_days: int = TASK_LOG_RETENTION_DAYS):
     """Delete per-task AI process log files older than retention_days.
 
@@ -1135,6 +1178,7 @@ def cleanup_old_task_logs(retention_days: int = TASK_LOG_RETENTION_DAYS):
     them without bound. The orchestrator's own rotating log is size-capped
     separately and is skipped here.
     """
+    cleanup_old_prompts(retention_days)
     if not LOG_DIR.exists():
         return
     cutoff = time.time() - retention_days * 86400
@@ -1264,16 +1308,12 @@ _CODEX_MODEL_MAP: dict[str, str] = {
 
 
 def build_ai_argv(ai_name: str, model: str, reasoning: str,
-                  prompt_file: Path, cwd: str) -> list[str]:
+                  prompt_file: Path, cwd: str, allow_tool_use: bool) -> tuple[list[str], bool]:
     """Build an argv list for a specific AI CLI tool.
 
-    Each tool's actual flags (verified via CLI):
-      codex exec -m <model> -C <dir> -s workspace-write --dangerously-bypass-approvals-and-sandbox <prompt>
-      agy --model "Gemini 3.6 Flash (High)" --print-timeout <dur> --dangerously-skip-permissions -p <prompt>
-      claude -p --model <model> --effort <level> --dangerously-skip-permissions <prompt>
+    Returns a tuple (argv, use_stdin) indicating the command line arguments
+    and whether the prompt should be fed via stdin instead of argv.
     """
-    prompt_text = prompt_file.read_text(encoding="utf-8")
-
     if ai_name == "codex":
         model_key = model.lower().strip()
         resolved_model = _CODEX_MODEL_MAP.get(model_key, model)
@@ -1282,17 +1322,23 @@ def build_ai_argv(ai_name: str, model: str, reasoning: str,
                 "Model alias: '%s' → '%s' (codex)",
                 model, resolved_model,
             )
-        # codex exec: -C workdir, prompt is positional
-        # --dangerously-bypass-approvals-and-sandbox for autonomous mode
-        # -s workspace-write to allow file edits
-        return [
+        # codex exec: -C workdir, prompt is positional or read from stdin if not provided
+        argv = [
             "codex", "exec",
             "-m", resolved_model,
             "-C", cwd,
-            "-s", "workspace-write",
-            "--dangerously-bypass-approvals-and-sandbox",
-            prompt_text,
         ]
+        if allow_tool_use:
+            argv += [
+                "-s", "workspace-write",
+                "--dangerously-bypass-approvals-and-sandbox",
+            ]
+        else:
+            argv += [
+                "-s", "read-only",
+                "--approve-for-me",
+            ]
+        return argv, True
 
     elif ai_name == "antigravity":
         resolved_model = _resolve_agy_model(model, reasoning)
@@ -1301,14 +1347,17 @@ def build_ai_argv(ai_name: str, model: str, reasoning: str,
             model, reasoning, resolved_model,
         )
         # agy does NOT use a separate --effort flag; effort is part of model name.
+        # agy does not support stdin prompt (demands value for -p/--print), so we pass it in argv.
+        prompt_text = prompt_file.read_text(encoding="utf-8")
         argv = [
             "agy",
-            "--dangerously-skip-permissions",
             "--model", resolved_model,
             "--print-timeout", ANTIGRAVITY_PRINT_TIMEOUT,
             "-p", prompt_text,
         ]
-        return argv
+        if allow_tool_use:
+            argv.insert(1, "--dangerously-skip-permissions")
+        return argv, False
 
     elif ai_name == "claude":
         resolved_model = _CLAUDE_MODEL_MAP.get(model.lower().strip(), model)
@@ -1320,18 +1369,19 @@ def build_ai_argv(ai_name: str, model: str, reasoning: str,
         effort = _CLAUDE_EFFORT_MAP.get(
             reasoning.lower().strip(), "medium",
         )
-        return [
+        argv = [
             "claude",
             "-p",
             "--model", resolved_model,
             "--effort", effort,
-            "--dangerously-skip-permissions",
-            prompt_text,
         ]
+        if allow_tool_use:
+            argv.append("--dangerously-skip-permissions")
+        return argv, True
 
     else:
         log.error("Unknown AI agent: %s", ai_name)
-        return []
+        return [], False
 
 
 def _map_reasoning_to_effort(reasoning: str) -> str:
@@ -1396,7 +1446,7 @@ def dispatch_worker(
 
     task_ref = task_ref or f"issue#{issue.number}:initial"
     prompt_file = write_prompt_file(prompt, "worker", task_ref)
-    argv = build_ai_argv(worker.ai, worker.model, worker.reasoning, prompt_file, str(worktree_path))
+    argv, use_stdin = build_ai_argv(worker.ai, worker.model, worker.reasoning, prompt_file, str(worktree_path), allow_tool_use=True)
 
     if dry_run:
         log.info("[DRY RUN] Would execute: %s", _format_argv_for_log(argv))
@@ -1410,13 +1460,21 @@ def dispatch_worker(
     log.info("  argv: %s", _format_argv_for_log(argv))
 
     try:
+        stdin_source = subprocess.DEVNULL
+        pf = None
+        if use_stdin:
+            pf = open(prompt_file, 'r', encoding='utf-8')
+            stdin_source = pf
+
         proc = subprocess.Popen(
             argv,
             cwd=str(worktree_path),
             stdout=stdout_file,
-            stderr=stderr_file, stdin=subprocess.DEVNULL,
-
+            stderr=stderr_file,
+            stdin=stdin_source,
         )
+        if pf:
+            pf.close()
         tracker.register(
             proc=proc,
             role="worker",
@@ -1478,12 +1536,13 @@ def dispatch_reviewer(
 
     task_ref = task_ref or f"review#{pr.number}-{pr.head_sha or 'initial'}"
     prompt_file = write_prompt_file(prompt, "reviewer", task_ref)
-    argv = build_ai_argv(
+    argv, use_stdin = build_ai_argv(
         reviewer.ai,
         reviewer.model,
         reviewer.reasoning,
         prompt_file,
         str(REPO_ROOT),
+        allow_tool_use=False,
     )
 
     if dry_run:
@@ -1497,12 +1556,21 @@ def dispatch_reviewer(
     log.info("Dispatching Reviewer %s for PR #%d (log: %s)", reviewer.ai, pr.number, log_path)
 
     try:
+        stdin_source = subprocess.DEVNULL
+        pf = None
+        if use_stdin:
+            pf = open(prompt_file, 'r', encoding='utf-8')
+            stdin_source = pf
+
         proc = subprocess.Popen(
             argv,
             cwd=str(REPO_ROOT),
             stdout=stdout_file,
-            stderr=stderr_file, stdin=subprocess.DEVNULL,
+            stderr=stderr_file,
+            stdin=stdin_source,
         )
+        if pf:
+            pf.close()
         tracker.register(
             proc=proc,
             role="reviewer",
@@ -1559,12 +1627,13 @@ def dispatch_maintainer(
 
     task_ref = task_ref or f"maintain#{pr.number}"
     prompt_file = write_prompt_file(prompt, "maintainer", task_ref)
-    argv = build_ai_argv(
+    argv, use_stdin = build_ai_argv(
         maintainer.ai,
         maintainer.model,
         maintainer.reasoning,
         prompt_file,
         str(REPO_ROOT),
+        allow_tool_use=False,
     )
 
     if dry_run:
@@ -1578,12 +1647,21 @@ def dispatch_maintainer(
     log.info("Dispatching Maintainer %s for PR #%d (log: %s)", maintainer.ai, pr.number, log_path)
 
     try:
+        stdin_source = subprocess.DEVNULL
+        pf = None
+        if use_stdin:
+            pf = open(prompt_file, 'r', encoding='utf-8')
+            stdin_source = pf
+
         proc = subprocess.Popen(
             argv,
             cwd=str(REPO_ROOT),
             stdout=stdout_file,
-            stderr=stderr_file, stdin=subprocess.DEVNULL,
+            stderr=stderr_file,
+            stdin=stdin_source,
         )
+        if pf:
+            pf.close()
         tracker.register(
             proc=proc,
             role="maintainer",
@@ -1654,7 +1732,7 @@ def dispatch_worker_revision(
     if not task_ref:
         task_ref = f"revise#{pr.number}"
     prompt_file = write_prompt_file(prompt, "worker-revise", task_ref)
-    argv = build_ai_argv(worker.ai, worker.model, worker.reasoning, prompt_file, str(worktree_path))
+    argv, use_stdin = build_ai_argv(worker.ai, worker.model, worker.reasoning, prompt_file, str(worktree_path), allow_tool_use=True)
 
     if dry_run:
         log.info("[DRY RUN] Would execute worker revision: %s", _format_argv_for_log(argv))
@@ -1668,12 +1746,21 @@ def dispatch_worker_revision(
     log.info("  argv: %s", _format_argv_for_log(argv))
 
     try:
+        stdin_source = subprocess.DEVNULL
+        pf = None
+        if use_stdin:
+            pf = open(prompt_file, 'r', encoding='utf-8')
+            stdin_source = pf
+
         proc = subprocess.Popen(
             argv,
             cwd=str(worktree_path),
             stdout=stdout_file,
-            stderr=stderr_file, stdin=subprocess.DEVNULL,
+            stderr=stderr_file,
+            stdin=stdin_source,
         )
+        if pf:
+            pf.close()
         tracker.register(
             proc=proc,
             role="worker_revise",
@@ -1817,6 +1904,21 @@ def process_prs(
             continue
 
         comments = fetch_pr_comments(pr_num)
+        current_user = get_gh_user()
+        if not current_user:
+            log.warning(
+                "Cannot determine current GitHub user; skipping comment-signal processing for PR #%d.",
+                pr_num,
+            )
+            continue
+
+        # Only trust comments from the orchestrator user or repo owners/collaborators
+        trusted_comments = []
+        for c in comments:
+            author_login = c.get("author", {}).get("login")
+            assoc = c.get("authorAssociation")
+            if author_login == current_user or assoc in ("OWNER", "COLLABORATOR", "MEMBER"):
+                trusted_comments.append(c)
 
         pr_obj = TaskPR(
             number=pr_num,
@@ -1834,7 +1936,7 @@ def process_prs(
             worker=worker,
         )
         pr_obj.reviewer = reviewer
-        action, signal_comment, signal_index = determine_pr_action(comments)
+        action, signal_comment, signal_index = determine_pr_action(trusted_comments)
         signal_id = (
             comment_signal_id(signal_comment, signal_index)
             if signal_comment is not None
@@ -2184,13 +2286,18 @@ def main():
         "--status", action="store_true",
         help="Print status of all tracked AI processes and exit",
     )
+    parser.add_argument(
+        "--reset", action="store_true",
+        help="Reset process history database on startup",
+    )
     args = parser.parse_args()
 
     if args.status:
         print(tracker.get_summary())
         return
 
-    reset_process_history()
+    if args.reset:
+        reset_process_history()
     cleanup_old_task_logs()
 
     if args.once:

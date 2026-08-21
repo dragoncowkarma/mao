@@ -6,11 +6,8 @@ import { registerIpcHandlers } from './ipc.ts'
 // Suppress EGL "Bad attribute" noise from Chromium's GPU process.
 // eglQueryDeviceAttribEXT is queried during EGL initialisation but the
 // extension is not always supported by the host driver, causing a harmless
-// but noisy error.  Disabling the GPU sandbox avoids the problematic query
-// path without affecting rendering quality on macOS (Metal is used instead).
-if (process.platform !== 'darwin') {
-  app.commandLine.appendSwitch('disable-gpu-sandbox')
-}
+// but noisy error.  Raising the log threshold to ERROR-only (log-level=3)
+// is enough to silence the noise without touching the GPU sandbox.
 app.commandLine.appendSwitch('disable-features', 'UseEcoQoSForBackgroundProcess')
 app.commandLine.appendSwitch('log-level', '3') // suppress INFO/WARNING logs from Chromium
 

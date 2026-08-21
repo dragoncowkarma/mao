@@ -1,6 +1,18 @@
 import { useEffect, useState } from 'react'
 import type { AiProviderConfig, ModelEffortPreset, ProviderKindId } from '../../core/ai/types'
 import { PROVIDER_OPTIONS } from '../../core/ai/provider-options'
+import type { ThemePreference } from '../../core/store'
+
+interface GlobalSettingsProps {
+  theme: ThemePreference
+  onThemeChange: (theme: ThemePreference) => void
+}
+
+const THEME_OPTIONS: { value: ThemePreference; label: string }[] = [
+  { value: 'light', label: 'Light' },
+  { value: 'dark', label: 'Dark' },
+  { value: 'system', label: 'System' },
+]
 
 function emptyProvider(): AiProviderConfig {
   return { id: crypto.randomUUID(), name: '', kind: 'api', apiFormat: 'anthropic' }
@@ -45,23 +57,31 @@ const PROVIDER_KIND_LABELS: Record<ProviderKindId, string> = {
 interface PresetRowProps {
   preset: ModelEffortPreset
   kindId?: ProviderKindId
+  isSelected: boolean
+  onSelect: () => void
   onChange: (patch: Partial<ModelEffortPreset>) => void
   onRemove: () => void
 }
 
-function PresetRow({ preset, kindId, onChange, onRemove }: PresetRowProps) {
+function PresetRow({ preset, kindId, isSelected, onSelect, onChange, onRemove }: PresetRowProps) {
   const opts = kindId ? PROVIDER_OPTIONS[kindId] : null
   const modelOpts = opts?.models ?? []
   const effortOpts = opts?.efforts ?? []
 
   const selectedModelOpt = modelOpts.find((m) => m.value === preset.model)
   const noEffort = selectedModelOpt?.noEffort ?? false
-
-  // For antigravity the model name already encodes effort, so no separate effort dropdown
   const showEffort = effortOpts.length > 0 && !noEffort
 
   return (
-    <div className="flex items-center gap-2 rounded border border-[var(--color-border)] bg-[var(--color-bg-subtle)] px-3 py-2">
+    <div className={`flex items-center gap-2 rounded border px-3 py-2 ${isSelected ? 'border-[var(--color-accent)] bg-[var(--color-bg)]' : 'border-[var(--color-border)] bg-[var(--color-bg-subtle)]'}`}>
+      <input
+        type="radio"
+        checked={isSelected}
+        onChange={onSelect}
+        title="Set as active preset"
+        className="cursor-pointer"
+      />
+
       {/* Model */}
       {modelOpts.length > 0 ? (
         <select
@@ -79,7 +99,7 @@ function PresetRow({ preset, kindId, onChange, onRemove }: PresetRowProps) {
       ) : (
         <input
           className="input flex-1 min-w-[180px]"
-          placeholder="Model"
+          placeholder="Model ID (e.g. gpt-4o)"
           value={preset.model}
           onChange={(e) => onChange({ model: e.target.value })}
         />
@@ -125,21 +145,54 @@ function ProviderCard({ provider: p, onUpdate, onRemove }: ProviderCardProps) {
   const [presetsExpanded, setPresetsExpanded] = useState(false)
 
   function updatePreset(presetId: string, patch: Partial<ModelEffortPreset>) {
-    onUpdate({
-      presets: (p.presets ?? []).map((pr) => (pr.id === presetId ? { ...pr, ...patch } : pr)),
-    })
+    const updatedPresets = (p.presets ?? []).map((pr) => (pr.id === presetId ? { ...pr, ...patch } : pr))
+    const patchObj: Partial<AiProviderConfig> = { presets: updatedPresets }
+    
+    // If updating the active preset, sync default model and effort
+    if (p.selectedPresetId === presetId) {
+      const activePr = updatedPresets.find((pr) => pr.id === presetId)
+      if (activePr) {
+        patchObj.model = activePr.model
+        patchObj.effort = activePr.effort
+      }
+    }
+    onUpdate(patchObj)
   }
 
   function addPreset() {
-    onUpdate({ presets: [...(p.presets ?? []), emptyPreset()] })
+    const newPreset = emptyPreset()
+    const nextPresets = [...(p.presets ?? []), newPreset]
+    const patchObj: Partial<AiProviderConfig> = { presets: nextPresets }
+    if (!p.selectedPresetId) {
+      patchObj.selectedPresetId = newPreset.id
+    }
+    onUpdate(patchObj)
     setPresetsExpanded(true)
   }
 
   function removePreset(presetId: string) {
-    onUpdate({ presets: (p.presets ?? []).filter((pr) => pr.id !== presetId) })
+    const nextPresets = (p.presets ?? []).filter((pr) => pr.id !== presetId)
+    const patchObj: Partial<AiProviderConfig> = { presets: nextPresets }
+    if (p.selectedPresetId === presetId) {
+      const nextActive = nextPresets[0]
+      patchObj.selectedPresetId = nextActive?.id
+      patchObj.model = nextActive?.model ?? ''
+      patchObj.effort = nextActive?.effort
+    }
+    onUpdate(patchObj)
+  }
+
+  function selectPreset(presetId: string) {
+    const selected = (p.presets ?? []).find((pr) => pr.id === presetId)
+    onUpdate({
+      selectedPresetId: presetId,
+      model: selected?.model ?? p.model,
+      effort: selected?.effort ?? p.effort,
+    })
   }
 
   const presetCount = p.presets?.length ?? 0
+  const kindOpts = p.providerKindId ? PROVIDER_OPTIONS[p.providerKindId] : PROVIDER_OPTIONS.custom
 
   return (
     <div className="card flex flex-col gap-3">
@@ -192,7 +245,7 @@ function ProviderCard({ provider: p, onUpdate, onRemove }: ProviderCardProps) {
               className="input w-[170px] flex-none"
               value={p.providerKindId ?? 'custom'}
               onChange={(e) =>
-                onUpdate({ providerKindId: e.target.value as ProviderKindId, presets: [] })
+                onUpdate({ providerKindId: e.target.value as ProviderKindId, presets: [], selectedPresetId: undefined })
               }
             >
               {(Object.keys(PROVIDER_KIND_LABELS) as ProviderKindId[]).map((k) => (
@@ -204,58 +257,96 @@ function ProviderCard({ provider: p, onUpdate, onRemove }: ProviderCardProps) {
           </>
         )}
 
+        {/* Default Model & Effort inline fields (Restored for review point 2) */}
+        {kindOpts.models.length > 0 ? (
+          <select
+            className="input w-[160px] flex-none"
+            value={p.model ?? ''}
+            onChange={(e) => onUpdate({ model: e.target.value })}
+          >
+            <option value="">Model: default</option>
+            {kindOpts.models.map((m) => (
+              <option key={m.value} value={m.value}>
+                {m.label}
+              </option>
+            ))}
+          </select>
+        ) : (
+          <input
+            className="input w-[140px] flex-none"
+            placeholder="Model (optional)"
+            value={p.model ?? ''}
+            onChange={(e) => onUpdate({ model: e.target.value })}
+          />
+        )}
+
+        <select
+          className="input w-[120px] flex-none"
+          value={p.effort ?? ''}
+          onChange={(e) =>
+            onUpdate({ effort: (e.target.value || undefined) as AiProviderConfig['effort'] })
+          }
+        >
+          <option value="">Effort: —</option>
+          <option value="low">Low</option>
+          <option value="medium">Medium</option>
+          <option value="high">High</option>
+          <option value="xhigh">X-High</option>
+          <option value="max">Max</option>
+        </select>
+
         <button onClick={onRemove} className="btn btn-ghost shrink-0">
           Remove
         </button>
       </div>
 
-      {/* ── Presets section (CLI only) ── */}
-      {p.kind === 'cli' && (
-        <div>
-          <div className="flex items-center justify-between gap-2 mb-2">
-            <button
-              className="flex items-center gap-1 text-xs text-muted hover:text-[var(--color-text)] transition-colors"
-              onClick={() => setPresetsExpanded((v) => !v)}
-            >
-              <span style={{ display: 'inline-block', transform: presetsExpanded ? 'rotate(90deg)' : 'none', transition: 'transform 0.15s' }}>▶</span>
-              Model / Effort presets
-              {presetCount > 0 && (
-                <span className="ml-1 rounded-full bg-[var(--color-accent)] px-1.5 py-0.5 text-[10px] text-white">
-                  {presetCount}
-                </span>
-              )}
-            </button>
-            <button onClick={addPreset} className="btn btn-secondary text-xs">
-              + Add preset
-            </button>
-          </div>
-
-          {presetsExpanded && (
-            <div className="flex flex-col gap-2 pl-2">
-              {(p.presets ?? []).length === 0 ? (
-                <p className="text-muted text-xs">No presets yet. Click "+ Add preset" to add one.</p>
-              ) : (
-                (p.presets ?? []).map((pr) => (
-                  <PresetRow
-                    key={pr.id}
-                    preset={pr}
-                    kindId={p.providerKindId}
-                    onChange={(patch) => updatePreset(pr.id, patch)}
-                    onRemove={() => removePreset(pr.id)}
-                  />
-                ))
-              )}
-            </div>
-          )}
+      {/* ── Presets section (CLI & API) ── */}
+      <div>
+        <div className="flex items-center justify-between gap-2 mb-2">
+          <button
+            className="flex items-center gap-1 text-xs text-muted hover:text-[var(--color-text)] transition-colors"
+            onClick={() => setPresetsExpanded((v) => !v)}
+          >
+            <span style={{ display: 'inline-block', transform: presetsExpanded ? 'rotate(90deg)' : 'none', transition: 'transform 0.15s' }}>▶</span>
+            Model / Effort presets
+            {presetCount > 0 && (
+              <span className="ml-1 rounded-full bg-[var(--color-accent)] px-1.5 py-0.5 text-[10px] text-white">
+                {presetCount}
+              </span>
+            )}
+          </button>
+          <button onClick={addPreset} className="btn btn-secondary text-xs">
+            + Add preset
+          </button>
         </div>
-      )}
+
+        {presetsExpanded && (
+          <div className="flex flex-col gap-2 pl-2">
+            {(p.presets ?? []).length === 0 ? (
+              <p className="text-muted text-xs">No presets yet. Click "+ Add preset" to add one.</p>
+            ) : (
+              (p.presets ?? []).map((pr) => (
+                <PresetRow
+                  key={pr.id}
+                  preset={pr}
+                  kindId={p.providerKindId}
+                  isSelected={p.selectedPresetId === pr.id}
+                  onSelect={() => selectPreset(pr.id)}
+                  onChange={(patch) => updatePreset(pr.id, patch)}
+                  onRemove={() => removePreset(pr.id)}
+                />
+              ))
+            )}
+          </div>
+        )}
+      </div>
     </div>
   )
 }
 
 // ─── GlobalSettings ────────────────────────────────────────────────────────────
 
-export default function GlobalSettings() {
+export default function GlobalSettings({ theme, onThemeChange }: GlobalSettingsProps) {
   const [githubToken, setGithubToken] = useState('')
   const [providers, setProviders] = useState<AiProviderConfig[]>([])
   const [savedMessage, setSavedMessage] = useState('')
@@ -300,6 +391,24 @@ export default function GlobalSettings() {
     <div>
       <h2>Global settings</h2>
       <p className="text-muted mb-4 text-sm">Applies across every registered project.</p>
+
+      <div className="mb-4">
+        <h3 className="!mb-2">Appearance</h3>
+        <div className="tabs">
+          {THEME_OPTIONS.map((opt) => (
+            <button
+              key={opt.value}
+              className={`tab ${theme === opt.value ? 'active' : ''}`}
+              onClick={() => onThemeChange(opt.value)}
+            >
+              {opt.label}
+            </button>
+          ))}
+        </div>
+        <p className="text-muted -mt-2 text-xs">
+          "System" follows your OS light/dark setting and updates automatically if it changes.
+        </p>
+      </div>
 
       <div className="field mb-4 max-w-[420px]">
         <label>GitHub token</label>

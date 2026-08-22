@@ -1,6 +1,9 @@
 import { useEffect, useState } from 'react'
-import type { AiProviderConfig } from '../../core/ai/types'
+import type { AgentStage, AiProviderConfig } from '../../core/ai/types'
 import type { ThemePreference } from '../../core/store'
+
+const ALL_STAGES: AgentStage[] = ['issue', 'pr', 'review', 'merge']
+const STAGE_LABELS: Record<AgentStage, string> = { issue: 'Issue', pr: 'PR', review: 'Review', merge: 'Merge' }
 
 interface GlobalSettingsProps {
   theme: ThemePreference
@@ -124,71 +127,103 @@ export default function GlobalSettings({ theme, onThemeChange }: GlobalSettingsP
 
       <div className="mb-4 flex flex-col gap-2">
         {providers.map((p) => (
-          <div key={p.id} className="card flex-row flex-wrap items-center gap-2">
-            <input
-              className="input min-w-[140px] flex-1"
-              placeholder="Name"
-              value={p.name}
-              onChange={(e) => updateProvider(p.id, { name: e.target.value })}
-            />
-            <select
-              className="input w-[130px] flex-none"
-              value={p.kind}
-              onChange={(e) => updateProvider(p.id, { kind: e.target.value as 'api' | 'cli' })}
-            >
-              <option value="api">API (BYOK)</option>
-              <option value="cli">CLI</option>
-            </select>
-
-            {p.kind === 'api' ? (
-              <>
-                <select
-                  className="input w-[150px] flex-none"
-                  value={p.apiFormat ?? 'anthropic'}
-                  onChange={(e) => updateProvider(p.id, { apiFormat: e.target.value as 'anthropic' | 'openai' })}
-                >
-                  <option value="anthropic">Anthropic</option>
-                  <option value="openai">OpenAI-compatible</option>
-                </select>
-                <input
-                  className="input min-w-[140px] flex-1"
-                  placeholder="API key"
-                  type="password"
-                  value={p.apiKey ?? ''}
-                  onChange={(e) => updateProvider(p.id, { apiKey: e.target.value })}
-                />
-              </>
-            ) : (
+          <div key={p.id} className="card flex flex-col gap-2">
+            <div className="flex flex-row flex-wrap items-center gap-2">
               <input
-                className="input min-w-[180px] flex-1"
-                placeholder="Command (e.g. claude)"
-                value={p.command ?? ''}
-                onChange={(e) => updateProvider(p.id, { command: e.target.value })}
+                className="input min-w-[140px] flex-1"
+                placeholder="Name"
+                value={p.name}
+                onChange={(e) => updateProvider(p.id, { name: e.target.value })}
               />
-            )}
+              <select
+                className="input w-[130px] flex-none"
+                value={p.kind}
+                onChange={(e) => updateProvider(p.id, { kind: e.target.value as 'api' | 'cli' })}
+              >
+                <option value="api">API (BYOK)</option>
+                <option value="cli">CLI</option>
+              </select>
 
-            <input
-              className="input w-[130px] flex-none"
-              placeholder="Model (optional)"
-              value={p.model ?? ''}
-              onChange={(e) => updateProvider(p.id, { model: e.target.value })}
-            />
-            <select
-              className="input w-[110px] flex-none"
-              value={p.effort ?? ''}
-              onChange={(e) =>
-                updateProvider(p.id, { effort: (e.target.value || undefined) as AiProviderConfig['effort'] })
-              }
-            >
-              <option value="">Effort: —</option>
-              <option value="low">Low</option>
-              <option value="medium">Medium</option>
-              <option value="high">High</option>
-            </select>
+              {p.kind === 'api' ? (
+                <>
+                  <select
+                    className="input w-[150px] flex-none"
+                    value={p.apiFormat ?? 'anthropic'}
+                    onChange={(e) => updateProvider(p.id, { apiFormat: e.target.value as 'anthropic' | 'openai' })}
+                  >
+                    <option value="anthropic">Anthropic</option>
+                    <option value="openai">OpenAI-compatible</option>
+                  </select>
+                  <input
+                    className="input min-w-[140px] flex-1"
+                    placeholder="API key"
+                    type="password"
+                    value={p.apiKey ?? ''}
+                    onChange={(e) => updateProvider(p.id, { apiKey: e.target.value })}
+                  />
+                </>
+              ) : (
+                <input
+                  className="input min-w-[180px] flex-1"
+                  placeholder="Command (e.g. claude)"
+                  value={p.command ?? ''}
+                  onChange={(e) => updateProvider(p.id, { command: e.target.value })}
+                />
+              )}
 
-            <button onClick={() => removeProvider(p.id)} className="btn btn-ghost shrink-0">
-              Remove
-            </button>
+              <input
+                className="input w-[130px] flex-none"
+                placeholder="Model (optional)"
+                value={p.model ?? ''}
+                onChange={(e) => updateProvider(p.id, { model: e.target.value })}
+              />
+              <select
+                className="input w-[110px] flex-none"
+                value={p.effort ?? ''}
+                onChange={(e) =>
+                  updateProvider(p.id, { effort: (e.target.value || undefined) as AiProviderConfig['effort'] })
+                }
+              >
+                <option value="">Effort: —</option>
+                <option value="low">Low</option>
+                <option value="medium">Medium</option>
+                <option value="high">High</option>
+              </select>
+
+              <button onClick={() => removeProvider(p.id)} className="btn btn-ghost shrink-0">
+                Remove
+              </button>
+            </div>
+
+            {/* Stage restrictions — leave all unchecked to allow any stage (unrestricted). */}
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
+              <span className="text-muted">Allowed stages:</span>
+              {ALL_STAGES.map((stage) => {
+                const isRestricted = !!(p.allowedStages && p.allowedStages.length > 0)
+                return (
+                  <label key={stage} className="flex items-center gap-1">
+                    <input
+                      type="checkbox"
+                      checked={isRestricted ? p.allowedStages!.includes(stage) : false}
+                      onChange={(e) => {
+                        const current = p.allowedStages && p.allowedStages.length > 0 ? p.allowedStages : []
+                        const next = e.target.checked
+                          ? [...current, stage]
+                          : current.filter((s) => s !== stage)
+                        // An empty selection means unrestricted — store as undefined to keep configs clean.
+                        updateProvider(p.id, { allowedStages: next.length > 0 ? next : undefined })
+                      }}
+                    />
+                    {STAGE_LABELS[stage]}
+                  </label>
+                )
+              })}
+              <span className="text-muted italic">
+                {!p.allowedStages || p.allowedStages.length === 0
+                  ? '(all stages — unrestricted)'
+                  : `restricted to: ${p.allowedStages.map((s) => STAGE_LABELS[s]).join(', ')}`}
+              </span>
+            </div>
           </div>
         ))}
         {providers.length === 0 && <p className="text-muted">No AI providers registered yet.</p>}

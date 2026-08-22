@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { WorkflowEngine, type RepoRef } from './workflow-engine.ts'
-import type { AiProviderConfig } from './ai/types.ts'
+import type { AgentStage, AiProviderConfig } from './ai/types.ts'
 import type { GithubService } from './github-service.ts'
 
 vi.mock('./ai/index.ts', () => ({
@@ -13,8 +13,16 @@ vi.mock('./ai/index.ts', () => ({
 
 const repo: RepoRef = { owner: 'acme', repo: 'widgets' }
 
-function makeProvider(id: string): AiProviderConfig {
-  return { id, name: id, kind: 'api', apiFormat: 'anthropic', apiKey: 'test-key', model: `${id}-model` }
+function makeProvider(id: string, allowedStages?: AgentStage[]): AiProviderConfig {
+  return {
+    id,
+    name: id,
+    kind: 'api',
+    apiFormat: 'anthropic',
+    apiKey: 'test-key',
+    model: `${id}-model`,
+    ...(allowedStages ? { allowedStages } : {}),
+  }
 }
 
 function makeFakeGithub(overrides: Partial<Record<string, unknown>> = {}) {
@@ -208,6 +216,81 @@ describe('WorkflowEngine', () => {
 
       const current = engine.getTasks().find((t) => t.id === task.id)!
       expect(current.error).toMatch(/unknown provider/i)
+    })
+  })
+
+  describe('allowedStages', () => {
+    it('restricts a provider to only its allowed stages, routing other stages to an eligible provider', async () => {
+      const github = makeFakeGithub()
+      const engine = new WorkflowEngine(github)
+      // agent-a may only run the review stage; agent-b handles everything else.
+      engine.setProviders([makeProvider('agent-a', ['review']), makeProvider('agent-b')])
+
+      const task = engine.enqueue('Add feature T', repo)
+      await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'done')
+
+      const finished = engine.getTasks().find((t) => t.id === task.id)!
+      expect(finished.history).toHaveLength(4)
+      expect(finished.history.map((h) => h.stage)).toEqual(['issue', 'pr', 'review', 'merge'])
+
+      // agent-a must only appear at the review stage.
+      expect(finished.history.find((h) => h.stage === 'review')?.agentId).toBe('agent-a')
+      expect(finished.history.filter((h) => h.agentId === 'agent-a')).toHaveLength(1)
+
+      // Stages that are not review must be handled by agent-b (the only unrestricted provider).
+      for (const step of finished.history.filter((h) => h.stage !== 'review')) {
+        expect(step.agentId).toBe('agent-b')
+      }
+
+      // Maker-checker is best-effort when only one provider is eligible for a stage; what we can
+      // assert is that stage-eligible selection is honoured: agent-a never appears outside review.
+    })
+
+    it('fails clearly when no provider is configured for the current stage', async () => {
+      const github = makeFakeGithub()
+      const engine = new WorkflowEngine(github)
+      // agent-a is only allowed to run `issue`; no provider can handle `pr` onward.
+      engine.setProviders([makeProvider('agent-a', ['issue'])])
+
+      const task = engine.enqueue('Add feature U', repo)
+      await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'error')
+
+      const current = engine.getTasks().find((t) => t.id === task.id)!
+      // issue succeeds, pr fails because no provider is eligible.
+      expect(current.history).toHaveLength(1)
+      expect(current.stage).toBe('pr')
+      expect(current.error).toMatch(/no ai provider is configured to handle the "pr" stage/i)
+    })
+
+    it('fails clearly when a provider override names a provider not eligible for the target stage', async () => {
+      const github = makeFakeGithub()
+      const engine = new WorkflowEngine(github)
+      // agent-a is only for review; agent-b handles everything.
+      engine.setProviders([makeProvider('agent-a', ['review']), makeProvider('agent-b')])
+
+      // Explicitly request agent-a (review-only) for a task that starts at the issue stage.
+      const task = engine.enqueue('Add feature V', repo, true, { providerId: 'agent-a' })
+      await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'error')
+
+      const current = engine.getTasks().find((t) => t.id === task.id)!
+      expect(current.stage).toBe('issue')
+      expect(current.error).toMatch(/not configured to handle the "issue" stage/i)
+    })
+
+    it('permits a provider with an empty allowedStages array to run any stage (same as absent)', async () => {
+      const github = makeFakeGithub()
+      const engine = new WorkflowEngine(github)
+      // Empty array should behave identically to no restriction.
+      engine.setProviders([makeProvider('agent-a', []), makeProvider('agent-b', [])])
+
+      const task = engine.enqueue('Add feature W2', repo)
+      await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'done')
+
+      const finished = engine.getTasks().find((t) => t.id === task.id)!
+      expect(finished.history).toHaveLength(4)
+      for (let i = 1; i < finished.history.length; i++) {
+        expect(finished.history[i].agentId).not.toBe(finished.history[i - 1].agentId)
+      }
     })
   })
 })

@@ -1,11 +1,15 @@
 import { randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { createAiProvider } from './ai/index.ts'
-import type { AiEffort, AiProviderConfig } from './ai/types.ts'
+import type { AgentStage, AiEffort, AiProviderConfig } from './ai/types.ts'
 import type { GithubService } from './github-service.ts'
 import { ensureClone, checkoutBranch, hasChanges, commitAndPush } from './git-workspace.ts'
 
-export type WorkflowStageName = 'issue' | 'pr' | 'review' | 'merge'
+/**
+ * Re-export of AgentStage for backward compatibility. The canonical definition lives in
+ * core/ai/types.ts alongside AiProviderConfig (to avoid circular imports).
+ */
+export type WorkflowStageName = AgentStage
 
 const STAGE_ORDER: WorkflowStageName[] = ['issue', 'pr', 'review', 'merge']
 
@@ -259,21 +263,46 @@ export class WorkflowEngine extends EventEmitter {
    * is only an error if honoring maker-checker would require a distinct provider that doesn't exist.
    * `model`/`effort` overrides are applied on top of whichever provider is selected, on a copy — the
    * caller's stored provider config is never mutated.
+   *
+   * Per-provider `allowedStages` restrictions narrow the candidate pool before maker-checker runs.
+   * A provider whose `allowedStages` is absent or empty is eligible for every stage. When no
+   * stage-eligible provider exists at all, a clear error is thrown so the task lands in `error`
+   * (retryable after the operator adds or reconfigures a provider).
    */
   private selectAgent(task: QueuedTask): AiProviderConfig {
     if (this.providers.length === 0) throw new Error('No AI providers registered')
     const previousAgentId = task.history[task.history.length - 1]?.agentId
     const override = task.providerOverride
 
+    // Filter to providers whose allowedStages permit the current stage.
+    const stageEligible = this.providers.filter(
+      (p) => !p.allowedStages || p.allowedStages.length === 0 || p.allowedStages.includes(task.stage),
+    )
+    if (stageEligible.length === 0) {
+      throw new Error(
+        `No AI provider is configured to handle the "${task.stage}" stage — ` +
+          `add a provider without stage restrictions, or enable this stage for an existing provider.`,
+      )
+    }
+
     let base: AiProviderConfig
     if (override?.providerId) {
-      const preferred = this.providers.find((p) => p.id === override.providerId)
-      if (!preferred) throw new Error(`Provider override references unknown provider: ${override.providerId}`)
+      // Check existence across all registered providers first so the error message is accurate.
+      const allRegistered = this.providers.find((p) => p.id === override.providerId)
+      if (!allRegistered) throw new Error(`Provider override references unknown provider: ${override.providerId}`)
+
+      const preferred = stageEligible.find((p) => p.id === override.providerId)
+      if (!preferred) {
+        throw new Error(
+          `Provider override "${override.providerId}" is not configured to handle the "${task.stage}" ` +
+            `stage — update its allowed-stages setting or choose a different provider.`,
+        )
+      }
 
       if (preferred.id !== previousAgentId) {
         base = preferred
       } else {
-        const alternative = this.providers.find((p) => p.id !== previousAgentId)
+        const alternative = stageEligible.find((p) => p.id !== previousAgentId)
         if (!alternative) {
           throw new Error(
             `Provider override "${override.providerId}" handled the immediately preceding stage and no other ` +
@@ -283,8 +312,11 @@ export class WorkflowEngine extends EventEmitter {
         base = alternative
       }
     } else {
-      const candidates = this.providers.filter((p) => p.id !== previousAgentId)
-      base = candidates[0] ?? this.providers[0]
+      // Prefer a provider that didn't just run (maker-checker), from the stage-eligible pool.
+      const candidates = stageEligible.filter((p) => p.id !== previousAgentId)
+      // Fall back to the first stage-eligible provider when only one is available — preserves the
+      // existing single-provider behaviour where maker-checker relaxes rather than hard-errors.
+      base = candidates[0] ?? stageEligible[0]
     }
 
     if (override?.model === undefined && override?.effort === undefined) return base

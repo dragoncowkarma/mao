@@ -1357,6 +1357,9 @@ def build_ai_argv(ai_name: str, model: str, reasoning: str,
         ]
         if allow_tool_use:
             argv.insert(1, "--dangerously-skip-permissions")
+        else:
+            argv.insert(1, "--sandbox")
+            argv.insert(2, "--dangerously-skip-permissions")
         return argv, False
 
     elif ai_name == "claude":
@@ -1377,6 +1380,8 @@ def build_ai_argv(ai_name: str, model: str, reasoning: str,
         ]
         if allow_tool_use:
             argv.append("--dangerously-skip-permissions")
+        else:
+            argv.extend(["--allowed-tools", "Bash(gh *),Bash(git *),Read"])
         return argv, True
 
     else:

@@ -124,10 +124,13 @@ function Column({
               <p className="card-title text-[15px]">{task.title}</p>
               <p className="card-meta">{new Date(task.updatedAt).toLocaleString()}</p>
               {workflowTask &&
-                currentAgent(workflowTask) &&
                 (() => {
-                  const agent = currentAgent(workflowTask)!
+                  // Don't gate the Run/Retry button on agent metadata: a task that fails during its
+                  // very first stage has `active` cleared by runStage() and no history entry yet, so
+                  // there is nothing to show here except the button itself — it must still render.
+                  const agent = currentAgent(workflowTask)
                   const label = runActionLabel(workflowTask)
+                  if (!agent && !label) return null
                   return (
                     <div
                       className="mt-1 flex items-end justify-between gap-2"
@@ -135,8 +138,8 @@ function Column({
                       onKeyDown={(e) => e.stopPropagation()}
                     >
                       <div className="flex min-w-0 flex-col gap-0.5">
-                        <p className="card-meta">{currentAgentLabel(workflowTask)}</p>
-                        {agent.prompt && (
+                        {agent && <p className="card-meta">{currentAgentLabel(workflowTask)}</p>}
+                        {agent?.prompt && (
                           <details>
                             <summary className="cursor-pointer text-xs text-muted">Prompt</summary>
                             <pre className="mt-1 max-h-40 overflow-y-auto whitespace-pre-wrap text-xs">

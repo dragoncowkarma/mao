@@ -128,13 +128,14 @@ export default function KanbanBoard({ repo }: KanbanBoardProps) {
   const [, forceTick] = useState(0)
   const [selectedTask, setSelectedTask] = useState<GithubTask | null>(null)
 
+  const loadWorkflowTasks = () =>
+    window.electronAPI.workflow
+      .list()
+      .then((all) => setWorkflowTasks(all.filter((t) => t.repo.owner === repo.owner && t.repo.repo === repo.repo)))
+
   useEffect(() => {
-    const load = () =>
-      window.electronAPI.workflow
-        .list()
-        .then((all) => setWorkflowTasks(all.filter((t) => t.repo.owner === repo.owner && t.repo.repo === repo.repo)))
-    load()
-    const interval = setInterval(load, 2000)
+    loadWorkflowTasks()
+    const interval = setInterval(loadWorkflowTasks, 2000)
     return () => clearInterval(interval)
   }, [repo.owner, repo.repo])
 
@@ -217,6 +218,11 @@ export default function KanbanBoard({ repo }: KanbanBoardProps) {
           repo={repo}
           number={selectedTask.number}
           type={selectedTask.type}
+          alreadyQueued={!!findWorkflowTask(selectedTask, workflowTasks)}
+          onEnqueued={() => {
+            loadWorkflowTasks()
+            setSelectedTask(null)
+          }}
           onClose={() => setSelectedTask(null)}
         />
       )}

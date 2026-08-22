@@ -259,6 +259,9 @@ export default function WorkflowQueue({ repo }: WorkflowQueueProps) {
           repo={repo}
           number={openTask.number}
           type={openTask.type}
+          // Every card here is already a QueuedTask by construction — no "add to workflow" action needed.
+          alreadyQueued
+          onEnqueued={() => {}}
           onClose={() => setOpenTask(null)}
         />
       )}

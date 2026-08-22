@@ -7,6 +7,10 @@ interface TaskDetailModalProps {
   /** Identifies the card that was clicked; full title/body/labels/comments are fetched on open. */
   number: number
   type: 'issue' | 'pull_request'
+  /** Whether this issue already has a QueuedTask driving it — hides the "add to workflow" action. */
+  alreadyQueued: boolean
+  /** Called after a successful enqueue so the caller can refresh its workflow task list. */
+  onEnqueued: () => void
   onClose: () => void
 }
 
@@ -15,10 +19,20 @@ interface TaskDetailModalProps {
  * already knows (number/type) immediately, then fills in from `github:fetchTaskDetail` once it
  * resolves. A "View on GitHub" link stays available for the cases the in-app view doesn't cover.
  */
-export default function TaskDetailModal({ repo, number, type, onClose }: TaskDetailModalProps) {
+export default function TaskDetailModal({
+  repo,
+  number,
+  type,
+  alreadyQueued,
+  onEnqueued,
+  onClose,
+}: TaskDetailModalProps) {
   const [detail, setDetail] = useState<GithubTaskDetail | null>(null)
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(true)
+  const [autoAdvance, setAutoAdvance] = useState(true)
+  const [enqueueing, setEnqueueing] = useState(false)
+  const [enqueueError, setEnqueueError] = useState('')
 
   useEffect(() => {
     let cancelled = false
@@ -48,6 +62,19 @@ export default function TaskDetailModal({ repo, number, type, onClose }: TaskDet
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [onClose])
+
+  async function enqueue() {
+    setEnqueueing(true)
+    setEnqueueError('')
+    try {
+      await window.electronAPI.workflow.enqueueFromIssue(repo.owner, repo.repo, number, autoAdvance)
+      onEnqueued()
+    } catch (err) {
+      setEnqueueError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setEnqueueing(false)
+    }
+  }
 
   const kicker = type === 'pull_request' ? 'Pull Request' : 'Issue'
   const fallbackUrl = `https://github.com/${repo.owner}/${repo.repo}/${type === 'pull_request' ? 'pull' : 'issues'}/${number}`
@@ -109,6 +136,28 @@ export default function TaskDetailModal({ repo, number, type, onClose }: TaskDet
                   </div>
                 ))}
               </div>
+            )}
+          </div>
+        )}
+
+        {type === 'issue' && !alreadyQueued && (
+          <div className="flex flex-col gap-2 border-t pt-3" style={{ borderColor: 'var(--color-divider)' }}>
+            <label className="flex items-center gap-2 text-xs">
+              <input
+                type="checkbox"
+                checked={autoAdvance}
+                onChange={(e) => setAutoAdvance(e.target.checked)}
+                disabled={enqueueing}
+              />
+              Auto-advance through pr → review → merge unattended
+            </label>
+            <button type="button" onClick={enqueue} disabled={enqueueing} className="btn btn-primary self-start">
+              {enqueueing ? 'Adding…' : 'Add to workflow'}
+            </button>
+            {enqueueError && (
+              <p className="text-sm" style={{ color: 'var(--color-accent-700)' }}>
+                {enqueueError}
+              </p>
             )}
           </div>
         )}

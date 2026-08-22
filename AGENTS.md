@@ -277,8 +277,7 @@ Mirror the product's own maker-checker principle in how you work:
 # MAO Operational Playbook
 
 Commands, verification workflows, and step-by-step recipes for working in this repo.
-Architecture rules, invariants, and conventions live in [AGENTS.md](AGENTS.md) — read
-that first; this file assumes you have.
+See architecture rules above.
 
 > ⚠️ Paths may contain spaces (the working copy can live on a volume like
 > `NO NAME`) — always quote paths in shell commands.

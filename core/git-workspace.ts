@@ -8,7 +8,7 @@ const execFileAsync = promisify(execFile)
 async function run(
   command: string,
   args: readonly string[],
-  options?: any,
+  options?: Parameters<typeof execFileAsync>[2],
 ): Promise<{ stdout: string; stderr: string }> {
   try {
     const { stdout, stderr } = await execFileAsync(command, args, options)
@@ -25,6 +25,9 @@ async function run(
     }
     if (err && typeof err.stdout === 'string') {
       err.stdout = err.stdout.replace(/https:\/\/x-access-token:[^@]+@/g, 'https://x-access-token:[REDACTED]@')
+    }
+    if (err && typeof err.cmd === 'string') {
+      err.cmd = err.cmd.replace(/https:\/\/x-access-token:[^@]+@/g, 'https://x-access-token:[REDACTED]@')
     }
     throw err
   }

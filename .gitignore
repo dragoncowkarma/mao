@@ -144,3 +144,11 @@ release
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+
+# Swarm Orchestrator runtime artifacts
+.worktrees/
+.agents/logs/
+.agents/.prompts/
+.agents/.process_registry.json
+__pycache__/
+*.pyc

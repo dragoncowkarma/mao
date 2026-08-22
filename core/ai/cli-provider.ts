@@ -39,17 +39,30 @@ export class CliProvider implements AiProvider {
     const { command, args = [] } = this.config
     if (!command) throw new Error(`[${this.name}] CLI command is not set`)
 
+    const effectiveModel = options?.model ?? this.config.model
+    const effectiveEffort = options?.effort ?? this.config.effort
+
     const commandName = command.split('/').pop() ?? command
+
+    const extraModelArgs: string[] = []
+    if (effectiveModel && !args.includes('--model') && !args.includes('-m')) {
+      extraModelArgs.push('--model', effectiveModel)
+    }
+    if (effectiveEffort && !args.includes('--effort')) {
+      extraModelArgs.push('--effort', effectiveEffort)
+    }
 
     let finalArgs: string[]
     let stdinInput: string
 
     if (options?.allowToolUse) {
-      finalArgs = [...args, ...(TOOL_USE_FLAGS_BY_COMMAND[commandName] ?? [])]
+      finalArgs = [...args, ...extraModelArgs, ...(TOOL_USE_FLAGS_BY_COMMAND[commandName] ?? [])]
       stdinInput = prompt
     } else {
       const systemPromptFlag = SYSTEM_PROMPT_FLAG_BY_COMMAND[commandName]
-      finalArgs = systemPromptFlag ? [systemPromptFlag, DEFAULT_SYSTEM_PROMPT, ...args] : args
+      finalArgs = systemPromptFlag
+        ? [systemPromptFlag, DEFAULT_SYSTEM_PROMPT, ...args, ...extraModelArgs]
+        : [...args, ...extraModelArgs]
       stdinInput = systemPromptFlag ? prompt : `${DEFAULT_SYSTEM_PROMPT}\n\n---\n\n${prompt}`
     }
 

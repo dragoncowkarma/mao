@@ -209,5 +209,28 @@ describe('WorkflowEngine', () => {
       const current = engine.getTasks().find((t) => t.id === task.id)!
       expect(current.error).toMatch(/unknown provider/i)
     })
+
+    it('resolves model and effort from selected preset when default model is unset', async () => {
+      const github = makeFakeGithub()
+      const engine = new WorkflowEngine(github)
+      const providerWithPreset: AiProviderConfig = {
+        id: 'agent-preset',
+        name: 'agent-preset',
+        kind: 'cli',
+        command: 'claude',
+        presets: [
+          { id: 'preset-1', model: 'claude-3-7-sonnet', effort: 'high' },
+        ],
+        selectedPresetId: 'preset-1',
+      }
+      engine.setProviders([providerWithPreset, makeProvider('agent-b')])
+
+      const task = engine.enqueue('Add feature Preset', repo, false, { providerId: 'agent-preset' })
+      await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'paused')
+
+      const current = engine.getTasks().find((t) => t.id === task.id)!
+      expect(current.history[0].model).toBe('claude-3-7-sonnet')
+      expect(current.history[0].effort).toBe('high')
+    })
   })
 })

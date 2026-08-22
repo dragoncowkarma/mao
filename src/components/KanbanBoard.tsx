@@ -36,11 +36,23 @@ function workflowBadgeLabel(task: QueuedTask): string {
 }
 
 /** The agent currently working the task, or the most recent one that touched it — for an at-a-glance "who". */
+function currentAgent(task: QueuedTask) {
+  return task.active ?? task.history[task.history.length - 1]
+}
+
+/** The agent currently working the task, or the most recent one that touched it — for an at-a-glance "who". */
 function currentAgentLabel(task: QueuedTask): string | undefined {
-  const agent = task.active ?? task.history[task.history.length - 1]
+  const agent = currentAgent(task)
   if (!agent) return undefined
   const parts = [agent.agentName, agent.model, agent.effort ? `${agent.effort} effort` : undefined].filter(Boolean)
   return parts.join(' · ')
+}
+
+/** Label for the run button when this task's stage can be (re)started right now, else undefined. */
+function runActionLabel(task: QueuedTask): string | undefined {
+  if (task.status === 'error') return 'Retry'
+  if (task.status === 'paused') return 'Run'
+  return undefined
 }
 
 function sortTasks(tasks: GithubTask[]): GithubTask[] {
@@ -65,11 +77,15 @@ function Column({
   tasks,
   workflowTasks,
   onSelectTask,
+  onRunTask,
+  runningTaskId,
 }: {
   title: string
   tasks: GithubTask[]
   workflowTasks: QueuedTask[]
   onSelectTask: (task: GithubTask) => void
+  onRunTask: (task: QueuedTask) => void
+  runningTaskId: string | null
 }) {
   return (
     <div>
@@ -107,9 +123,44 @@ function Column({
               </div>
               <p className="card-title text-[15px]">{task.title}</p>
               <p className="card-meta">{new Date(task.updatedAt).toLocaleString()}</p>
-              {workflowTask && currentAgentLabel(workflowTask) && (
-                <p className="card-meta">{currentAgentLabel(workflowTask)}</p>
-              )}
+              {workflowTask &&
+                (() => {
+                  // Don't gate the Run/Retry button on agent metadata: a task that fails during its
+                  // very first stage has `active` cleared by runStage() and no history entry yet, so
+                  // there is nothing to show here except the button itself — it must still render.
+                  const agent = currentAgent(workflowTask)
+                  const label = runActionLabel(workflowTask)
+                  if (!agent && !label) return null
+                  return (
+                    <div
+                      className="mt-1 flex items-end justify-between gap-2"
+                      onClick={(e) => e.stopPropagation()}
+                      onKeyDown={(e) => e.stopPropagation()}
+                    >
+                      <div className="flex min-w-0 flex-col gap-0.5">
+                        {agent && <p className="card-meta">{currentAgentLabel(workflowTask)}</p>}
+                        {agent?.prompt && (
+                          <details>
+                            <summary className="cursor-pointer text-xs text-muted">Prompt</summary>
+                            <pre className="mt-1 max-h-40 overflow-y-auto whitespace-pre-wrap text-xs">
+                              {agent.prompt}
+                            </pre>
+                          </details>
+                        )}
+                      </div>
+                      {label && (
+                        <button
+                          type="button"
+                          onClick={() => onRunTask(workflowTask)}
+                          disabled={runningTaskId === workflowTask.id}
+                          className="btn btn-primary shrink-0 px-2.5 py-1 text-xs"
+                        >
+                          {runningTaskId === workflowTask.id ? 'Running…' : label}
+                        </button>
+                      )}
+                    </div>
+                  )
+                })()}
             </div>
           )
         })}
@@ -127,6 +178,7 @@ export default function KanbanBoard({ repo }: KanbanBoardProps) {
   const [refreshing, setRefreshing] = useState(false)
   const [, forceTick] = useState(0)
   const [selectedTask, setSelectedTask] = useState<GithubTask | null>(null)
+  const [runningTaskId, setRunningTaskId] = useState<string | null>(null)
 
   const loadWorkflowTasks = () =>
     window.electronAPI.workflow
@@ -138,6 +190,20 @@ export default function KanbanBoard({ repo }: KanbanBoardProps) {
     const interval = setInterval(loadWorkflowTasks, 2000)
     return () => clearInterval(interval)
   }, [repo.owner, repo.repo])
+
+  /** Runs the assigned agent's current stage right now: retries an errored task, or advances a paused one. */
+  async function runTask(task: QueuedTask) {
+    setRunningTaskId(task.id)
+    try {
+      if (task.status === 'error') await window.electronAPI.workflow.retry(task.id)
+      else if (task.status === 'paused') await window.electronAPI.workflow.advance(task.id)
+      await loadWorkflowTasks()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setRunningTaskId(null)
+    }
+  }
 
   useEffect(() => {
     let cancelled = false
@@ -204,12 +270,21 @@ export default function KanbanBoard({ repo }: KanbanBoardProps) {
 
       {error && <p className="mt-2 text-xs" style={{ color: 'var(--color-accent-700)' }}>{error}</p>}
       <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2">
-        <Column title="Issues" tasks={issues} workflowTasks={workflowTasks} onSelectTask={setSelectedTask} />
+        <Column
+          title="Issues"
+          tasks={issues}
+          workflowTasks={workflowTasks}
+          onSelectTask={setSelectedTask}
+          onRunTask={runTask}
+          runningTaskId={runningTaskId}
+        />
         <Column
           title="Pull Requests"
           tasks={pullRequests}
           workflowTasks={workflowTasks}
           onSelectTask={setSelectedTask}
+          onRunTask={runTask}
+          runningTaskId={runningTaskId}
         />
       </div>
 

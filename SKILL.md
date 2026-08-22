@@ -195,7 +195,7 @@ Two traps:
    local `main` ref can lag the remote by many commits. Note the exact base
    SHA, and check for an existing same-scope PR to reuse
    (`gh pr list --repo <owner>/<repo>`) instead of opening a duplicate.
-   Branch names: `feature/<topic>` or `claude/<topic>-<hex>`.
+   Branch names: see `.agents/rules/git-conventions.md` (`<type>/<issue-number>-<kebab-description>` for manual branches, or automated agent/workflow prefixes).
 2. Stage only the paths the task intended — avoid `git add -A` in a worktree
    that may hold unrelated changes. Never stage: `.env*`, `dist/`,
    `dist-electron/`, `dist-cli/`, `release/`, store/config files, or anything

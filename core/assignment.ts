@@ -15,15 +15,17 @@ const ROLE_TAG_PATTERN = /\[\s*(worker|reviewer|maintainer)\s*:\s*([^\]\s|]+)\s*
 
 /**
  * Strips markdown constructs that commonly *quote* or *illustrate* this exact tag syntax rather than
- * declare it — fenced code blocks, inline code spans, HTML comments, and blockquote lines — before tag
- * matching runs. Without this, an issue that merely documents the `[Worker: id]` format (in a code
- * fence, inline code, or an issue-template HTML-comment hint) would have that example text parsed as a
- * real directive. This is a coarse, not fully markdown-spec-accurate, filter — good enough to rule out
- * the common cases without needing a full markdown parser.
+ * declare it — fenced code blocks (GFM allows both ``` and ~~~ as fence characters, so both are
+ * matched, requiring the closing fence to reuse the exact opening delimiter via a backreference),
+ * inline code spans, HTML comments, and blockquote lines — before tag matching runs. Without this, an
+ * issue that merely documents the `[Worker: id]` format (in a code fence, inline code, or an
+ * issue-template HTML-comment hint) would have that example text parsed as a real directive. This is a
+ * coarse, not fully markdown-spec-accurate, filter — good enough to rule out the common cases without
+ * needing a full markdown parser.
  */
 function stripQuotedText(text: string): string {
   return text
-    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/(`{3,}|~{3,})[\s\S]*?\1/g, ' ')
     .replace(/`[^`\n]*`/g, ' ')
     .replace(/<!--[\s\S]*?-->/g, ' ')
     .replace(/^\s*>.*$/gm, ' ')

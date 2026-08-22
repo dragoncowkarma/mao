@@ -48,8 +48,13 @@ describe('parseAssignmentTags', () => {
     expect(parseAssignmentTags('[Worker: my provider] [Reviewer: agent-b]')).toEqual({ reviewer: 'agent-b' })
   })
 
-  it('ignores a tag written inside a fenced code block', () => {
+  it('ignores a tag written inside a backtick-fenced code block', () => {
     const body = 'Here is the format:\n```\n[Worker: example-id]\n```\nDon\'t assign anyone yet.'
+    expect(parseAssignmentTags(body)).toEqual({})
+  })
+
+  it('ignores a tag written inside a tilde-fenced code block (GFM allows ~~~ as well as ```)', () => {
+    const body = 'Here is the format:\n~~~\n[Worker: example-id]\n~~~\nDon\'t assign anyone yet.'
     expect(parseAssignmentTags(body)).toEqual({})
   })
 

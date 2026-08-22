@@ -26,6 +26,8 @@
 - [ ] `npm run lint` passes (`tsc --noEmit`)
 - [ ] `npm run test` passes (vitest)
 - [ ] `npm run test:origin` passes
+- [ ] `npx vite build` passes
+- [ ] `npm run build:cli` passes (if `cli/` or `core/` changed)
 - [ ] I have not committed `.env`, tokens, or API keys
 
 ### Architecture (see AGENTS.md)

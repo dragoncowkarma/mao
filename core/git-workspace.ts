@@ -3,7 +3,35 @@ import { promisify } from 'node:util'
 import fs from 'node:fs'
 import path from 'node:path'
 
-const run = promisify(execFile)
+const execFileAsync = promisify(execFile)
+
+async function run(
+  command: string,
+  args: readonly string[],
+  options?: Parameters<typeof execFileAsync>[2],
+): Promise<{ stdout: string; stderr: string }> {
+  try {
+    const { stdout, stderr } = await execFileAsync(command, args, options)
+    return {
+      stdout: typeof stdout === 'string' ? stdout : stdout.toString('utf8'),
+      stderr: typeof stderr === 'string' ? stderr : stderr.toString('utf8'),
+    }
+  } catch (err: any) {
+    if (err && typeof err.message === 'string') {
+      err.message = err.message.replace(/https:\/\/x-access-token:[^@]+@/g, 'https://x-access-token:[REDACTED]@')
+    }
+    if (err && typeof err.stderr === 'string') {
+      err.stderr = err.stderr.replace(/https:\/\/x-access-token:[^@]+@/g, 'https://x-access-token:[REDACTED]@')
+    }
+    if (err && typeof err.stdout === 'string') {
+      err.stdout = err.stdout.replace(/https:\/\/x-access-token:[^@]+@/g, 'https://x-access-token:[REDACTED]@')
+    }
+    if (err && typeof err.cmd === 'string') {
+      err.cmd = err.cmd.replace(/https:\/\/x-access-token:[^@]+@/g, 'https://x-access-token:[REDACTED]@')
+    }
+    throw err
+  }
+}
 
 function repoDir(root: string, owner: string, repo: string): string {
   return path.join(root, `${owner}__${repo}`)

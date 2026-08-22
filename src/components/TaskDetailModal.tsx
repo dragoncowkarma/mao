@@ -63,11 +63,35 @@ export default function TaskDetailModal({
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [onClose])
 
+  /**
+   * enqueueFromIssue() returns as soon as the task is queued — it never awaits the stage that
+   * `processQueue()` kicks off in the background, so init failures (e.g. no AI providers
+   * registered) never reach this call's try/catch. Those failures set status: 'error' inside
+   * runStage() essentially synchronously (before any await), so a short poll of the freshly
+   * created task is enough to catch them and show them inline instead of silently closing the
+   * modal and leaving the user to notice the failed card later in the queue.
+   */
+  async function waitForImmediateFailure(taskId: string): Promise<string | null> {
+    for (let i = 0; i < 10; i++) {
+      const tasks = await window.electronAPI.workflow.list()
+      const task = tasks.find((t) => t.id === taskId)
+      if (task?.status === 'error') return task.error ?? 'Task failed to start'
+      if (task && task.status !== 'pending') return null
+      await new Promise((r) => setTimeout(r, 150))
+    }
+    return null
+  }
+
   async function enqueue() {
     setEnqueueing(true)
     setEnqueueError('')
     try {
-      await window.electronAPI.workflow.enqueueFromIssue(repo.owner, repo.repo, number, autoAdvance)
+      const task = await window.electronAPI.workflow.enqueueFromIssue(repo.owner, repo.repo, number, autoAdvance)
+      const immediateError = await waitForImmediateFailure(task.id)
+      if (immediateError) {
+        setEnqueueError(immediateError)
+        return
+      }
       onEnqueued()
     } catch (err) {
       setEnqueueError(err instanceof Error ? err.message : String(err))

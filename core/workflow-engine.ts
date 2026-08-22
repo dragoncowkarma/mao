@@ -287,11 +287,14 @@ export class WorkflowEngine extends EventEmitter {
       base = candidates[0] ?? this.providers[0]
     }
 
-    if (override?.model === undefined && override?.effort === undefined) return base
+    const activePreset = base.presets?.find((p) => p.id === base.selectedPresetId) ?? base.presets?.[0]
+    const effectiveModel = override?.model !== undefined ? override.model : (base.model || activePreset?.model)
+    const effectiveEffort = override?.effort !== undefined ? override.effort : (base.effort || activePreset?.effort)
+
     return {
       ...base,
-      ...(override.model !== undefined ? { model: override.model } : {}),
-      ...(override.effort !== undefined ? { effort: override.effort } : {}),
+      model: effectiveModel,
+      effort: effectiveEffort,
     }
   }
 
@@ -338,7 +341,7 @@ export class WorkflowEngine extends EventEmitter {
       } else {
         prompt = buildPromptForStage(task)
         const provider = createAiProvider(agentConfig)
-        output = await provider.run(prompt)
+        output = await provider.run(prompt, { model: agentConfig.model, effort: agentConfig.effort })
         await this.applyGithubAction(task, output)
       }
 
@@ -389,7 +392,12 @@ export class WorkflowEngine extends EventEmitter {
     if (task.active) task.active.prompt = prompt
     this.notify()
 
-    const output = await createAiProvider(agentConfig).run(prompt, { cwd: dir, allowToolUse: true })
+    const output = await createAiProvider(agentConfig).run(prompt, {
+      cwd: dir,
+      allowToolUse: true,
+      model: agentConfig.model,
+      effort: agentConfig.effort,
+    })
 
     if (await hasChanges(dir)) {
       await commitAndPush(dir, branch, `Implement: ${task.title}`)

@@ -63,6 +63,11 @@ describe('parseAssignmentTags', () => {
     expect(parseAssignmentTags(body)).toEqual({ worker: 'agent-real' })
   })
 
+  it('recognizes a closing fence longer than the opening one (CommonMark allows this)', () => {
+    expect(parseAssignmentTags('~~~\n[Worker: example-id]\n~~~~')).toEqual({})
+    expect(parseAssignmentTags('```\n[Worker: example-id]\n````')).toEqual({})
+  })
+
   it('ignores a tag written inside an inline code span', () => {
     expect(parseAssignmentTags('Use the tag like `[Worker: example-id]` in your issue.')).toEqual({})
   })

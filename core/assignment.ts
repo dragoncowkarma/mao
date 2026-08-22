@@ -13,25 +13,50 @@ import type { WorkflowRoleAssignment } from './workflow-engine.ts'
  */
 const ROLE_TAG_PATTERN = /\[\s*(worker|reviewer|maintainer)\s*:\s*([^\]\s|]+)\s*\]/gi
 
+const FENCE_OPEN_LINE = /^[ \t]{0,3}(`{3,}|~{3,})/
+
+/**
+ * Blanks out fenced code blocks line by line, tracking open/close state explicitly rather than trying
+ * to express GFM's fence rule as a single regex (two attempts at that both had real bugs — see git
+ * history). The rule being implemented: a fence opens on a line that (after up to 3 spaces of
+ * indentation) starts with 3+ of the same character (backtick or tilde); it closes on the next such
+ * line using the *same character*, with a run length *at least* as long as the opening's (not
+ * necessarily identical — CommonMark explicitly allows a longer closing fence), and nothing else but
+ * trailing whitespace. An unterminated fence is treated as extending to the end of the text. This is a
+ * coarse, not fully markdown-spec-accurate, filter — good enough to rule out the common cases without
+ * needing a full markdown parser.
+ */
+function stripFencedCodeBlocks(text: string): string {
+  const lines = text.split('\n')
+  let fenceChar: string | null = null
+  let fenceLen = 0
+  const out = lines.map((line) => {
+    if (fenceChar === null) {
+      const open = line.match(FENCE_OPEN_LINE)
+      if (!open) return line
+      fenceChar = open[1][0]
+      fenceLen = open[1].length
+      return ''
+    }
+    const closeRe = new RegExp(`^[ \\t]{0,3}${fenceChar === '`' ? '`' : '~'}{${fenceLen},}[ \\t]*$`)
+    if (closeRe.test(line)) {
+      fenceChar = null
+      fenceLen = 0
+    }
+    return ''
+  })
+  return out.join('\n')
+}
+
 /**
  * Strips markdown constructs that commonly *quote* or *illustrate* this exact tag syntax rather than
- * declare it — fenced code blocks, inline code spans, HTML comments, and blockquote lines — before tag
- * matching runs. Without this, an issue that merely documents the `[Worker: id]` format (in a code
- * fence, inline code, or an issue-template HTML-comment hint) would have that example text parsed as a
- * real directive. This is a coarse, not fully markdown-spec-accurate, filter — good enough to rule out
- * the common cases without needing a full markdown parser.
- *
- * The fenced-code-block pattern is deliberately line-anchored (`^...fence chars...$` per line, via the
- * `m` flag), not just "fence chars...anything...fence chars" anywhere in the text: GFM allows both ```
- * and ~~~ as fence characters, but only when the fence stands alone on its own line (optionally
- * indented up to 3 spaces, optionally followed by an info string on the *opening* line only). An
- * earlier version matched any `~~~`/``` occurrence anywhere — including inside ordinary prose, e.g.
- * "Decorative ~~~ marker" — which could span across and strip a *real* tag sitting between two such
- * unrelated occurrences. The closing fence must reuse the exact opening delimiter via a backreference.
+ * declare it — fenced code blocks (see stripFencedCodeBlocks), inline code spans, HTML comments, and
+ * blockquote lines — before tag matching runs. Without this, an issue that merely documents the
+ * `[Worker: id]` format (in a code fence, inline code, or an issue-template HTML-comment hint) would
+ * have that example text parsed as a real directive.
  */
 function stripQuotedText(text: string): string {
-  return text
-    .replace(/^[ \t]{0,3}(`{3,}|~{3,})[^\n]*\n(?:[\s\S]*?\n)?[ \t]{0,3}\1[ \t]*$/gm, ' ')
+  return stripFencedCodeBlocks(text)
     .replace(/`[^`\n]*`/g, ' ')
     .replace(/<!--[\s\S]*?-->/g, ' ')
     .replace(/^\s*>.*$/gm, ' ')

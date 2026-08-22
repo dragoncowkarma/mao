@@ -58,6 +58,11 @@ describe('parseAssignmentTags', () => {
     expect(parseAssignmentTags(body)).toEqual({})
   })
 
+  it('does NOT treat a stray fence-like substring mid-prose as a real fence, and preserves a real tag between two such occurrences', () => {
+    const body = 'Decorative ~~~ marker\n[Worker: agent-real]\n~~~ not a closing fence'
+    expect(parseAssignmentTags(body)).toEqual({ worker: 'agent-real' })
+  })
+
   it('ignores a tag written inside an inline code span', () => {
     expect(parseAssignmentTags('Use the tag like `[Worker: example-id]` in your issue.')).toEqual({})
   })

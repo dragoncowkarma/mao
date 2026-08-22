@@ -15,17 +15,23 @@ const ROLE_TAG_PATTERN = /\[\s*(worker|reviewer|maintainer)\s*:\s*([^\]\s|]+)\s*
 
 /**
  * Strips markdown constructs that commonly *quote* or *illustrate* this exact tag syntax rather than
- * declare it — fenced code blocks (GFM allows both ``` and ~~~ as fence characters, so both are
- * matched, requiring the closing fence to reuse the exact opening delimiter via a backreference),
- * inline code spans, HTML comments, and blockquote lines — before tag matching runs. Without this, an
- * issue that merely documents the `[Worker: id]` format (in a code fence, inline code, or an
- * issue-template HTML-comment hint) would have that example text parsed as a real directive. This is a
- * coarse, not fully markdown-spec-accurate, filter — good enough to rule out the common cases without
- * needing a full markdown parser.
+ * declare it — fenced code blocks, inline code spans, HTML comments, and blockquote lines — before tag
+ * matching runs. Without this, an issue that merely documents the `[Worker: id]` format (in a code
+ * fence, inline code, or an issue-template HTML-comment hint) would have that example text parsed as a
+ * real directive. This is a coarse, not fully markdown-spec-accurate, filter — good enough to rule out
+ * the common cases without needing a full markdown parser.
+ *
+ * The fenced-code-block pattern is deliberately line-anchored (`^...fence chars...$` per line, via the
+ * `m` flag), not just "fence chars...anything...fence chars" anywhere in the text: GFM allows both ```
+ * and ~~~ as fence characters, but only when the fence stands alone on its own line (optionally
+ * indented up to 3 spaces, optionally followed by an info string on the *opening* line only). An
+ * earlier version matched any `~~~`/``` occurrence anywhere — including inside ordinary prose, e.g.
+ * "Decorative ~~~ marker" — which could span across and strip a *real* tag sitting between two such
+ * unrelated occurrences. The closing fence must reuse the exact opening delimiter via a backreference.
  */
 function stripQuotedText(text: string): string {
   return text
-    .replace(/(`{3,}|~{3,})[\s\S]*?\1/g, ' ')
+    .replace(/^[ \t]{0,3}(`{3,}|~{3,})[^\n]*\n(?:[\s\S]*?\n)?[ \t]{0,3}\1[ \t]*$/gm, ' ')
     .replace(/`[^`\n]*`/g, ' ')
     .replace(/<!--[\s\S]*?-->/g, ' ')
     .replace(/^\s*>.*$/gm, ' ')

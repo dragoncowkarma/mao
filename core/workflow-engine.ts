@@ -406,8 +406,12 @@ export class WorkflowEngine extends EventEmitter {
 
   private async runStage(task: QueuedTask) {
     task.status = 'running'
-    this.notify()
     try {
+      // Entry notify lives inside the try: a throwing 'change' listener (e.g. createMaoApp's
+      // synchronous store.set) must land the task in 'error' via the catch below instead of
+      // leaving it stuck at 'running' forever with no path back to retry().
+      this.notify()
+
       const agentConfig = this.selectAgent(task)
       const usesCodeEdits = task.stage === 'pr' && agentConfig.kind === 'cli' && !!this.workspaceRoot
       task.active = {
@@ -456,7 +460,16 @@ export class WorkflowEngine extends EventEmitter {
     }
     task.active = undefined
     this.pruneFinishedTasks()
-    this.notify()
+    try {
+      this.notify()
+    } catch (err) {
+      // The exit notify fires after this stage's real work (GitHub writes, stage advance) already
+      // happened in memory. A throwing listener here must not escape and crash the queue loop, nor
+      // leave an unpersisted advance masquerading as success — degrade to a normal 'error' status
+      // (retryable) instead of silently corrupting queue state.
+      task.status = 'error'
+      task.error = err instanceof Error ? err.message : String(err)
+    }
   }
 
   /** Lets a CLI agent make real file edits in a local clone, then pushes them as the PR branch. */

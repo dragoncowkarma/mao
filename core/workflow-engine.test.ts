@@ -452,4 +452,58 @@ describe('WorkflowEngine', () => {
       }
     })
   })
+
+  describe('runStage notify() guarding (regression for a throwing "change" listener)', () => {
+    it('lands the task in "error" instead of stuck "running" when the entry notify listener throws', async () => {
+      const github = makeFakeGithub()
+      const engine = new WorkflowEngine(github)
+      engine.setProviders([makeProvider('agent-a')])
+
+      let calls = 0
+      engine.on('change', () => {
+        calls++
+        // Call 1 is enqueue()'s own notify() — let it through so the task actually gets queued.
+        // Every notify() from inside runStage (call 2 onward: entry, active-set, exit) throws.
+        if (calls > 1) throw new Error('persistence boom')
+      })
+
+      const task = engine.enqueue('Add feature Boom', repo, false)
+      await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'error')
+
+      const current = engine.getTasks().find((t) => t.id === task.id)!
+      expect(current.status).toBe('error')
+      expect(current.error).toMatch(/persistence boom/)
+      // The throw happened on runStage's entry notify, before any real work — no GitHub write, no history.
+      expect(current.history).toHaveLength(0)
+      expect(github.createIssue).not.toHaveBeenCalled()
+    })
+
+    it('lands the task in "error" (not a silently-lost advance) when the exit notify listener throws after a successful stage', async () => {
+      const github = makeFakeGithub()
+      const engine = new WorkflowEngine(github)
+      engine.setProviders([makeProvider('agent-a')])
+
+      let calls = 0
+      engine.on('change', () => {
+        calls++
+        // Calls 1-3 are enqueue()'s notify() plus runStage's entry and active-set notify — let the
+        // stage's real work (the GitHub issue creation) actually happen. Only the 4th call — the
+        // exit notify fired after the stage already advanced in memory — throws.
+        if (calls === 4) throw new Error('persistence boom')
+      })
+
+      const task = engine.enqueue('Add feature Boom 2', repo, false)
+      await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'error')
+
+      const current = engine.getTasks().find((t) => t.id === task.id)!
+      expect(current.status).toBe('error')
+      expect(current.error).toMatch(/persistence boom/)
+      // The 'issue' stage's real GitHub write already succeeded and the task already advanced to
+      // 'pr' in memory — that must not be silently discarded, nor re-run (which would duplicate the
+      // GitHub write) — it should surface as a normal retryable error at the advanced stage.
+      expect(current.stage).toBe('pr')
+      expect(current.history).toHaveLength(1)
+      expect(github.createIssue).toHaveBeenCalledTimes(1)
+    })
+  })
 })

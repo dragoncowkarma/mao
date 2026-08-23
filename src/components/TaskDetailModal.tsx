@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { GithubTaskDetail } from '../../core/github-service'
 import type { RepoRef } from '../../core/workflow-engine'
 
@@ -33,6 +33,21 @@ export default function TaskDetailModal({
   const [autoAdvance, setAutoAdvance] = useState(true)
   const [enqueueing, setEnqueueing] = useState(false)
   const [enqueueError, setEnqueueError] = useState('')
+
+  /**
+   * Guards the enqueue flow's async tail (the poll in waitForImmediateFailure, and its onEnqueued()
+   * call) against running after this modal has unmounted — e.g. the user closed it and opened a
+   * different issue's modal while the single-flight queue was still busy with something else. Without
+   * this, the stale onEnqueued() fires later and closes whatever modal happens to be open then, since
+   * KanbanBoard's callback unconditionally clears the selected task.
+   */
+  const mountedRef = useRef(true)
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+    }
+  }, [])
 
   useEffect(() => {
     let cancelled = false
@@ -73,7 +88,9 @@ export default function TaskDetailModal({
    */
   async function waitForImmediateFailure(taskId: string): Promise<string | null> {
     for (let i = 0; i < 10; i++) {
+      if (!mountedRef.current) return null
       const tasks = await window.electronAPI.workflow.list()
+      if (!mountedRef.current) return null
       const task = tasks.find((t) => t.id === taskId)
       if (task?.status === 'error') return task.error ?? 'Task failed to start'
       if (task && task.status !== 'pending') return null
@@ -88,15 +105,16 @@ export default function TaskDetailModal({
     try {
       const task = await window.electronAPI.workflow.enqueueFromIssue(repo.owner, repo.repo, number, autoAdvance)
       const immediateError = await waitForImmediateFailure(task.id)
+      if (!mountedRef.current) return
       if (immediateError) {
         setEnqueueError(immediateError)
         return
       }
       onEnqueued()
     } catch (err) {
-      setEnqueueError(err instanceof Error ? err.message : String(err))
+      if (mountedRef.current) setEnqueueError(err instanceof Error ? err.message : String(err))
     } finally {
-      setEnqueueing(false)
+      if (mountedRef.current) setEnqueueing(false)
     }
   }
 

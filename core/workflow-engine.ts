@@ -488,7 +488,7 @@ export class WorkflowEngine extends EventEmitter {
     })
 
     if (await hasChanges(dir)) {
-      await commitAndPush(dir, branch, `Implement: ${task.title}`)
+      await commitAndPush(dir, branch, `feat(workflow): ${task.title}`)
       const body = task.github.issueNumber ? `${output}\n\nCloses #${task.github.issueNumber}` : output
       const pr = await this.github.createPullRequest(owner, repo, branch, base, task.title, body)
       task.github.branch = branch
@@ -522,7 +522,7 @@ export class WorkflowEngine extends EventEmitter {
           branch,
           `workflow-notes/${task.github.issueNumber ?? task.id}.md`,
           output,
-          `Add implementation notes for: ${task.title}`,
+          `docs(workflow): Add implementation notes for ${task.title}`,
         )
         const body = task.github.issueNumber ? `${output}\n\nCloses #${task.github.issueNumber}` : output
         const pr = await this.github.createPullRequest(owner, repo, branch, base, task.title, body)

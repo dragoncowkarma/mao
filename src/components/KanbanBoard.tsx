@@ -75,6 +75,7 @@ function timeAgo(ms: number): string {
 function Column({
   title,
   tasks,
+  allTasks,
   workflowTasks,
   onSelectTask,
   onRunTask,
@@ -82,6 +83,8 @@ function Column({
 }: {
   title: string
   tasks: GithubTask[]
+  /** Full board task list — used to resolve linked issue/PR numbers into their states and titles. */
+  allTasks: GithubTask[]
   workflowTasks: QueuedTask[]
   onSelectTask: (task: GithubTask) => void
   onRunTask: (task: QueuedTask) => void
@@ -95,6 +98,22 @@ function Column({
       <div className="flex flex-col gap-2">
         {tasks.map((task) => {
           const workflowTask = findWorkflowTask(task, workflowTasks)
+
+          // For PR cards: show the issues this PR closes (from linkedIssueNumbers on the PR).
+          // For issue cards: show any open PRs that reference this issue via closing keywords.
+          // `task` may be undefined when the referenced item is closed and not in the open-item
+          // snapshot — render those as a static "closed" badge rather than silently dropping them.
+          const linkedItems: { number: number; label: string; task: GithubTask | undefined }[] =
+            task.type === 'pull_request'
+              ? (task.linkedIssueNumbers ?? []).map((n) => ({
+                  number: n,
+                  label: `Issue #${n}`,
+                  task: allTasks.find((t) => t.number === n),
+                }))
+              : allTasks
+                  .filter((t) => t.type === 'pull_request' && t.linkedIssueNumbers?.includes(task.number))
+                  .map((t) => ({ number: t.number, label: `PR #${t.number}`, task: t }))
+
           return (
             <div
               key={task.id}
@@ -161,6 +180,30 @@ function Column({
                     </div>
                   )
                 })()}
+              {linkedItems.length > 0 && (
+                <div className="flex flex-wrap gap-1.5 pt-0.5">
+                  {linkedItems.map(({ number, label, task: linked }) =>
+                    linked ? (
+                      <button
+                        key={number}
+                        type="button"
+                        className="tag tag-neutral cursor-pointer"
+                        title={linked.title}
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          onSelectTask(linked)
+                        }}
+                      >
+                        {label} · {linked.state}
+                      </button>
+                    ) : (
+                      <span key={number} className="tag tag-neutral" title="No longer in open items">
+                        {label} · closed
+                      </span>
+                    ),
+                  )}
+                </div>
+              )}
             </div>
           )
         })}
@@ -273,6 +316,7 @@ export default function KanbanBoard({ repo }: KanbanBoardProps) {
         <Column
           title="Issues"
           tasks={issues}
+          allTasks={sorted}
           workflowTasks={workflowTasks}
           onSelectTask={setSelectedTask}
           onRunTask={runTask}
@@ -281,6 +325,7 @@ export default function KanbanBoard({ repo }: KanbanBoardProps) {
         <Column
           title="Pull Requests"
           tasks={pullRequests}
+          allTasks={sorted}
           workflowTasks={workflowTasks}
           onSelectTask={setSelectedTask}
           onRunTask={runTask}
@@ -298,6 +343,8 @@ export default function KanbanBoard({ repo }: KanbanBoardProps) {
             loadWorkflowTasks()
             setSelectedTask(null)
           }}
+          allTasks={sorted}
+          onNavigate={setSelectedTask}
           onClose={() => setSelectedTask(null)}
         />
       )}

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import type { GithubTaskDetail } from '../../core/github-service'
+import type { GithubTask, GithubTaskDetail } from '../../core/github-service'
 import type { RepoRef } from '../../core/workflow-engine'
 
 interface TaskDetailModalProps {
@@ -11,6 +11,13 @@ interface TaskDetailModalProps {
   alreadyQueued: boolean
   /** Called after a successful enqueue so the caller can refresh its workflow task list. */
   onEnqueued: () => void
+  /**
+   * Full task list from the board — used to resolve linked issue/PR numbers to their states.
+   * Optional: when absent (e.g. in WorkflowQueue), the linked-item section is simply hidden.
+   */
+  allTasks?: GithubTask[]
+  /** Called when the user clicks a linked issue or PR badge to navigate to it in-app. */
+  onNavigate?: (task: GithubTask) => void
   onClose: () => void
 }
 
@@ -25,6 +32,8 @@ export default function TaskDetailModal({
   type,
   alreadyQueued,
   onEnqueued,
+  allTasks = [],
+  onNavigate,
   onClose,
 }: TaskDetailModalProps) {
   const [detail, setDetail] = useState<GithubTaskDetail | null>(null)
@@ -121,6 +130,21 @@ export default function TaskDetailModal({
   const kicker = type === 'pull_request' ? 'Pull Request' : 'Issue'
   const fallbackUrl = `https://github.com/${repo.owner}/${repo.repo}/${type === 'pull_request' ? 'pull' : 'issues'}/${number}`
 
+  // For PRs: resolve linked issue numbers from the fetched detail body.
+  // For issues: find any open PRs in the board list that close this issue.
+  // Items not in the current open-item snapshot (closed) are kept with task: undefined
+  // and rendered as GitHub links rather than silently dropping the relationship.
+  const linkedItems: { number: number; label: string; task: GithubTask | undefined }[] =
+    type === 'pull_request'
+      ? (detail?.linkedIssueNumbers ?? []).map((n) => ({
+          number: n,
+          label: `Closes Issue #${n}`,
+          task: allTasks.find((t) => t.number === n),
+        }))
+      : allTasks
+          .filter((t) => t.type === 'pull_request' && t.linkedIssueNumbers?.includes(number))
+          .map((t) => ({ number: t.number, label: `PR #${t.number}`, task: t }))
+
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <div className="modal card elev-sm" onClick={(e) => e.stopPropagation()}>
@@ -145,6 +169,36 @@ export default function TaskDetailModal({
                 {label}
               </span>
             ))}
+          </div>
+        )}
+
+        {linkedItems.length > 0 && (
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="card-meta shrink-0">{type === 'pull_request' ? 'Closes:' : 'Linked PRs:'}</span>
+            {linkedItems.map(({ number: n, label, task }) =>
+              task ? (
+                <button
+                  key={n}
+                  type="button"
+                  onClick={() => onNavigate?.(task)}
+                  className="tag tag-neutral cursor-pointer"
+                  title={task.title}
+                >
+                  {label} · {task.state}
+                </button>
+              ) : (
+                <a
+                  key={n}
+                  href={`https://github.com/${repo.owner}/${repo.repo}/issues/${n}`}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="tag tag-neutral"
+                  title="No longer in open items — view on GitHub"
+                >
+                  {label} · closed ↗
+                </a>
+              ),
+            )}
           </div>
         )}
 

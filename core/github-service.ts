@@ -17,6 +17,11 @@ export interface GithubTask {
    * off the bulk listing without a second fetch per issue.
    */
   body: string
+  /**
+   * Issue numbers referenced by this PR's closing keywords (`Closes/Fixes/Resolves #N`).
+   * Only populated on pull-request items; undefined on issues.
+   */
+  linkedIssueNumbers?: number[]
 }
 
 export interface GithubComment {
@@ -31,6 +36,32 @@ export interface GithubComment {
 export interface GithubTaskDetail extends GithubTask {
   author: string
   comments: GithubComment[]
+}
+
+/**
+ * Strips contexts where GitHub ignores closing keywords: HTML comments, fenced code blocks
+ * (``` or ~~~), inline code spans, and blockquote lines. Mirrors GitHub's documented behaviour
+ * so we don't create false linked-item badges from examples or quoted text in a PR body.
+ */
+function sanitizeBodyForKeywords(body: string): string {
+  return body
+    .replace(/<!--[\s\S]*?-->/g, '')     // HTML comments
+    .replace(/```[\s\S]*?```/g, '')      // fenced code blocks (backtick)
+    .replace(/~~~[\s\S]*?~~~/g, '')      // fenced code blocks (tilde)
+    .replace(/`[^`\r\n]+`/g, '')        // inline code spans
+    .replace(/^>.*$/gm, '')              // blockquote lines
+}
+
+/**
+ * Parses issue numbers from PR body closing-keyword patterns.
+ * Covers all GitHub-supported keywords: close, closes, closed, fix, fixes, fixed,
+ * resolve, resolves, resolved (case-insensitive). A word-boundary anchor (`\b`) prevents
+ * false matches on substrings like "prefixes #12". Code/quote contexts are stripped first.
+ */
+function parseLinkedIssues(body: string): number[] {
+  const sanitized = sanitizeBodyForKeywords(body)
+  const matches = sanitized.matchAll(/\b(?:close[ds]?|fix(?:e[ds]?)?|resolve[ds]?)\s+#(\d+)/gi)
+  return [...matches].map((m) => parseInt(m[1], 10))
 }
 
 export class GithubService {
@@ -65,6 +96,7 @@ export class GithubService {
         urgent: labels.some((label) => label.toLowerCase().includes('urgent')),
         labels,
         body: item.body ?? '',
+        linkedIssueNumbers: item.pull_request ? parseLinkedIssues(item.body ?? '') : undefined,
       }
     })
   }
@@ -93,6 +125,7 @@ export class GithubService {
       urgent: labels.some((label) => label.toLowerCase().includes('urgent')),
       labels,
       body: issue.body ?? '',
+      linkedIssueNumbers: issue.pull_request ? parseLinkedIssues(issue.body ?? '') : undefined,
       author: issue.user?.login ?? 'unknown',
       comments: comments.map((comment) => ({
         id: comment.id,

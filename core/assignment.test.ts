@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { hasAssignment, parseAssignmentTags } from './assignment.ts'
+import { hasAssignment, parseAssignmentTags, parseProviderOverride } from './assignment.ts'
 
 describe('parseAssignmentTags', () => {
   it('parses Worker/Reviewer/Maintainer tags out of free-form text', () => {
@@ -94,5 +94,69 @@ describe('hasAssignment', () => {
     expect(hasAssignment({ worker: 'agent-a' })).toBe(true)
     expect(hasAssignment({ reviewer: 'agent-a' })).toBe(true)
     expect(hasAssignment({ maintainer: 'agent-a' })).toBe(true)
+  })
+})
+
+describe('parseProviderOverride', () => {
+  it('returns undefined for a body with no directives at all', () => {
+    expect(parseProviderOverride('just a normal issue body')).toBeUndefined()
+    expect(parseProviderOverride(undefined)).toBeUndefined()
+    expect(parseProviderOverride(null)).toBeUndefined()
+    expect(parseProviderOverride('')).toBeUndefined()
+  })
+
+  it('folds role tags into a roles pin', () => {
+    expect(parseProviderOverride('[Worker: agent-cli] [Reviewer: agent-cli2]')).toEqual({
+      roles: { worker: 'agent-cli', reviewer: 'agent-cli2' },
+    })
+  })
+
+  it('parses a task-level Model tag', () => {
+    expect(parseProviderOverride('Please use [Model: claude-opus-5] for this.')).toEqual({
+      model: 'claude-opus-5',
+    })
+  })
+
+  it('parses a task-level Effort tag, case-insensitively', () => {
+    expect(parseProviderOverride('[Effort: high]')).toEqual({ effort: 'high' })
+    expect(parseProviderOverride('[EFFORT: High]')).toEqual({ effort: 'high' })
+  })
+
+  it('accepts the two-word effort level and collapses inner whitespace', () => {
+    expect(parseProviderOverride('[Effort: Extra   High]')).toEqual({ effort: 'extra high' })
+  })
+
+  it('drops an unrecognized effort level instead of throwing', () => {
+    expect(parseProviderOverride('[Effort: turbo]')).toBeUndefined()
+    expect(parseProviderOverride('[Effort: turbo] [Model: gpt-5-codex]')).toEqual({ model: 'gpt-5-codex' })
+  })
+
+  it('combines role, model, and effort tags into one override', () => {
+    const body = 'Fix it.\n\n[Worker: agent-cli] [Reviewer: agent-cli2]\n[Model: claude-opus-5] [Effort: high]'
+    expect(parseProviderOverride(body)).toEqual({
+      roles: { worker: 'agent-cli', reviewer: 'agent-cli2' },
+      model: 'claude-opus-5',
+      effort: 'high',
+    })
+  })
+
+  it('keeps the last occurrence when a model or effort tag is repeated', () => {
+    const body = '[Model: model-a] [Effort: low] ... edit: [Model: model-b] [Effort: max]'
+    expect(parseProviderOverride(body)).toEqual({ model: 'model-b', effort: 'max' })
+  })
+
+  it('ignores model/effort tags quoted in a code fence, code span, HTML comment, or blockquote', () => {
+    expect(parseProviderOverride('```\n[Model: example-model]\n```')).toBeUndefined()
+    expect(parseProviderOverride('Write `[Effort: high]` to pin the effort.')).toBeUndefined()
+    expect(parseProviderOverride('<!-- [Model: hidden-model] -->')).toBeUndefined()
+    expect(parseProviderOverride('> quoted: [Effort: max]')).toBeUndefined()
+  })
+
+  it('ignores a malformed model tag (missing colon, empty value, value containing a space)', () => {
+    expect(parseProviderOverride('[Model] [Model:] [Model: my model]')).toBeUndefined()
+  })
+
+  it('does not confuse a swarm_orchestrator-style piped sub-field with a real tag', () => {
+    expect(parseProviderOverride('[Worker: agent-cli | Model: claude-opus-5]')).toBeUndefined()
   })
 })

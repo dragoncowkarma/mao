@@ -3,15 +3,23 @@ export type AiProviderKind = 'api' | 'cli'
 /** Known CLI tool identifiers — used to drive model/effort option sets in the UI. */
 export type ProviderKindId = 'antigravity' | 'claude' | 'codex' | 'custom'
 
-export type AiEffort =
-  | 'low'
-  | 'medium'
-  | 'high'
-  | 'xhigh'
-  | 'max'
-  | 'ultracode'
-  | 'extra high'
-  | 'ultra'
+/**
+ * Every accepted reasoning-effort value, as a runtime list so free-form input (e.g. an `[Effort: …]`
+ * tag parsed out of a GitHub issue body — see core/assignment.ts) can be validated against the same
+ * single definition the `AiEffort` type is derived from; adding a level here adds it to both at once.
+ */
+export const AI_EFFORTS = [
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+  'ultracode',
+  'extra high',
+  'ultra',
+] as const
+
+export type AiEffort = (typeof AI_EFFORTS)[number]
 
 /** A single model + effort preset entry stored per provider. */
 export interface ModelEffortPreset {

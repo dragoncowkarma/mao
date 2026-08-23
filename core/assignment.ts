@@ -1,10 +1,13 @@
-import type { WorkflowRoleAssignment } from './workflow-engine.ts'
+import { AI_EFFORTS, type AiEffort } from './ai/types.ts'
+import type { ProviderOverride, WorkflowRoleAssignment } from './workflow-engine.ts'
 
 /**
  * Matches swarm_orchestrator.py-style role metadata tags: `[Worker: <id>]`, `[Reviewer: <id>]`,
  * `[Maintainer: <id>]`. Unlike swarm_orchestrator's `[Worker: <ai> | Model: <model> | Reasoning:
- * <reasoning>]` tags, mao's carry only a provider id — model/effort already live on that provider's
- * own registered config (see AiProviderConfig), so there's nothing else to parse out of the tag.
+ * <reasoning>]` tags, mao's carry only a provider id: model/effort default to that provider's own
+ * registered config (see AiProviderConfig) and are overridden — for the whole task, not per role —
+ * by the separate `[Model: …]`/`[Effort: …]` tags below, mirroring the task-level `model`/`effort`
+ * fields of `ProviderOverride` (a per-role model would have nowhere to go).
  * The id itself is taken verbatim (any character except `]`, `|`, or whitespace — so an id containing
  * a space, e.g. copied from a display name rather than a slug, will not match; stick to the same
  * charset conventions used elsewhere for provider ids). It's matched against registered provider ids
@@ -12,6 +15,25 @@ import type { WorkflowRoleAssignment } from './workflow-engine.ts'
  * id surfaces as a normal retryable task error rather than being silently dropped.
  */
 const ROLE_TAG_PATTERN = /\[\s*(worker|reviewer|maintainer)\s*:\s*([^\]\s|]+)\s*\]/gi
+
+/**
+ * Matches a task-level `[Model: <id>]` tag. The value follows the same charset rule as a role tag's
+ * provider id (any character except `]`, `|`, or whitespace), so a model id written with a space is
+ * ignored rather than half-parsed — model *ids* (`claude-opus-5`, `gpt-5-codex`) don't contain
+ * spaces even when their display names do. The value is passed through verbatim: unlike a provider
+ * id it is never matched against anything mao knows about, so an unusable model surfaces as a
+ * provider-side error when the stage runs.
+ */
+const MODEL_TAG_PATTERN = /\[\s*model\s*:\s*([^\]\s|]+)\s*\]/gi
+
+/**
+ * Matches a task-level `[Effort: <level>]` tag. Unlike ids, effort levels are a closed set that
+ * includes a two-word value (`extra high`), so the value here may contain inner whitespace and is
+ * validated against `AI_EFFORTS` after normalizing case and runs of whitespace. An unrecognized
+ * level is dropped (the task simply keeps its provider's configured effort) rather than throwing —
+ * consistent with the rest of this parser, which never rejects an issue body.
+ */
+const EFFORT_TAG_PATTERN = /\[\s*effort\s*:\s*([^\]|]+?)\s*\]/gi
 
 const FENCE_OPEN_LINE = /^[ \t]{0,3}(`{3,}|~{3,})/
 
@@ -72,12 +94,54 @@ function stripQuotedText(text: string): string {
  * assignment" and fall back to the default maker-checker rotation.
  */
 export function parseAssignmentTags(text: string | null | undefined): WorkflowRoleAssignment {
+  return collectRoles(stripQuotedText(text ?? ''))
+}
+
+/** Role-tag collection over text that has already been through stripQuotedText(). */
+function collectRoles(stripped: string): WorkflowRoleAssignment {
   const assignment: WorkflowRoleAssignment = {}
-  for (const match of stripQuotedText(text ?? '').matchAll(ROLE_TAG_PATTERN)) {
+  for (const match of stripped.matchAll(ROLE_TAG_PATTERN)) {
     const role = match[1].toLowerCase() as keyof WorkflowRoleAssignment
     assignment[role] = match[2]
   }
   return assignment
+}
+
+/** Normalizes a raw `[Effort: …]` value and returns it only if it names a known level. */
+function toEffort(raw: string): AiEffort | undefined {
+  const normalized = raw.trim().toLowerCase().replace(/\s+/g, ' ')
+  return (AI_EFFORTS as readonly string[]).includes(normalized) ? (normalized as AiEffort) : undefined
+}
+
+/**
+ * Parses every directive mao understands out of a GitHub issue/PR body and folds them into the
+ * `ProviderOverride` shape the workflow engine consumes: `[Worker|Reviewer|Maintainer: <providerId>]`
+ * role pins (see parseAssignmentTags) plus task-level `[Model: <id>]` / `[Effort: <level>]` tags.
+ * This is what lets an auto-triggered issue — one filed on GitHub rather than enqueued through the
+ * CLI, which has had `--model`/`--effort` flags all along — pin a model or reasoning effort at all.
+ *
+ * The same quoting rules apply to every tag (code fences, inline code, HTML comments and blockquotes
+ * are stripped first), a repeated tag keeps its last occurrence, and an unrecognized effort level is
+ * dropped. Returns `undefined` — not an empty object — when a body carries no directives, so callers
+ * can pass the result straight through as "no override" without an emptiness check of their own.
+ *
+ * Note the model/effort tags are *preferences applied to whichever provider maker-checker ends up
+ * choosing*, exactly like their CLI-flag equivalents: they never influence provider selection, and a
+ * body that pins only a model still rotates providers the default way.
+ */
+export function parseProviderOverride(text: string | null | undefined): ProviderOverride | undefined {
+  const stripped = stripQuotedText(text ?? '')
+  const roles = collectRoles(stripped)
+
+  const override: ProviderOverride = {}
+  if (hasAssignment(roles)) override.roles = roles
+  for (const match of stripped.matchAll(MODEL_TAG_PATTERN)) override.model = match[1]
+  for (const match of stripped.matchAll(EFFORT_TAG_PATTERN)) {
+    const effort = toEffort(match[1])
+    if (effort !== undefined) override.effort = effort
+  }
+
+  return Object.keys(override).length > 0 ? override : undefined
 }
 
 /** True when `assignment` has at least one role pinned — lets callers avoid attaching an empty override. */

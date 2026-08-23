@@ -114,6 +114,18 @@ into the issue body instead — `[Worker: <providerId>]`, `[Reviewer: <providerI
 the issue is enqueued; an issue with none of these tags enqueues exactly as before
 (default maker-checker rotation).
 
+**Pinning model/effort from an issue body:** the same parser reads task-level
+`[Model: <modelId>]` and `[Effort: <level>]` tags — the auto-trigger equivalent of
+`enqueue --model/--effort`. They apply to the whole task (every stage, whichever provider
+maker-checker picks), never to a single role, and never influence *which* provider runs.
+`<level>` must name one of the levels in `AI_EFFORTS` (`core/ai/types.ts`: `low`, `medium`,
+`high`, `xhigh`, `max`, `ultracode`, `extra high`, `ultra`), matched case-insensitively;
+anything else is ignored and the provider keeps its configured effort. `<modelId>` is
+passed through as written, so a typo surfaces later as a provider error. All directive
+tags are ignored inside code fences, inline code spans, HTML comments, and blockquotes —
+quote the syntax freely when documenting it. A repeated tag keeps its last occurrence, so
+an amendment can simply be appended further down the body.
+
 ## End-to-end pipeline test (real GitHub repo)
 
 Use a **throwaway repo** — the harness creates real issues/branches/PRs and can

@@ -13,6 +13,16 @@ export type WorkflowStageName = AgentStage
 
 const STAGE_ORDER: WorkflowStageName[] = ['issue', 'pr', 'review', 'merge']
 
+/** Which lifecycle "role" (à la swarm_orchestrator.py's Worker/Reviewer/Maintainer tags) owns each stage. */
+export type WorkflowRole = 'worker' | 'reviewer' | 'maintainer'
+
+const STAGE_ROLE: Record<WorkflowStageName, WorkflowRole> = {
+  issue: 'worker',
+  pr: 'worker',
+  review: 'reviewer',
+  merge: 'maintainer',
+}
+
 /** Cap on finished (done/error) tasks kept around, so the persisted queue doesn't grow forever. */
 const MAX_FINISHED_TASKS = 50
 
@@ -28,6 +38,19 @@ export interface RepoRef {
   pollIntervalMs?: number
 }
 
+/**
+ * Per-role explicit provider assignment, e.g. parsed from a GitHub issue/PR body via
+ * `parseAssignmentTags()` (see core/assignment.ts) — `[Worker: agent-cli]`, `[Reviewer: agent-cli2]`,
+ * `[Maintainer: agent-cli2]` — or set directly via CLI flags. `worker` covers both the `issue` and
+ * `pr` stages (drafting the issue and implementing the PR that resolves it — both the "making" side
+ * of the work); `reviewer` covers `review`; `maintainer` covers `merge`.
+ */
+export interface WorkflowRoleAssignment {
+  worker?: string
+  reviewer?: string
+  maintainer?: string
+}
+
 export interface ProviderOverride {
   /**
    * Preferred provider id for this task's stages. Only ever influences *which* provider is picked —
@@ -39,6 +62,15 @@ export interface ProviderOverride {
   model?: string
   /** Applied to whichever provider ends up selected, without mutating that provider's saved config. */
   effort?: AiEffort
+  /**
+   * Per-role provider pins that take priority over `providerId` for the stage(s) they name. A Worker
+   * pin is exempt from the maker-checker guard when it re-selects itself across the `issue -> pr`
+   * boundary (same role, not a check on its own work) — that is the *only* exemption. A Reviewer or
+   * Maintainer pin that would hand a stage back to the agent that ran the immediately preceding stage
+   * is guarded exactly like a plain `providerId` override: passed over for another registered
+   * provider, or the stage fails clearly if none exists — never silently weakened.
+   */
+  roles?: WorkflowRoleAssignment
 }
 
 export interface WorkflowStepResult {
@@ -257,12 +289,15 @@ export class WorkflowEngine extends EventEmitter {
 
   /**
    * Prevents the AI that handled the previous stage from being assigned the next one (Maker-Checker).
-   * A task-level provider preference (`providerOverride.providerId`) may steer which provider gets
-   * picked, but never at the expense of that guarantee: if the preferred provider is the one that just
-   * ran, it is passed over for another registered provider exactly as if no preference had been set. It
-   * is only an error if honoring maker-checker would require a distinct provider that doesn't exist.
-   * `model`/`effort` overrides are applied on top of whichever provider is selected, on a copy — the
-   * caller's stored provider config is never mutated.
+   * A task-level provider preference (`providerOverride.providerId`, or a per-role pin in
+   * `providerOverride.roles` — the role pin wins when both apply to the current stage) may steer which
+   * provider gets picked, but never at the expense of that guarantee: if the preferred provider is the
+   * one that just ran, it is passed over for another registered provider exactly as if no preference
+   * had been set. The one deliberate exception is a Worker role pin re-selecting itself across the
+   * `issue -> pr` boundary — both stages are the same "making" role, not a check on its own work, so
+   * that specific case is not a maker-checker violation. It is only an error if honoring maker-checker
+   * would require a distinct provider that doesn't exist. `model`/`effort` overrides are applied on top
+   * of whichever provider is selected, on a copy — the caller's stored provider config is never mutated.
    *
    * Per-provider `allowedStages` restrictions narrow the candidate pool before maker-checker runs.
    * A provider whose `allowedStages` is absent or empty is eligible for every stage. When no
@@ -271,7 +306,8 @@ export class WorkflowEngine extends EventEmitter {
    */
   private selectAgent(task: QueuedTask): AiProviderConfig {
     if (this.providers.length === 0) throw new Error('No AI providers registered')
-    const previousAgentId = task.history[task.history.length - 1]?.agentId
+    const previousEntry = task.history[task.history.length - 1]
+    const previousAgentId = previousEntry?.agentId
     const override = task.providerOverride
 
     // Filter to providers whose allowedStages permit the current stage.
@@ -285,21 +321,27 @@ export class WorkflowEngine extends EventEmitter {
       )
     }
 
-    let base: AiProviderConfig
-    if (override?.providerId) {
-      // Check existence across all registered providers first so the error message is accurate.
-      const allRegistered = this.providers.find((p) => p.id === override.providerId)
-      if (!allRegistered) throw new Error(`Provider override references unknown provider: ${override.providerId}`)
+    const role = STAGE_ROLE[task.stage]
+    const rolePreferredId = override?.roles?.[role]
+    const preferredId = rolePreferredId ?? override?.providerId
+    // A Worker pin doing both 'issue' and 'pr' is the same role reusing itself, not maker-checker at
+    // all — only guard when the preference came from `roles` AND the previous stage shares that role.
+    const skipGuard = rolePreferredId !== undefined && previousEntry !== undefined && STAGE_ROLE[previousEntry.stage] === role
 
-      const preferred = stageEligible.find((p) => p.id === override.providerId)
+    let base: AiProviderConfig
+    if (preferredId) {
+      const allRegistered = this.providers.find((p) => p.id === preferredId)
+      if (!allRegistered) throw new Error(`Provider override references unknown provider: ${preferredId}`)
+
+      const preferred = stageEligible.find((p) => p.id === preferredId)
       if (!preferred) {
         throw new Error(
-          `Provider override "${override.providerId}" is not configured to handle the "${task.stage}" ` +
+          `Provider override "${preferredId}" is not configured to handle the "${task.stage}" ` +
             `stage — update its allowed-stages setting or choose a different provider.`,
         )
       }
 
-      if (preferred.id !== previousAgentId) {
+      if (skipGuard || preferred.id !== previousAgentId) {
         base = preferred
       } else {
         const alternative = stageEligible.find((p) => p.id !== previousAgentId)
@@ -321,11 +363,14 @@ export class WorkflowEngine extends EventEmitter {
       base = candidates[0] ?? stageEligible[0]
     }
 
-    if (override?.model === undefined && override?.effort === undefined) return base
+    const activePreset = base.presets?.find((p) => p.id === base.selectedPresetId) ?? base.presets?.[0]
+    const effectiveModel = override?.model !== undefined ? override.model : (base.model || activePreset?.model)
+    const effectiveEffort = override?.effort !== undefined ? override.effort : (base.effort || activePreset?.effort)
+
     return {
       ...base,
-      ...(override.model !== undefined ? { model: override.model } : {}),
-      ...(override.effort !== undefined ? { effort: override.effort } : {}),
+      model: effectiveModel,
+      effort: effectiveEffort,
     }
   }
 
@@ -372,7 +417,7 @@ export class WorkflowEngine extends EventEmitter {
       } else {
         prompt = buildPromptForStage(task)
         const provider = createAiProvider(agentConfig)
-        output = await provider.run(prompt)
+        output = await provider.run(prompt, { model: agentConfig.model, effort: agentConfig.effort })
         await this.applyGithubAction(task, output)
       }
 
@@ -423,7 +468,12 @@ export class WorkflowEngine extends EventEmitter {
     if (task.active) task.active.prompt = prompt
     this.notify()
 
-    const output = await createAiProvider(agentConfig).run(prompt, { cwd: dir, allowToolUse: true })
+    const output = await createAiProvider(agentConfig).run(prompt, {
+      cwd: dir,
+      allowToolUse: true,
+      model: agentConfig.model,
+      effort: agentConfig.effort,
+    })
 
     if (await hasChanges(dir)) {
       await commitAndPush(dir, branch, `Implement: ${task.title}`)

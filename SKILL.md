@@ -88,6 +88,8 @@ npm run cli -- repos list
 npm run cli -- github check <owner> <repo>       # open issues/PRs as JSON
 npm run cli -- github view <owner> <repo> <number>  # full body + comments for one issue/PR as JSON
 npm run cli -- workflow enqueue "<title>" --owner <o> --repo <r> [--no-auto-advance]
+npm run cli -- workflow enqueue "<title>" --owner <o> --repo <r> \
+  --worker <providerId> --reviewer <providerId> --maintainer <providerId>  # pin specific agents per role
 npm run cli -- workflow list
 npm run cli -- workflow retry <taskId>
 npm run cli -- workflow advance <taskId>
@@ -99,6 +101,18 @@ npm run cli -- run                               # foreground: auto-trigger + re
 unattended** (real GitHub writes) in the foreground with no progress output; only
 `run` streams status. Use `--no-auto-advance` + `workflow advance` to step through
 stages one at a time.
+
+**Assigning specific AI agents to an issue/PR (swarm_orchestrator-style):** `--provider`
+(global) / `--worker` / `--reviewer` / `--maintainer` (per-role, take priority over
+`--provider` for the stage(s) they name — `--worker` covers `issue`+`pr`, `--reviewer`
+covers `review`, `--maintainer` covers `merge`) all reference a provider **id** from
+`mao config show`, not a raw CLI tool name — every value is still checked against
+maker-checker (see AGENTS.md). For issues that already exist on GitHub and get picked
+up by auto-trigger (`mao run`, or `github:refreshRepo`), write the same tags directly
+into the issue body instead — `[Worker: <providerId>]`, `[Reviewer: <providerId>]`,
+`[Maintainer: <providerId>]` — and `core/assignment.ts` parses them automatically when
+the issue is enqueued; an issue with none of these tags enqueues exactly as before
+(default maker-checker rotation).
 
 ## End-to-end pipeline test (real GitHub repo)
 
@@ -195,7 +209,7 @@ Two traps:
    local `main` ref can lag the remote by many commits. Note the exact base
    SHA, and check for an existing same-scope PR to reuse
    (`gh pr list --repo <owner>/<repo>`) instead of opening a duplicate.
-   Branch names: `feature/<topic>` or `claude/<topic>-<hex>`.
+   Branch names: see `.agents/rules/git-conventions.md` (`<type>/<issue-number>-<kebab-description>` for manual branches, or automated agent/workflow prefixes).
 2. Stage only the paths the task intended — avoid `git add -A` in a worktree
    that may hold unrelated changes. Never stage: `.env*`, `dist/`,
    `dist-electron/`, `dist-cli/`, `release/`, store/config files, or anything

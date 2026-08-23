@@ -166,15 +166,34 @@ workflow
   )
   .option('--model <model>', 'model override applied to whichever provider is selected for each stage')
   .option('--effort <effort>', 'reasoning-effort override (low|medium|high) applied to each selected provider')
+  .option('--worker <id>', 'provider id for the issue+pr stages — takes priority over --provider for those stages')
+  .option('--reviewer <id>', 'provider id for the review stage — takes priority over --provider for that stage')
+  .option('--maintainer <id>', 'provider id for the merge stage — takes priority over --provider for that stage')
   .action(
     (
       title: string,
-      opts: { owner: string; repo: string; autoAdvance: boolean; provider?: string; model?: string; effort?: string },
+      opts: {
+        owner: string
+        repo: string
+        autoAdvance: boolean
+        provider?: string
+        model?: string
+        effort?: string
+        worker?: string
+        reviewer?: string
+        maintainer?: string
+      },
     ) => {
       const { workflowEngine } = loadApp()
-      const hasOverride = opts.provider !== undefined || opts.model !== undefined || opts.effort !== undefined
+      const hasRoles = opts.worker !== undefined || opts.reviewer !== undefined || opts.maintainer !== undefined
+      const hasOverride = hasRoles || opts.provider !== undefined || opts.model !== undefined || opts.effort !== undefined
       const providerOverride = hasOverride
-        ? { providerId: opts.provider, model: opts.model, effort: opts.effort as AiEffort | undefined }
+        ? {
+            providerId: opts.provider,
+            model: opts.model,
+            effort: opts.effort as AiEffort | undefined,
+            roles: hasRoles ? { worker: opts.worker, reviewer: opts.reviewer, maintainer: opts.maintainer } : undefined,
+          }
         : undefined
       const task = workflowEngine.enqueue(
         title,

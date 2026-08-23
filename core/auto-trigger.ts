@@ -1,3 +1,4 @@
+import { parseAssignmentTags, hasAssignment } from './assignment.ts'
 import type { GithubService } from './github-service.ts'
 import { WORKFLOW_ACTIVE_LABEL, type RepoRef, type WorkflowEngine } from './workflow-engine.ts'
 
@@ -29,7 +30,13 @@ export function startAutoTrigger(
         if (task.type !== 'issue' || task.state !== 'open') continue
         if (task.labels.includes(WORKFLOW_ACTIVE_LABEL)) continue
 
-        workflowEngine.enqueueFromIssue(task.number, task.url, task.title, { owner, repo })
+        // Swarm_orchestrator-style [Worker: id] / [Reviewer: id] / [Maintainer: id] tags in the issue
+        // body pin specific registered providers to specific stages; an issue with none of those tags
+        // enqueues exactly as before, falling back to the default maker-checker rotation.
+        const assignment = parseAssignmentTags(task.body)
+        const providerOverride = hasAssignment(assignment) ? { roles: assignment } : undefined
+
+        workflowEngine.enqueueFromIssue(task.number, task.url, task.title, { owner, repo }, providerOverride)
         await githubService.addLabel(owner, repo, task.number, WORKFLOW_ACTIVE_LABEL).catch(() => {})
       }
       lastError.delete(key)

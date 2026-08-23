@@ -31,6 +31,7 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
 | `core/github-service.ts` | Octokit REST wrapper (issues, PRs, labels, reviews, merge, CI status) |
 | `core/git-workspace.ts` | Local git clone/branch/commit/push via `execFile` (no shell) |
 | `core/auto-trigger.ts` | Per-repo polling scheduler; auto-enqueues new open issues |
+| `core/assignment.ts` | `parseAssignmentTags()` — swarm_orchestrator-style `[Worker: id]`/`[Reviewer: id]`/`[Maintainer: id]` tag parser for issue/PR bodies |
 | `core/store.ts` | `MaoStoreSchema`, `MAO_STORE_DEFAULTS`, the `MaoStore` interface, and `FileStore` (JSON impl for the CLI) |
 | `core/app.ts` | `createMaoApp()` — the **single composition root** both frontends call |
 | `core/paths.ts` | Platform-appropriate data dir for the CLI (mirrors Electron's `userData`) |
@@ -113,6 +114,22 @@ There is no codegen — these couplings are maintained by hand and only `npm run
 - **Maker-checker**: `selectAgent()` excludes the `agentId` of the last
   `task.history` entry; falls back to the sole provider if only one is registered.
   Preserve this in any routing change.
+- **Explicit provider assignment (`ProviderOverride`)**: a task can carry a preferred
+  `providerId` (global, applies to every stage) and/or a per-role `roles` pin
+  (`worker` → `issue`+`pr`, `reviewer` → `review`, `maintainer` → `merge`; a role pin
+  wins over `providerId` for the stage(s) it names). Either is still fully subordinate
+  to maker-checker — a preference/pin that would hand a stage back to the agent that
+  ran immediately before it is passed over for another registered provider, or the
+  stage fails clearly if none exists. The one deliberate exception: a Worker pin
+  reusing itself across `issue → pr` is *not* a violation (same role, not a check on
+  its own work), so that specific case skips the guard. `roles` is normally populated
+  by `core/assignment.ts`'s `parseAssignmentTags()` reading `[Worker: id]` /
+  `[Reviewer: id]` / `[Maintainer: id]` tags out of an auto-triggered issue's body
+  (mirroring `dev-toolkit`'s `swarm_orchestrator.py` role-tag convention, minus its
+  unused Model/Reasoning sub-fields — those already live on the provider's own saved
+  config) — or set directly via `mao workflow enqueue --worker/--reviewer/--maintainer`.
+  An id that doesn't match a registered provider throws (retryable), same as an
+  invalid `providerId`.
 - **Single-flight queue**: `processQueue()` runs one stage at a time globally.
   Therefore every external call must be time-bounded. Today only the AI-provider
   calls are: the API provider aborts after 5 min, the CLI provider SIGKILLs after

@@ -10,6 +10,13 @@ export interface GithubTask {
   updatedAt: string
   urgent: boolean
   labels: string[]
+  /**
+   * Full body text. GitHub's list-issues endpoint already includes it in every item, so this costs no
+   * extra API call — carried here (rather than only on `GithubTaskDetail`) so auto-trigger can parse
+   * `[Worker: ...]`/`[Reviewer: ...]`/`[Maintainer: ...]` role tags (see core/assignment.ts) directly
+   * off the bulk listing without a second fetch per issue.
+   */
+  body: string
 }
 
 export interface GithubComment {
@@ -20,9 +27,8 @@ export interface GithubComment {
   url: string
 }
 
-/** Full issue/PR body + comment thread, fetched on demand when a card is opened in-app. */
+/** Full issue/PR body + comment thread, fetched on demand when a card is opened in-app. `body` is inherited from GithubTask. */
 export interface GithubTaskDetail extends GithubTask {
-  body: string
   author: string
   comments: GithubComment[]
 }
@@ -58,6 +64,7 @@ export class GithubService {
         updatedAt: item.updated_at,
         urgent: labels.some((label) => label.toLowerCase().includes('urgent')),
         labels,
+        body: item.body ?? '',
       }
     })
   }

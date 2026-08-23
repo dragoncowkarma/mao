@@ -1,7 +1,10 @@
 import { useEffect, useState } from 'react'
-import type { AiProviderConfig, ModelEffortPreset, ProviderKindId } from '../../core/ai/types'
+import type { AgentStage, AiProviderConfig, ModelEffortPreset, ProviderKindId } from '../../core/ai/types'
 import { PROVIDER_OPTIONS } from '../../core/ai/provider-options'
 import type { ThemePreference } from '../../core/store'
+
+const ALL_STAGES: AgentStage[] = ['issue', 'pr', 'review', 'merge']
+const STAGE_LABELS: Record<AgentStage, string> = { issue: 'Issue', pr: 'PR', review: 'Review', merge: 'Merge' }
 
 interface GlobalSettingsProps {
   theme: ThemePreference
@@ -298,6 +301,36 @@ function ProviderCard({ provider: p, onUpdate, onRemove }: ProviderCardProps) {
         <button onClick={onRemove} className="btn btn-ghost shrink-0">
           Remove
         </button>
+      </div>
+
+      {/* Stage restrictions — leave all unchecked to allow any stage (unrestricted). */}
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
+        <span className="text-muted">Allowed stages:</span>
+        {ALL_STAGES.map((stage) => {
+          const isRestricted = !!(p.allowedStages && p.allowedStages.length > 0)
+          return (
+            <label key={stage} className="flex items-center gap-1">
+              <input
+                type="checkbox"
+                checked={isRestricted ? p.allowedStages!.includes(stage) : false}
+                onChange={(e) => {
+                  const current = p.allowedStages && p.allowedStages.length > 0 ? p.allowedStages : []
+                  const next = e.target.checked
+                    ? [...current, stage]
+                    : current.filter((s) => s !== stage)
+                  // An empty selection means unrestricted — store as undefined to keep configs clean.
+                  onUpdate({ allowedStages: next.length > 0 ? next : undefined })
+                }}
+              />
+              {STAGE_LABELS[stage]}
+            </label>
+          )
+        })}
+        <span className="text-muted italic">
+          {!p.allowedStages || p.allowedStages.length === 0
+            ? '(all stages — unrestricted)'
+            : `restricted to: ${p.allowedStages.map((s) => STAGE_LABELS[s]).join(', ')}`}
+        </span>
       </div>
 
       {/* ── Presets section (CLI & API) ── */}

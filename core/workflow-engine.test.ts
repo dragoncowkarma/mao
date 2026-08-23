@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { WorkflowEngine, type RepoRef } from './workflow-engine.ts'
-import type { AiProviderConfig } from './ai/types.ts'
+import type { AgentStage, AiProviderConfig } from './ai/types.ts'
 import type { GithubService } from './github-service.ts'
 
 vi.mock('./ai/index.ts', () => ({
@@ -13,8 +13,16 @@ vi.mock('./ai/index.ts', () => ({
 
 const repo: RepoRef = { owner: 'acme', repo: 'widgets' }
 
-function makeProvider(id: string): AiProviderConfig {
-  return { id, name: id, kind: 'api', apiFormat: 'anthropic', apiKey: 'test-key', model: `${id}-model` }
+function makeProvider(id: string, allowedStages?: AgentStage[]): AiProviderConfig {
+  return {
+    id,
+    name: id,
+    kind: 'api',
+    apiFormat: 'anthropic',
+    apiKey: 'test-key',
+    model: `${id}-model`,
+    ...(allowedStages ? { allowedStages } : {}),
+  }
 }
 
 function makeFakeGithub(overrides: Partial<Record<string, unknown>> = {}) {
@@ -204,21 +212,21 @@ describe('WorkflowEngine', () => {
       expect(providerB.model).toBe('agent-b-model')
     })
 
-    it('fails clearly when an explicit provider override has no distinct provider for a maker-checker stage', async () => {
+    it('falls back to the sole registered provider when a providerId override has no stage-eligible alternative', async () => {
+      // With only one provider registered, maker-checker relaxes for the override path too —
+      // consistent with the no-override path which never errors in a single-provider setup.
       const github = makeFakeGithub()
       const engine = new WorkflowEngine(github)
       engine.setProviders([makeProvider('agent-a')])
 
       const task = engine.enqueue('Add feature R', repo, true, { providerId: 'agent-a' })
-      await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'error')
+      await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'done')
 
       const current = engine.getTasks().find((t) => t.id === task.id)!
-      // The issue stage (no predecessor) succeeds using the preferred provider...
-      expect(current.history).toHaveLength(1)
-      expect(current.stage).toBe('pr')
-      // ...but the pr stage can't honor maker-checker without a second provider, and fails clearly.
-      expect(current.error).toMatch(/no other provider is registered/i)
-      expect(github.createPullRequest).not.toHaveBeenCalled()
+      // All four stages complete with agent-a (only provider available).
+      expect(current.history).toHaveLength(4)
+      expect(current.history.every((h) => h.agentId === 'agent-a')).toBe(true)
+      expect(github.createPullRequest).toHaveBeenCalledTimes(1)
     })
 
     it('rejects an override that references an unregistered provider id', async () => {
@@ -333,6 +341,115 @@ describe('WorkflowEngine', () => {
 
       const current = engine.getTasks().find((t) => t.id === task.id)!
       expect(current.error).toMatch(/unknown provider/i)
+    })
+  })
+
+  describe('allowedStages', () => {
+    it('restricts a provider to only its allowed stages, routing other stages to an eligible provider', async () => {
+      const github = makeFakeGithub()
+      const engine = new WorkflowEngine(github)
+      // agent-a may only run the review stage; agent-b handles everything else.
+      engine.setProviders([makeProvider('agent-a', ['review']), makeProvider('agent-b')])
+
+      const task = engine.enqueue('Add feature T', repo)
+      await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'done')
+
+      const finished = engine.getTasks().find((t) => t.id === task.id)!
+      expect(finished.history).toHaveLength(4)
+      expect(finished.history.map((h) => h.stage)).toEqual(['issue', 'pr', 'review', 'merge'])
+
+      // agent-a must only appear at the review stage.
+      expect(finished.history.find((h) => h.stage === 'review')?.agentId).toBe('agent-a')
+      expect(finished.history.filter((h) => h.agentId === 'agent-a')).toHaveLength(1)
+
+      // Stages that are not review must be handled by agent-b (the only unrestricted provider).
+      for (const step of finished.history.filter((h) => h.stage !== 'review')) {
+        expect(step.agentId).toBe('agent-b')
+      }
+
+      // Maker-checker is best-effort when only one provider is eligible for a stage; what we can
+      // assert is that stage-eligible selection is honoured: agent-a never appears outside review.
+    })
+
+    it('fails clearly when no provider is configured for the current stage', async () => {
+      const github = makeFakeGithub()
+      const engine = new WorkflowEngine(github)
+      // agent-a is only allowed to run `issue`; no provider can handle `pr` onward.
+      engine.setProviders([makeProvider('agent-a', ['issue'])])
+
+      const task = engine.enqueue('Add feature U', repo)
+      await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'error')
+
+      const current = engine.getTasks().find((t) => t.id === task.id)!
+      // issue succeeds, pr fails because no provider is eligible.
+      expect(current.history).toHaveLength(1)
+      expect(current.stage).toBe('pr')
+      expect(current.error).toMatch(/no ai provider is configured to handle the "pr" stage/i)
+    })
+
+    it('fails clearly when a provider override names a provider not eligible for the target stage', async () => {
+      const github = makeFakeGithub()
+      const engine = new WorkflowEngine(github)
+      // agent-a is only for review; agent-b handles everything.
+      engine.setProviders([makeProvider('agent-a', ['review']), makeProvider('agent-b')])
+
+      // Explicitly request agent-a (review-only) for a task that starts at the issue stage.
+      const task = engine.enqueue('Add feature V', repo, true, { providerId: 'agent-a' })
+      await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'error')
+
+      const current = engine.getTasks().find((t) => t.id === task.id)!
+      expect(current.stage).toBe('issue')
+      expect(current.error).toMatch(/not configured to handle the "issue" stage/i)
+    })
+
+    it('falls back to the only stage-eligible provider (via override) when stage restrictions leave no alternative', async () => {
+      // Regression for P1 review finding: A(issue+pr) + B(review+merge), override:A.
+      // At the pr stage, A already ran issue but is the only eligible provider for pr —
+      // maker-checker should relax (same as single-eligible-provider fallback), not error.
+      const github = makeFakeGithub()
+      const engine = new WorkflowEngine(github)
+      engine.setProviders([
+        makeProvider('agent-a', ['issue', 'pr']),
+        makeProvider('agent-b', ['review', 'merge']),
+      ])
+
+      // autoAdvance:false so we can inspect state after each stage without racing past review.
+      const task = engine.enqueue('Add feature Y2', repo, false, { providerId: 'agent-a' })
+
+      // issue stage runs, task pauses at pr.
+      await waitFor(() => {
+        const t = engine.getTasks().find((t) => t.id === task.id)
+        return t?.status === 'paused' && t.stage === 'pr'
+      })
+
+      // pr stage — A is the only eligible provider even though it just ran issue.
+      engine.advance(task.id)
+      await waitFor(() => {
+        const t = engine.getTasks().find((t) => t.id === task.id)
+        return t?.status === 'paused' && t.stage === 'review'
+      })
+
+      const current = engine.getTasks().find((t) => t.id === task.id)!
+      expect(current.error).toBeUndefined()
+      expect(current.history).toHaveLength(2)
+      expect(current.history.find((h) => h.stage === 'issue')?.agentId).toBe('agent-a')
+      expect(current.history.find((h) => h.stage === 'pr')?.agentId).toBe('agent-a')
+    })
+
+    it('permits a provider with an empty allowedStages array to run any stage (same as absent)', async () => {
+      const github = makeFakeGithub()
+      const engine = new WorkflowEngine(github)
+      // Empty array should behave identically to no restriction.
+      engine.setProviders([makeProvider('agent-a', []), makeProvider('agent-b', [])])
+
+      const task = engine.enqueue('Add feature W2', repo)
+      await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'done')
+
+      const finished = engine.getTasks().find((t) => t.id === task.id)!
+      expect(finished.history).toHaveLength(4)
+      for (let i = 1; i < finished.history.length; i++) {
+        expect(finished.history[i].agentId).not.toBe(finished.history[i - 1].agentId)
+      }
     })
   })
 })

@@ -215,12 +215,13 @@ There is no codegen — these couplings are maintained by hand and only `npm run
 - **Known token-exposure path**: `ensureClone` (`core/git-workspace.ts`) embeds
   the GitHub token in the HTTPS remote URL
   (`https://x-access-token:<token>@github.com/…`). That URL persists in each
-  workspace clone's `.git/config`, and when a git command fails, the `execFile`
-  error message echoes the credential URL — which lands in `task.error`, the
-  persisted queue, and `mao run` stderr / the UI. Treat task errors, the queue
-  store, and workspace `.git/config` files as secret-bearing: never paste them
-  into issues, PRs, or logs. Removing the credential from the URL (or redacting
-  git errors) would be a welcome fix.
+  workspace clone's `.git/config`, so treat workspace `.git/config` files as
+  secret-bearing: never paste them into issues, PRs, or logs. Git-command error
+  output is already redacted — `core/git-workspace.ts`'s internal `run()` wrapper
+  scrubs `err.message`, `err.stderr`, `err.stdout`, and `err.cmd` of the
+  credential URL (added in `0a517e4` "secure exec wrapper", tightened in
+  `b884f24` "resolve cmd leakage") — so task errors and the queue store no longer
+  leak the token. Removing the credential from the URL would be a welcome fix.
 
 ## Code conventions
 

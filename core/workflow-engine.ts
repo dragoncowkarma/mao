@@ -346,6 +346,12 @@ export class WorkflowEngine extends EventEmitter {
       } else {
         const alternative = stageEligible.find((p) => p.id !== previousAgentId)
         if (!alternative) {
+          if (rolePreferredId !== undefined) {
+            throw new Error(
+              `Provider override "${preferredId}" handled the immediately preceding stage and no other ` +
+                `provider is registered to check its own work — maker-checker requires a distinct provider here.`,
+            )
+          }
           // No other stage-eligible provider is available — relax maker-checker and use the only
           // eligible provider. Consistent with the no-override path's `candidates[0] ?? stageEligible[0]`
           // fallback: when stage restrictions (or a single-provider setup) leave only one option,

@@ -293,6 +293,11 @@ export default function KanbanBoard({ repo }: KanbanBoardProps) {
           repo={repo}
           number={selectedTask.number}
           type={selectedTask.type}
+          alreadyQueued={!!findWorkflowTask(selectedTask, workflowTasks)}
+          onEnqueued={() => {
+            loadWorkflowTasks()
+            setSelectedTask(null)
+          }}
           onClose={() => setSelectedTask(null)}
         />
       )}

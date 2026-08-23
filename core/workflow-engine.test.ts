@@ -140,6 +140,28 @@ describe('WorkflowEngine', () => {
     expect(current.error).toMatch(/No AI providers registered/)
   })
 
+  it('enqueueFromIssue defaults to autoAdvance=true but honors an explicit false', async () => {
+    const github = makeFakeGithub()
+    const engine = new WorkflowEngine(github)
+    engine.setProviders([makeProvider('agent-a'), makeProvider('agent-b')])
+
+    // Default (no 5th arg) preserves auto-trigger's existing unattended behavior.
+    const auto = engine.enqueueFromIssue(1, 'https://github.com/acme/widgets/issues/1', 'Bug A', repo)
+    expect(auto.stage).toBe('pr')
+    expect(auto.autoAdvance).toBe(true)
+    await waitFor(() => engine.getTasks().find((t) => t.id === auto.id)?.status === 'done')
+    expect(github.createIssue).not.toHaveBeenCalled()
+    expect(github.mergePullRequest).toHaveBeenCalledTimes(1)
+
+    // Explicit false pauses after the 'pr' stage instead of running through to merge.
+    const paused = engine.enqueueFromIssue(2, 'https://github.com/acme/widgets/issues/2', 'Bug B', repo, false)
+    expect(paused.autoAdvance).toBe(false)
+    await waitFor(() => engine.getTasks().find((t) => t.id === paused.id)?.status === 'paused')
+    const current = engine.getTasks().find((t) => t.id === paused.id)!
+    expect(current.stage).toBe('review')
+    expect(current.history).toHaveLength(1)
+  })
+
   describe('provider override', () => {
     it('honors the preferred provider except when it would violate maker-checker, across all stages', async () => {
       const github = makeFakeGithub()

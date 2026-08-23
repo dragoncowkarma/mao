@@ -36,7 +36,9 @@ export function startAutoTrigger(
         const assignment = parseAssignmentTags(task.body)
         const providerOverride = hasAssignment(assignment) ? { roles: assignment } : undefined
 
-        workflowEngine.enqueueFromIssue(task.number, task.url, task.title, { owner, repo }, providerOverride)
+        // autoAdvance stays true here (unchanged auto-trigger behavior) — the role/model/effort
+        // preference goes in the providerOverride slot after it.
+        workflowEngine.enqueueFromIssue(task.number, task.url, task.title, { owner, repo }, true, providerOverride)
         await githubService.addLabel(owner, repo, task.number, WORKFLOW_ACTIVE_LABEL).catch(() => {})
       }
       lastError.delete(key)

@@ -30,6 +30,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
   workflow: {
     enqueue: (title: string, repo: RepoRef, autoAdvance?: boolean): Promise<QueuedTask> =>
       ipcRenderer.invoke('workflow:enqueue', title, repo, autoAdvance),
+    enqueueFromIssue: (
+      owner: string,
+      repo: string,
+      issueNumber: number,
+      autoAdvance?: boolean,
+    ): Promise<QueuedTask> => ipcRenderer.invoke('workflow:enqueueFromIssue', owner, repo, issueNumber, autoAdvance),
     list: (): Promise<QueuedTask[]> => ipcRenderer.invoke('workflow:list'),
     retry: (taskId: string): Promise<QueuedTask> => ipcRenderer.invoke('workflow:retry', taskId),
     advance: (taskId: string): Promise<QueuedTask> => ipcRenderer.invoke('workflow:advance', taskId),

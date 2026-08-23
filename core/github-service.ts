@@ -161,17 +161,31 @@ export class GithubService {
     return data.default_branch
   }
 
+  /**
+   * Idempotent by design: a retried `applyGithubAction`'s notes-only `pr` case (`core/workflow-engine.ts`)
+   * re-calls this after a prior attempt already created the ref but failed on a later step
+   * (`commitFile`/`createPullRequest`). Without this, `createRef` rejects with "Reference already
+   * exists" on every subsequent retry and the task is stuck forever (issue #37) — so a 422 whose
+   * message says the ref already exists is treated as success (the branch is reused) rather than
+   * rethrown. Any other failure (including a genuine 422 for an unrelated reason) still throws.
+   */
   async createBranch(owner: string, repo: string, branchName: string) {
     if (!this.octokit) throw new Error('GitHub token is not set')
     const { data: repoData } = await this.octokit.rest.repos.get({ owner, repo })
     const base = repoData.default_branch
     const { data: ref } = await this.octokit.rest.git.getRef({ owner, repo, ref: `heads/${base}` })
-    await this.octokit.rest.git.createRef({
-      owner,
-      repo,
-      ref: `refs/heads/${branchName}`,
-      sha: ref.object.sha,
-    })
+    try {
+      await this.octokit.rest.git.createRef({
+        owner,
+        repo,
+        ref: `refs/heads/${branchName}`,
+        sha: ref.object.sha,
+      })
+    } catch (err) {
+      const status = (err as { status?: number } | null)?.status
+      const message = err instanceof Error ? err.message : String(err)
+      if (status !== 422 || !/already exists/i.test(message)) throw err
+    }
     return { base }
   }
 

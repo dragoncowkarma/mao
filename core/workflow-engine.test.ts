@@ -190,21 +190,21 @@ describe('WorkflowEngine', () => {
       expect(providerB.model).toBe('agent-b-model')
     })
 
-    it('fails clearly when an explicit provider override has no distinct provider for a maker-checker stage', async () => {
+    it('falls back to the sole registered provider when a providerId override has no stage-eligible alternative', async () => {
+      // With only one provider registered, maker-checker relaxes for the override path too —
+      // consistent with the no-override path which never errors in a single-provider setup.
       const github = makeFakeGithub()
       const engine = new WorkflowEngine(github)
       engine.setProviders([makeProvider('agent-a')])
 
       const task = engine.enqueue('Add feature R', repo, true, { providerId: 'agent-a' })
-      await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'error')
+      await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'done')
 
       const current = engine.getTasks().find((t) => t.id === task.id)!
-      // The issue stage (no predecessor) succeeds using the preferred provider...
-      expect(current.history).toHaveLength(1)
-      expect(current.stage).toBe('pr')
-      // ...but the pr stage can't honor maker-checker without a second provider, and fails clearly.
-      expect(current.error).toMatch(/no other provider is registered/i)
-      expect(github.createPullRequest).not.toHaveBeenCalled()
+      // All four stages complete with agent-a (only provider available).
+      expect(current.history).toHaveLength(4)
+      expect(current.history.every((h) => h.agentId === 'agent-a')).toBe(true)
+      expect(github.createPullRequest).toHaveBeenCalledTimes(1)
     })
 
     it('rejects an override that references an unregistered provider id', async () => {

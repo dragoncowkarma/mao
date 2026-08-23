@@ -304,12 +304,22 @@ export class WorkflowEngine extends EventEmitter {
       } else {
         const alternative = stageEligible.find((p) => p.id !== previousAgentId)
         if (!alternative) {
-          throw new Error(
-            `Provider override "${override.providerId}" handled the immediately preceding stage and no other ` +
-              `provider is registered to check its own work — maker-checker requires a distinct provider here.`,
-          )
+          // No other stage-eligible provider is available. Distinguish two situations:
+          //   - Stage restrictions narrowed the pool to one (other providers exist but are
+          //     restricted away from this stage): relax maker-checker and use the only eligible
+          //     provider, same as the no-override path's `candidates[0] ?? stageEligible[0]`.
+          //   - Genuinely only one provider registered: require the user to add another.
+          if (this.providers.some((p) => p.id !== preferred.id)) {
+            base = preferred // stage restrictions made this the only eligible option
+          } else {
+            throw new Error(
+              `Provider override "${override.providerId}" handled the immediately preceding stage and no other ` +
+                `provider is registered to check its own work — maker-checker requires a distinct provider here.`,
+            )
+          }
+        } else {
+          base = alternative
         }
-        base = alternative
       }
     } else {
       // Prefer a provider that didn't just run (maker-checker), from the stage-eligible pool.

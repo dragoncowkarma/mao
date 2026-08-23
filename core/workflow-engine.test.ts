@@ -277,6 +277,40 @@ describe('WorkflowEngine', () => {
       expect(current.error).toMatch(/not configured to handle the "issue" stage/i)
     })
 
+    it('falls back to the only stage-eligible provider (via override) when stage restrictions leave no alternative', async () => {
+      // Regression for P1 review finding: A(issue+pr) + B(review+merge), override:A.
+      // At the pr stage, A already ran issue but is the only eligible provider for pr —
+      // maker-checker should relax (same as single-eligible-provider fallback), not error.
+      const github = makeFakeGithub()
+      const engine = new WorkflowEngine(github)
+      engine.setProviders([
+        makeProvider('agent-a', ['issue', 'pr']),
+        makeProvider('agent-b', ['review', 'merge']),
+      ])
+
+      // autoAdvance:false so we can inspect state after each stage without racing past review.
+      const task = engine.enqueue('Add feature Y2', repo, false, { providerId: 'agent-a' })
+
+      // issue stage runs, task pauses at pr.
+      await waitFor(() => {
+        const t = engine.getTasks().find((t) => t.id === task.id)
+        return t?.status === 'paused' && t.stage === 'pr'
+      })
+
+      // pr stage — A is the only eligible provider even though it just ran issue.
+      engine.advance(task.id)
+      await waitFor(() => {
+        const t = engine.getTasks().find((t) => t.id === task.id)
+        return t?.status === 'paused' && t.stage === 'review'
+      })
+
+      const current = engine.getTasks().find((t) => t.id === task.id)!
+      expect(current.error).toBeUndefined()
+      expect(current.history).toHaveLength(2)
+      expect(current.history.find((h) => h.stage === 'issue')?.agentId).toBe('agent-a')
+      expect(current.history.find((h) => h.stage === 'pr')?.agentId).toBe('agent-a')
+    })
+
     it('permits a provider with an empty allowedStages array to run any stage (same as absent)', async () => {
       const github = makeFakeGithub()
       const engine = new WorkflowEngine(github)

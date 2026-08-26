@@ -145,6 +145,20 @@ describe('parseProviderOverride', () => {
     expect(parseProviderOverride(body)).toEqual({ model: 'model-b', effort: 'max' })
   })
 
+  it('lets an invalid final effort supersede an earlier valid one instead of resurrecting it', () => {
+    // Last-occurrence-wins is resolved before validation: the amendment drops the override entirely
+    // rather than silently leaving the task pinned to the tag the author meant to replace.
+    expect(parseProviderOverride('[Effort: high] ... edit: [Effort: turbo]')).toBeUndefined()
+    expect(parseProviderOverride('[Model: model-a] [Effort: high]\nedit: [Effort: turbo]')).toEqual({
+      model: 'model-a',
+    })
+  })
+
+  it('still honors an earlier valid effort when only a *quoted* later tag is invalid', () => {
+    // The quoted tag never counts as an occurrence at all, so it cannot supersede anything.
+    expect(parseProviderOverride('[Effort: high]\n\n`[Effort: turbo]`')).toEqual({ effort: 'high' })
+  })
+
   it('ignores model/effort tags quoted in a code fence, code span, HTML comment, or blockquote', () => {
     expect(parseProviderOverride('```\n[Model: example-model]\n```')).toBeUndefined()
     expect(parseProviderOverride('Write `[Effort: high]` to pin the effort.')).toBeUndefined()

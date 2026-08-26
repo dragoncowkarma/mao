@@ -124,7 +124,9 @@ anything else is ignored and the provider keeps its configured effort. `<modelId
 passed through as written, so a typo surfaces later as a provider error. All directive
 tags are ignored inside code fences, inline code spans, HTML comments, and blockquotes —
 quote the syntax freely when documenting it. A repeated tag keeps its last occurrence, so
-an amendment can simply be appended further down the body.
+an amendment can simply be appended further down the body — and that applies even when the
+amendment is invalid: `[Effort: high]` later amended to `[Effort: turbo]` leaves the task
+with no effort override rather than the superseded `high`.
 
 ## End-to-end pipeline test (real GitHub repo)
 

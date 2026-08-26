@@ -140,7 +140,9 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   The model value is passed through verbatim (an unusable one fails provider-side); the
   effort value is validated against `AI_EFFORTS` in `core/ai/types.ts` — that list is the
   single definition the `AiEffort` union is derived from, so a new level must be added
-  there and nowhere else. Every directive tag is ignored inside code fences, inline code
+  there and nowhere else. Validation runs *after* last-occurrence-wins, never as a
+  per-match filter: an invalid amendment drops the override instead of falling back to the
+  tag it superseded. Every directive tag is ignored inside code fences, inline code
   spans, HTML comments, and blockquotes, so documenting the syntax never acts as a directive.
 - **Single-flight queue**: `processQueue()` runs one stage at a time globally.
   Therefore every external call must be time-bounded. Today only the AI-provider

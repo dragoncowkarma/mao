@@ -31,7 +31,10 @@ const MODEL_TAG_PATTERN = /\[\s*model\s*:\s*([^\]\s|]+)\s*\]/gi
  * includes a two-word value (`extra high`), so the value here may contain inner whitespace and is
  * validated against `AI_EFFORTS` after normalizing case and runs of whitespace. An unrecognized
  * level is dropped (the task simply keeps its provider's configured effort) rather than throwing —
- * consistent with the rest of this parser, which never rejects an issue body.
+ * consistent with the rest of this parser, which never rejects an issue body. Note validation runs
+ * *after* last-occurrence-wins, not as a filter before it: a later amendment always supersedes an
+ * earlier tag, so `[Effort: high]` followed by `[Effort: turbo]` yields no effort override at all
+ * rather than resurrecting the superseded `high`.
  */
 const EFFORT_TAG_PATTERN = /\[\s*effort\s*:\s*([^\]|]+?)\s*\]/gi
 
@@ -107,6 +110,13 @@ function collectRoles(stripped: string): WorkflowRoleAssignment {
   return assignment
 }
 
+/** Captured value of the last match of `pattern` (a repeated tag's winner), or undefined if none. */
+function lastMatch(stripped: string, pattern: RegExp): string | undefined {
+  let value: string | undefined
+  for (const match of stripped.matchAll(pattern)) value = match[1]
+  return value
+}
+
 /** Normalizes a raw `[Effort: …]` value and returns it only if it names a known level. */
 function toEffort(raw: string): AiEffort | undefined {
   const normalized = raw.trim().toLowerCase().replace(/\s+/g, ' ')
@@ -121,9 +131,10 @@ function toEffort(raw: string): AiEffort | undefined {
  * CLI, which has had `--model`/`--effort` flags all along — pin a model or reasoning effort at all.
  *
  * The same quoting rules apply to every tag (code fences, inline code, HTML comments and blockquotes
- * are stripped first), a repeated tag keeps its last occurrence, and an unrecognized effort level is
- * dropped. Returns `undefined` — not an empty object — when a body carries no directives, so callers
- * can pass the result straight through as "no override" without an emptiness check of their own.
+ * are stripped first) and a repeated tag keeps its last occurrence — including when that last one is
+ * an unrecognized effort level, which drops the override entirely rather than falling back to the tag
+ * it superseded. Returns `undefined` — not an empty object — when a body carries no directives, so
+ * callers can pass the result straight through as "no override" without an emptiness check of their own.
  *
  * Note the model/effort tags are *preferences applied to whichever provider maker-checker ends up
  * choosing*, exactly like their CLI-flag equivalents: they never influence provider selection, and a
@@ -135,11 +146,15 @@ export function parseProviderOverride(text: string | null | undefined): Provider
 
   const override: ProviderOverride = {}
   if (hasAssignment(roles)) override.roles = roles
-  for (const match of stripped.matchAll(MODEL_TAG_PATTERN)) override.model = match[1]
-  for (const match of stripped.matchAll(EFFORT_TAG_PATTERN)) {
-    const effort = toEffort(match[1])
-    if (effort !== undefined) override.effort = effort
-  }
+
+  // Resolve last-occurrence-wins first, then validate that winner — never validate per match, which
+  // would let an invalid amendment fall through to a superseded earlier tag (see EFFORT_TAG_PATTERN).
+  const lastModel = lastMatch(stripped, MODEL_TAG_PATTERN)
+  if (lastModel !== undefined) override.model = lastModel
+
+  const lastEffort = lastMatch(stripped, EFFORT_TAG_PATTERN)
+  const effort = lastEffort === undefined ? undefined : toEffort(lastEffort)
+  if (effort !== undefined) override.effort = effort
 
   return Object.keys(override).length > 0 ? override : undefined
 }

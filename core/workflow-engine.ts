@@ -142,6 +142,17 @@ export class WorkflowEngine extends EventEmitter {
   private github: GithubService
   private githubToken = ''
   private workspaceRoot = ''
+  /**
+   * Set when a `'change'` listener (e.g. createMaoApp's synchronous store.set) throws on every
+   * attempt to persist a task's new status, including the guarded retry in `runStage()`. At that
+   * point the in-memory queue and the on-disk store have diverged with no way to reconcile them
+   * from here, and continuing to process more tasks would only widen the gap — most dangerously,
+   * a restart with `resume: true` could reload the last *durably persisted* (stale) state and
+   * re-run GitHub work that already happened. `processQueue()` refuses to run any further stages
+   * once this is set; callers should surface `isPersistenceBroken()` / `getPersistenceError()` to
+   * an operator rather than silently retrying.
+   */
+  private persistenceBroken: Error | undefined
 
   constructor(github: GithubService) {
     super()
@@ -168,6 +179,16 @@ export class WorkflowEngine extends EventEmitter {
 
   getTasks(): QueuedTask[] {
     return this.queue
+  }
+
+  /** True once a `'change'` listener has failed to persist a task even after the guarded retry (see `persistenceBroken`). */
+  isPersistenceBroken(): boolean {
+    return this.persistenceBroken !== undefined
+  }
+
+  /** The error from the persistence failure that tripped `isPersistenceBroken()`, if any. */
+  getPersistenceError(): Error | undefined {
+    return this.persistenceBroken
   }
 
   /** Removes all finished (done/error) tasks immediately. */
@@ -388,12 +409,17 @@ export class WorkflowEngine extends EventEmitter {
 
   private async processQueue() {
     if (this.processing) return
+    // Persistence is confirmed broken (see `persistenceBroken`) — refuse to run more stages until
+    // the process restarts. Continuing would only produce more in-memory state the store can't
+    // durably reflect.
+    if (this.persistenceBroken) return
     this.processing = true
     try {
       let advanced = true
       while (advanced) {
         advanced = false
         for (const task of this.queue) {
+          if (this.persistenceBroken) return
           if (task.status !== 'pending') continue
           await this.runStage(task)
           advanced = true
@@ -460,15 +486,32 @@ export class WorkflowEngine extends EventEmitter {
     }
     task.active = undefined
     this.pruneFinishedTasks()
+    this.notifyAfterStage(task)
+  }
+
+  /**
+   * Persists the just-finished stage's outcome, guarding against a throwing `'change'` listener.
+   * A single failure (whether from the entry notify inside `runStage`'s try, or this exit notify)
+   * degrades the task to `'error'` and retries once — `task.active` is already cleared by this
+   * point, so a failure caused by transiently-unserializable in-flight data (e.g. a large prompt)
+   * won't repeat. If the retry *also* throws, persistence is confirmed broken: the on-disk store
+   * can no longer be trusted to reflect this task's real status, and pretending otherwise risks a
+   * restart-with-resume replaying GitHub work that already happened. Record it via
+   * `persistenceBroken` (surfaced through `isPersistenceBroken()`/`getPersistenceError()`) so
+   * `processQueue()` stops running further stages instead of silently continuing.
+   */
+  private notifyAfterStage(task: QueuedTask) {
+    try {
+      this.notify()
+      return
+    } catch (err) {
+      task.status = 'error'
+      task.error = err instanceof Error ? err.message : String(err)
+    }
     try {
       this.notify()
     } catch (err) {
-      // The exit notify fires after this stage's real work (GitHub writes, stage advance) already
-      // happened in memory. A throwing listener here must not escape and crash the queue loop, nor
-      // leave an unpersisted advance masquerading as success — degrade to a normal 'error' status
-      // (retryable) instead of silently corrupting queue state.
-      task.status = 'error'
-      task.error = err instanceof Error ? err.message : String(err)
+      this.persistenceBroken = err instanceof Error ? err : new Error(String(err))
     }
   }
 

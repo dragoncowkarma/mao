@@ -31,7 +31,7 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
 | `core/github-service.ts` | Octokit REST wrapper (issues, PRs, labels, reviews, merge, CI status) |
 | `core/git-workspace.ts` | Local git clone/branch/commit/push via `execFile` (no shell) |
 | `core/auto-trigger.ts` | Per-repo polling scheduler; auto-enqueues new open issues |
-| `core/assignment.ts` | `parseAssignmentTags()` — swarm_orchestrator-style `[Worker: id]`/`[Reviewer: id]`/`[Maintainer: id]` tag parser for issue/PR bodies |
+| `core/assignment.ts` | Issue/PR body directive parser — `parseAssignmentTags()` for swarm_orchestrator-style `[Worker: id]`/`[Reviewer: id]`/`[Maintainer: id]` role tags, and `parseProviderOverride()` which folds those plus task-level `[Model: id]`/`[Effort: level]` tags into a `ProviderOverride` |
 | `core/store.ts` | `MaoStoreSchema`, `MAO_STORE_DEFAULTS`, the `MaoStore` interface, and `FileStore` (JSON impl for the CLI) |
 | `core/app.ts` | `createMaoApp()` — the **single composition root** both frontends call |
 | `core/paths.ts` | Platform-appropriate data dir for the CLI (mirrors Electron's `userData`) |
@@ -125,11 +125,25 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   its own work), so that specific case skips the guard. `roles` is normally populated
   by `core/assignment.ts`'s `parseAssignmentTags()` reading `[Worker: id]` /
   `[Reviewer: id]` / `[Maintainer: id]` tags out of an auto-triggered issue's body
-  (mirroring `dev-toolkit`'s `swarm_orchestrator.py` role-tag convention, minus its
-  unused Model/Reasoning sub-fields — those already live on the provider's own saved
-  config) — or set directly via `mao workflow enqueue --worker/--reviewer/--maintainer`.
+  (mirroring `dev-toolkit`'s `swarm_orchestrator.py` role-tag convention, but with its
+  Model/Reasoning sub-fields split out into the separate task-level tags below rather
+  than nested in the role tag) — or set directly via
+  `mao workflow enqueue --worker/--reviewer/--maintainer`.
   An id that doesn't match a registered provider throws (retryable), same as an
   invalid `providerId`.
+- **Model/effort overrides are preferences, not selection inputs**: `providerOverride`'s
+  `model`/`effort` are applied to whichever provider maker-checker ends up choosing (on a
+  copy — the saved provider config is never mutated), falling back to that provider's own
+  `model`/`effort` or its active preset. Auto-triggered issues set them via task-level
+  `[Model: <id>]` / `[Effort: <level>]` tags in the issue body, parsed by
+  `parseProviderOverride()` — the body equivalent of `mao workflow enqueue --model/--effort`.
+  The model value is passed through verbatim (an unusable one fails provider-side); the
+  effort value is validated against `AI_EFFORTS` in `core/ai/types.ts` — that list is the
+  single definition the `AiEffort` union is derived from, so a new level must be added
+  there and nowhere else. Validation runs *after* last-occurrence-wins, never as a
+  per-match filter: an invalid amendment drops the override instead of falling back to the
+  tag it superseded. Every directive tag is ignored inside code fences, inline code
+  spans, HTML comments, and blockquotes, so documenting the syntax never acts as a directive.
 - **Single-flight queue**: `processQueue()` runs one stage at a time globally.
   Therefore every external call must be time-bounded. Today only the AI-provider
   calls are: the API provider aborts after 5 min, the CLI provider SIGKILLs after

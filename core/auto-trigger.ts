@@ -1,4 +1,4 @@
-import { parseAssignmentTags, hasAssignment } from './assignment.ts'
+import { parseProviderOverride } from './assignment.ts'
 import type { GithubService } from './github-service.ts'
 import { WORKFLOW_ACTIVE_LABEL, type RepoRef, type WorkflowEngine } from './workflow-engine.ts'
 
@@ -30,11 +30,12 @@ export function startAutoTrigger(
         if (task.type !== 'issue' || task.state !== 'open') continue
         if (task.labels.includes(WORKFLOW_ACTIVE_LABEL)) continue
 
-        // Swarm_orchestrator-style [Worker: id] / [Reviewer: id] / [Maintainer: id] tags in the issue
-        // body pin specific registered providers to specific stages; an issue with none of those tags
-        // enqueues exactly as before, falling back to the default maker-checker rotation.
-        const assignment = parseAssignmentTags(task.body)
-        const providerOverride = hasAssignment(assignment) ? { roles: assignment } : undefined
+        // Directive tags in the issue body: swarm_orchestrator-style [Worker: id] / [Reviewer: id] /
+        // [Maintainer: id] pin specific registered providers to specific stages, while [Model: id] /
+        // [Effort: level] pin the model and reasoning effort for the whole task (the auto-trigger
+        // equivalent of `mao workflow enqueue --model/--effort`). An issue carrying none of them
+        // enqueues exactly as before — undefined override, default maker-checker rotation.
+        const providerOverride = parseProviderOverride(task.body)
 
         // autoAdvance stays true here (unchanged auto-trigger behavior) — the role/model/effort
         // preference goes in the providerOverride slot after it.

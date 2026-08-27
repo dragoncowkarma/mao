@@ -45,7 +45,27 @@ export function createMaoApp({ store, workspaceRoot, resume }: MaoAppOptions): M
   workflowEngine.setProviders(store.get('aiProviders'))
   workflowEngine.setWorkspaceRoot(workspaceRoot)
   workflowEngine.on('change', (tasks: QueuedTask[]) => store.set('workflowTasks', tasks))
-  workflowEngine.restore(store.get('workflowTasks'), { resume })
+  // Best-effort durable record of a confirmed persistence failure (see
+  // WorkflowEngine.isPersistenceBroken()) — a small, independent write, distinct from the 'change'
+  // listener above that just failed twice running the same task list through it. If this write
+  // *also* fails, there's nothing more this process can do; the in-memory flag on workflowEngine
+  // still stops it from running further stages for the rest of this process's life.
+  workflowEngine.on('persistence-broken', () => {
+    try {
+      store.set('workflowPersistenceBroken', true)
+    } catch {
+      // Nothing more we can do — the store itself has failed two independent writes now.
+    }
+  })
+
+  // A prior process confirmed it could no longer durably persist queue state (see above) and may
+  // have advanced a task's stage in memory — including real GitHub writes — without that advance
+  // reaching workflowTasks. The on-disk snapshot can therefore predate work that already happened;
+  // auto-resuming from it risks re-running (duplicating) that work. Refuse to auto-resume — no
+  // matter what the caller asked for — until an operator has verified the queue and explicitly
+  // cleared the flag (`mao config clear-persistence-broken`).
+  const safeToResume = resume && !store.get('workflowPersistenceBroken')
+  workflowEngine.restore(store.get('workflowTasks'), { resume: safeToResume })
 
   return { githubService, workflowEngine, store }
 }

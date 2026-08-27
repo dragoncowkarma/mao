@@ -15,6 +15,16 @@ export interface MaoStoreSchema {
   aiProviders: AiProviderConfig[]
   workflowTasks: QueuedTask[]
   theme: ThemePreference
+  /**
+   * Set (best-effort, from createMaoApp's 'persistence-broken' handler) when the WorkflowEngine
+   * confirms it can no longer durably persist queue state — see WorkflowEngine.isPersistenceBroken().
+   * createMaoApp checks this on every boot and refuses to auto-resume the queue while it's true,
+   * even when the caller asked for resume: true — the on-disk workflowTasks snapshot may predate a
+   * GitHub side effect that already happened, and blindly resuming risks re-running (duplicating)
+   * it. An operator must confirm the queue is safe and clear this explicitly (see
+   * `mao config clear-persistence-broken`) before auto-resume runs again.
+   */
+  workflowPersistenceBroken: boolean
 }
 
 export const MAO_STORE_DEFAULTS: MaoStoreSchema = {
@@ -23,6 +33,7 @@ export const MAO_STORE_DEFAULTS: MaoStoreSchema = {
   aiProviders: [],
   workflowTasks: [],
   theme: 'system',
+  workflowPersistenceBroken: false,
 }
 
 /**

@@ -92,7 +92,26 @@ config
       githubRepos: store.get('githubRepos'),
       aiProviders: store.get('aiProviders').map((p) => ({ ...p, apiKey: p.apiKey ? '[set]' : undefined })),
       theme: store.get('theme'),
+      workflowPersistenceBroken: store.get('workflowPersistenceBroken'),
     })
+  })
+
+config
+  .command('clear-persistence-broken')
+  .description(
+    'Clear the workflowPersistenceBroken flag that blocks auto-resume after a confirmed queue ' +
+      'persistence failure (see AGENTS.md). Only run this after verifying by hand — via `mao workflow ' +
+      'list` and the target repo\'s actual GitHub state — that no queued task will duplicate work if ' +
+      'resumed.',
+  )
+  .action(() => {
+    const { store } = loadApp()
+    if (!store.get('workflowPersistenceBroken')) {
+      log('workflowPersistenceBroken is already false — nothing to clear.')
+      return
+    }
+    store.set('workflowPersistenceBroken', false)
+    log('Cleared workflowPersistenceBroken. Auto-resume (`mao run`) will run normally again.')
   })
 
 // --- repos ------------------------------------------------------------------

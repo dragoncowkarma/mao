@@ -498,7 +498,10 @@ export class WorkflowEngine extends EventEmitter {
    * can no longer be trusted to reflect this task's real status, and pretending otherwise risks a
    * restart-with-resume replaying GitHub work that already happened. Record it via
    * `persistenceBroken` (surfaced through `isPersistenceBroken()`/`getPersistenceError()`) so
-   * `processQueue()` stops running further stages instead of silently continuing.
+   * `processQueue()` stops running further stages instead of silently continuing — and emit
+   * `'persistence-broken'` so a host with independent durable storage (createMaoApp writes
+   * `workflowPersistenceBroken` to the MaoStore) can record that fact even though the *normal*
+   * queue-persisting write path is the one that just failed twice.
    */
   private notifyAfterStage(task: QueuedTask) {
     try {
@@ -511,7 +514,15 @@ export class WorkflowEngine extends EventEmitter {
     try {
       this.notify()
     } catch (err) {
-      this.persistenceBroken = err instanceof Error ? err : new Error(String(err))
+      const persistErr = err instanceof Error ? err : new Error(String(err))
+      this.persistenceBroken = persistErr
+      try {
+        this.emit('persistence-broken', persistErr)
+      } catch {
+        // A throwing 'persistence-broken' listener must not escape notifyAfterStage — the
+        // in-memory persistenceBroken flag above is already set regardless of whether any
+        // listener could act on the event.
+      }
     }
   }
 

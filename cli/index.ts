@@ -6,6 +6,7 @@ import { createMaoApp, type MaoApp } from '../core/app.ts'
 import { startAutoTrigger } from '../core/auto-trigger.ts'
 import { FileStore } from '../core/store.ts'
 import { defaultDataDir } from '../core/paths.ts'
+import { clearPersistenceBrokenMarker, hasPersistenceBrokenMarker } from '../core/persistence-guard.ts'
 import type { AiEffort, AiProviderConfig } from '../core/ai/types.ts'
 import type { QueuedTask, RepoRef } from '../core/workflow-engine.ts'
 import type { ThemePreference } from '../core/store.ts'
@@ -22,6 +23,11 @@ function printJson(value: unknown) {
   console.log(JSON.stringify(value, null, 2))
 }
 
+/** Resolves the same per-user data directory `loadApp()` boots against, for commands that need it directly (e.g. the persistence-broken marker). */
+function resolveDataDir(): string {
+  return process.env.MAO_DATA_DIR || defaultDataDir()
+}
+
 /**
  * Every command boots a fresh app instance against the on-disk store — the CLI is stateless between
  * invocations. `resume` defaults to false so that inspecting or reconfiguring state (e.g. `mao config
@@ -29,10 +35,10 @@ function printJson(value: unknown) {
  * previous `mao run`; only `run` itself opts in.
  */
 function loadApp(resume = false): MaoApp {
-  const dataDir = process.env.MAO_DATA_DIR || defaultDataDir()
+  const dataDir = resolveDataDir()
   const store = new FileStore(path.join(dataDir, 'config.json'))
   const workspaceRoot = path.join(dataDir, 'workspaces')
-  return createMaoApp({ store, workspaceRoot, resume })
+  return createMaoApp({ store, workspaceRoot, dataDir, resume })
 }
 
 const program = new Command()
@@ -92,25 +98,24 @@ config
       githubRepos: store.get('githubRepos'),
       aiProviders: store.get('aiProviders').map((p) => ({ ...p, apiKey: p.apiKey ? '[set]' : undefined })),
       theme: store.get('theme'),
-      workflowPersistenceBroken: store.get('workflowPersistenceBroken'),
+      workflowPersistenceBroken: hasPersistenceBrokenMarker(resolveDataDir()),
     })
   })
 
 config
   .command('clear-persistence-broken')
   .description(
-    'Clear the workflowPersistenceBroken flag that blocks auto-resume after a confirmed queue ' +
-      'persistence failure (see AGENTS.md). Only run this after verifying by hand — via `mao workflow ' +
-      'list` and the target repo\'s actual GitHub state — that no queued task will duplicate work if ' +
-      'resumed.',
+    'Clear the marker that blocks auto-resume after a confirmed queue persistence failure (see ' +
+      'AGENTS.md). Only run this after verifying by hand — via `mao workflow list` and the target ' +
+      "repo's actual GitHub state — that no queued task will duplicate work if resumed.",
   )
   .action(() => {
-    const { store } = loadApp()
-    if (!store.get('workflowPersistenceBroken')) {
+    const dataDir = resolveDataDir()
+    if (!hasPersistenceBrokenMarker(dataDir)) {
       log('workflowPersistenceBroken is already false — nothing to clear.')
       return
     }
-    store.set('workflowPersistenceBroken', false)
+    clearPersistenceBrokenMarker(dataDir)
     log('Cleared workflowPersistenceBroken. Auto-resume (`mao run`) will run normally again.')
   })
 

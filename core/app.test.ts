@@ -1,19 +1,27 @@
-import { describe, expect, it, vi } from 'vitest'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createMaoApp } from './app.ts'
-import { MAO_STORE_DEFAULTS, type MaoStore, type MaoStoreSchema } from './store.ts'
+import { FileStore } from './store.ts'
+import { hasPersistenceBrokenMarker, writePersistenceBrokenMarker } from './persistence-guard.ts'
 import type { QueuedTask } from './workflow-engine.ts'
 
-/** In-memory MaoStore for tests — tracks every set() call so we can assert what got persisted. */
-function makeFakeStore(overrides: Partial<MaoStoreSchema> = {}): MaoStore & { data: MaoStoreSchema } {
-  const data: MaoStoreSchema = { ...MAO_STORE_DEFAULTS, ...overrides }
-  return {
-    data,
-    get: (key) => data[key],
-    set: (key, value) => {
-      data[key] = value
-    },
-  }
+const tmpDirs: string[] = []
+
+/** A fresh per-test data directory on the real filesystem, backing a real FileStore — per review feedback, a fake in-memory MaoStore doesn't exercise the actual (single-JSON-blob, rewrite-whole-file) persistence model these regressions are about. */
+function makeRealDataDir(): { dataDir: string; store: FileStore } {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mao-app-test-'))
+  tmpDirs.push(dataDir)
+  return { dataDir, store: new FileStore(path.join(dataDir, 'config.json')) }
 }
+
+afterEach(() => {
+  vi.restoreAllMocks()
+  while (tmpDirs.length) {
+    fs.rmSync(tmpDirs.pop()!, { recursive: true, force: true })
+  }
+})
 
 function makePendingTask(id: string): QueuedTask {
   return {
@@ -29,33 +37,51 @@ function makePendingTask(id: string): QueuedTask {
 }
 
 describe('createMaoApp', () => {
-  it('durably records a confirmed WorkflowEngine persistence failure via a separate store write', () => {
-    const store = makeFakeStore()
-    const { workflowEngine } = createMaoApp({ store, workspaceRoot: '/tmp/mao-test', resume: false })
+  it('durably records a confirmed WorkflowEngine persistence failure as a real file on disk', () => {
+    const { dataDir, store } = makeRealDataDir()
+    const { workflowEngine } = createMaoApp({ store, workspaceRoot: path.join(dataDir, 'workspaces'), dataDir, resume: false })
 
-    expect(store.get('workflowPersistenceBroken')).toBe(false)
+    expect(hasPersistenceBrokenMarker(dataDir)).toBe(false)
     workflowEngine.emit('persistence-broken', new Error('disk full'))
-    expect(store.get('workflowPersistenceBroken')).toBe(true)
+    expect(hasPersistenceBrokenMarker(dataDir)).toBe(true)
   })
 
-  it('a store.set() that also throws for the durable flag does not crash the persistence-broken handler', () => {
-    const store = makeFakeStore()
-    const realSet = store.set.bind(store)
-    store.set = vi.fn((key, value) => {
-      if (key === 'workflowPersistenceBroken') throw new Error('store is completely gone')
-      realSet(key, value)
-    }) as MaoStore['set']
-    const { workflowEngine } = createMaoApp({ store, workspaceRoot: '/tmp/mao-test', resume: false })
+  it('the marker still lands even when FileStore.set() (the exact write that already failed for workflowTasks) is broken', () => {
+    const { dataDir, store } = makeRealDataDir()
+    const { workflowEngine } = createMaoApp({ store, workspaceRoot: path.join(dataDir, 'workspaces'), dataDir, resume: false })
+
+    // Simulate the real failure mode this regression is about: the store's config.json write is
+    // broken (e.g. disk full, permissions), but the marker file — a separate, independent
+    // writeFileSync call to a different path — is not, because the underlying disk can still take
+    // a few bytes even when it can't take the full task-list blob.
+    const realWriteFileSync = fs.writeFileSync
+    vi.spyOn(fs, 'writeFileSync').mockImplementation((file, ...rest) => {
+      if (String(file).endsWith('config.json')) throw new Error('ENOSPC: no space left on device')
+      return realWriteFileSync(file, ...(rest as [never]))
+    })
+
+    expect(() => store.set('workflowTasks', [])).toThrow(/ENOSPC/)
+    expect(() => workflowEngine.emit('persistence-broken', new Error('disk full'))).not.toThrow()
+    expect(hasPersistenceBrokenMarker(dataDir)).toBe(true)
+  })
+
+  it('an also-broken marker write does not crash the persistence-broken handler', () => {
+    const { dataDir, store } = makeRealDataDir()
+    const { workflowEngine } = createMaoApp({ store, workspaceRoot: path.join(dataDir, 'workspaces'), dataDir, resume: false })
+
+    vi.spyOn(fs, 'writeFileSync').mockImplementation(() => {
+      throw new Error('disk is completely gone')
+    })
 
     expect(() => workflowEngine.emit('persistence-broken', new Error('disk full'))).not.toThrow()
   })
 
-  it('refuses to auto-resume — even when the caller asks for resume: true — once workflowPersistenceBroken is set', async () => {
-    const store = makeFakeStore({
-      workflowPersistenceBroken: true,
-      workflowTasks: [makePendingTask('leftover-task')],
-    })
-    const { workflowEngine } = createMaoApp({ store, workspaceRoot: '/tmp/mao-test', resume: true })
+  it('refuses to auto-resume — even when the caller asks for resume: true — once the marker file is present', async () => {
+    const { dataDir, store } = makeRealDataDir()
+    store.set('workflowTasks', [makePendingTask('leftover-task')])
+    writePersistenceBrokenMarker(dataDir, new Error('disk full'))
+
+    const { workflowEngine } = createMaoApp({ store, workspaceRoot: path.join(dataDir, 'workspaces'), dataDir, resume: true })
 
     // Give any (incorrectly) auto-started processing a chance to run — with no AI providers
     // registered, a resumed task would immediately flip to 'error'. It must stay untouched instead.
@@ -65,12 +91,11 @@ describe('createMaoApp', () => {
     expect(task.status).toBe('pending')
   })
 
-  it('still auto-resumes normally when workflowPersistenceBroken is false', async () => {
-    const store = makeFakeStore({
-      workflowPersistenceBroken: false,
-      workflowTasks: [makePendingTask('leftover-task-2')],
-    })
-    const { workflowEngine } = createMaoApp({ store, workspaceRoot: '/tmp/mao-test', resume: true })
+  it('still auto-resumes normally when no marker file is present', async () => {
+    const { dataDir, store } = makeRealDataDir()
+    store.set('workflowTasks', [makePendingTask('leftover-task-2')])
+
+    const { workflowEngine } = createMaoApp({ store, workspaceRoot: path.join(dataDir, 'workspaces'), dataDir, resume: true })
 
     // No AI providers registered, so the resumed stage fails fast and predictably — proving
     // processing actually started (as opposed to the task sitting untouched at 'pending').

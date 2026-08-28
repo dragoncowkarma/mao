@@ -15,16 +15,6 @@ export interface MaoStoreSchema {
   aiProviders: AiProviderConfig[]
   workflowTasks: QueuedTask[]
   theme: ThemePreference
-  /**
-   * Set (best-effort, from createMaoApp's 'persistence-broken' handler) when the WorkflowEngine
-   * confirms it can no longer durably persist queue state — see WorkflowEngine.isPersistenceBroken().
-   * createMaoApp checks this on every boot and refuses to auto-resume the queue while it's true,
-   * even when the caller asked for resume: true — the on-disk workflowTasks snapshot may predate a
-   * GitHub side effect that already happened, and blindly resuming risks re-running (duplicating)
-   * it. An operator must confirm the queue is safe and clear this explicitly (see
-   * `mao config clear-persistence-broken`) before auto-resume runs again.
-   */
-  workflowPersistenceBroken: boolean
 }
 
 export const MAO_STORE_DEFAULTS: MaoStoreSchema = {
@@ -33,8 +23,16 @@ export const MAO_STORE_DEFAULTS: MaoStoreSchema = {
   aiProviders: [],
   workflowTasks: [],
   theme: 'system',
-  workflowPersistenceBroken: false,
 }
+
+/**
+ * A confirmed WorkflowEngine queue-persistence failure (see WorkflowEngine.isPersistenceBroken())
+ * is deliberately NOT a MaoStoreSchema field — both shipped MaoStore backends (FileStore below, and
+ * Electron's electron-store wrapper) persist their entire schema as one JSON blob and rewrite the
+ * whole file on every set() call, so a flag written through `store` would just retry the exact
+ * full-file write that already failed for `workflowTasks`. See core/persistence-guard.ts for the
+ * independent marker-file mechanism createMaoApp uses instead.
+ */
 
 /**
  * Minimal persistence contract the core app needs. The Electron GUI backs this with electron-store

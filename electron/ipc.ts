@@ -11,6 +11,7 @@ export function registerIpcHandlers() {
   const { githubService, workflowEngine } = createMaoApp({
     store,
     workspaceRoot: path.join(app.getPath('userData'), 'workspaces'),
+    dataDir: app.getPath('userData'),
     resume: true,
   })
   const autoTrigger = startAutoTrigger(githubService, workflowEngine, () => store.get('githubRepos'))

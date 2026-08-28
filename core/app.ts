@@ -1,11 +1,22 @@
 import { GithubService } from './github-service.ts'
 import { WorkflowEngine, type QueuedTask } from './workflow-engine.ts'
 import type { MaoStore } from './store.ts'
+import { hasPersistenceBrokenMarker, writePersistenceBrokenMarker } from './persistence-guard.ts'
 
 export interface MaoAppOptions {
   store: MaoStore
   /** Local directory where repos get cloned so CLI agents can make real file edits. */
   workspaceRoot: string
+  /**
+   * Per-user app data directory (Electron's `app.getPath('userData')`, or the CLI's resolved
+   * `defaultDataDir()`/`MAO_DATA_DIR`) — passed explicitly rather than derived from `workspaceRoot`
+   * so its location doesn't depend on an incidental relationship between the two. Used only to
+   * durably record a confirmed queue-persistence failure via a marker file independent of
+   * `MaoStore` (see core/persistence-guard.ts) — both shipped `MaoStore` backends rewrite their
+   * entire JSON blob on every `set()`, so a flag written *through* `store` would retry the exact
+   * write that just failed.
+   */
+  dataDir: string
   /**
    * Whether to immediately resume processing any leftover 'pending'/'running' tasks from a previous
    * session. Required (no default) on purpose: a long-lived process (the Electron main process, or
@@ -33,7 +44,7 @@ export interface MaoApp {
  * session but would make every one-shot CLI invocation hang forever. Callers that want continuous
  * polling (the Electron main process, or `mao run`) start it themselves.
  */
-export function createMaoApp({ store, workspaceRoot, resume }: MaoAppOptions): MaoApp {
+export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOptions): MaoApp {
   const githubService = new GithubService()
   const workflowEngine = new WorkflowEngine(githubService)
 
@@ -46,15 +57,16 @@ export function createMaoApp({ store, workspaceRoot, resume }: MaoAppOptions): M
   workflowEngine.setWorkspaceRoot(workspaceRoot)
   workflowEngine.on('change', (tasks: QueuedTask[]) => store.set('workflowTasks', tasks))
   // Best-effort durable record of a confirmed persistence failure (see
-  // WorkflowEngine.isPersistenceBroken()) — a small, independent write, distinct from the 'change'
-  // listener above that just failed twice running the same task list through it. If this write
-  // *also* fails, there's nothing more this process can do; the in-memory flag on workflowEngine
-  // still stops it from running further stages for the rest of this process's life.
-  workflowEngine.on('persistence-broken', () => {
+  // WorkflowEngine.isPersistenceBroken()) — via a marker file independent of `store` (see
+  // core/persistence-guard.ts's module doc for why going through `store` here wouldn't actually be
+  // independent). If even this minimal write also fails, there's nothing more this process can do;
+  // the in-memory flag on workflowEngine still stops it from running further stages for the rest of
+  // this process's life.
+  workflowEngine.on('persistence-broken', (err: Error) => {
     try {
-      store.set('workflowPersistenceBroken', true)
+      writePersistenceBrokenMarker(dataDir, err)
     } catch {
-      // Nothing more we can do — the store itself has failed two independent writes now.
+      // Nothing more we can do — even this independent, minimal write has now failed too.
     }
   })
 
@@ -63,8 +75,8 @@ export function createMaoApp({ store, workspaceRoot, resume }: MaoAppOptions): M
   // reaching workflowTasks. The on-disk snapshot can therefore predate work that already happened;
   // auto-resuming from it risks re-running (duplicating) that work. Refuse to auto-resume — no
   // matter what the caller asked for — until an operator has verified the queue and explicitly
-  // cleared the flag (`mao config clear-persistence-broken`).
-  const safeToResume = resume && !store.get('workflowPersistenceBroken')
+  // cleared the marker (`mao config clear-persistence-broken`).
+  const safeToResume = resume && !hasPersistenceBrokenMarker(dataDir)
   workflowEngine.restore(store.get('workflowTasks'), { resume: safeToResume })
 
   return { githubService, workflowEngine, store }

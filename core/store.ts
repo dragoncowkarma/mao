@@ -26,6 +26,15 @@ export const MAO_STORE_DEFAULTS: MaoStoreSchema = {
 }
 
 /**
+ * A confirmed WorkflowEngine queue-persistence failure (see WorkflowEngine.isPersistenceBroken())
+ * is deliberately NOT a MaoStoreSchema field — both shipped MaoStore backends (FileStore below, and
+ * Electron's electron-store wrapper) persist their entire schema as one JSON blob and rewrite the
+ * whole file on every set() call, so a flag written through `store` would just retry the exact
+ * full-file write that already failed for `workflowTasks`. See core/persistence-guard.ts for the
+ * independent marker-file mechanism createMaoApp uses instead.
+ */
+
+/**
  * Minimal persistence contract the core app needs. The Electron GUI backs this with electron-store
  * (see electron/store.ts); the headless CLI backs it with FileStore below. Core code never imports
  * either implementation directly, so it stays runnable outside of Electron.

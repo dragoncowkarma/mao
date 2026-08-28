@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { WorkflowEngine, type RepoRef } from './workflow-engine.ts'
+import { WorkflowEngine, type QueuedTask, type RepoRef } from './workflow-engine.ts'
 import type { AgentStage, AiProviderConfig } from './ai/types.ts'
 import type { GithubService } from './github-service.ts'
 
@@ -450,6 +450,135 @@ describe('WorkflowEngine', () => {
       for (let i = 1; i < finished.history.length; i++) {
         expect(finished.history[i].agentId).not.toBe(finished.history[i - 1].agentId)
       }
+    })
+  })
+
+  describe('runStage notify() guarding (regression for a throwing "change" listener)', () => {
+    /** Simulates a persistence listener (like createMaoApp's store.set) — only records a snapshot when it doesn't throw. */
+    function makeDurableStore() {
+      let snapshot: QueuedTask[] | undefined
+      return {
+        listener: (queue: QueuedTask[]) => {
+          snapshot = structuredClone(queue)
+        },
+        get: () => snapshot,
+      }
+    }
+
+    it('lands the task in "error" instead of stuck "running" when the entry notify listener throws once transiently', async () => {
+      const github = makeFakeGithub()
+      const engine = new WorkflowEngine(github)
+      engine.setProviders([makeProvider('agent-a')])
+      const store = makeDurableStore()
+
+      let calls = 0
+      engine.on('change', (queue) => {
+        calls++
+        // Call 1 is enqueue()'s own notify() — let it through so the task actually gets queued.
+        // Call 2 (runStage's entry notify) throws exactly once; every later call succeeds — this
+        // models a one-off transient failure, not a permanently broken store.
+        if (calls === 2) throw new Error('persistence boom')
+        store.listener(queue)
+      })
+
+      const task = engine.enqueue('Add feature Boom', repo, false)
+      await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'error')
+
+      const current = engine.getTasks().find((t) => t.id === task.id)!
+      expect(current.status).toBe('error')
+      expect(current.error).toMatch(/persistence boom/)
+      // The throw happened on runStage's entry notify, before any real work — no GitHub write, no history.
+      expect(current.history).toHaveLength(0)
+      expect(github.createIssue).not.toHaveBeenCalled()
+      // The guarded retry notify must have actually reached the durable store, not just the
+      // in-memory task — otherwise a restart could reload the stale pre-'error' snapshot.
+      const persisted = store.get()?.find((t) => t.id === task.id)
+      expect(persisted?.status).toBe('error')
+      expect(engine.isPersistenceBroken()).toBe(false)
+    })
+
+    it('lands the task in "error" in the durable store (not a silently-lost advance) when the exit notify listener throws once transiently', async () => {
+      const github = makeFakeGithub()
+      const engine = new WorkflowEngine(github)
+      engine.setProviders([makeProvider('agent-a')])
+      const store = makeDurableStore()
+
+      let calls = 0
+      engine.on('change', (queue) => {
+        calls++
+        // Calls 1-3 are enqueue()'s notify() plus runStage's entry and active-set notify — let the
+        // stage's real work (the GitHub issue creation) actually happen. Call 4 — the exit notify
+        // fired after the stage already advanced in memory — throws exactly once; the guarded
+        // retry (call 5) succeeds, modeling a transient failure rather than a broken store.
+        if (calls === 4) throw new Error('persistence boom')
+        store.listener(queue)
+      })
+
+      const task = engine.enqueue('Add feature Boom 2', repo, false)
+      await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'error')
+
+      const current = engine.getTasks().find((t) => t.id === task.id)!
+      expect(current.status).toBe('error')
+      expect(current.error).toMatch(/persistence boom/)
+      // The 'issue' stage's real GitHub write already succeeded and the task already advanced to
+      // 'pr' in memory — that must not be silently discarded, nor re-run (which would duplicate the
+      // GitHub write) — it should surface as a normal retryable error at the advanced stage, and
+      // the guarded retry must land that 'error' in the durable store, not just in memory: a stale
+      // durable snapshot at the pre-advance 'running'/'issue' state is exactly what would let a
+      // restart with resume:true replay the GitHub write that already succeeded.
+      expect(current.stage).toBe('pr')
+      expect(current.history).toHaveLength(1)
+      expect(github.createIssue).toHaveBeenCalledTimes(1)
+      const persisted = store.get()?.find((t) => t.id === task.id)
+      expect(persisted?.status).toBe('error')
+      expect(persisted?.stage).toBe('pr')
+      expect(engine.isPersistenceBroken()).toBe(false)
+    })
+
+    it('marks persistence as terminally broken — and stops processing further tasks — when notify() keeps throwing', async () => {
+      const github = makeFakeGithub()
+      const engine = new WorkflowEngine(github)
+      engine.setProviders([makeProvider('agent-a')])
+
+      let calls = 0
+      engine.on('change', () => {
+        calls++
+        // Call 1 is enqueue()'s own notify() for the task below — let it through so the task
+        // actually gets queued. Every notify() from inside runStage (call 2 onward) throws,
+        // modeling a store that is permanently unable to persist (not a one-off blip).
+        if (calls > 1) throw new Error('persistence boom')
+      })
+
+      const task1 = engine.enqueue('Add feature Boom 3', repo, false)
+      await waitFor(() => engine.isPersistenceBroken())
+      // Let the in-flight processQueue() fully settle (its `finally` clears `processing`) before
+      // driving a fresh resumeProcessing() below.
+      await new Promise((r) => setTimeout(r, 0))
+
+      expect(engine.getPersistenceError()?.message).toMatch(/persistence boom/)
+      const first = engine.getTasks().find((t) => t.id === task1.id)!
+      expect(first.status).toBe('error')
+      expect(github.createIssue).not.toHaveBeenCalled()
+
+      // A second task queued directly into the live queue — bypassing enqueue()'s own notify(),
+      // which is a separate, unguarded call outside the scope of this regression (see runStage) —
+      // must be left completely untouched: processQueue() refuses to run any further stages once
+      // persistence is confirmed broken.
+      engine.getTasks().push({
+        id: 'sentinel-task',
+        title: 'Untouched sentinel',
+        repo,
+        stage: 'issue',
+        history: [],
+        status: 'pending',
+        autoAdvance: false,
+        github: {},
+      })
+
+      // A fresh attempt to resume processing must also be refused, not just the in-flight one.
+      engine.resumeProcessing()
+      await new Promise((r) => setTimeout(r, 20))
+      expect(engine.getTasks().find((t) => t.id === 'sentinel-task')!.status).toBe('pending')
     })
   })
 })

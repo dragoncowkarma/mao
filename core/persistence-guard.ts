@@ -49,11 +49,24 @@ export function hasPersistenceBrokenMarker(dataDir: string): boolean {
   }
 }
 
-/** Removes the marker once an operator has verified the queue and target repo by hand. Silently no-ops if absent. */
-export function clearPersistenceBrokenMarker(dataDir: string): void {
+/**
+ * Removes the marker once an operator has verified the queue and target repo by hand. No-ops (and
+ * reports success) if it was already absent.
+ *
+ * Returns whether the marker is confirmed gone afterward, rather than whether `rmSync` itself threw
+ * — deleting a file that isn't there isn't a real failure (that's what `force: true` is for), and
+ * conversely a permission error, a concurrent recreation, or any other surprise during removal must
+ * not be reported as success just because it happened to be swallowed. Re-checking presence with
+ * `hasPersistenceBrokenMarker` after the attempt catches both: it's the actual postcondition the
+ * caller cares about ("is auto-resume unblocked now?"), not "did rmSync avoid throwing?".
+ */
+export function clearPersistenceBrokenMarker(dataDir: string): boolean {
   try {
     fs.rmSync(markerPath(dataDir), { force: true })
   } catch {
-    // Best-effort; nothing more to do if even removing it fails.
+    // Fall through to the presence re-check below rather than assuming failure here — e.g. a
+    // permission error on a directory listing that doesn't actually prevent the file from being
+    // gone. The re-check is the authoritative answer either way.
   }
+  return !hasPersistenceBrokenMarker(dataDir)
 }

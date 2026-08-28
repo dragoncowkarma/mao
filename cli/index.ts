@@ -115,7 +115,16 @@ config
       log('workflowPersistenceBroken is already false — nothing to clear.')
       return
     }
-    clearPersistenceBrokenMarker(dataDir)
+    // clearPersistenceBrokenMarker() reports the actual postcondition (is the marker confirmed
+    // gone?), not just whether the removal call happened to avoid throwing — a permission or I/O
+    // failure leaving the marker in place must surface as a real failure here, never a false
+    // "cleared" that would let the operator believe auto-resume is safe again when it isn't.
+    if (!clearPersistenceBrokenMarker(dataDir)) {
+      throw new Error(
+        `Failed to clear workflowPersistenceBroken — the marker file is still present at ${dataDir}. ` +
+          'Auto-resume remains blocked. Check filesystem permissions and try again.',
+      )
+    }
     log('Cleared workflowPersistenceBroken. Auto-resume (`mao run`) will run normally again.')
   })
 

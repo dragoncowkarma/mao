@@ -161,22 +161,52 @@ export class GithubService {
     return data.default_branch
   }
 
+  /**
+   * Idempotent by design: a retried `applyGithubAction`'s notes-only `pr` case (`core/workflow-engine.ts`)
+   * re-calls this after a prior attempt already created the ref but failed on a later step
+   * (`commitFile`/`createPullRequest`). Without this, `createRef` rejects with "Reference already
+   * exists" on every subsequent retry and the task is stuck forever (issue #37) — so a 422 whose
+   * message says the ref already exists is treated as success (the branch is reused) rather than
+   * rethrown. Any other failure (including a genuine 422 for an unrelated reason) still throws.
+   */
   async createBranch(owner: string, repo: string, branchName: string) {
     if (!this.octokit) throw new Error('GitHub token is not set')
     const { data: repoData } = await this.octokit.rest.repos.get({ owner, repo })
     const base = repoData.default_branch
     const { data: ref } = await this.octokit.rest.git.getRef({ owner, repo, ref: `heads/${base}` })
-    await this.octokit.rest.git.createRef({
-      owner,
-      repo,
-      ref: `refs/heads/${branchName}`,
-      sha: ref.object.sha,
-    })
+    try {
+      await this.octokit.rest.git.createRef({
+        owner,
+        repo,
+        ref: `refs/heads/${branchName}`,
+        sha: ref.object.sha,
+      })
+    } catch (err) {
+      const status = (err as { status?: number } | null)?.status
+      const message = err instanceof Error ? err.message : String(err)
+      if (status !== 422 || !/already exists/i.test(message)) throw err
+    }
     return { base }
   }
 
+  /**
+   * Idempotent by design: a retried notes-only `pr` stage (`core/workflow-engine.ts`) can re-call this
+   * after a prior attempt already wrote this same `path` on `branch` but failed on a later step
+   * (`createPullRequest`). `createOrUpdateFileContents` requires the existing blob's `sha` to update a
+   * file — without it GitHub rejects the retry with 422 and the task is stuck again, same failure mode
+   * as issue #37's `createBranch` case. Look up any existing sha on `branch` first and pass it through
+   * when present; a missing file (404) means this is the first write, so no sha is needed.
+   */
   async commitFile(owner: string, repo: string, branch: string, path: string, content: string, message: string) {
     if (!this.octokit) throw new Error('GitHub token is not set')
+    let sha: string | undefined
+    try {
+      const { data: existing } = await this.octokit.rest.repos.getContent({ owner, repo, path, ref: branch })
+      if (!Array.isArray(existing) && existing.type === 'file') sha = existing.sha
+    } catch (err) {
+      const status = (err as { status?: number } | null)?.status
+      if (status !== 404) throw err
+    }
     await this.octokit.rest.repos.createOrUpdateFileContents({
       owner,
       repo,
@@ -184,13 +214,37 @@ export class GithubService {
       branch,
       message,
       content: Buffer.from(content, 'utf-8').toString('base64'),
+      ...(sha ? { sha } : {}),
     })
   }
 
+  /**
+   * Idempotent by design: see `createBranch`'s doc comment (issue #37) — a retried notes-only `pr`
+   * stage can reach this call again after a prior attempt already opened the PR but failed afterward
+   * (e.g. the CI-gate/notify path). GitHub rejects a duplicate head/base PR with 422 ("A pull request
+   * already exists for <owner>:<head>."); on that specific error, look the existing PR up and return
+   * it instead of throwing so the retry completes. Any other failure still throws.
+   */
   async createPullRequest(owner: string, repo: string, head: string, base: string, title: string, body: string) {
     if (!this.octokit) throw new Error('GitHub token is not set')
-    const { data } = await this.octokit.rest.pulls.create({ owner, repo, head, base, title, body })
-    return data
+    try {
+      const { data } = await this.octokit.rest.pulls.create({ owner, repo, head, base, title, body })
+      return data
+    } catch (err) {
+      const status = (err as { status?: number } | null)?.status
+      const message = err instanceof Error ? err.message : String(err)
+      if (status !== 422 || !/already exists/i.test(message)) throw err
+      const { data: existing } = await this.octokit.rest.pulls.list({
+        owner,
+        repo,
+        head: `${owner}:${head}`,
+        base,
+        state: 'open',
+      })
+      const pr = existing[0]
+      if (!pr) throw err
+      return pr
+    }
   }
 
   async reviewPullRequest(owner: string, repo: string, pullNumber: number, body: string) {

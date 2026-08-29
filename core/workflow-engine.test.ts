@@ -105,6 +105,83 @@ describe('WorkflowEngine', () => {
     expect(github.mergePullRequest).toHaveBeenCalledTimes(1)
   })
 
+  it('retrying a failed notes-only pr stage re-creates the branch without hitting "Reference already exists"', async () => {
+    // commitFile fails on the first attempt (simulating a transient failure after createBranch already
+    // succeeded), then succeeds on retry. createBranch is called again by the retried stage — with the
+    // real GithubService that would previously reject with "Reference already exists" (issue #37); here
+    // it's a fake that unconditionally succeeds, matching the now-idempotent real implementation, so this
+    // asserts retry() correctly drives the stage back through to done rather than getting stuck.
+    const commitFile = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('commitFile transient failure'))
+      .mockResolvedValueOnce(undefined)
+    const github = makeFakeGithub({ commitFile })
+    const engine = new WorkflowEngine(github)
+    engine.setProviders([makeProvider('agent-a'), makeProvider('agent-b')])
+
+    const task = engine.enqueue('Add feature V', repo, false)
+    await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'paused') // issue done
+    let current = engine.getTasks().find((t) => t.id === task.id)!
+    expect(current.stage).toBe('pr') // next stage to run
+
+    engine.advance(task.id)
+    await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'error') // pr stage fails
+
+    current = engine.getTasks().find((t) => t.id === task.id)!
+    expect(current.stage).toBe('pr')
+    expect(current.error).toMatch(/commitFile transient failure/)
+    expect(github.createBranch).toHaveBeenCalledTimes(1)
+
+    engine.retry(task.id)
+    await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'paused')
+
+    current = engine.getTasks().find((t) => t.id === task.id)!
+    expect(current.stage).toBe('review')
+    expect(current.error).toBeUndefined()
+    expect(github.createBranch).toHaveBeenCalledTimes(2)
+    expect(commitFile).toHaveBeenCalledTimes(2)
+    expect(github.createPullRequest).toHaveBeenCalledTimes(1)
+  })
+
+  it('retrying a failed notes-only pr stage re-commits the note and reuses the PR after createPullRequest fails', async () => {
+    // PR #46 review follow-up: the first regression only covered commitFile failing. This covers the
+    // other post-branch failure the review flagged — createPullRequest fails once *after* commitFile
+    // already succeeded, so the retry re-calls createBranch (idempotent, issue #37) and commitFile
+    // (idempotent via the existing-sha lookup) for the same note before createPullRequest succeeds.
+    const createPullRequest = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('createPullRequest transient failure'))
+      .mockResolvedValueOnce({ number: 2, html_url: 'https://github.com/acme/widgets/pull/2' })
+    const github = makeFakeGithub({ createPullRequest })
+    const engine = new WorkflowEngine(github)
+    engine.setProviders([makeProvider('agent-a'), makeProvider('agent-b')])
+
+    const task = engine.enqueue('Add feature U', repo, false)
+    await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'paused') // issue done
+    let current = engine.getTasks().find((t) => t.id === task.id)!
+    expect(current.stage).toBe('pr') // next stage to run
+
+    engine.advance(task.id)
+    await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'error') // pr stage fails
+
+    current = engine.getTasks().find((t) => t.id === task.id)!
+    expect(current.stage).toBe('pr')
+    expect(current.error).toMatch(/createPullRequest transient failure/)
+    expect(github.createBranch).toHaveBeenCalledTimes(1)
+    expect(github.commitFile).toHaveBeenCalledTimes(1)
+
+    engine.retry(task.id)
+    await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'paused')
+
+    current = engine.getTasks().find((t) => t.id === task.id)!
+    expect(current.stage).toBe('review')
+    expect(current.error).toBeUndefined()
+    expect(current.github.prNumber).toBe(2)
+    expect(github.createBranch).toHaveBeenCalledTimes(2)
+    expect(github.commitFile).toHaveBeenCalledTimes(2)
+    expect(createPullRequest).toHaveBeenCalledTimes(2)
+  })
+
   it('retry() rejects tasks that are not currently in an error state', () => {
     const engine = new WorkflowEngine(makeFakeGithub())
     engine.setProviders([makeProvider('agent-a')])

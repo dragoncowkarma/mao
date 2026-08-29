@@ -16,6 +16,7 @@ const STAGE_LABELS: Record<QueuedTask['stage'], string> = {
 function statusTagClass(task: QueuedTask): string {
   if (task.status === 'error') return 'tag-accent'
   if (task.status === 'done') return 'tag-neutral'
+  if (task.status === 'paused') return 'tag-warn'
   return 'tag-outline'
 }
 
@@ -23,6 +24,12 @@ function statusLabel(task: QueuedTask): string {
   if (task.status === 'done') return 'Done'
   if (task.status === 'paused') return `${STAGE_LABELS[task.stage]} · paused`
   return `${STAGE_LABELS[task.stage]} · ${task.status}`
+}
+
+/** A task is "active" (in-flight right now) when it's actually running, or sitting in review — the
+ * two states this issue asks to be visually unmissable across the queue. */
+function isActiveTask(task: QueuedTask): boolean {
+  return task.status === 'running' || task.stage === 'review'
 }
 
 function AgentBadge({ name, model, effort }: { name: string; model?: string; effort?: string }) {
@@ -49,9 +56,10 @@ function TaskCard({
   onOpenTask: (number: number, type: 'issue' | 'pull_request') => void
 }) {
   const [expanded, setExpanded] = useState<number | null>(null)
+  const active = isActiveTask(task)
 
   return (
-    <div className="card elev-sm">
+    <div className={`card elev-sm ${active ? 'card-active' : ''}`}>
       <div className="flex items-center justify-between gap-2">
         <span className="card-title text-[15px]">{task.title}</span>
         <div className="flex items-center gap-2">
@@ -102,7 +110,7 @@ function TaskCard({
           {task.history.map((step, i) => (
             <div key={i} className="flex flex-col gap-1">
               <div className="flex flex-wrap items-center gap-1.5">
-                <span className="tag tag-neutral">{STAGE_LABELS[step.stage]}</span>
+                <span className="tag tag-stage">{STAGE_LABELS[step.stage]}</span>
                 <AgentBadge name={step.agentName} model={step.model} effort={step.effort} />
                 <button
                   onClick={() => setExpanded(expanded === i ? null : i)}
@@ -207,11 +215,20 @@ export default function WorkflowQueue({ repo }: WorkflowQueueProps) {
   }
 
   const finishedCount = repoTasks.filter((t) => t.status === 'done' || t.status === 'error').length
+  const activeCount = repoTasks.filter(isActiveTask).length
 
   return (
     <div>
-      <div className="flex items-center justify-between">
-        <h2>Workflow Queue</h2>
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2">
+          <h2>Workflow Queue</h2>
+          {activeCount > 0 && (
+            <span className="summary-indicator">
+              <span className="live-dot" />
+              {activeCount} active
+            </span>
+          )}
+        </div>
         {finishedCount > 0 && (
           <button onClick={clearCompleted} className="btn btn-secondary">
             Clear completed ({finishedCount})

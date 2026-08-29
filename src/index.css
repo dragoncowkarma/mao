@@ -259,6 +259,42 @@ a {
   color: var(--color-accent);
 }
 
+.tag-warn {
+  border: 1px solid var(--color-accent-2);
+  color: var(--color-accent-2);
+}
+
+.tag-stage {
+  background: transparent;
+  border: 1px solid rgb(var(--color-text-rgb) / 0.3);
+  color: rgb(var(--color-text-rgb) / 0.7);
+}
+
+/*
+ * Applied to a task card while its workflow is actually in flight (status `running`, or stage
+ * `review` regardless of status) so it stands out from queued/paused/done neighbors at a glance —
+ * issue #28. Uses box-shadow (not border) so it never shifts layout, and pulses between the two
+ * accent tones already reserved for "live" state (see .live-dot) rather than introducing a new color.
+ */
+.card-active {
+  box-shadow: 0 0 0 2px var(--color-accent), var(--shadow-sm);
+  animation: card-active-pulse 1.8s ease-in-out infinite;
+}
+
+@keyframes card-active-pulse {
+  0%, 100% { box-shadow: 0 0 0 2px var(--color-accent), var(--shadow-sm); }
+  50% { box-shadow: 0 0 0 4px var(--color-accent-2), var(--shadow-sm); }
+}
+
+.summary-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--color-accent);
+}
+
 .field label {
   display: block;
   margin-bottom: var(--space-1);

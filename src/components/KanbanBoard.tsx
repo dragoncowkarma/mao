@@ -24,7 +24,14 @@ function findWorkflowTask(task: GithubTask, workflowTasks: QueuedTask[]): Queued
 function workflowBadgeClass(task: QueuedTask): string {
   if (task.status === 'error') return 'tag-accent'
   if (task.status === 'running') return 'tag-outline'
+  if (task.status === 'paused') return 'tag-warn'
   return 'tag-neutral'
+}
+
+/** A task is "active" (in-flight right now) when it's actually running, or sitting in review — the
+ * two states this issue asks to be visually unmissable across the board. */
+function isActiveTask(task: QueuedTask): boolean {
+  return task.status === 'running' || task.stage === 'review'
 }
 
 function workflowBadgeLabel(task: QueuedTask): string {
@@ -90,14 +97,26 @@ function Column({
   onRunTask: (task: QueuedTask) => void
   runningTaskId: string | null
 }) {
+  const activeCount = tasks.filter((task) => {
+    const workflowTask = findWorkflowTask(task, workflowTasks)
+    return workflowTask && isActiveTask(workflowTask)
+  }).length
+
   return (
     <div>
-      <h4 className="mb-2">
+      <h4 className="mb-2 flex items-center gap-2">
         {title} <span className="text-muted">({tasks.length})</span>
+        {activeCount > 0 && (
+          <span className="summary-indicator">
+            <span className="live-dot" />
+            {activeCount} active
+          </span>
+        )}
       </h4>
       <div className="flex flex-col gap-2">
         {tasks.map((task) => {
           const workflowTask = findWorkflowTask(task, workflowTasks)
+          const active = !!workflowTask && isActiveTask(workflowTask)
 
           // For PR cards: show the issues this PR closes (from linkedIssueNumbers on the PR).
           // For issue cards: show any open PRs that reference this issue via closing keywords.
@@ -126,7 +145,7 @@ function Column({
                   onSelectTask(task)
                 }
               }}
-              className="card elev-sm cursor-pointer"
+              className={`card elev-sm cursor-pointer ${active ? 'card-active' : ''}`}
             >
               <div className="flex items-center justify-between gap-2">
                 <span className="card-kicker">#{task.number}</span>

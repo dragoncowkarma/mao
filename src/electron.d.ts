@@ -3,11 +3,20 @@ import type { GithubTask, GithubTaskDetail } from '../core/github-service'
 import type { QueuedTask, RepoRef } from '../core/workflow-engine'
 import type { AutoTriggerStatus } from '../core/auto-trigger'
 import type { ThemePreference } from '../core/store'
+import type { SelfUpdateCheck } from '../core/self-update'
+
+export interface AppUpdateCheck extends SelfUpdateCheck {
+  runningTaskCount: number
+}
 
 declare global {
   interface Window {
     electronAPI: {
       platform: string
+      app: {
+        checkUpdate: () => Promise<AppUpdateCheck>
+        relaunch: (force?: boolean) => Promise<void>
+      }
       ai: {
         list: () => Promise<AiProviderConfig[]>
         save: (providers: AiProviderConfig[]) => Promise<AiProviderConfig[]>

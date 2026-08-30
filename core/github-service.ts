@@ -161,6 +161,13 @@ export class GithubService {
     return data.default_branch
   }
 
+  /** Fetches the commit SHA currently pointed to by a branch ref. */
+  async getBranchHeadSha(owner: string, repo: string, branch: string): Promise<string> {
+    if (!this.octokit) throw new Error('GitHub token is not set')
+    const { data } = await this.octokit.rest.git.getRef({ owner, repo, ref: `heads/${branch}` })
+    return data.object.sha
+  }
+
   /**
    * Idempotent by design: a retried `applyGithubAction`'s notes-only `pr` case (`core/workflow-engine.ts`)
    * re-calls this after a prior attempt already created the ref but failed on a later step

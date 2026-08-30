@@ -14,6 +14,12 @@ export interface MaoStoreSchema {
   githubRepos: RepoRef[]
   aiProviders: AiProviderConfig[]
   workflowTasks: QueuedTask[]
+  /**
+   * Git commit SHA for the Electron build currently running. Electron writes this on boot from the
+   * build-time constant when available so the update checker can compare the app's own repository
+   * `main` branch against the binary the user is actually running.
+   */
+  buildSha: string
   theme: ThemePreference
 }
 
@@ -22,6 +28,7 @@ export const MAO_STORE_DEFAULTS: MaoStoreSchema = {
   githubRepos: [],
   aiProviders: [],
   workflowTasks: [],
+  buildSha: '',
   theme: 'system',
 }
 

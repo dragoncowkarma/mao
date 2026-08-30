@@ -1,4 +1,5 @@
 import type { GithubService } from './github-service.ts'
+import type { QueuedTask } from './workflow-engine.ts'
 
 export interface SelfUpdateCheck {
   currentSha: string
@@ -36,4 +37,21 @@ export async function checkForUpdates(
     latestSha,
     updateAvailable: latestSha !== normalizedCurrentSha,
   }
+}
+
+/** Counts workflow stages that are actively in flight and should prompt before relaunch. */
+export function countRunningWorkflowTasks(tasks: QueuedTask[]): number {
+  return tasks.filter((task) => task.status === 'running').length
+}
+
+/**
+ * Shared relaunch policy for Electron's update flow. Keeping the gate in core prevents the displayed
+ * warning count and the final relaunch check from drifting apart in shell code.
+ */
+export function assertCanRelaunchForUpdate(tasks: QueuedTask[], force = false): number {
+  const runningTaskCount = countRunningWorkflowTasks(tasks)
+  if (runningTaskCount > 0 && !force) {
+    throw new Error(`${runningTaskCount} workflow task(s) are still running`)
+  }
+  return runningTaskCount
 }

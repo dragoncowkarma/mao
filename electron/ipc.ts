@@ -3,7 +3,7 @@ import path from 'node:path'
 import { store } from './store.ts'
 import { createMaoApp } from '../core/app.ts'
 import { startAutoTrigger } from '../core/auto-trigger.ts'
-import { checkForUpdates } from '../core/self-update.ts'
+import { assertCanRelaunchForUpdate, checkForUpdates, countRunningWorkflowTasks } from '../core/self-update.ts'
 import { createAiProvider, type AiProviderConfig } from '../core/ai/index.ts'
 import type { RepoRef } from '../core/workflow-engine.ts'
 import type { ThemePreference } from '../core/store.ts'
@@ -22,18 +22,14 @@ export function registerIpcHandlers() {
 
   ipcMain.handle('app:checkUpdate', async () => {
     const update = await checkForUpdates(githubService, store.get('buildSha'))
-    const runningTasks = workflowEngine.getTasks().filter((task) => task.status === 'running')
     return {
       ...update,
-      runningTaskCount: runningTasks.length,
+      runningTaskCount: countRunningWorkflowTasks(workflowEngine.getTasks()),
     }
   })
 
   ipcMain.handle('app:relaunch', (_event, force = false) => {
-    const runningTaskCount = workflowEngine.getTasks().filter((task) => task.status === 'running').length
-    if (runningTaskCount > 0 && !force) {
-      throw new Error(`${runningTaskCount} workflow task(s) are still running`)
-    }
+    assertCanRelaunchForUpdate(workflowEngine.getTasks(), force)
     app.relaunch()
     app.quit()
   })

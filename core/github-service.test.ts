@@ -100,6 +100,19 @@ describe('GithubService.createBranch', () => {
   })
 })
 
+describe('GithubService.getBranchHeadSha', () => {
+  it('returns the sha pointed to by the requested branch ref', async () => {
+    const { service, octokit } = makeServiceWithFakeOctokit()
+
+    await expect(service.getBranchHeadSha('acme', 'widgets', 'release')).resolves.toBe('base-sha')
+    expect(octokit.rest.git.getRef).toHaveBeenCalledWith({
+      owner: 'acme',
+      repo: 'widgets',
+      ref: 'heads/release',
+    })
+  })
+})
+
 describe('GithubService.commitFile', () => {
   it('writes a new file without a sha when none exists yet', async () => {
     const { service, octokit } = makeServiceWithFakeOctokit()

@@ -4,9 +4,18 @@ import type { GithubTask, GithubTaskDetail } from '../core/github-service.ts'
 import type { QueuedTask, RepoRef } from '../core/workflow-engine.ts'
 import type { AutoTriggerStatus } from '../core/auto-trigger.ts'
 import type { ThemePreference } from '../core/store.ts'
+import type { SelfUpdateCheck } from '../core/self-update.ts'
+
+export interface AppUpdateCheck extends SelfUpdateCheck {
+  runningTaskCount: number
+}
 
 contextBridge.exposeInMainWorld('electronAPI', {
   platform: process.platform,
+  app: {
+    checkUpdate: (): Promise<AppUpdateCheck> => ipcRenderer.invoke('app:checkUpdate'),
+    relaunch: (force?: boolean): Promise<void> => ipcRenderer.invoke('app:relaunch', force),
+  },
   ai: {
     list: (): Promise<AiProviderConfig[]> => ipcRenderer.invoke('ai:list'),
     save: (providers: AiProviderConfig[]): Promise<AiProviderConfig[]> =>

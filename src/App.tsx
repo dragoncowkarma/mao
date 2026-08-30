@@ -4,8 +4,10 @@ import KanbanBoard from './components/KanbanBoard'
 import WorkflowQueue from './components/WorkflowQueue'
 import ProjectSettings from './components/ProjectSettings'
 import GlobalSettings from './components/GlobalSettings'
+import UpdateBanner from './components/UpdateBanner'
 import type { RepoRef } from '../core/workflow-engine'
 import type { ThemePreference } from '../core/store'
+import type { AppUpdateCheck } from './electron'
 
 type ProjectTab = 'board' | 'queue' | 'settings'
 type View = 'project' | 'global-settings'
@@ -16,6 +18,8 @@ export default function App() {
   const [view, setView] = useState<View>('project')
   const [projectTab, setProjectTab] = useState<ProjectTab>('board')
   const [theme, setThemeState] = useState<ThemePreference>('system')
+  const [update, setUpdate] = useState<AppUpdateCheck | null>(null)
+  const [dismissedUpdateSha, setDismissedUpdateSha] = useState<string | null>(null)
 
   useEffect(() => {
     window.electronAPI.github.getRepos().then((savedRepos) => {
@@ -54,6 +58,47 @@ export default function App() {
   async function setTheme(next: ThemePreference) {
     setThemeState(next)
     await window.electronAPI.ui.setTheme(next)
+  }
+
+  useEffect(() => {
+    let cancelled = false
+
+    async function checkUpdate() {
+      try {
+        const result = await window.electronAPI.app.checkUpdate()
+        if (cancelled) return
+        if (result.updateAvailable && result.latestSha !== dismissedUpdateSha) {
+          setUpdate(result)
+        } else if (!result.updateAvailable) {
+          setUpdate(null)
+        }
+      } catch {
+        // Missing token/offline/self-update lookup errors should not interrupt normal app use.
+      }
+    }
+
+    checkUpdate()
+    const interval = setInterval(checkUpdate, 60_000)
+    return () => {
+      cancelled = true
+      clearInterval(interval)
+    }
+  }, [dismissedUpdateSha])
+
+  async function restartForUpdate() {
+    if (!update) return
+    const force =
+      update.runningTaskCount === 0 ||
+      window.confirm(`${update.runningTaskCount} workflow task(s) are still running. Restart anyway?`)
+    if (!force) return
+    try {
+      await window.electronAPI.app.relaunch(update.runningTaskCount > 0)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      if (window.confirm(`${message}. Restart anyway?`)) {
+        await window.electronAPI.app.relaunch(true)
+      }
+    }
   }
 
   useEffect(() => {
@@ -111,6 +156,17 @@ export default function App() {
       />
 
       <main className="flex-1 mx-auto w-full max-w-[1120px] px-6 py-8">
+        {update && (
+          <UpdateBanner
+            update={update}
+            onRestart={restartForUpdate}
+            onDismiss={() => {
+              setDismissedUpdateSha(update.latestSha)
+              setUpdate(null)
+            }}
+          />
+        )}
+
         {view === 'global-settings' ? (
           <GlobalSettings theme={theme} onThemeChange={setTheme} />
         ) : !selected ? (

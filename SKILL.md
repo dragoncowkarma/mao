@@ -21,19 +21,19 @@ Use `npm install` only when intentionally changing dependencies + lockfile.
 | --- | --- |
 | `npm run dev` | Electron + Vite dev server with hot reload |
 | `npm run lint` | `tsc --noEmit` — the only automated style/type gate (no ESLint/Prettier) |
-| `npm run test` | `vitest run` — node env, `core/**/*.test.ts` only |
+| `npm run test` | Vitest (`core/**/*.test.ts`) plus Python Swarm worktree-safety tests |
 | `npm run test:origin` | Standalone matrix for `scripts/check-origin.mjs` (verdicts + no-credential-leak contract) |
 | `npm run build` | `vite build` + `electron-builder --dir` (fast unpacked build → `release/`) |
 | `npm run dist` | Full distributable (dmg/zip on mac) |
-| `npm run build:cli` | esbuild-bundle `cli/index.ts` → `dist-cli/index.cjs` (CJS, node18) |
+| `npm run build:cli` | Bundle `cli/index.ts` → `dist-cli/index.cjs` (CJS, node18) and copy the Swarm Python asset beside it |
 | `npm run cli -- <args>` | Build the CLI bundle, then run it (e.g. `npm run cli -- config show`) |
 | `npm run preview` | Vite preview of the built renderer |
 
 **Never run the CLI via `tsx`** — it fails on `@octokit/app`
 (`ERR_PACKAGE_PATH_NOT_EXPORTED`). Always go through the esbuild bundle
-(`npm run cli` / `npm run build:cli`). Note `build:cli` ends with `chmod +x`,
-which fails under Windows' default npm shell — on Windows run the esbuild step
-manually (the bundle is invoked via `node` anyway) or use Git Bash/WSL.
+(`npm run cli` / `npm run build:cli`). The Node build script applies executable
+bits only on non-Windows platforms and always copies `swarm_orchestrator.py` into
+`dist-cli/`, so a built `mao swarm` does not depend on the source tree layout.
 
 ## Verification workflow
 
@@ -66,7 +66,10 @@ Additionally, because CI does **not** cover them:
   `node dist-cli/index.cjs --help` (CLI bundle breakage is invisible to CI).
 - Iterating on the engine? → focused run: `npx vitest run core/workflow-engine.test.ts`.
 - Touched `scripts/`? → note `scripts/` is not in `tsconfig.json`'s `include`, so
-  tsc/CI never typechecks it — verify by actually running the harness.
+  tsc/CI never typechecks it — verify by actually running the harness. For
+  `scripts/build-cli.mjs`, `npm run build:cli` is the required execution check.
+- Touched `.agents/workflows/swarm_orchestrator.py`? → `npm run test` must run its
+  Python worktree-safety matrix; also smoke-test the bundled `mao swarm --status`.
 - Touched the IPC surface? → **nothing automated** checks that
   `electron/preload.ts` and `src/electron.d.ts` stay consistent (`contextBridge`
   takes an untyped object, so tsc checks each file only against core types, not
@@ -95,12 +98,30 @@ npm run cli -- workflow retry <taskId>
 npm run cli -- workflow advance <taskId>
 npm run cli -- workflow clear-completed
 npm run cli -- run                               # foreground: auto-trigger + resume queue
+npm run cli -- swarm --repo-root /path/to/repo --status
+npm run cli -- swarm --repo-root /path/to/repo --dry-run --once
 ```
 
 ⚠️ `workflow enqueue` without `--no-auto-advance` runs the **entire pipeline
 unattended** (real GitHub writes) in the foreground with no progress output; only
 `run` streams status. Use `--no-auto-advance` + `workflow advance` to step through
 stages one at a time.
+
+`mao swarm` is the autonomous multi-agent path. It requires Python 3, `git`, an
+authenticated `gh` CLI, and the AI CLIs named by its role tags. The target defaults
+to the current Git checkout; use `--repo-root` when invoking it elsewhere. It creates
+task worktrees under `<repo>/.worktrees`, persists process history under
+`<repo>/.agents/.process_registry.json`, and can create issues/PR comments, push,
+review, merge, and close issues. Only `--dry-run` and `--status` are non-writing modes;
+`--once` still performs real dispatch and GitHub/Git operations. `--reset` clears only
+the persisted dispatch history, not Git branches or worktrees. On first launch it adds
+only these runtime paths to the checkout's local `.git/info/exclude`; it never edits or
+commits the target repository's shared `.gitignore`.
+
+Worktree handling is preservation-first: a branch already checked out elsewhere is a
+hard blocker; a damaged checkout is repaired with `git worktree repair`; and a
+non-empty damaged or mismatched directory is retained for human inspection rather
+than recursively deleted.
 
 **Assigning specific AI agents to an issue/PR (swarm_orchestrator-style):** `--provider`
 (global) / `--worker` / `--reviewer` / `--maintainer` (per-role, take priority over

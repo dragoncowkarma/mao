@@ -7,6 +7,7 @@ import { startAutoTrigger } from '../core/auto-trigger.ts'
 import { FileStore } from '../core/store.ts'
 import { defaultDataDir } from '../core/paths.ts'
 import { clearPersistenceBrokenMarker, hasPersistenceBrokenMarker } from '../core/persistence-guard.ts'
+import { runSwarm } from '../core/swarm-runner.ts'
 import type { AiEffort, AiProviderConfig } from '../core/ai/types.ts'
 import type { QueuedTask, RepoRef } from '../core/workflow-engine.ts'
 import type { ThemePreference } from '../core/store.ts'
@@ -331,6 +332,34 @@ program
       process.exit(0)
     })
   })
+
+// --- swarm --------------------------------------------------------------------
+
+program
+  .command('swarm')
+  .description(
+    'Run the autonomous Worker/Reviewer/Maintainer orchestrator for a Git repository. This may ' +
+      'create worktrees, dispatch AI CLIs, and write to GitHub unless --dry-run or --status is used.',
+  )
+  .option('--repo-root <path>', 'target Git checkout (default: current directory)')
+  .option('--interval <seconds>', 'GitHub polling interval in seconds', (value) => Number(value))
+  .option('--dry-run', 'log planned work without dispatching agents or changing Git/GitHub state')
+  .option('--once', 'run one polling cycle and exit')
+  .option('--status', 'print the persisted process registry and exit')
+  .option('--reset', 'clear persisted dispatch history before starting')
+  .action(
+    async (opts: {
+      repoRoot?: string
+      interval?: number
+      dryRun?: boolean
+      once?: boolean
+      status?: boolean
+      reset?: boolean
+    }) => {
+      const exitCode = await runSwarm(opts)
+      if (exitCode !== 0) throw new Error(`Swarm orchestrator exited with code ${exitCode}`)
+    },
+  )
 
 program.parseAsync(process.argv).catch((err) => {
   logErr(err instanceof Error ? err.message : String(err))

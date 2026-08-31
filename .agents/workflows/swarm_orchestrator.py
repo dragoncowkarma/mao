@@ -6,10 +6,11 @@ Polls GitHub Issues and PRs via `gh` CLI, parses role metadata tags,
 creates isolated git worktrees, and dispatches AI agents as subprocesses.
 
 Usage:
-    python .agents/workflows/swarm_orchestrator.py [--interval 30] [--dry-run]
-    python .agents/workflows/swarm_orchestrator.py --status
+    mao swarm [--repo-root /path/to/repo] [--interval 30] [--dry-run]
+    mao swarm --repo-root /path/to/repo --status
 
-Requires: gh CLI authenticated, git, and at least one AI CLI installed.
+The MAO CLI sets MAO_SWARM_REPO_ROOT before launching this bundled asset.
+Requires: Python 3, authenticated gh CLI, git, and at least one AI CLI installed.
 """
 
 import argparse
@@ -18,7 +19,6 @@ import logging
 import logging.handlers
 import os
 import re
-import shutil
 import signal
 import subprocess
 import sys
@@ -34,7 +34,9 @@ from typing import Optional
 # Configuration
 # ---------------------------------------------------------------------------
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(
+    os.environ.get("MAO_SWARM_REPO_ROOT", Path(__file__).resolve().parents[2])
+).expanduser().resolve()
 WORKTREE_DIR = REPO_ROOT / ".worktrees"
 LOG_DIR = REPO_ROOT / ".agents" / "logs"
 POLL_INTERVAL_SECONDS = 30
@@ -126,6 +128,36 @@ DEFAULT_ROTATION = {
 # Prompt temp file directory (cleaned on shutdown)
 PROMPT_DIR = REPO_ROOT / ".agents" / ".prompts"
 
+
+def ensure_runtime_git_excludes():
+    """Hide local Swarm artifacts without changing the repository's shared .gitignore."""
+    result = subprocess.run(
+        ["git", "rev-parse", "--git-path", "info/exclude"],
+        cwd=REPO_ROOT, capture_output=True, text=True, check=False,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        raise RuntimeError(f"Not a Git checkout: {REPO_ROOT}")
+
+    exclude_path = Path(result.stdout.strip())
+    if not exclude_path.is_absolute():
+        exclude_path = REPO_ROOT / exclude_path
+    exclude_path.parent.mkdir(parents=True, exist_ok=True)
+    current = exclude_path.read_text() if exclude_path.exists() else ""
+    patterns = (
+        "/.worktrees/",
+        "/.agents/logs/",
+        "/.agents/.prompts/",
+        "/.agents/.process_registry.json",
+    )
+    missing = [pattern for pattern in patterns if pattern not in current.splitlines()]
+    if not missing:
+        return
+    separator = "" if not current or current.endswith("\n") else "\n"
+    with exclude_path.open("a", encoding="utf-8") as stream:
+        stream.write(separator + "\n".join(missing) + "\n")
+
+
+ensure_runtime_git_excludes()
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 _log_formatter = logging.Formatter(
     fmt="%(asctime)s [%(levelname)s] %(message)s",
@@ -918,13 +950,127 @@ def local_branch_exists(branch_name: str) -> bool:
     return bool(result.stdout.strip())
 
 
+def list_git_worktrees() -> list[dict[str, str]]:
+    """Return Git's authoritative worktree registry in porcelain form."""
+    result = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        capture_output=True, text=True, cwd=REPO_ROOT, check=True,
+    )
+    entries: list[dict[str, str]] = []
+    current: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        if not line:
+            if current:
+                entries.append(current)
+                current = {}
+            continue
+        key, _, value = line.partition(" ")
+        current[key] = value
+    if current:
+        entries.append(current)
+    return entries
+
+
+def worktree_entry_for_path(
+    entries: list[dict[str, str]],
+    worktree_path: Path,
+) -> Optional[dict[str, str]]:
+    """Find the registry entry for an exact filesystem path."""
+    expected = worktree_path.resolve()
+    return next(
+        (
+            entry for entry in entries
+            if entry.get("worktree")
+            and Path(entry["worktree"]).resolve() == expected
+        ),
+        None,
+    )
+
+
+def worktree_entry_for_branch(
+    entries: list[dict[str, str]],
+    branch_name: str,
+) -> Optional[dict[str, str]]:
+    """Find the checkout that already owns a local branch, if any."""
+    branch_ref = f"refs/heads/{branch_name}"
+    return next((entry for entry in entries if entry.get("branch") == branch_ref), None)
+
+
+def repair_worktree(worktree_path: Path):
+    """Ask Git to repair administrative links without deleting user files."""
+    result = subprocess.run(
+        ["git", "worktree", "repair", str(worktree_path)],
+        cwd=REPO_ROOT, capture_output=True, text=True, check=False,
+    )
+    if result.returncode != 0:
+        log.warning("Failed to repair worktree %s; preserving it.", worktree_path)
+
+
+def directory_is_empty(directory: Path) -> bool:
+    """Return true only for an existing directory with no entries."""
+    try:
+        next(directory.iterdir())
+    except StopIteration:
+        return True
+    except OSError:
+        return False
+    return False
+
+
 def create_worktree(issue_number: int, branch_name: str) -> Path:
-    """Create an isolated git worktree for a task."""
+    """Create or safely reuse the one isolated worktree owned by a task."""
     worktree_path = WORKTREE_DIR / str(issue_number)
 
-    if worktree_path.exists():
-        log.info("Worktree already exists: %s", worktree_path)
-        return worktree_path
+    if worktree_path.is_symlink():
+        raise RuntimeError(f"Refusing symlinked worktree path: {worktree_path}")
+
+    entries = list_git_worktrees()
+    path_entry = worktree_entry_for_path(entries, worktree_path)
+    if not worktree_path.exists() and path_entry:
+        # The directory is already gone, so only prunable administrative
+        # metadata remains. Pruning it cannot remove user files.
+        subprocess.run(
+            ["git", "worktree", "prune"], cwd=REPO_ROOT, check=False,
+        )
+        entries = list_git_worktrees()
+        path_entry = worktree_entry_for_path(entries, worktree_path)
+    if worktree_path.exists() or path_entry:
+        if not worktree_path.exists():
+            # Git retains prunable metadata after a directory is removed. Prune
+            # only that metadata; there are no files at the path to preserve.
+            subprocess.run(
+                ["git", "worktree", "prune"], cwd=REPO_ROOT, check=False,
+            )
+        elif not (worktree_path / ".git").exists() or not path_entry:
+            repair_worktree(worktree_path)
+
+        entries = list_git_worktrees()
+        path_entry = worktree_entry_for_path(entries, worktree_path)
+        expected_branch = f"refs/heads/{branch_name}"
+        if (
+            worktree_path.exists()
+            and (worktree_path / ".git").exists()
+            and path_entry
+            and path_entry.get("branch") == expected_branch
+        ):
+            log.info("Reusing worktree: %s", worktree_path)
+            return worktree_path
+
+        if worktree_path.exists() and directory_is_empty(worktree_path):
+            worktree_path.rmdir()
+        elif worktree_path.exists():
+            raise RuntimeError(
+                f"Worktree path is not a valid checkout for '{branch_name}'; "
+                f"preserving non-empty directory: {worktree_path}"
+            )
+
+    entries = list_git_worktrees()
+    branch_entry = worktree_entry_for_branch(entries, branch_name)
+    if branch_entry:
+        raise RuntimeError(
+            f"Branch '{branch_name}' is already checked out at "
+            f"{branch_entry.get('worktree', '(unknown path)')}"
+        )
 
     WORKTREE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -962,24 +1108,41 @@ def cleanup_worktree(issue_number: int, branch_name: str):
         )
         return
 
-    if worktree_path.exists():
-        git_link = worktree_path / ".git"
-        if not git_link.exists():
-            # Prunable worktree: .git file is missing so `git worktree remove`
-            # will fail with "validation failed". Prune git's internal refs and
-            # remove the orphaned directory manually.
-            log.warning(
-                "Worktree %s is prunable (missing .git file); "
-                "pruning refs and removing directory.",
-                worktree_path,
-            )
-            subprocess.run(
-                ["git", "worktree", "prune"],
-                cwd=REPO_ROOT, check=False,
-            )
-            shutil.rmtree(worktree_path, ignore_errors=True)
-            log.info("Removed prunable worktree: %s", worktree_path)
-        else:
+    if worktree_path.is_symlink():
+        log_blocker(
+            f"symlink-worktree:{issue_number}",
+            "Refusing to inspect or remove symlinked worktree path: %s",
+            worktree_path,
+        )
+        return
+
+    entries = list_git_worktrees()
+    path_entry = worktree_entry_for_path(entries, worktree_path)
+    if not worktree_path.exists() and path_entry:
+        # The directory is already gone, so only prunable administrative
+        # metadata remains. Pruning it cannot remove user files.
+        subprocess.run(
+            ["git", "worktree", "prune"], cwd=REPO_ROOT, check=False,
+        )
+        entries = list_git_worktrees()
+        path_entry = worktree_entry_for_path(entries, worktree_path)
+    if worktree_path.exists() or path_entry:
+        if worktree_path.exists() and (
+            not (worktree_path / ".git").exists() or not path_entry
+        ):
+            repair_worktree(worktree_path)
+            entries = list_git_worktrees()
+            path_entry = worktree_entry_for_path(entries, worktree_path)
+
+        if worktree_path.exists() and path_entry and (worktree_path / ".git").exists():
+            expected_branch = f"refs/heads/{branch_name}"
+            if path_entry.get("branch") != expected_branch:
+                log_blocker(
+                    f"mismatched-worktree:{issue_number}",
+                    "Refusing cleanup: %s is registered for a different branch.",
+                    worktree_path,
+                )
+                return
             status = subprocess.run(
                 ["git", "status", "--porcelain"],
                 cwd=worktree_path,
@@ -1006,6 +1169,32 @@ def cleanup_worktree(issue_number: int, branch_name: str):
                 log.warning("Failed to remove worktree: %s", worktree_path)
                 return
             log.info("Removed worktree: %s", worktree_path)
+        elif worktree_path.exists():
+            if not directory_is_empty(worktree_path):
+                log_blocker(
+                    f"damaged-worktree:{issue_number}",
+                    "Refusing to remove damaged non-empty worktree for Issue #%d: %s",
+                    issue_number,
+                    worktree_path,
+                    level=logging.WARNING,
+                )
+                return
+            worktree_path.rmdir()
+            subprocess.run(
+                ["git", "worktree", "prune"], cwd=REPO_ROOT, check=False,
+            )
+            log.info("Removed empty damaged worktree directory: %s", worktree_path)
+
+    # Never delete a branch that another registered worktree still owns.
+    branch_entry = worktree_entry_for_branch(list_git_worktrees(), branch_name)
+    if branch_entry:
+        log_blocker(
+            f"checked-out-branch:{issue_number}:{branch_name}",
+            "Refusing to delete branch '%s'; it is checked out at %s.",
+            branch_name,
+            branch_entry.get("worktree", "(unknown path)"),
+        )
+        return
 
     # Force-delete the local branch. We already confirmed the PR is merged on
     # GitHub, so the local merge check (`-d`) is unreliable when the PR was

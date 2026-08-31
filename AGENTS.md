@@ -30,6 +30,7 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
 | `core/workflow-engine.ts` | The state machine: queue, stage progression, maker-checker agent routing, CI gate, pause/advance/retry |
 | `core/github-service.ts` | Octokit REST wrapper (issues, PRs, labels, reviews, merge, CI status) |
 | `core/git-workspace.ts` | Local git clone/branch/commit/push via `execFile` (no shell) |
+| `core/swarm-runner.ts` | Shell-free launcher and repository/asset validation for the autonomous Swarm Orchestrator |
 | `core/auto-trigger.ts` | Per-repo polling scheduler; auto-enqueues new open issues |
 | `core/assignment.ts` | Issue/PR body directive parser — `parseAssignmentTags()` for swarm_orchestrator-style `[Worker: id]`/`[Reviewer: id]`/`[Maintainer: id]` role tags, and `parseProviderOverride()` which folds those plus task-level `[Model: id]`/`[Effort: level]` tags into a `ProviderOverride` |
 | `core/store.ts` | `MaoStoreSchema`, `MAO_STORE_DEFAULTS`, the `MaoStore` interface, and `FileStore` (JSON impl for the CLI) |
@@ -41,7 +42,9 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
 | `electron/preload.ts` | `contextBridge` exposing `window.electronAPI` |
 | `electron/store.ts` | 7-line `electron-store` adapter satisfying `MaoStore` |
 | `src/` | React 18 renderer (Vite + Tailwind); `App.tsx` owns all cross-view state |
-| `cli/index.ts` | Commander CLI: `config` / `repos` / `github` / `workflow` / `run` |
+| `cli/index.ts` | Commander CLI: `config` / `repos` / `github` / `workflow` / `run` / `swarm` |
+| `.agents/workflows/swarm_orchestrator.py` | Autonomous Worker/Reviewer/Maintainer lifecycle, isolated worktrees, process registry, retry/cooldown, and safe merged-task cleanup; copied beside the CLI bundle by `scripts/build-cli.mjs` |
+| `.agents/workflows/swarm_orchestrator_test.py` | Standalone Python worktree-safety regressions, included in `npm run test` |
 | `scripts/test-workflow.ts` | Standalone e2e harness against a real (throwaway) repo |
 | `scripts/check-origin.mjs` | Publish-preflight guard: validates every effective `origin` fetch/push URL against an expected host/owner/repo; failure output is fixed-category-only, never remote-derived strings (see SKILL.md) |
 | `scripts/check-origin.test.mjs` | Committed negative/positive matrix for the guard incl. its no-leak contract — `npm run test:origin`, also run in CI |
@@ -56,6 +59,10 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
    `electron/ipc.ts` and every CLI action in `cli/index.ts` must stay a thin
    delegation to the store / `GithubService` / `WorkflowEngine` / auto-trigger. A
    feature added only in one shell breaks GUI↔CLI parity.
+   The one scoped exception is Issue #31's CLI-only autonomous Swarm engine:
+   `.agents/workflows/swarm_orchestrator.py` owns that long-lived process lifecycle,
+   while `cli/index.ts` must remain a thin delegation to `core/swarm-runner.ts` for
+   validation and shell-free launch. Do not duplicate Swarm behavior in the CLI shell.
 3. **`createMaoApp()` (`core/app.ts`) is the only boot path.** Both shells call it;
    it wires token/providers/workspace, subscribes queue persistence to the engine's
    `'change'` event, and restores tasks. Workflow mutations must go through
@@ -83,6 +90,9 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
    and break `core/` under Node). Vitest tests live in `core/**/*.test.ts` only;
    the one exception to the vitest layout is `scripts/check-origin.test.mjs`, a
    dependency-free standalone matrix invoked as `npm run test:origin`.
+   The autonomous Swarm asset is the second explicit exception: its worktree-safety
+   regressions live in `.agents/workflows/swarm_orchestrator_test.py` and run through
+   `npm run test`, so Python 3 is required for the repository test matrix.
 
 ## Files that must change together
 
@@ -202,7 +212,8 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   close issues, push branches, open/comment/approve/merge PRs, create releases,
   or delete refs — on this repo or any target repo — unless the user's task
   explicitly calls for that specific write. Enqueueing a workflow task, `mao
-  run`, `refreshRepo`, and the e2e harness all count: they drive the pipeline,
+  run`, `mao swarm` (except `--dry-run`/`--status`), `refreshRepo`, and the e2e
+  harness all count: they drive the pipeline,
   which performs those writes unattended.
 - The pipeline creates real issues, branches, PRs, reviews, and merges. Test only
   against throwaway repos (see SKILL.md).

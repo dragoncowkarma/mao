@@ -1,0 +1,117 @@
+import fs from 'node:fs'
+import path from 'node:path'
+import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process'
+
+const SWARM_SCRIPT_NAME = 'swarm_orchestrator.py'
+
+export interface SwarmRunOptions {
+  /** Repository the swarm should inspect and mutate. Defaults to the caller's current directory. */
+  repoRoot?: string
+  /** GitHub polling interval in seconds. */
+  interval?: number
+  /** Report planned actions without dispatching agents or changing Git/GitHub state. */
+  dryRun?: boolean
+  /** Poll once instead of running the long-lived loop. */
+  once?: boolean
+  /** Print the persisted process registry and exit. */
+  status?: boolean
+  /** Clear persisted dispatch history before starting. */
+  reset?: boolean
+}
+
+interface SwarmRunnerDependencies {
+  scriptPath?: string
+  pythonCommand?: string
+  spawnProcess?: (command: string, args: string[], options: SpawnOptions) => ChildProcess
+}
+
+/** Build only fixed argv elements so repository paths and options are never shell-interpolated. */
+export function buildSwarmArgs(scriptPath: string, options: SwarmRunOptions): string[] {
+  const args = [scriptPath]
+  if (options.interval !== undefined) {
+    if (!Number.isInteger(options.interval) || options.interval <= 0) {
+      throw new Error(`Swarm interval must be a positive integer, received ${options.interval}`)
+    }
+    args.push('--interval', String(options.interval))
+  }
+  if (options.dryRun) args.push('--dry-run')
+  if (options.once) args.push('--once')
+  if (options.status) args.push('--status')
+  if (options.reset) args.push('--reset')
+  return args
+}
+
+/**
+ * Locate the orchestrator copied beside the CLI bundle, with a source-tree fallback for local
+ * development. `MAO_SWARM_SCRIPT` is an explicit operator override for custom packaging layouts.
+ */
+export function resolveSwarmScriptPath(): string {
+  const cliDir = path.dirname(path.resolve(process.argv[1] ?? process.cwd()))
+  const candidates = [
+    process.env.MAO_SWARM_SCRIPT,
+    path.join(cliDir, SWARM_SCRIPT_NAME),
+    path.resolve(cliDir, '..', '.agents', 'workflows', SWARM_SCRIPT_NAME),
+    path.resolve(process.cwd(), '.agents', 'workflows', SWARM_SCRIPT_NAME),
+  ].filter((candidate): candidate is string => Boolean(candidate))
+
+  const scriptPath = candidates.find((candidate) => fs.existsSync(candidate))
+  if (!scriptPath) {
+    throw new Error(
+      `Swarm orchestrator asset was not found. Rebuild the CLI or set MAO_SWARM_SCRIPT explicitly.`,
+    )
+  }
+  return scriptPath
+}
+
+/**
+ * Run the autonomous Swarm Orchestrator for one repository.
+ *
+ * The Python implementation owns the lifecycle state machine, worktree isolation, provider retry,
+ * and GitHub polling. This core adapter owns cross-platform asset resolution and shell-free process
+ * launch so the CLI remains a thin delegation and paths supplied by users are never interpolated.
+ */
+export async function runSwarm(
+  options: SwarmRunOptions,
+  dependencies: SwarmRunnerDependencies = {},
+): Promise<number> {
+  const repoRoot = path.resolve(options.repoRoot ?? process.cwd())
+  if (!fs.existsSync(repoRoot) || !fs.statSync(repoRoot).isDirectory()) {
+    throw new Error(`Swarm repository root does not exist or is not a directory: ${repoRoot}`)
+  }
+  if (!fs.existsSync(path.join(repoRoot, '.git'))) {
+    throw new Error(`Swarm repository root is not a Git checkout: ${repoRoot}`)
+  }
+
+  const scriptPath = path.resolve(dependencies.scriptPath ?? resolveSwarmScriptPath())
+  if (!fs.existsSync(scriptPath) || !fs.statSync(scriptPath).isFile()) {
+    throw new Error(`Swarm orchestrator script does not exist: ${scriptPath}`)
+  }
+
+  const args = buildSwarmArgs(scriptPath, options)
+  const pythonCommand = dependencies.pythonCommand ?? process.env.MAO_SWARM_PYTHON ?? 'python3'
+  const spawnProcess = dependencies.spawnProcess ?? spawn
+  const child = spawnProcess(pythonCommand, args, {
+    cwd: repoRoot,
+    env: { ...process.env, MAO_SWARM_REPO_ROOT: repoRoot },
+    shell: false,
+    stdio: 'inherit',
+  })
+
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const settle = (fn: () => void) => {
+      if (settled) return
+      settled = true
+      fn()
+    }
+
+    child.once('error', (error) => settle(() => reject(error)))
+    child.once('close', (code, signal) => {
+      settle(() => {
+        if (signal === 'SIGINT') resolve(130)
+        else if (signal === 'SIGTERM') resolve(143)
+        else resolve(code ?? 1)
+      })
+    })
+  })
+}

@@ -34,8 +34,11 @@ from typing import Optional
 # Configuration
 # ---------------------------------------------------------------------------
 
+# The bundled MAO CLI always supplies MAO_SWARM_REPO_ROOT. Resolving from this
+# source file is only a convenience for direct source-tree execution.
+_SOURCE_REPO_ROOT = Path(__file__).resolve().parents[2]
 REPO_ROOT = Path(
-    os.environ.get("MAO_SWARM_REPO_ROOT", Path(__file__).resolve().parents[2])
+    os.environ.get("MAO_SWARM_REPO_ROOT", _SOURCE_REPO_ROOT)
 ).expanduser().resolve()
 WORKTREE_DIR = REPO_ROOT / ".worktrees"
 LOG_DIR = REPO_ROOT / ".agents" / "logs"
@@ -101,7 +104,6 @@ DISPATCH_PROVIDER_COOLDOWN = "provider cooldown"
 
 # Upper bound on persisted history so the registry cannot grow without limit.
 MAX_HISTORY_RECORDS = 500
-IDLE_EXIT_CYCLES = 1
 
 # Metadata tag patterns
 WORKER_PATTERN = re.compile(
@@ -157,23 +159,32 @@ def ensure_runtime_git_excludes():
         stream.write(separator + "\n".join(missing) + "\n")
 
 
-ensure_runtime_git_excludes()
-LOG_DIR.mkdir(parents=True, exist_ok=True)
 _log_formatter = logging.Formatter(
     fmt="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 _console_handler = logging.StreamHandler()
 _console_handler.setFormatter(_log_formatter)
-_file_handler = logging.handlers.RotatingFileHandler(
-    ORCHESTRATOR_LOG_FILE,
-    maxBytes=ORCHESTRATOR_LOG_MAX_BYTES,
-    backupCount=ORCHESTRATOR_LOG_BACKUP_COUNT,
-    encoding="utf-8",
-)
-_file_handler.setFormatter(_log_formatter)
-logging.basicConfig(level=logging.INFO, handlers=[_console_handler, _file_handler])
+logging.basicConfig(level=logging.INFO, handlers=[_console_handler])
 log = logging.getLogger("swarm")
+_file_handler: Optional[logging.Handler] = None
+
+
+def enable_runtime_writes():
+    """Configure local artifacts only for a real, non-dry-run swarm execution."""
+    global _file_handler
+    ensure_runtime_git_excludes()
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    if _file_handler is not None:
+        return
+    _file_handler = logging.handlers.RotatingFileHandler(
+        ORCHESTRATOR_LOG_FILE,
+        maxBytes=ORCHESTRATOR_LOG_MAX_BYTES,
+        backupCount=ORCHESTRATOR_LOG_BACKUP_COUNT,
+        encoding="utf-8",
+    )
+    _file_handler.setFormatter(_log_formatter)
+    logging.getLogger().addHandler(_file_handler)
 
 # Blocker states already reported, so a stuck PR cannot flood the log on every
 # polling cycle. Keys include the head SHA or comment ID, so a new lifecycle
@@ -1210,13 +1221,17 @@ def cleanup_worktree(issue_number: int, branch_name: str):
 
 
 def sync_main_branch(dry_run: bool = False):
-    """Fast-forward local main from origin, and push local-only commits back.
+    """Fast-forward a clean local main without ever publishing local commits.
 
     Runs periodically so the shared checkout that worktrees branch off of
     never drifts far from origin/main after Maintainers merge PRs on GitHub.
-    Only ever fast-forwards or pushes — never rewrites history — so a
-    genuinely diverged main is reported and left for a human, not clobbered.
+    It never pushes or rewrites history, so an ahead or diverged local main is
+    reported and left for a human instead of being published or clobbered.
     """
+    if dry_run:
+        log.info("[DRY RUN] Would fetch and reconcile local main with origin/main")
+        return
+
     fetch = subprocess.run(
         ["git", "fetch", "origin", "main"],
         cwd=REPO_ROOT, capture_output=True, text=True, check=False,
@@ -1272,12 +1287,6 @@ def sync_main_branch(dry_run: bool = False):
     ).returncode == 0
 
     if behind and not ahead:
-        if dry_run:
-            log.info(
-                "[DRY RUN] Would fast-forward local main %s -> origin/main %s",
-                local_sha[:8], remote_sha[:8],
-            )
-            return
         merge = subprocess.run(
             ["git", "merge", "--ff-only", "origin/main"],
             cwd=REPO_ROOT, capture_output=True, text=True, check=False,
@@ -1496,8 +1505,15 @@ _CODEX_MODEL_MAP: dict[str, str] = {
 }
 
 
-def build_ai_argv(ai_name: str, model: str, reasoning: str,
-                  prompt_file: Path, cwd: str, allow_tool_use: bool) -> tuple[list[str], bool]:
+def build_ai_argv(
+    ai_name: str,
+    model: str,
+    reasoning: str,
+    prompt_file: Path,
+    cwd: str,
+    allow_tool_use: bool,
+    prompt_text: Optional[str] = None,
+) -> tuple[list[str], bool]:
     """Build an argv list for a specific AI CLI tool.
 
     Returns a tuple (argv, use_stdin) indicating the command line arguments
@@ -1537,12 +1553,16 @@ def build_ai_argv(ai_name: str, model: str, reasoning: str,
         )
         # agy does NOT use a separate --effort flag; effort is part of model name.
         # agy does not support stdin prompt (demands value for -p/--print), so we pass it in argv.
-        prompt_text = prompt_file.read_text(encoding="utf-8")
+        effective_prompt = (
+            prompt_text
+            if prompt_text is not None
+            else prompt_file.read_text(encoding="utf-8")
+        )
         argv = [
             "agy",
             "--model", resolved_model,
             "--print-timeout", ANTIGRAVITY_PRINT_TIMEOUT,
-            "-p", prompt_text,
+            "-p", effective_prompt,
         ]
         if allow_tool_use:
             argv.insert(1, "--dangerously-skip-permissions")
@@ -1639,8 +1659,20 @@ def dispatch_worker(
     )
 
     task_ref = task_ref or f"issue#{issue.number}:initial"
-    prompt_file = write_prompt_file(prompt, "worker", task_ref)
-    argv, use_stdin = build_ai_argv(worker.ai, worker.model, worker.reasoning, prompt_file, str(worktree_path), allow_tool_use=True)
+    prompt_file = (
+        PROMPT_DIR / "dry-run-worker.md"
+        if dry_run
+        else write_prompt_file(prompt, "worker", task_ref)
+    )
+    argv, use_stdin = build_ai_argv(
+        worker.ai,
+        worker.model,
+        worker.reasoning,
+        prompt_file,
+        str(worktree_path),
+        allow_tool_use=True,
+        prompt_text=prompt if dry_run else None,
+    )
 
     if dry_run:
         log.info("[DRY RUN] Would execute: %s", _format_argv_for_log(argv))
@@ -1729,7 +1761,11 @@ def dispatch_reviewer(
     )
 
     task_ref = task_ref or f"review#{pr.number}-{pr.head_sha or 'initial'}"
-    prompt_file = write_prompt_file(prompt, "reviewer", task_ref)
+    prompt_file = (
+        PROMPT_DIR / "dry-run-reviewer.md"
+        if dry_run
+        else write_prompt_file(prompt, "reviewer", task_ref)
+    )
     argv, use_stdin = build_ai_argv(
         reviewer.ai,
         reviewer.model,
@@ -1737,6 +1773,7 @@ def dispatch_reviewer(
         prompt_file,
         str(REPO_ROOT),
         allow_tool_use=False,
+        prompt_text=prompt if dry_run else None,
     )
 
     if dry_run:
@@ -1820,7 +1857,11 @@ def dispatch_maintainer(
     )
 
     task_ref = task_ref or f"maintain#{pr.number}"
-    prompt_file = write_prompt_file(prompt, "maintainer", task_ref)
+    prompt_file = (
+        PROMPT_DIR / "dry-run-maintainer.md"
+        if dry_run
+        else write_prompt_file(prompt, "maintainer", task_ref)
+    )
     argv, use_stdin = build_ai_argv(
         maintainer.ai,
         maintainer.model,
@@ -1828,6 +1869,7 @@ def dispatch_maintainer(
         prompt_file,
         str(REPO_ROOT),
         allow_tool_use=False,
+        prompt_text=prompt if dry_run else None,
     )
 
     if dry_run:
@@ -1925,8 +1967,20 @@ def dispatch_worker_revision(
 
     if not task_ref:
         task_ref = f"revise#{pr.number}"
-    prompt_file = write_prompt_file(prompt, "worker-revise", task_ref)
-    argv, use_stdin = build_ai_argv(worker.ai, worker.model, worker.reasoning, prompt_file, str(worktree_path), allow_tool_use=True)
+    prompt_file = (
+        PROMPT_DIR / "dry-run-worker-revise.md"
+        if dry_run
+        else write_prompt_file(prompt, "worker-revise", task_ref)
+    )
+    argv, use_stdin = build_ai_argv(
+        worker.ai,
+        worker.model,
+        worker.reasoning,
+        prompt_file,
+        str(worktree_path),
+        allow_tool_use=True,
+        prompt_text=prompt if dry_run else None,
+    )
 
     if dry_run:
         log.info("[DRY RUN] Would execute worker revision: %s", _format_argv_for_log(argv))
@@ -2404,21 +2458,22 @@ def run_loop(interval: int, dry_run: bool = False):
     # Graceful shutdown on SIGTERM/SIGINT
     def handle_signal(signum, frame):
         log.info("Received signal %d, shutting down...", signum)
-        tracker.kill_all()
+        if not dry_run:
+            tracker.kill_all()
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
     initial = True
-    idle_cycles = 0
     cycle_count = 0
     while True:
         try:
             log.info("--- Polling cycle (active: %d) ---", tracker.active_count)
 
             # 1. Check status of all running AI processes
-            tracker.poll_all()
+            if not dry_run:
+                tracker.poll_all()
 
             # 2. Keep local main current so new worktrees branch from a fresh
             # base. Cheap, but still throttled — no need to hit the network
@@ -2434,20 +2489,10 @@ def run_loop(interval: int, dry_run: bool = False):
             process_polling_cycle(dry_run, initial=initial)
             initial = False
 
-            if tracker.active_count == 0:
-                idle_cycles += 1
-                if idle_cycles >= IDLE_EXIT_CYCLES:
-                    log.info(
-                        "No active tasks remain after %d idle cycle(s); exiting.",
-                        idle_cycles,
-                    )
-                    break
-            else:
-                idle_cycles = 0
-
         except KeyboardInterrupt:
             log.info("Shutting down gracefully...")
-            tracker.kill_all()
+            if not dry_run:
+                tracker.kill_all()
             break
         except Exception as e:
             log.error("Error in polling cycle: %s", e, exc_info=True)
@@ -2490,15 +2535,21 @@ def main():
         print(tracker.get_summary())
         return
 
-    if args.reset:
-        reset_process_history()
-    cleanup_old_task_logs()
+    if args.dry_run:
+        if args.reset:
+            log.info("[DRY RUN] Would reset process history")
+    else:
+        enable_runtime_writes()
+        if args.reset:
+            reset_process_history()
+        cleanup_old_task_logs()
 
     if args.once:
         log.info("Running single polling cycle...")
         sync_main_branch(args.dry_run)
         process_polling_cycle(args.dry_run, initial=True)
-        tracker.poll_all()
+        if not args.dry_run:
+            tracker.poll_all()
         cleanup_merged_prs(args.dry_run)
         log.info("Done.")
     else:

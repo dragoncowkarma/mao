@@ -357,7 +357,7 @@ program
       reset?: boolean
     }) => {
       const exitCode = await runSwarm(opts)
-      if (exitCode !== 0) throw new Error(`Swarm orchestrator exited with code ${exitCode}`)
+      process.exitCode = exitCode
     },
   )
 

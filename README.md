@@ -53,8 +53,9 @@ The Swarm command requires Python 3, `git`, an authenticated `gh` CLI, and the A
 the repository's role tags. It can perform real Git/GitHub writes unless `--dry-run` or `--status`
 is supplied. Runtime worktrees, logs, prompts, and the process registry stay inside the target
 repository's ignored `.worktrees/` and `.agents/` paths.
-The command records those runtime patterns only in the target checkout's local
-`.git/info/exclude`; it does not edit the repository's shared `.gitignore`.
+The first real run records those runtime patterns only in the target checkout's local
+`.git/info/exclude`; it does not edit the repository's shared `.gitignore`. `--status`
+and `--dry-run` leave both the checkout and its Git metadata unchanged.
 
 ### Settings
 

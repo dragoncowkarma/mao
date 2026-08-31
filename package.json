@@ -15,7 +15,7 @@
     "build:dir": "vite build && electron-builder --dir",
     "preview": "vite preview",
     "lint": "tsc --noEmit",
-    "test": "vitest run && python3 -m unittest discover -s .agents/workflows -p '*_test.py'",
+    "test": "vitest run && python3 -m unittest discover -s .agents/workflows -p \"*_test.py\"",
     "test:origin": "node scripts/check-origin.test.mjs",
     "cli": "npm run build:cli --silent && node dist-cli/index.cjs",
     "build:cli": "node scripts/build-cli.mjs"

@@ -11,6 +11,7 @@ that first; this file assumes you have.
 
 ```bash
 npm ci             # locked graph, same as CI; Node 22 is what CI uses (CLI bundle targets node18)
+python3 --version   # Python 3.11 in CI; required by the Swarm asset/tests
 ```
 
 Use `npm install` only when intentionally changing dependencies + lockfile.
@@ -112,11 +113,12 @@ authenticated `gh` CLI, and the AI CLIs named by its role tags. The target defau
 to the current Git checkout; use `--repo-root` when invoking it elsewhere. It creates
 task worktrees under `<repo>/.worktrees`, persists process history under
 `<repo>/.agents/.process_registry.json`, and can create issues/PR comments, push,
-review, merge, and close issues. Only `--dry-run` and `--status` are non-writing modes;
+review, merge, and close issues. `--dry-run` and `--status` do not modify the target
+checkout, its Git metadata, or GitHub; `--dry-run` performs GitHub reads only.
 `--once` still performs real dispatch and GitHub/Git operations. `--reset` clears only
-the persisted dispatch history, not Git branches or worktrees. On first launch it adds
-only these runtime paths to the checkout's local `.git/info/exclude`; it never edits or
-commits the target repository's shared `.gitignore`.
+the persisted dispatch history, not Git branches or worktrees. On the first real run it
+adds only these runtime paths to the checkout's local `.git/info/exclude`; it never edits
+or commits the target repository's shared `.gitignore`.
 
 Worktree handling is preservation-first: a branch already checked out elsewhere is a
 hard blocker; a damaged checkout is repaired with `git worktree repair`; and a

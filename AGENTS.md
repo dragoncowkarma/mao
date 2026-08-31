@@ -291,7 +291,7 @@ There is no codegen — these couplings are maintained by hand and only `npm run
 - **Branches**: `<type>/<issue-number>-<kebab-description>` for manual branches.
   AI-agent branches (`claude/`, `codex/`) and engine branches (`workflow/`)
   keep their automated patterns. PRs merge into `main` via merge commits.
-- **CI runs on every PR and push to `main`** (Node 22): `npm ci`, `npm run lint`,
+- **CI runs on every PR and push to `main`** (Node 22, Python 3.11): `npm ci`, `npm run lint`,
   `npm run test`, `npm run test:origin`, `npx vite build`. As of 2026-08 `main` has **no branch
   protection** (no required checks, no rulesets), so a green CI is convention,
   not a GitHub-enforced merge gate — treat it as required anyway. (Separate
@@ -314,9 +314,6 @@ Mirror the product's own maker-checker principle in how you work:
 
 ## Known documentation drift — do not trust these
 
-- `README.md` "Architecture" section predates the `core/` extraction: it claims
-  `ai/`, `workflow-engine.ts`, `github-service.ts`, etc. live under `electron/`.
-  They live under `core/`. The README also doesn't mention the CLI at all.
 - `core/app.ts` docstring says `mao run` passes `resume: true` — it doesn't (see
   rule 4 above).
 - README says "Copy the env template", but no `.env.example` exists — the only

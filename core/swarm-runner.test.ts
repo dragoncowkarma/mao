@@ -4,7 +4,7 @@ import path from 'node:path'
 import { EventEmitter } from 'node:events'
 import type { ChildProcess, SpawnOptions } from 'node:child_process'
 import { afterEach, describe, expect, it } from 'vitest'
-import { buildSwarmArgs, runSwarm } from './swarm-runner.ts'
+import { buildSwarmArgs, resolveSwarmScriptPath, runSwarm } from './swarm-runner.ts'
 
 const tmpDirs: string[] = []
 
@@ -37,6 +37,18 @@ describe('buildSwarmArgs', () => {
   it('rejects intervals that would make the polling loop invalid', () => {
     expect(() => buildSwarmArgs('/tmp/swarm.py', { interval: 0 })).toThrow(/positive integer/)
     expect(() => buildSwarmArgs('/tmp/swarm.py', { interval: 1.5 })).toThrow(/positive integer/)
+  })
+})
+
+describe('resolveSwarmScriptPath', () => {
+  it('resolves the asset beside the real CLI bundle directory', () => {
+    const { repoRoot } = makeCheckout()
+    const runtimeDirectory = path.join(repoRoot, 'dist-cli')
+    fs.mkdirSync(runtimeDirectory)
+    const assetPath = path.join(runtimeDirectory, 'swarm_orchestrator.py')
+    fs.writeFileSync(assetPath, '# bundled asset\n')
+
+    expect(resolveSwarmScriptPath(runtimeDirectory)).toBe(assetPath)
   })
 })
 

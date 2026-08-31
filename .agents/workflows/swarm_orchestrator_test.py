@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 SCRIPT_PATH = Path(__file__).with_name("swarm_orchestrator.py")
@@ -38,10 +39,15 @@ class WorktreeSafetyTest(unittest.TestCase):
             check=True,
         )
 
+        exclude_path = cls.repo / ".git" / "info" / "exclude"
+        exclude_before = exclude_path.read_text()
         os.environ["MAO_SWARM_REPO_ROOT"] = str(cls.repo)
         spec = importlib.util.spec_from_file_location("mao_swarm_test_module", SCRIPT_PATH)
         cls.swarm = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cls.swarm)
+        cls.import_wrote_runtime_files = (cls.repo / ".agents").exists()
+        cls.import_changed_excludes = exclude_path.read_text() != exclude_before
+        cls.swarm.enable_runtime_writes()
 
     @classmethod
     def tearDownClass(cls):
@@ -75,6 +81,39 @@ class WorktreeSafetyTest(unittest.TestCase):
             text=True,
         ).stdout
         self.assertEqual(status, "")
+
+    def test_module_import_is_read_only_for_status_mode(self):
+        self.assertFalse(self.import_wrote_runtime_files)
+        self.assertFalse(self.import_changed_excludes)
+
+    def test_dry_run_does_not_write_prompt_files(self):
+        shutil.rmtree(self.swarm.PROMPT_DIR, ignore_errors=True)
+        issue = self.swarm.TaskIssue(
+            number=99,
+            title="[Task] dry run",
+            body="No writes",
+            worker=self.swarm.RoleAssignment("codex", "5.6", "high"),
+        )
+
+        self.swarm.dispatch_worker(issue, dry_run=True)
+
+        self.assertFalse(self.swarm.PROMPT_DIR.exists())
+
+    def test_dry_run_skips_git_sync(self):
+        with patch.object(self.swarm.subprocess, "run") as run:
+            self.swarm.sync_main_branch(dry_run=True)
+        run.assert_not_called()
+
+    def test_default_loop_waits_for_another_poll_when_idle(self):
+        with (
+            patch.object(self.swarm.signal, "signal"),
+            patch.object(self.swarm, "sync_main_branch"),
+            patch.object(self.swarm, "process_polling_cycle") as poll,
+            patch.object(self.swarm.time, "sleep", side_effect=KeyboardInterrupt),
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                self.swarm.run_loop(interval=30, dry_run=True)
+        poll.assert_called_once_with(True, initial=True)
 
     def test_blocks_a_branch_checked_out_at_another_path(self):
         other = self.repo / "other-worktree"

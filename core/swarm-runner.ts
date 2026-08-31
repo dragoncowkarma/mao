@@ -41,16 +41,28 @@ export function buildSwarmArgs(scriptPath: string, options: SwarmRunOptions): st
   return args
 }
 
+function resolveRuntimeDirectory(): string {
+  if (typeof __dirname === 'string') return __dirname
+  const entryPath = process.argv[1]
+  if (!entryPath) return process.cwd()
+  try {
+    return path.dirname(fs.realpathSync.native(entryPath))
+  } catch {
+    return path.dirname(path.resolve(entryPath))
+  }
+}
+
 /**
  * Locate the orchestrator copied beside the CLI bundle, with a source-tree fallback for local
  * development. `MAO_SWARM_SCRIPT` is an explicit operator override for custom packaging layouts.
+ * The CJS bundle directory is based on Node's real module path, so npm's symlinked `bin` shim does
+ * not redirect asset lookup into the caller's global bin directory.
  */
-export function resolveSwarmScriptPath(): string {
-  const cliDir = path.dirname(path.resolve(process.argv[1] ?? process.cwd()))
+export function resolveSwarmScriptPath(runtimeDirectory = resolveRuntimeDirectory()): string {
   const candidates = [
     process.env.MAO_SWARM_SCRIPT,
-    path.join(cliDir, SWARM_SCRIPT_NAME),
-    path.resolve(cliDir, '..', '.agents', 'workflows', SWARM_SCRIPT_NAME),
+    path.join(runtimeDirectory, SWARM_SCRIPT_NAME),
+    path.resolve(runtimeDirectory, '..', '.agents', 'workflows', SWARM_SCRIPT_NAME),
     path.resolve(process.cwd(), '.agents', 'workflows', SWARM_SCRIPT_NAME),
   ].filter((candidate): candidate is string => Boolean(candidate))
 

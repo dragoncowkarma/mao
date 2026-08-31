@@ -5,7 +5,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 
 SCRIPT_PATH = Path(__file__).with_name("swarm_orchestrator.py")
@@ -114,6 +114,24 @@ class WorktreeSafetyTest(unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt):
                 self.swarm.run_loop(interval=30, dry_run=True)
         poll.assert_called_once_with(True, initial=True)
+
+    def test_once_failure_returns_nonzero_without_reraising(self):
+        with (
+            patch.object(self.swarm, "sync_main_branch"),
+            patch.object(
+                self.swarm,
+                "process_polling_cycle",
+                side_effect=RuntimeError("GitHub unavailable"),
+            ),
+            patch.object(self.swarm.log, "error") as log_error,
+        ):
+            result = self.swarm.run_once(dry_run=True)
+
+        self.assertEqual(result, 1)
+        log_error.assert_called_once_with(
+            "Single polling cycle failed: %s",
+            ANY,
+        )
 
     def test_blocks_a_branch_checked_out_at_another_path(self):
         other = self.repo / "other-worktree"

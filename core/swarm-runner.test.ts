@@ -4,7 +4,13 @@ import path from 'node:path'
 import { EventEmitter } from 'node:events'
 import type { ChildProcess, SpawnOptions } from 'node:child_process'
 import { afterEach, describe, expect, it } from 'vitest'
-import { buildSwarmArgs, resolveSwarmScriptPath, runSwarm } from './swarm-runner.ts'
+import {
+  buildSwarmArgs,
+  resolveGitCheckoutRoot,
+  resolveRuntimeDirectory,
+  resolveSwarmScriptPath,
+  runSwarm,
+} from './swarm-runner.ts'
 
 const tmpDirs: string[] = []
 
@@ -41,6 +47,24 @@ describe('buildSwarmArgs', () => {
 })
 
 describe('resolveSwarmScriptPath', () => {
+  it('resolves a symlinked CLI entry to the real bundle directory', () => {
+    const { repoRoot } = makeCheckout()
+    const runtimeDirectory = path.join(repoRoot, 'dist-cli')
+    const binDirectory = path.join(repoRoot, 'bin')
+    fs.mkdirSync(runtimeDirectory)
+    fs.mkdirSync(binDirectory)
+    const entryPath = path.join(runtimeDirectory, 'index.cjs')
+    const symlinkPath = path.join(binDirectory, 'mao')
+    fs.writeFileSync(entryPath, '# bundled CLI\n')
+    fs.symlinkSync(entryPath, symlinkPath)
+
+    expect(resolveRuntimeDirectory(symlinkPath, null)).toBe(fs.realpathSync.native(runtimeDirectory))
+  })
+
+  it('uses the CommonJS module directory when the bundle provides it', () => {
+    expect(resolveRuntimeDirectory('/ignored/bin/mao', '/real/dist-cli')).toBe('/real/dist-cli')
+  })
+
   it('resolves the asset beside the real CLI bundle directory', () => {
     const { repoRoot } = makeCheckout()
     const runtimeDirectory = path.join(repoRoot, 'dist-cli')
@@ -52,9 +76,22 @@ describe('resolveSwarmScriptPath', () => {
   })
 })
 
+describe('resolveGitCheckoutRoot', () => {
+  it('resolves a nested path to its containing checkout', () => {
+    const { repoRoot } = makeCheckout()
+    const nestedPath = path.join(repoRoot, 'packages', 'example')
+    fs.mkdirSync(nestedPath, { recursive: true })
+
+    expect(resolveGitCheckoutRoot(nestedPath)).toBe(fs.realpathSync.native(repoRoot))
+  })
+})
+
 describe('runSwarm', () => {
   it('launches Python shell-free in the selected repository and forwards its exit code', async () => {
     const { repoRoot, scriptPath } = makeCheckout()
+    const nestedPath = path.join(repoRoot, 'packages', 'example')
+    const canonicalRepoRoot = fs.realpathSync.native(repoRoot)
+    fs.mkdirSync(nestedPath, { recursive: true })
     let invocation:
       | { command: string; args: string[]; options: SpawnOptions }
       | undefined
@@ -68,7 +105,7 @@ describe('runSwarm', () => {
 
     await expect(
       runSwarm(
-        { repoRoot, interval: 15, dryRun: true, once: true },
+        { repoRoot: nestedPath, interval: 15, dryRun: true, once: true },
         { scriptPath, pythonCommand: 'python-test', spawnProcess },
       ),
     ).resolves.toBe(0)
@@ -77,12 +114,12 @@ describe('runSwarm', () => {
       command: 'python-test',
       args: [scriptPath, '--interval', '15', '--dry-run', '--once'],
       options: {
-        cwd: repoRoot,
+        cwd: canonicalRepoRoot,
         shell: false,
         stdio: 'inherit',
       },
     })
-    expect(invocation?.options.env).toMatchObject({ MAO_SWARM_REPO_ROOT: repoRoot })
+    expect(invocation?.options.env).toMatchObject({ MAO_SWARM_REPO_ROOT: canonicalRepoRoot })
   })
 
   it('fails before spawning when the selected directory is not a Git checkout', async () => {
@@ -91,6 +128,6 @@ describe('runSwarm', () => {
     const scriptPath = path.join(repoRoot, 'swarm.py')
     fs.writeFileSync(scriptPath, '# test asset\n')
 
-    await expect(runSwarm({ repoRoot }, { scriptPath })).rejects.toThrow(/not a Git checkout/)
+    await expect(runSwarm({ repoRoot }, { scriptPath })).rejects.toThrow(/not inside a Git checkout/)
   })
 })

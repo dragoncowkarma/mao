@@ -2501,6 +2501,22 @@ def run_loop(interval: int, dry_run: bool = False):
         time.sleep(interval)
 
 
+def run_once(dry_run: bool = False) -> int:
+    """Run one polling cycle and return a concise process exit status."""
+    try:
+        log.info("Running single polling cycle...")
+        sync_main_branch(dry_run)
+        process_polling_cycle(dry_run, initial=True)
+        if not dry_run:
+            tracker.poll_all()
+        cleanup_merged_prs(dry_run)
+        log.info("Done.")
+        return 0
+    except Exception as error:
+        log.error("Single polling cycle failed: %s", error)
+        return 1
+
+
 # ---------------------------------------------------------------------------
 # Entry Point
 # ---------------------------------------------------------------------------
@@ -2533,7 +2549,7 @@ def main():
 
     if args.status:
         print(tracker.get_summary())
-        return
+        return 0
 
     if args.dry_run:
         if args.reset:
@@ -2545,16 +2561,10 @@ def main():
         cleanup_old_task_logs()
 
     if args.once:
-        log.info("Running single polling cycle...")
-        sync_main_branch(args.dry_run)
-        process_polling_cycle(args.dry_run, initial=True)
-        if not args.dry_run:
-            tracker.poll_all()
-        cleanup_merged_prs(args.dry_run)
-        log.info("Done.")
-    else:
-        run_loop(args.interval, args.dry_run)
+        return run_once(args.dry_run)
+    run_loop(args.interval, args.dry_run)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

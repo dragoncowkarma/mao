@@ -341,7 +341,7 @@ program
     'Run the autonomous Worker/Reviewer/Maintainer orchestrator for a Git repository. This may ' +
       'create worktrees, dispatch AI CLIs, and write to GitHub unless --dry-run or --status is used.',
   )
-  .option('--repo-root <path>', 'target Git checkout (default: current directory)')
+  .option('--repo-root <path>', 'path inside target Git checkout (default: current directory)')
   .option('--interval <seconds>', 'GitHub polling interval in seconds', (value) => Number(value))
   .option('--dry-run', 'log planned work without dispatching agents or changing Git/GitHub state')
   .option('--once', 'run one polling cycle and exit')

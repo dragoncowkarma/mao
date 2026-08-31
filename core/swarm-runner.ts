@@ -5,7 +5,7 @@ import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process'
 const SWARM_SCRIPT_NAME = 'swarm_orchestrator.py'
 
 export interface SwarmRunOptions {
-  /** Repository the swarm should inspect and mutate. Defaults to the caller's current directory. */
+  /** Repository path the swarm should inspect and mutate. Resolves to the containing checkout. */
   repoRoot?: string
   /** GitHub polling interval in seconds. */
   interval?: number
@@ -41,15 +41,46 @@ export function buildSwarmArgs(scriptPath: string, options: SwarmRunOptions): st
   return args
 }
 
-function resolveRuntimeDirectory(): string {
-  if (typeof __dirname === 'string') return __dirname
-  const entryPath = process.argv[1]
+/**
+ * Resolve the actual CLI bundle directory. The explicit parameters keep both the CommonJS and
+ * symlink fallback branches directly testable without mutating process globals.
+ */
+export function resolveRuntimeDirectory(
+  entryPath = process.argv[1],
+  moduleDirectory: string | null = typeof __dirname === 'string' ? __dirname : null,
+): string {
+  if (moduleDirectory) return moduleDirectory
   if (!entryPath) return process.cwd()
   try {
     return path.dirname(fs.realpathSync.native(entryPath))
   } catch {
     return path.dirname(path.resolve(entryPath))
   }
+}
+
+/**
+ * Resolve a repository path to its nearest containing checkout. Walking `.git` markers supports
+ * regular clones, linked worktrees, submodules, and nested working directories without adding a
+ * shell or an unbounded Git subprocess before the orchestrator starts.
+ */
+export function resolveGitCheckoutRoot(repoPath: string): string {
+  const resolvedPath = path.resolve(repoPath)
+  if (!fs.existsSync(resolvedPath) || !fs.statSync(resolvedPath).isDirectory()) {
+    throw new Error(`Swarm repository path does not exist or is not a directory: ${resolvedPath}`)
+  }
+
+  let candidate = fs.realpathSync.native(resolvedPath)
+  while (!fs.existsSync(path.join(candidate, '.git'))) {
+    const parent = path.dirname(candidate)
+    if (parent === candidate) {
+      throw new Error(
+        `Swarm repository path is not inside a Git checkout: ${resolvedPath}. ` +
+          `Run from a checkout or pass --repo-root explicitly.`,
+      )
+    }
+    candidate = parent
+  }
+  return candidate
 }
 
 /**
@@ -86,13 +117,7 @@ export async function runSwarm(
   options: SwarmRunOptions,
   dependencies: SwarmRunnerDependencies = {},
 ): Promise<number> {
-  const repoRoot = path.resolve(options.repoRoot ?? process.cwd())
-  if (!fs.existsSync(repoRoot) || !fs.statSync(repoRoot).isDirectory()) {
-    throw new Error(`Swarm repository root does not exist or is not a directory: ${repoRoot}`)
-  }
-  if (!fs.existsSync(path.join(repoRoot, '.git'))) {
-    throw new Error(`Swarm repository root is not a Git checkout: ${repoRoot}`)
-  }
+  const repoRoot = resolveGitCheckoutRoot(options.repoRoot ?? process.cwd())
 
   const scriptPath = path.resolve(dependencies.scriptPath ?? resolveSwarmScriptPath())
   if (!fs.existsSync(scriptPath) || !fs.statSync(scriptPath).isFile()) {

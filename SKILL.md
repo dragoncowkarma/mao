@@ -110,7 +110,8 @@ stages one at a time.
 
 `mao swarm` is the autonomous multi-agent path. It requires Python 3, `git`, an
 authenticated `gh` CLI, and the AI CLIs named by its role tags. The target defaults
-to the current Git checkout; use `--repo-root` when invoking it elsewhere. It creates
+to the Git checkout containing the current directory; use `--repo-root` with any path
+inside another checkout when invoking it elsewhere. It creates
 task worktrees under `<repo>/.worktrees`, persists process history under
 `<repo>/.agents/.process_registry.json`, and can create issues/PR comments, push,
 review, merge, and close issues. `--dry-run` and `--status` do not modify the target

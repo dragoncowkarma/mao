@@ -6,10 +6,11 @@ Polls GitHub Issues and PRs via `gh` CLI, parses role metadata tags,
 creates isolated git worktrees, and dispatches AI agents as subprocesses.
 
 Usage:
-    python .agents/workflows/swarm_orchestrator.py [--interval 30] [--dry-run]
-    python .agents/workflows/swarm_orchestrator.py --status
+    mao swarm [--repo-root /path/to/repo] [--interval 30] [--dry-run]
+    mao swarm --repo-root /path/to/repo --status
 
-Requires: gh CLI authenticated, git, and at least one AI CLI installed.
+The MAO CLI sets MAO_SWARM_REPO_ROOT before launching this bundled asset.
+Requires: Python 3, authenticated gh CLI, git, and at least one AI CLI installed.
 """
 
 import argparse
@@ -18,7 +19,6 @@ import logging
 import logging.handlers
 import os
 import re
-import shutil
 import signal
 import subprocess
 import sys
@@ -34,7 +34,12 @@ from typing import Optional
 # Configuration
 # ---------------------------------------------------------------------------
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+# The bundled MAO CLI always supplies MAO_SWARM_REPO_ROOT. Resolving from this
+# source file is only a convenience for direct source-tree execution.
+_SOURCE_REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(
+    os.environ.get("MAO_SWARM_REPO_ROOT", _SOURCE_REPO_ROOT)
+).expanduser().resolve()
 WORKTREE_DIR = REPO_ROOT / ".worktrees"
 LOG_DIR = REPO_ROOT / ".agents" / "logs"
 POLL_INTERVAL_SECONDS = 30
@@ -99,7 +104,6 @@ DISPATCH_PROVIDER_COOLDOWN = "provider cooldown"
 
 # Upper bound on persisted history so the registry cannot grow without limit.
 MAX_HISTORY_RECORDS = 500
-IDLE_EXIT_CYCLES = 1
 
 # Metadata tag patterns
 WORKER_PATTERN = re.compile(
@@ -126,22 +130,61 @@ DEFAULT_ROTATION = {
 # Prompt temp file directory (cleaned on shutdown)
 PROMPT_DIR = REPO_ROOT / ".agents" / ".prompts"
 
-LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+def ensure_runtime_git_excludes():
+    """Hide local Swarm artifacts without changing the repository's shared .gitignore."""
+    result = subprocess.run(
+        ["git", "rev-parse", "--git-path", "info/exclude"],
+        cwd=REPO_ROOT, capture_output=True, text=True, check=False,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        raise RuntimeError(f"Not a Git checkout: {REPO_ROOT}")
+
+    exclude_path = Path(result.stdout.strip())
+    if not exclude_path.is_absolute():
+        exclude_path = REPO_ROOT / exclude_path
+    exclude_path.parent.mkdir(parents=True, exist_ok=True)
+    current = exclude_path.read_text() if exclude_path.exists() else ""
+    patterns = (
+        "/.worktrees/",
+        "/.agents/logs/",
+        "/.agents/.prompts/",
+        "/.agents/.process_registry.json",
+    )
+    missing = [pattern for pattern in patterns if pattern not in current.splitlines()]
+    if not missing:
+        return
+    separator = "" if not current or current.endswith("\n") else "\n"
+    with exclude_path.open("a", encoding="utf-8") as stream:
+        stream.write(separator + "\n".join(missing) + "\n")
+
+
 _log_formatter = logging.Formatter(
     fmt="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 _console_handler = logging.StreamHandler()
 _console_handler.setFormatter(_log_formatter)
-_file_handler = logging.handlers.RotatingFileHandler(
-    ORCHESTRATOR_LOG_FILE,
-    maxBytes=ORCHESTRATOR_LOG_MAX_BYTES,
-    backupCount=ORCHESTRATOR_LOG_BACKUP_COUNT,
-    encoding="utf-8",
-)
-_file_handler.setFormatter(_log_formatter)
-logging.basicConfig(level=logging.INFO, handlers=[_console_handler, _file_handler])
+logging.basicConfig(level=logging.INFO, handlers=[_console_handler])
 log = logging.getLogger("swarm")
+_file_handler: Optional[logging.Handler] = None
+
+
+def enable_runtime_writes():
+    """Configure local artifacts only for a real, non-dry-run swarm execution."""
+    global _file_handler
+    ensure_runtime_git_excludes()
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    if _file_handler is not None:
+        return
+    _file_handler = logging.handlers.RotatingFileHandler(
+        ORCHESTRATOR_LOG_FILE,
+        maxBytes=ORCHESTRATOR_LOG_MAX_BYTES,
+        backupCount=ORCHESTRATOR_LOG_BACKUP_COUNT,
+        encoding="utf-8",
+    )
+    _file_handler.setFormatter(_log_formatter)
+    logging.getLogger().addHandler(_file_handler)
 
 # Blocker states already reported, so a stuck PR cannot flood the log on every
 # polling cycle. Keys include the head SHA or comment ID, so a new lifecycle
@@ -918,13 +961,127 @@ def local_branch_exists(branch_name: str) -> bool:
     return bool(result.stdout.strip())
 
 
+def list_git_worktrees() -> list[dict[str, str]]:
+    """Return Git's authoritative worktree registry in porcelain form."""
+    result = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        capture_output=True, text=True, cwd=REPO_ROOT, check=True,
+    )
+    entries: list[dict[str, str]] = []
+    current: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        if not line:
+            if current:
+                entries.append(current)
+                current = {}
+            continue
+        key, _, value = line.partition(" ")
+        current[key] = value
+    if current:
+        entries.append(current)
+    return entries
+
+
+def worktree_entry_for_path(
+    entries: list[dict[str, str]],
+    worktree_path: Path,
+) -> Optional[dict[str, str]]:
+    """Find the registry entry for an exact filesystem path."""
+    expected = worktree_path.resolve()
+    return next(
+        (
+            entry for entry in entries
+            if entry.get("worktree")
+            and Path(entry["worktree"]).resolve() == expected
+        ),
+        None,
+    )
+
+
+def worktree_entry_for_branch(
+    entries: list[dict[str, str]],
+    branch_name: str,
+) -> Optional[dict[str, str]]:
+    """Find the checkout that already owns a local branch, if any."""
+    branch_ref = f"refs/heads/{branch_name}"
+    return next((entry for entry in entries if entry.get("branch") == branch_ref), None)
+
+
+def repair_worktree(worktree_path: Path):
+    """Ask Git to repair administrative links without deleting user files."""
+    result = subprocess.run(
+        ["git", "worktree", "repair", str(worktree_path)],
+        cwd=REPO_ROOT, capture_output=True, text=True, check=False,
+    )
+    if result.returncode != 0:
+        log.warning("Failed to repair worktree %s; preserving it.", worktree_path)
+
+
+def directory_is_empty(directory: Path) -> bool:
+    """Return true only for an existing directory with no entries."""
+    try:
+        next(directory.iterdir())
+    except StopIteration:
+        return True
+    except OSError:
+        return False
+    return False
+
+
 def create_worktree(issue_number: int, branch_name: str) -> Path:
-    """Create an isolated git worktree for a task."""
+    """Create or safely reuse the one isolated worktree owned by a task."""
     worktree_path = WORKTREE_DIR / str(issue_number)
 
-    if worktree_path.exists():
-        log.info("Worktree already exists: %s", worktree_path)
-        return worktree_path
+    if worktree_path.is_symlink():
+        raise RuntimeError(f"Refusing symlinked worktree path: {worktree_path}")
+
+    entries = list_git_worktrees()
+    path_entry = worktree_entry_for_path(entries, worktree_path)
+    if not worktree_path.exists() and path_entry:
+        # The directory is already gone, so only prunable administrative
+        # metadata remains. Pruning it cannot remove user files.
+        subprocess.run(
+            ["git", "worktree", "prune"], cwd=REPO_ROOT, check=False,
+        )
+        entries = list_git_worktrees()
+        path_entry = worktree_entry_for_path(entries, worktree_path)
+    if worktree_path.exists() or path_entry:
+        if not worktree_path.exists():
+            # Git retains prunable metadata after a directory is removed. Prune
+            # only that metadata; there are no files at the path to preserve.
+            subprocess.run(
+                ["git", "worktree", "prune"], cwd=REPO_ROOT, check=False,
+            )
+        elif not (worktree_path / ".git").exists() or not path_entry:
+            repair_worktree(worktree_path)
+
+        entries = list_git_worktrees()
+        path_entry = worktree_entry_for_path(entries, worktree_path)
+        expected_branch = f"refs/heads/{branch_name}"
+        if (
+            worktree_path.exists()
+            and (worktree_path / ".git").exists()
+            and path_entry
+            and path_entry.get("branch") == expected_branch
+        ):
+            log.info("Reusing worktree: %s", worktree_path)
+            return worktree_path
+
+        if worktree_path.exists() and directory_is_empty(worktree_path):
+            worktree_path.rmdir()
+        elif worktree_path.exists():
+            raise RuntimeError(
+                f"Worktree path is not a valid checkout for '{branch_name}'; "
+                f"preserving non-empty directory: {worktree_path}"
+            )
+
+    entries = list_git_worktrees()
+    branch_entry = worktree_entry_for_branch(entries, branch_name)
+    if branch_entry:
+        raise RuntimeError(
+            f"Branch '{branch_name}' is already checked out at "
+            f"{branch_entry.get('worktree', '(unknown path)')}"
+        )
 
     WORKTREE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -962,24 +1119,41 @@ def cleanup_worktree(issue_number: int, branch_name: str):
         )
         return
 
-    if worktree_path.exists():
-        git_link = worktree_path / ".git"
-        if not git_link.exists():
-            # Prunable worktree: .git file is missing so `git worktree remove`
-            # will fail with "validation failed". Prune git's internal refs and
-            # remove the orphaned directory manually.
-            log.warning(
-                "Worktree %s is prunable (missing .git file); "
-                "pruning refs and removing directory.",
-                worktree_path,
-            )
-            subprocess.run(
-                ["git", "worktree", "prune"],
-                cwd=REPO_ROOT, check=False,
-            )
-            shutil.rmtree(worktree_path, ignore_errors=True)
-            log.info("Removed prunable worktree: %s", worktree_path)
-        else:
+    if worktree_path.is_symlink():
+        log_blocker(
+            f"symlink-worktree:{issue_number}",
+            "Refusing to inspect or remove symlinked worktree path: %s",
+            worktree_path,
+        )
+        return
+
+    entries = list_git_worktrees()
+    path_entry = worktree_entry_for_path(entries, worktree_path)
+    if not worktree_path.exists() and path_entry:
+        # The directory is already gone, so only prunable administrative
+        # metadata remains. Pruning it cannot remove user files.
+        subprocess.run(
+            ["git", "worktree", "prune"], cwd=REPO_ROOT, check=False,
+        )
+        entries = list_git_worktrees()
+        path_entry = worktree_entry_for_path(entries, worktree_path)
+    if worktree_path.exists() or path_entry:
+        if worktree_path.exists() and (
+            not (worktree_path / ".git").exists() or not path_entry
+        ):
+            repair_worktree(worktree_path)
+            entries = list_git_worktrees()
+            path_entry = worktree_entry_for_path(entries, worktree_path)
+
+        if worktree_path.exists() and path_entry and (worktree_path / ".git").exists():
+            expected_branch = f"refs/heads/{branch_name}"
+            if path_entry.get("branch") != expected_branch:
+                log_blocker(
+                    f"mismatched-worktree:{issue_number}",
+                    "Refusing cleanup: %s is registered for a different branch.",
+                    worktree_path,
+                )
+                return
             status = subprocess.run(
                 ["git", "status", "--porcelain"],
                 cwd=worktree_path,
@@ -1006,6 +1180,32 @@ def cleanup_worktree(issue_number: int, branch_name: str):
                 log.warning("Failed to remove worktree: %s", worktree_path)
                 return
             log.info("Removed worktree: %s", worktree_path)
+        elif worktree_path.exists():
+            if not directory_is_empty(worktree_path):
+                log_blocker(
+                    f"damaged-worktree:{issue_number}",
+                    "Refusing to remove damaged non-empty worktree for Issue #%d: %s",
+                    issue_number,
+                    worktree_path,
+                    level=logging.WARNING,
+                )
+                return
+            worktree_path.rmdir()
+            subprocess.run(
+                ["git", "worktree", "prune"], cwd=REPO_ROOT, check=False,
+            )
+            log.info("Removed empty damaged worktree directory: %s", worktree_path)
+
+    # Never delete a branch that another registered worktree still owns.
+    branch_entry = worktree_entry_for_branch(list_git_worktrees(), branch_name)
+    if branch_entry:
+        log_blocker(
+            f"checked-out-branch:{issue_number}:{branch_name}",
+            "Refusing to delete branch '%s'; it is checked out at %s.",
+            branch_name,
+            branch_entry.get("worktree", "(unknown path)"),
+        )
+        return
 
     # Force-delete the local branch. We already confirmed the PR is merged on
     # GitHub, so the local merge check (`-d`) is unreliable when the PR was
@@ -1021,13 +1221,17 @@ def cleanup_worktree(issue_number: int, branch_name: str):
 
 
 def sync_main_branch(dry_run: bool = False):
-    """Fast-forward local main from origin, and push local-only commits back.
+    """Fast-forward a clean local main without ever publishing local commits.
 
     Runs periodically so the shared checkout that worktrees branch off of
     never drifts far from origin/main after Maintainers merge PRs on GitHub.
-    Only ever fast-forwards or pushes — never rewrites history — so a
-    genuinely diverged main is reported and left for a human, not clobbered.
+    It never pushes or rewrites history, so an ahead or diverged local main is
+    reported and left for a human instead of being published or clobbered.
     """
+    if dry_run:
+        log.info("[DRY RUN] Would fetch and reconcile local main with origin/main")
+        return
+
     fetch = subprocess.run(
         ["git", "fetch", "origin", "main"],
         cwd=REPO_ROOT, capture_output=True, text=True, check=False,
@@ -1083,12 +1287,6 @@ def sync_main_branch(dry_run: bool = False):
     ).returncode == 0
 
     if behind and not ahead:
-        if dry_run:
-            log.info(
-                "[DRY RUN] Would fast-forward local main %s -> origin/main %s",
-                local_sha[:8], remote_sha[:8],
-            )
-            return
         merge = subprocess.run(
             ["git", "merge", "--ff-only", "origin/main"],
             cwd=REPO_ROOT, capture_output=True, text=True, check=False,
@@ -1307,8 +1505,15 @@ _CODEX_MODEL_MAP: dict[str, str] = {
 }
 
 
-def build_ai_argv(ai_name: str, model: str, reasoning: str,
-                  prompt_file: Path, cwd: str, allow_tool_use: bool) -> tuple[list[str], bool]:
+def build_ai_argv(
+    ai_name: str,
+    model: str,
+    reasoning: str,
+    prompt_file: Path,
+    cwd: str,
+    allow_tool_use: bool,
+    prompt_text: Optional[str] = None,
+) -> tuple[list[str], bool]:
     """Build an argv list for a specific AI CLI tool.
 
     Returns a tuple (argv, use_stdin) indicating the command line arguments
@@ -1348,12 +1553,16 @@ def build_ai_argv(ai_name: str, model: str, reasoning: str,
         )
         # agy does NOT use a separate --effort flag; effort is part of model name.
         # agy does not support stdin prompt (demands value for -p/--print), so we pass it in argv.
-        prompt_text = prompt_file.read_text(encoding="utf-8")
+        effective_prompt = (
+            prompt_text
+            if prompt_text is not None
+            else prompt_file.read_text(encoding="utf-8")
+        )
         argv = [
             "agy",
             "--model", resolved_model,
             "--print-timeout", ANTIGRAVITY_PRINT_TIMEOUT,
-            "-p", prompt_text,
+            "-p", effective_prompt,
         ]
         if allow_tool_use:
             argv.insert(1, "--dangerously-skip-permissions")
@@ -1450,8 +1659,20 @@ def dispatch_worker(
     )
 
     task_ref = task_ref or f"issue#{issue.number}:initial"
-    prompt_file = write_prompt_file(prompt, "worker", task_ref)
-    argv, use_stdin = build_ai_argv(worker.ai, worker.model, worker.reasoning, prompt_file, str(worktree_path), allow_tool_use=True)
+    prompt_file = (
+        PROMPT_DIR / "dry-run-worker.md"
+        if dry_run
+        else write_prompt_file(prompt, "worker", task_ref)
+    )
+    argv, use_stdin = build_ai_argv(
+        worker.ai,
+        worker.model,
+        worker.reasoning,
+        prompt_file,
+        str(worktree_path),
+        allow_tool_use=True,
+        prompt_text=prompt if dry_run else None,
+    )
 
     if dry_run:
         log.info("[DRY RUN] Would execute: %s", _format_argv_for_log(argv))
@@ -1540,7 +1761,11 @@ def dispatch_reviewer(
     )
 
     task_ref = task_ref or f"review#{pr.number}-{pr.head_sha or 'initial'}"
-    prompt_file = write_prompt_file(prompt, "reviewer", task_ref)
+    prompt_file = (
+        PROMPT_DIR / "dry-run-reviewer.md"
+        if dry_run
+        else write_prompt_file(prompt, "reviewer", task_ref)
+    )
     argv, use_stdin = build_ai_argv(
         reviewer.ai,
         reviewer.model,
@@ -1548,6 +1773,7 @@ def dispatch_reviewer(
         prompt_file,
         str(REPO_ROOT),
         allow_tool_use=False,
+        prompt_text=prompt if dry_run else None,
     )
 
     if dry_run:
@@ -1631,7 +1857,11 @@ def dispatch_maintainer(
     )
 
     task_ref = task_ref or f"maintain#{pr.number}"
-    prompt_file = write_prompt_file(prompt, "maintainer", task_ref)
+    prompt_file = (
+        PROMPT_DIR / "dry-run-maintainer.md"
+        if dry_run
+        else write_prompt_file(prompt, "maintainer", task_ref)
+    )
     argv, use_stdin = build_ai_argv(
         maintainer.ai,
         maintainer.model,
@@ -1639,6 +1869,7 @@ def dispatch_maintainer(
         prompt_file,
         str(REPO_ROOT),
         allow_tool_use=False,
+        prompt_text=prompt if dry_run else None,
     )
 
     if dry_run:
@@ -1736,8 +1967,20 @@ def dispatch_worker_revision(
 
     if not task_ref:
         task_ref = f"revise#{pr.number}"
-    prompt_file = write_prompt_file(prompt, "worker-revise", task_ref)
-    argv, use_stdin = build_ai_argv(worker.ai, worker.model, worker.reasoning, prompt_file, str(worktree_path), allow_tool_use=True)
+    prompt_file = (
+        PROMPT_DIR / "dry-run-worker-revise.md"
+        if dry_run
+        else write_prompt_file(prompt, "worker-revise", task_ref)
+    )
+    argv, use_stdin = build_ai_argv(
+        worker.ai,
+        worker.model,
+        worker.reasoning,
+        prompt_file,
+        str(worktree_path),
+        allow_tool_use=True,
+        prompt_text=prompt if dry_run else None,
+    )
 
     if dry_run:
         log.info("[DRY RUN] Would execute worker revision: %s", _format_argv_for_log(argv))
@@ -2215,21 +2458,22 @@ def run_loop(interval: int, dry_run: bool = False):
     # Graceful shutdown on SIGTERM/SIGINT
     def handle_signal(signum, frame):
         log.info("Received signal %d, shutting down...", signum)
-        tracker.kill_all()
+        if not dry_run:
+            tracker.kill_all()
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
     initial = True
-    idle_cycles = 0
     cycle_count = 0
     while True:
         try:
             log.info("--- Polling cycle (active: %d) ---", tracker.active_count)
 
             # 1. Check status of all running AI processes
-            tracker.poll_all()
+            if not dry_run:
+                tracker.poll_all()
 
             # 2. Keep local main current so new worktrees branch from a fresh
             # base. Cheap, but still throttled — no need to hit the network
@@ -2245,26 +2489,42 @@ def run_loop(interval: int, dry_run: bool = False):
             process_polling_cycle(dry_run, initial=initial)
             initial = False
 
-            if tracker.active_count == 0:
-                idle_cycles += 1
-                if idle_cycles >= IDLE_EXIT_CYCLES:
-                    log.info(
-                        "No active tasks remain after %d idle cycle(s); exiting.",
-                        idle_cycles,
-                    )
-                    break
-            else:
-                idle_cycles = 0
-
         except KeyboardInterrupt:
             log.info("Shutting down gracefully...")
-            tracker.kill_all()
+            if not dry_run:
+                tracker.kill_all()
             break
         except Exception as e:
             log.error("Error in polling cycle: %s", e, exc_info=True)
 
         log.info("Sleeping %ds...", interval)
         time.sleep(interval)
+
+
+def run_once(dry_run: bool = False) -> int:
+    """Run one polling cycle and return a concise process exit status."""
+    log.info("Repo root: %s", REPO_ROOT)
+    try:
+        log.info("Running single polling cycle...")
+        sync_main_branch(dry_run)
+        process_polling_cycle(dry_run, initial=True)
+        if not dry_run:
+            tracker.poll_all()
+        cleanup_merged_prs(dry_run)
+        log.info("Done.")
+        return 0
+    except KeyboardInterrupt:
+        log.info("Single polling cycle interrupted.")
+        if not dry_run:
+            tracker.kill_all()
+        return 130
+    except subprocess.SubprocessError as error:
+        # gh() has already logged the actionable command failure or timeout.
+        log.error("Single polling cycle failed: %s", error)
+        return 1
+    except Exception as error:
+        log.error("Single polling cycle failed: %s", error, exc_info=True)
+        return 1
 
 
 # ---------------------------------------------------------------------------
@@ -2298,23 +2558,24 @@ def main():
     args = parser.parse_args()
 
     if args.status:
+        log.info("Repo root: %s", REPO_ROOT)
         print(tracker.get_summary())
-        return
+        return 0
 
-    if args.reset:
-        reset_process_history()
-    cleanup_old_task_logs()
+    if args.dry_run:
+        if args.reset:
+            log.info("[DRY RUN] Would reset process history")
+    else:
+        enable_runtime_writes()
+        if args.reset:
+            reset_process_history()
+        cleanup_old_task_logs()
 
     if args.once:
-        log.info("Running single polling cycle...")
-        sync_main_branch(args.dry_run)
-        process_polling_cycle(args.dry_run, initial=True)
-        tracker.poll_all()
-        cleanup_merged_prs(args.dry_run)
-        log.info("Done.")
-    else:
-        run_loop(args.interval, args.dry_run)
+        return run_once(args.dry_run)
+    run_loop(args.interval, args.dry_run)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

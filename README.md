@@ -21,6 +21,9 @@ Electron dev-toolkit that lets AI agents drive a GitHub workflow — **issue →
 - **Multi-repo** — register any number of `owner/repo` pairs; each queued task carries its own repo.
 - **Persistence & retry** — the workflow queue survives app restarts (interrupted tasks resume), and failed tasks can be retried from the same stage with one click.
 - **Queue cleanup** — finished tasks are capped (oldest dropped past 50) and can be cleared manually.
+- **Autonomous Swarm CLI** — `mao swarm` coordinates Worker, Reviewer, revision, and Maintainer
+  lifecycles across isolated worktrees, with persistent process tracking, bounded crash retry,
+  provider cooldowns, and preservation-first cleanup.
 
 ## Getting started
 
@@ -37,6 +40,23 @@ npm run dist           # full distributable: dmg + zip (mac)
 npx electron-builder --win zip --linux AppImage --publish=never   # cross-build win/linux from a mac host
 ```
 
+### Headless CLI and autonomous Swarm
+
+```bash
+npm run build:cli
+node dist-cli/index.cjs --help
+node dist-cli/index.cjs swarm --repo-root /path/to/repo --status
+node dist-cli/index.cjs swarm --repo-root /path/to/repo --dry-run --once
+```
+
+The Swarm command requires Python 3, `git`, an authenticated `gh` CLI, and the AI CLIs named by
+the repository's role tags. It can perform real Git/GitHub writes unless `--dry-run` or `--status`
+is supplied. Runtime worktrees, logs, prompts, and the process registry stay inside the target
+repository's ignored `.worktrees/` and `.agents/` paths.
+The first real run records those runtime patterns only in the target checkout's local
+`.git/info/exclude`; it does not edit the repository's shared `.gitignore`. `--status`
+and `--dry-run` leave both the checkout and its Git metadata unchanged.
+
 ### Settings
 
 Open the app and fill in the **Settings** panel:
@@ -52,17 +72,21 @@ All settings persist locally via `electron-store` (in the OS's app-data director
 ## Architecture
 
 ```
-electron/
-  ai/               AiProvider adapter (api-provider.ts, cli-provider.ts) behind a common interface
+core/
+  ai/               Provider adapters shared by both frontends
   github-service.ts GitHub REST calls: issue/PR fetch, branch/commit/review/merge/CI-status
   git-workspace.ts  Local git clone/branch/commit/push (child_process, no Electron dep)
-  workflow-engine.ts Core state machine: queue, stage progression, agent routing, CI gate,
-                    manual auto-advance/pause control
-  auto-trigger.ts   Per-repo polling scheduler; auto-enqueues new issues, tracks last-poll
-                    status, and exposes a manual pollNow() for on-demand refresh
-  store.ts          electron-store schema (token, repos, providers, workflow queue)
-  ipc.ts            IPC handlers wiring the above to the renderer
+  workflow-engine.ts Core state machine: queue, stage progression, agent routing, CI gate
+  swarm-runner.ts   Shell-free launcher for the autonomous Swarm CLI asset
+  auto-trigger.ts   Per-repo polling scheduler
+  store.ts          Shared persistence schema and FileStore
+electron/
+  ipc.ts            Thin IPC delegations to core services
   main.ts / preload.ts  Electron entry points
+cli/
+  index.ts          Headless `mao` commands backed by core services
+.agents/workflows/
+  swarm_orchestrator.py  Autonomous role lifecycle, worktrees, process tracking, retry/cooldown
 src/
   App.tsx           Sidebar + project tabs (Board / Queue / Settings) shell
   components/

@@ -15,10 +15,10 @@
     "build:dir": "vite build && electron-builder --dir",
     "preview": "vite preview",
     "lint": "tsc --noEmit",
-    "test": "vitest run",
+    "test": "vitest run && python3 -m unittest discover -s .agents/workflows -p \"*_test.py\"",
     "test:origin": "node scripts/check-origin.test.mjs",
     "cli": "npm run build:cli --silent && node dist-cli/index.cjs",
-    "build:cli": "esbuild cli/index.ts --bundle --platform=node --format=cjs --target=node18 --outfile=dist-cli/index.cjs && chmod +x dist-cli/index.cjs"
+    "build:cli": "node scripts/build-cli.mjs"
   },
   "dependencies": {
     "commander": "^12.1.0",

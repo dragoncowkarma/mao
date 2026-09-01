@@ -73,10 +73,7 @@ export function resolveGitCheckoutRoot(repoPath: string): string {
   while (!fs.existsSync(path.join(candidate, '.git'))) {
     const parent = path.dirname(candidate)
     if (parent === candidate) {
-      throw new Error(
-        `Swarm repository path is not inside a Git checkout: ${resolvedPath}. ` +
-          `Run from a checkout or pass --repo-root explicitly.`,
-      )
+      throw new Error(`Swarm repository path is not inside a Git checkout: ${resolvedPath}`)
     }
     candidate = parent
   }

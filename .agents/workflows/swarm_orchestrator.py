@@ -2503,6 +2503,7 @@ def run_loop(interval: int, dry_run: bool = False):
 
 def run_once(dry_run: bool = False) -> int:
     """Run one polling cycle and return a concise process exit status."""
+    log.info("Repo root: %s", REPO_ROOT)
     try:
         log.info("Running single polling cycle...")
         sync_main_branch(dry_run)
@@ -2512,8 +2513,17 @@ def run_once(dry_run: bool = False) -> int:
         cleanup_merged_prs(dry_run)
         log.info("Done.")
         return 0
-    except Exception as error:
+    except KeyboardInterrupt:
+        log.info("Single polling cycle interrupted.")
+        if not dry_run:
+            tracker.kill_all()
+        return 130
+    except subprocess.SubprocessError as error:
+        # gh() has already logged the actionable command failure or timeout.
         log.error("Single polling cycle failed: %s", error)
+        return 1
+    except Exception as error:
+        log.error("Single polling cycle failed: %s", error, exc_info=True)
         return 1
 
 
@@ -2548,6 +2558,7 @@ def main():
     args = parser.parse_args()
 
     if args.status:
+        log.info("Repo root: %s", REPO_ROOT)
         print(tracker.get_summary())
         return 0
 

@@ -115,13 +115,13 @@ class WorktreeSafetyTest(unittest.TestCase):
                 self.swarm.run_loop(interval=30, dry_run=True)
         poll.assert_called_once_with(True, initial=True)
 
-    def test_once_failure_returns_nonzero_without_reraising(self):
+    def test_once_subprocess_failure_returns_nonzero_without_traceback(self):
         with (
             patch.object(self.swarm, "sync_main_branch"),
             patch.object(
                 self.swarm,
                 "process_polling_cycle",
-                side_effect=RuntimeError("GitHub unavailable"),
+                side_effect=subprocess.CalledProcessError(1, ["gh", "issue", "list"]),
             ),
             patch.object(self.swarm.log, "error") as log_error,
         ):
@@ -132,6 +132,46 @@ class WorktreeSafetyTest(unittest.TestCase):
             "Single polling cycle failed: %s",
             ANY,
         )
+
+    def test_once_unexpected_failure_keeps_debug_traceback(self):
+        with (
+            patch.object(self.swarm, "sync_main_branch"),
+            patch.object(
+                self.swarm,
+                "process_polling_cycle",
+                side_effect=RuntimeError("unexpected bug"),
+            ),
+            patch.object(self.swarm.log, "error") as log_error,
+        ):
+            result = self.swarm.run_once(dry_run=True)
+
+        self.assertEqual(result, 1)
+        log_error.assert_called_once_with(
+            "Single polling cycle failed: %s",
+            ANY,
+            exc_info=True,
+        )
+
+    def test_once_interrupt_returns_sigint_status(self):
+        with (
+            patch.object(self.swarm, "sync_main_branch", side_effect=KeyboardInterrupt),
+            patch.object(self.swarm.tracker, "kill_all") as kill_all,
+        ):
+            result = self.swarm.run_once(dry_run=True)
+
+        self.assertEqual(result, 130)
+        kill_all.assert_not_called()
+
+    def test_status_logs_the_resolved_repository_root(self):
+        with (
+            patch.object(self.swarm.sys, "argv", ["swarm_orchestrator.py", "--status"]),
+            patch.object(self.swarm.log, "info") as log_info,
+            patch("builtins.print"),
+        ):
+            result = self.swarm.main()
+
+        self.assertEqual(result, 0)
+        log_info.assert_called_once_with("Repo root: %s", self.swarm.REPO_ROOT)
 
     def test_blocks_a_branch_checked_out_at_another_path(self):
         other = self.repo / "other-worktree"

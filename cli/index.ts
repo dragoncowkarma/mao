@@ -361,8 +361,13 @@ program
         process.exitCode = exitCode
       } catch (error) {
         if (error instanceof SwarmRepositoryPathError) {
+          const hint =
+            error.code === 'missing'
+              ? 'Check that the --repo-root path exists and names a directory.'
+              : 'Run from a Git checkout or pass --repo-root <path> explicitly.'
           throw new Error(
-            `${error.message}. Run from a Git checkout or pass --repo-root <path> explicitly.`,
+            `${error.message}. ${hint}`,
+            { cause: error },
           )
         }
         throw error

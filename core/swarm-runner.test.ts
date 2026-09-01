@@ -85,6 +85,21 @@ describe('resolveGitCheckoutRoot', () => {
 
     expect(resolveGitCheckoutRoot(nestedPath)).toBe(fs.realpathSync.native(repoRoot))
   })
+
+  it('distinguishes a missing path for shell-specific guidance', () => {
+    const { repoRoot } = makeCheckout()
+    const missingPath = path.join(repoRoot, 'missing')
+
+    try {
+      resolveGitCheckoutRoot(missingPath)
+      expect.unreachable('resolveGitCheckoutRoot should reject a missing path')
+    } catch (error) {
+      expect(error).toMatchObject({
+        name: 'SwarmRepositoryPathError',
+        code: 'missing',
+      })
+    }
+  })
 })
 
 describe('runSwarm', () => {
@@ -134,6 +149,7 @@ describe('runSwarm', () => {
       expect.unreachable('runSwarm should reject a path outside a Git checkout')
     } catch (error) {
       expect(error).toBeInstanceOf(SwarmRepositoryPathError)
+      expect(error).toMatchObject({ code: 'not-checkout' })
       expect((error as Error).message).not.toContain('--repo-root')
     }
   })

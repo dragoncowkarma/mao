@@ -4,9 +4,18 @@ import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process'
 
 const SWARM_SCRIPT_NAME = 'swarm_orchestrator.py'
 
+export type SwarmRepositoryPathErrorCode = 'missing' | 'not-checkout'
+
 /** Identifies repository-path validation failures so shells can add interface-specific help. */
 export class SwarmRepositoryPathError extends Error {
-  override name = 'SwarmRepositoryPathError'
+  override readonly name = 'SwarmRepositoryPathError'
+
+  constructor(
+    readonly code: SwarmRepositoryPathErrorCode,
+    message: string,
+  ) {
+    super(message)
+  }
 }
 
 export interface SwarmRunOptions {
@@ -72,6 +81,7 @@ export function resolveGitCheckoutRoot(repoPath: string): string {
   const resolvedPath = path.resolve(repoPath)
   if (!fs.existsSync(resolvedPath) || !fs.statSync(resolvedPath).isDirectory()) {
     throw new SwarmRepositoryPathError(
+      'missing',
       `Swarm repository path does not exist or is not a directory: ${resolvedPath}`,
     )
   }
@@ -81,6 +91,7 @@ export function resolveGitCheckoutRoot(repoPath: string): string {
     const parent = path.dirname(candidate)
     if (parent === candidate) {
       throw new SwarmRepositoryPathError(
+        'not-checkout',
         `Swarm repository path is not inside a Git checkout: ${resolvedPath}`,
       )
     }

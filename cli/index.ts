@@ -7,7 +7,7 @@ import { startAutoTrigger } from '../core/auto-trigger.ts'
 import { FileStore } from '../core/store.ts'
 import { defaultDataDir } from '../core/paths.ts'
 import { clearPersistenceBrokenMarker, hasPersistenceBrokenMarker } from '../core/persistence-guard.ts'
-import { runSwarm } from '../core/swarm-runner.ts'
+import { runSwarm, SwarmRepositoryPathError } from '../core/swarm-runner.ts'
 import type { AiEffort, AiProviderConfig } from '../core/ai/types.ts'
 import type { QueuedTask, RepoRef } from '../core/workflow-engine.ts'
 import type { ThemePreference } from '../core/store.ts'
@@ -356,8 +356,17 @@ program
       status?: boolean
       reset?: boolean
     }) => {
-      const exitCode = await runSwarm(opts)
-      process.exitCode = exitCode
+      try {
+        const exitCode = await runSwarm(opts)
+        process.exitCode = exitCode
+      } catch (error) {
+        if (error instanceof SwarmRepositoryPathError) {
+          throw new Error(
+            `${error.message}. Run from a Git checkout or pass --repo-root <path> explicitly.`,
+          )
+        }
+        throw error
+      }
     },
   )
 

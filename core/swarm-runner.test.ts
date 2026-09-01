@@ -10,6 +10,7 @@ import {
   resolveRuntimeDirectory,
   resolveSwarmScriptPath,
   runSwarm,
+  SwarmRepositoryPathError,
 } from './swarm-runner.ts'
 
 const tmpDirs: string[] = []
@@ -128,6 +129,12 @@ describe('runSwarm', () => {
     const scriptPath = path.join(repoRoot, 'swarm.py')
     fs.writeFileSync(scriptPath, '# test asset\n')
 
-    await expect(runSwarm({ repoRoot }, { scriptPath })).rejects.toThrow(/not inside a Git checkout/)
+    try {
+      await runSwarm({ repoRoot }, { scriptPath })
+      expect.unreachable('runSwarm should reject a path outside a Git checkout')
+    } catch (error) {
+      expect(error).toBeInstanceOf(SwarmRepositoryPathError)
+      expect((error as Error).message).not.toContain('--repo-root')
+    }
   })
 })

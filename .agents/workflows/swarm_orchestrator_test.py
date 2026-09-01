@@ -162,6 +162,16 @@ class WorktreeSafetyTest(unittest.TestCase):
         self.assertEqual(result, 130)
         kill_all.assert_not_called()
 
+    def test_once_interrupt_kills_children_for_real_run(self):
+        with (
+            patch.object(self.swarm, "sync_main_branch", side_effect=KeyboardInterrupt),
+            patch.object(self.swarm.tracker, "kill_all") as kill_all,
+        ):
+            result = self.swarm.run_once(dry_run=False)
+
+        self.assertEqual(result, 130)
+        kill_all.assert_called_once_with()
+
     def test_status_logs_the_resolved_repository_root(self):
         with (
             patch.object(self.swarm.sys, "argv", ["swarm_orchestrator.py", "--status"]),

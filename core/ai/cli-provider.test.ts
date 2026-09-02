@@ -12,9 +12,10 @@ describe('CliProvider', () => {
     expect(() => provider.run('hello')).toThrow(/CLI command is not set/)
   })
 
-  it('rejects the promise cleanly instead of crashing the process when stdin write encounters EPIPE', async () => {
-    // Spawn a node child process that exits immediately without reading stdin.
-    // When a large payload is written to stdin, Node emits an EPIPE error on child.stdin.
+  it('rejects the promise cleanly with EPIPE when stdin write encounters a closed pipe', async () => {
+    // Spawn a process that exits immediately without consuming stdin.
+    // Writing a 1MB payload to a closed stdin pipe reliably emits EPIPE on child.stdin
+    // before the process exit event can settle the run() promise.
     const provider = new CliProvider({
       id: 'test-cli',
       name: 'Test CLI',
@@ -23,18 +24,11 @@ describe('CliProvider', () => {
       args: ['-e', 'process.exit(0)'],
     })
 
-    const largePrompt = 'a'.repeat(2 * 1024 * 1024)
+    const largePrompt = 'a'.repeat(1024 * 1024)
 
-    // Should reject (either with EPIPE or process exit code depending on race), but never crash the process with an unhandled stream error
-    let rejectedError: unknown
-    try {
-      await provider.run(largePrompt)
-    } catch (err) {
-      rejectedError = err
-    }
-
-    expect(rejectedError).toBeDefined()
-    expect(rejectedError).toBeInstanceOf(Error)
+    const runPromise = provider.run(largePrompt)
+    await expect(runPromise).rejects.toThrow(/EPIPE/)
+    await expect(runPromise).rejects.toMatchObject({ code: 'EPIPE' })
   })
 
   it('resolves standard output when the CLI command succeeds', async () => {

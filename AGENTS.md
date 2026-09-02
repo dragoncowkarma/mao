@@ -180,10 +180,11 @@ There is no codegen — these couplings are maintained by hand and only `npm run
 - **`retry()` re-runs the stage, but stage actions are not idempotent**: the
   notes-only `pr` path runs branch → commit → PR, and `createBranch` rejects an
   existing ref — so a failure after branch creation leaves retry permanently
-  stuck on `Reference already exists`; the merge stage comments before merging,
-  so a failed merge means retry posts a duplicate comment. "Retryable" describes
-  the state machine, not side-effect safety — making these actions idempotent
-  (with regression tests) is welcome.
+  stuck on `Reference already exists`. "Retryable" describes the state
+  machine, not side-effect safety — making these actions idempotent (with
+  regression tests) is welcome. (The merge stage merges before posting the
+  summary comment to avoid duplicate comments when retry re-runs after a failed
+  merge attempt.)
 - **CI gate**: the merge stage only proceeds when `getChecksStatus` reports
   `'success'` or `'none'`; `'pending'` and `'failure'` throw (retryable). No CI
   configured on the target repo means "nothing to wait for". Note the check

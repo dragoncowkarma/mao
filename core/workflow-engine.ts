@@ -610,8 +610,8 @@ export class WorkflowEngine extends EventEmitter {
         if (checksStatus === 'pending') throw new Error('CI checks are still running — retry once they complete')
         if (checksStatus === 'failure') throw new Error('CI checks failed — merge blocked')
 
-        await this.github.commentOnIssue(owner, repo, task.github.prNumber, output)
         await this.github.mergePullRequest(owner, repo, task.github.prNumber, `Merge: ${task.title}`)
+        await this.github.commentOnIssue(owner, repo, task.github.prNumber, output)
         break
       }
     }

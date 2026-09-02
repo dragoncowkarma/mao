@@ -174,9 +174,9 @@ There is no codegen — these couplings are maintained by hand and only `npm run
     `'running'`; on the exit `notify()` it loses the *persisted* advance after
     the stage's GitHub writes already succeeded — after a restart the stage
     re-runs and duplicates those writes;
-  - `core/ai/cli-provider.ts` never handles `child.stdin` `'error'` events, so
-    writing a large prompt to a fast-exiting CLI crashes the process with an
-    unhandled `EPIPE` instead of failing the task.
+  - `core/ai/cli-provider.ts` routes `child.stdin` `'error'` events through
+    `settle()` to reject the execution promise, so a fast-exiting CLI or broken
+    pipe surfaces as a normal task failure instead of an unhandled `EPIPE` crash.
 - **`retry()` re-runs the stage, but stage actions are not idempotent**: the
   notes-only `pr` path runs branch → commit → PR, and `createBranch` rejects an
   existing ref — so a failure after branch creation leaves retry permanently

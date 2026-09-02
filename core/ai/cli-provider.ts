@@ -93,6 +93,7 @@ export class CliProvider implements AiProvider {
         stderr += chunk.toString()
       })
 
+      child.stdin.on('error', (err) => settle(() => reject(err)))
       child.on('error', (err) => settle(() => reject(err)))
       child.on('close', (code) => {
         settle(() => {

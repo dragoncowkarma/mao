@@ -184,7 +184,8 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   machine, not side-effect safety — making these actions idempotent (with
   regression tests) is welcome. (The merge stage merges before posting the
   summary comment to avoid duplicate comments when retry re-runs after a failed
-  merge attempt.)
+  merge attempt, and treats post-merge comment failure as non-fatal so an already
+  merged PR does not fail the task or invite re-merge retries.)
 - **CI gate**: the merge stage only proceeds when `getChecksStatus` reports
   `'success'` or `'none'`; `'pending'` and `'failure'` throw (retryable). No CI
   configured on the target repo means "nothing to wait for". Note the check

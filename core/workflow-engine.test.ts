@@ -136,6 +136,22 @@ describe('WorkflowEngine', () => {
     expect(github.commentOnIssue).toHaveBeenCalledTimes(1)
   })
 
+  it('completes the merge stage as done even if post-merge commentOnIssue fails', async () => {
+    const commentOnIssue = vi.fn().mockRejectedValue(new Error('commentOnIssue failure'))
+    const github = makeFakeGithub({ commentOnIssue })
+    const engine = new WorkflowEngine(github)
+    engine.setProviders([makeProvider('agent-a'), makeProvider('agent-b')])
+
+    const task = engine.enqueue('Add feature W', repo)
+    await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'done')
+
+    const current = engine.getTasks().find((t) => t.id === task.id)!
+    expect(current.status).toBe('done')
+    expect(current.error).toBeUndefined()
+    expect(github.mergePullRequest).toHaveBeenCalledTimes(1)
+    expect(commentOnIssue).toHaveBeenCalledTimes(1)
+  })
+
   it('retrying a failed notes-only pr stage re-creates the branch without hitting "Reference already exists"', async () => {
     // commitFile fails on the first attempt (simulating a transient failure after createBranch already
     // succeeded), then succeeds on retry. createBranch is called again by the retried stage — with the

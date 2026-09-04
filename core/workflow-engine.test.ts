@@ -94,6 +94,7 @@ describe('WorkflowEngine', () => {
     expect(current.stage).toBe('merge')
     expect(current.error).toMatch(/CI checks are still running/)
     expect(github.mergePullRequest).not.toHaveBeenCalled()
+    expect(github.commentOnIssue).not.toHaveBeenCalled()
 
     // CI turns green — retrying the same stage should now succeed through to done.
     ;(github.getChecksStatus as ReturnType<typeof vi.fn>).mockResolvedValue('success')
@@ -103,6 +104,52 @@ describe('WorkflowEngine', () => {
     current = engine.getTasks().find((t) => t.id === task.id)!
     expect(current.error).toBeUndefined()
     expect(github.mergePullRequest).toHaveBeenCalledTimes(1)
+    expect(github.commentOnIssue).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not post the summary comment if mergePullRequest fails, and posts it once after retry succeeds', async () => {
+    const mergePullRequest = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('mergePullRequest transient failure'))
+      .mockResolvedValueOnce(undefined)
+    const github = makeFakeGithub({ mergePullRequest })
+    const engine = new WorkflowEngine(github)
+    engine.setProviders([makeProvider('agent-a'), makeProvider('agent-b')])
+
+    const task = engine.enqueue('Add feature Z', repo)
+    await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'error')
+
+    let current = engine.getTasks().find((t) => t.id === task.id)!
+    expect(current.stage).toBe('merge')
+    expect(current.error).toMatch(/mergePullRequest transient failure/)
+    expect(mergePullRequest).toHaveBeenCalledTimes(1)
+    // Issue #38 regression: previously commentOnIssue was called before mergePullRequest,
+    // leaving a duplicate comment if mergePullRequest failed and was retried.
+    expect(github.commentOnIssue).not.toHaveBeenCalled()
+
+    engine.retry(task.id)
+    await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'done')
+
+    current = engine.getTasks().find((t) => t.id === task.id)!
+    expect(current.error).toBeUndefined()
+    expect(mergePullRequest).toHaveBeenCalledTimes(2)
+    expect(github.commentOnIssue).toHaveBeenCalledTimes(1)
+  })
+
+  it('completes the merge stage as done even if post-merge commentOnIssue fails', async () => {
+    const commentOnIssue = vi.fn().mockRejectedValue(new Error('commentOnIssue failure'))
+    const github = makeFakeGithub({ commentOnIssue })
+    const engine = new WorkflowEngine(github)
+    engine.setProviders([makeProvider('agent-a'), makeProvider('agent-b')])
+
+    const task = engine.enqueue('Add feature W', repo)
+    await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'done')
+
+    const current = engine.getTasks().find((t) => t.id === task.id)!
+    expect(current.status).toBe('done')
+    expect(current.error).toBeUndefined()
+    expect(github.mergePullRequest).toHaveBeenCalledTimes(1)
+    expect(commentOnIssue).toHaveBeenCalledTimes(1)
   })
 
   it('retrying a failed notes-only pr stage re-creates the branch without hitting "Reference already exists"', async () => {

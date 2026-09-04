@@ -1,4 +1,48 @@
 import { describe, expect, it, vi } from 'vitest'
+
+const timeoutHarness = vi.hoisted(() => {
+  type RequestOptions = { request?: { signal?: AbortSignal } }
+  type RequestHook = (options: RequestOptions) => void | Promise<void>
+
+  let requestHook: RequestHook | undefined
+  const signals: AbortSignal[] = []
+  const get = vi.fn(async () => {
+    if (!requestHook) throw new Error('Octokit request hook is not installed')
+    const options: RequestOptions = {}
+    await requestHook(options)
+    const signal = options.request?.signal
+    if (!(signal instanceof AbortSignal)) throw new Error('Octokit request has no abort signal')
+    signals.push(signal)
+    return new Promise<never>((_resolve, reject) => {
+      const rejectOnAbort = () => reject(signal.reason)
+      if (signal.aborted) rejectOnAbort()
+      else signal.addEventListener('abort', rejectOnAbort, { once: true })
+    })
+  })
+
+  class FakeOctokit {
+    hook = {
+      before: (_name: string, hook: RequestHook) => {
+        requestHook = hook
+      },
+    }
+    rest = { repos: { get } }
+  }
+
+  return {
+    FakeOctokit,
+    get,
+    signals,
+    reset() {
+      requestHook = undefined
+      signals.length = 0
+      get.mockClear()
+    },
+  }
+})
+
+vi.mock('octokit', () => ({ Octokit: timeoutHarness.FakeOctokit }))
+
 import { GithubService } from './github-service.ts'
 
 /**
@@ -37,6 +81,37 @@ function makeServiceWithFakeOctokit(overrides: {
   ;(service as unknown as { octokit: unknown }).octokit = octokit
   return { service, octokit }
 }
+
+describe('GithubService request timeouts', () => {
+  it('rejects hanging fake Octokit calls through fresh 60-second signals', async () => {
+    timeoutHarness.reset()
+    const timeoutCalls: number[] = []
+    const originalTimeout = AbortSignal.timeout
+    AbortSignal.timeout = (milliseconds) => {
+      timeoutCalls.push(milliseconds)
+      const controller = new AbortController()
+      setTimeout(() => {
+        controller.abort(Object.assign(new Error('GitHub request timed out'), { name: 'TimeoutError' }))
+      }, 0)
+      return controller.signal
+    }
+
+    try {
+      const service = new GithubService()
+      service.setToken('test-token')
+
+      await expect(service.getDefaultBranch('acme', 'widgets')).rejects.toThrow('GitHub request timed out')
+      await expect(service.getDefaultBranch('acme', 'widgets')).rejects.toThrow('GitHub request timed out')
+
+      expect(timeoutCalls).toEqual([60_000, 60_000])
+      expect(timeoutHarness.get).toHaveBeenCalledTimes(2)
+      expect(timeoutHarness.signals).toHaveLength(2)
+      expect(new Set(timeoutHarness.signals).size).toBe(2)
+    } finally {
+      AbortSignal.timeout = originalTimeout
+    }
+  })
+})
 
 describe('GithubService.createBranch', () => {
   it('creates the branch and returns the default branch as base', async () => {

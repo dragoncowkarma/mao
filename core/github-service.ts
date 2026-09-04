@@ -1,5 +1,7 @@
 import { Octokit } from 'octokit'
 
+const GITHUB_REQUEST_TIMEOUT_MS = 60_000
+
 export interface GithubTask {
   id: number
   number: number
@@ -68,7 +70,16 @@ export class GithubService {
   private octokit: Octokit | null = null
 
   setToken(token: string) {
-    this.octokit = new Octokit({ auth: token })
+    const octokit = new Octokit({ auth: token })
+    // The paginate plugin drops per-call `request` options when it follows links, so install the
+    // timeout at the request hook layer where it runs once for every actual HTTP request/page.
+    octokit.hook.before('request', (options) => {
+      options.request = {
+        ...options.request,
+        signal: AbortSignal.timeout(GITHUB_REQUEST_TIMEOUT_MS),
+      }
+    })
+    this.octokit = octokit
   }
 
   async fetchTasks(owner: string, repo: string): Promise<GithubTask[]> {

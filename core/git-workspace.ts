@@ -5,18 +5,30 @@ import path from 'node:path'
 
 const execFileAsync = promisify(execFile)
 
+/**
+ * A hung Git subprocess would otherwise block the single-flight workflow queue indefinitely.
+ * Fifteen minutes still leaves room for legitimate large clone and push operations.
+ */
+const GIT_OPERATION_TIMEOUT_MS = 15 * 60 * 1000
+
 async function run(
   command: string,
   args: readonly string[],
   options?: Parameters<typeof execFileAsync>[2],
 ): Promise<{ stdout: string; stderr: string }> {
   try {
-    const { stdout, stderr } = await execFileAsync(command, args, options)
+    const { stdout, stderr } = await execFileAsync(command, args, {
+      ...options,
+      timeout: GIT_OPERATION_TIMEOUT_MS,
+    })
     return {
       stdout: typeof stdout === 'string' ? stdout : stdout.toString('utf8'),
       stderr: typeof stderr === 'string' ? stderr : stderr.toString('utf8'),
     }
   } catch (err: any) {
+    if (err?.killed === true && err.signal) {
+      err.message = `Git operation timed out after ${GIT_OPERATION_TIMEOUT_MS / 1000}s`
+    }
     if (err && typeof err.message === 'string') {
       err.message = err.message.replace(/https:\/\/x-access-token:[^@]+@/g, 'https://x-access-token:[REDACTED]@')
     }

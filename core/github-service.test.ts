@@ -1,54 +1,42 @@
-import { describe, expect, it, vi } from 'vitest'
-
-const timeoutHarness = vi.hoisted(() => {
-  type RequestOptions = { request?: { signal?: AbortSignal } }
-  type RequestHook = (options: RequestOptions) => void | Promise<void>
-
-  let requestHook: RequestHook | undefined
-  const signals: AbortSignal[] = []
-  const get = vi.fn(async () => {
-    if (!requestHook) throw new Error('Octokit request hook is not installed')
-    const options: RequestOptions = {}
-    await requestHook(options)
-    const signal = options.request?.signal
-    if (!(signal instanceof AbortSignal)) throw new Error('Octokit request has no abort signal')
-    signals.push(signal)
-    return new Promise<never>((_resolve, reject) => {
-      const rejectOnAbort = () => reject(signal.reason)
-      if (signal.aborted) rejectOnAbort()
-      else signal.addEventListener('abort', rejectOnAbort, { once: true })
-    })
-  })
-
-  class FakeOctokit {
-    hook = {
-      before: (_name: string, hook: RequestHook) => {
-        requestHook = hook
-      },
-    }
-    rest = { repos: { get } }
-  }
-
-  return {
-    FakeOctokit,
-    get,
-    signals,
-    reset() {
-      requestHook = undefined
-      signals.length = 0
-      get.mockClear()
-    },
-  }
-})
-
-vi.mock('octokit', () => ({ Octokit: timeoutHarness.FakeOctokit }))
-
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { GithubService } from './github-service.ts'
 
+function jsonResponse(data: unknown, status = 200, headers: Record<string, string> = {}): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { 'content-type': 'application/json', ...headers },
+  })
+}
+
+function requireSignal(init?: RequestInit): AbortSignal {
+  if (!(init?.signal instanceof AbortSignal)) throw new Error('Octokit fetch has no abort signal')
+  return init.signal
+}
+
+function accelerateRequestTimeout() {
+  const nativeSetTimeout = globalThis.setTimeout
+  return vi.spyOn(globalThis, 'setTimeout').mockImplementation((callback, delay, ...args) => {
+    return nativeSetTimeout(callback, delay === 60_000 ? 0 : delay, ...args)
+  })
+}
+
+async function captureError(promise: Promise<unknown>): Promise<Error> {
+  try {
+    await promise
+  } catch (error) {
+    return error instanceof Error ? error : new Error(String(error))
+  }
+  throw new Error('Expected promise to reject')
+}
+
+afterEach(() => {
+  vi.restoreAllMocks()
+  vi.useRealTimers()
+})
+
 /**
- * Builds a GithubService wired to a fake Octokit-shaped object instead of a real client.
- * `octokit` is private with no constructor injection point, so the fake is installed via a cast —
- * the same pattern `applyGithubAction`'s retry path exercises against the real Octokit surface.
+ * Installs a fake REST surface for behavior tests that do not exercise transport. Timeout tests
+ * above inject only fetch and retain the real Octokit plugin stack.
  */
 function makeServiceWithFakeOctokit(overrides: {
   git?: Record<string, unknown>
@@ -83,33 +71,127 @@ function makeServiceWithFakeOctokit(overrides: {
 }
 
 describe('GithubService request timeouts', () => {
-  it('rejects hanging fake Octokit calls through fresh 60-second signals', async () => {
-    timeoutHarness.reset()
-    const timeoutCalls: number[] = []
-    const originalTimeout = AbortSignal.timeout
-    AbortSignal.timeout = (milliseconds) => {
-      timeoutCalls.push(milliseconds)
-      const controller = new AbortController()
-      setTimeout(() => {
-        controller.abort(Object.assign(new Error('GitHub request timed out'), { name: 'TimeoutError' }))
-      }, 0)
-      return controller.signal
-    }
+  it('aborts a hanging fetch after 60 seconds through a real Octokit instance', async () => {
+    const signals: AbortSignal[] = []
+    const timeoutSpy = accelerateRequestTimeout()
+    const requestFetch = vi.fn((_input: string | URL | Request, init?: RequestInit) => {
+      const signal = requireSignal(init)
+      signals.push(signal)
 
-    try {
-      const service = new GithubService()
-      service.setToken('test-token')
+      return new Promise<Response>((_resolve, reject) => {
+        signal.addEventListener('abort', () => {
+          reject(signal.reason)
+        }, { once: true })
+      })
+    })
+    const service = new GithubService(requestFetch as typeof globalThis.fetch)
+    service.setToken('test-token')
 
-      await expect(service.getDefaultBranch('acme', 'widgets')).rejects.toThrow('GitHub request timed out')
-      await expect(service.getDefaultBranch('acme', 'widgets')).rejects.toThrow('GitHub request timed out')
+    const error = await captureError(service.getDefaultBranch('acme', 'widgets'))
 
-      expect(timeoutCalls).toEqual([60_000, 60_000])
-      expect(timeoutHarness.get).toHaveBeenCalledTimes(2)
-      expect(timeoutHarness.signals).toHaveLength(2)
-      expect(new Set(timeoutHarness.signals).size).toBe(2)
-    } finally {
-      AbortSignal.timeout = originalTimeout
-    }
+    expect(requestFetch).toHaveBeenCalledTimes(1)
+    expect(signals[0].aborted).toBe(true)
+    expect(signals[0].reason).toMatchObject({
+      name: 'AbortError',
+      message: 'GitHub request timed out after 60s',
+    })
+    expect(error.message).toBe('GitHub request timed out after 60s')
+    expect(timeoutSpy).toHaveBeenCalledWith(expect.any(Function), 60_000)
+  })
+
+  it('keeps the deadline active while a real Octokit response body is stalled', async () => {
+    const timeoutSpy = accelerateRequestTimeout()
+    let signal: AbortSignal | undefined
+    const requestFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      signal = requireSignal(init)
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          signal!.addEventListener('abort', () => controller.error(signal!.reason), { once: true })
+        },
+      })
+      return new Response(body, {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    })
+    const service = new GithubService(requestFetch as typeof globalThis.fetch)
+    service.setToken('test-token')
+
+    const error = await captureError(service.getDefaultBranch('acme', 'widgets'))
+
+    expect(requestFetch).toHaveBeenCalledTimes(1)
+    expect(signal?.aborted).toBe(true)
+    expect(error.message).toBe('GitHub request timed out after 60s')
+    expect(timeoutSpy).toHaveBeenCalledWith(expect.any(Function), 60_000)
+  })
+
+  it('creates a fresh deadline for every real Octokit retry attempt', async () => {
+    const signals: AbortSignal[] = []
+    const requestFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      signals.push(requireSignal(init))
+      if (signals.length === 1) return jsonResponse({ message: 'Temporary failure' }, 500)
+      return jsonResponse({ default_branch: 'main' })
+    })
+    const service = new GithubService(requestFetch as typeof globalThis.fetch)
+    service.setToken('test-token')
+
+    await expect(service.getDefaultBranch('acme', 'widgets')).resolves.toBe('main')
+    expect(requestFetch).toHaveBeenCalledTimes(2)
+    expect(signals).toHaveLength(2)
+    expect(new Set(signals).size).toBe(2)
+    expect(signals.every((signal) => !signal.aborted)).toBe(true)
+  })
+
+  it('creates a fresh deadline for every real Octokit pagination page', async () => {
+    const commentSignals: AbortSignal[] = []
+    const requestFetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input)
+      const signal = requireSignal(init)
+      if (url.includes('/issues/7/comments')) {
+        commentSignals.push(signal)
+        const page = new URL(url).searchParams.get('page')
+        if (page === '2') {
+          return jsonResponse([{
+            id: 2,
+            user: { login: 'reviewer' },
+            body: 'second',
+            created_at: '2026-09-06T00:01:00Z',
+            html_url: 'https://github.com/acme/widgets/issues/7#issuecomment-2',
+          }])
+        }
+        return jsonResponse([{
+          id: 1,
+          user: { login: 'author' },
+          body: 'first',
+          created_at: '2026-09-06T00:00:00Z',
+          html_url: 'https://github.com/acme/widgets/issues/7#issuecomment-1',
+        }], 200, {
+          link:
+            '<https://api.github.com/repos/acme/widgets/issues/7/comments?' +
+            'per_page=100&page=2>; rel="next"',
+        })
+      }
+      return jsonResponse({
+        id: 7,
+        number: 7,
+        title: 'Timeout issue',
+        state: 'open',
+        html_url: 'https://github.com/acme/widgets/issues/7',
+        updated_at: '2026-09-06T00:00:00Z',
+        labels: [],
+        body: '',
+        user: { login: 'author' },
+      })
+    })
+    const service = new GithubService(requestFetch as typeof globalThis.fetch)
+    service.setToken('test-token')
+
+    const detail = await service.fetchTaskDetail('acme', 'widgets', 7)
+
+    expect(detail.comments.map((comment) => comment.body)).toEqual(['first', 'second'])
+    expect(commentSignals).toHaveLength(2)
+    expect(new Set(commentSignals).size).toBe(2)
+    expect(commentSignals.every((signal) => !signal.aborted)).toBe(true)
   })
 })
 

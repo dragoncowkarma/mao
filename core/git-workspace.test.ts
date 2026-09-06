@@ -4,21 +4,7 @@ import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const { execFileMock } = vi.hoisted(() => {
-  const mock = vi.fn()
-  Object.defineProperty(mock, Symbol.for('nodejs.util.promisify.custom'), {
-    value: (...args: unknown[]) =>
-      new Promise((resolve, reject) => {
-        mock(...args, (error: Error | null, stdout: string, stderr: string) => {
-          if (error) {
-            Object.assign(error, { stdout, stderr })
-            reject(error)
-            return
-          }
-          resolve({ stdout, stderr })
-        })
-      }),
-  })
-  return { execFileMock: mock }
+  return { execFileMock: vi.fn() }
 })
 
 vi.mock('node:child_process', () => ({ execFile: execFileMock }))
@@ -42,10 +28,20 @@ function makeRoot(): string {
   return root
 }
 
+async function captureError(promise: Promise<unknown>): Promise<Error> {
+  try {
+    await promise
+  } catch (error) {
+    return error instanceof Error ? error : new Error(String(error))
+  }
+  throw new Error('Expected promise to reject')
+}
+
 beforeEach(() => {
   execFileMock.mockReset()
   execFileMock.mockImplementation((...args: unknown[]) => {
     queueMicrotask(() => callbackFrom(args)(null, '', ''))
+    return { kill: vi.fn() }
   })
 })
 
@@ -69,29 +65,44 @@ describe('git workspace command timeout', () => {
 
     expect(execFileMock).toHaveBeenCalledTimes(10)
     for (const [, , options] of execFileMock.mock.calls) {
-      expect(options).toMatchObject({ timeout: EXPECTED_TIMEOUT_MS })
+      expect(options).toMatchObject({
+        encoding: 'utf8',
+        timeout: EXPECTED_TIMEOUT_MS,
+        killSignal: 'SIGKILL',
+      })
     }
   })
 
-  it('rejects a Git command that never finishes before the configured timeout', async () => {
+  it('rejects independently and sends SIGKILL when execFile never calls back', async () => {
     vi.useFakeTimers()
-    execFileMock.mockImplementation((...args: unknown[]) => {
-      const options = args[2] as { timeout?: number }
-      // A mocked execFile has no native watchdog, so emulate Node's timeout callback using
-      // the option supplied by run() while the fake command itself never completes.
-      setTimeout(() => {
-        const error = Object.assign(new Error('Command failed'), {
-          killed: true,
-          signal: 'SIGTERM',
-        })
-        callbackFrom(args)(error, '', '')
-      }, options.timeout)
-    })
+    const kill = vi.fn()
+    execFileMock.mockReturnValue({ kill })
 
     const result = hasChanges('/test/repo')
-    const rejection = expect(result).rejects.toThrow('Git operation timed out after 900s')
+    const rejection = expect(result).rejects.toThrow(
+      'Git operation timed out after 900s: git status --porcelain',
+    )
 
     await vi.advanceTimersByTimeAsync(EXPECTED_TIMEOUT_MS)
     await rejection
+    expect(kill).toHaveBeenCalledExactlyOnceWith('SIGKILL')
+  })
+
+  it('redacts credentials while retaining timed-out command context', async () => {
+    vi.useFakeTimers()
+    const kill = vi.fn()
+    execFileMock.mockReturnValue({ kill })
+    const root = makeRoot()
+
+    const errorPromise = captureError(ensureClone(root, 'acme', 'widgets', 'secret-token'))
+    await vi.advanceTimersByTimeAsync(EXPECTED_TIMEOUT_MS)
+    const error = await errorPromise
+
+    const redactedRemote = 'https://x-access-token:[REDACTED]@github.com/acme/widgets.git'
+    expect(error.message).toContain(
+      `Git operation timed out after 900s: git clone ${redactedRemote}`,
+    )
+    expect(error.message).not.toContain('secret-token')
+    expect(kill).toHaveBeenCalledExactlyOnceWith('SIGKILL')
   })
 })

@@ -156,11 +156,12 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   spans, HTML comments, and blockquotes, so documenting the syntax never acts as a directive.
 - **Single-flight queue**: `processQueue()` runs one stage at a time globally.
   Therefore every external call must be time-bounded. The API provider aborts
-  after 5 min, the CLI provider SIGKILLs after 15 min, each Octokit request in
-  `core/github-service.ts` gets a fresh 60 sec abort signal, and every
-  `execFile`-based git operation in `core/git-workspace.ts` times out after 15
-  min. Don't add unbounded calls. Timeouts must surface as task errors, never
-  silent stalls.
+  after 5 min, the CLI provider SIGKILLs after 15 min, each actual Octokit HTTP
+  attempt/page in `core/github-service.ts` gets a fresh 60 sec deadline, and every
+  `execFile`-based git operation in `core/git-workspace.ts` has a 15 min watchdog
+  that rejects independently after sending SIGKILL. A top-level Octokit call can
+  take longer than 60 sec across plugin backoff, throttling, or pagination. Don't
+  add unbounded calls. Timeouts must surface as task errors, never silent stalls.
 - **Failures should be retryable states, not crashes**: any throw inside
   `runStage()`'s `try/catch` (including synchronous setup like `selectAgent()` —
   keep it inside) sets `status: 'error'` without advancing the stage, so `retry()`

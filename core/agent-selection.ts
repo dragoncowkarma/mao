@@ -1,3 +1,4 @@
+import { getProviderOptions } from './ai/provider-options.ts'
 import type { AgentStage, AiEffort, AiProviderConfig } from './ai/types.ts'
 
 /**
@@ -244,8 +245,21 @@ export function resolveStageAgent(providers: AiProviderConfig[], params: StageAg
   return {
     ...base,
     model: effectiveModel,
-    effort: effectiveEffort,
+    effort: takesEffort(base.providerKindId, effectiveModel) ? effectiveEffort : undefined,
   }
+}
+
+/**
+ * Whether a resolved model accepts a reasoning-effort argument at all. Every layer of the preference
+ * chain can contribute an effort — a one-shot pick, the task's durable override, the provider's own
+ * `effort`, its active preset — and none of them knows which model it will land on. Without this,
+ * selecting a no-effort model (Haiku) on a provider configured with `effort: 'high'` still resolves
+ * to `high`, which `core/ai/cli-provider.ts` turns into a literal `--effort high` flag on an
+ * invocation that does not take one, while the card that hides the effort control for that very
+ * model reports otherwise. Unknown/absent kinds have no catalog, so they always take an effort.
+ */
+function takesEffort(kindId: AiProviderConfig['providerKindId'], model: string | undefined): boolean {
+  return !getProviderOptions(kindId).models.find((m) => m.value === model)?.noEffort
 }
 
 /**

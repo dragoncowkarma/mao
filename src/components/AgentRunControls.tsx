@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import type { AiProviderConfig } from '../../core/ai/types'
 import type { EffortOption, ModelOption } from '../../core/ai/provider-options'
-import { getProviderOptions } from '../../core/ai/provider-options'
+import { getProviderOptions, providerToolLabel } from '../../core/ai/provider-options'
 import { eligibleAgentsForRun, previewStageAgent } from '../../core/agent-selection'
 import type { RunOverride } from '../../core/agent-selection'
 import type { QueuedTask } from '../../core/workflow-engine'
@@ -15,16 +15,6 @@ interface AgentRunControlsProps {
   busy: boolean
   /** Receives the one-shot override the operator picked, or undefined when they changed nothing. */
   onRun: (runOverride?: RunOverride) => void
-}
-
-/**
- * Names the tool behind a provider, since a provider's `name` is operator-chosen and needn't say
- * which CLI it drives. 'custom' adds nothing the name doesn't already say, so it stays off the label.
- */
-function toolLabel(provider: AiProviderConfig): string {
-  return provider.providerKindId && provider.providerKindId !== 'custom'
-    ? `${provider.name} · ${provider.providerKindId}`
-    : provider.name
 }
 
 /** Appends values that are in play but absent from the tool's catalog, so a hand-entered preset model
@@ -134,7 +124,7 @@ export default function AgentRunControls({ task, providers, actionLabel, busy, o
       >
         {agentOptions.map((p) => (
           <option key={p.id} value={p.id}>
-            {toolLabel(p)}
+            {providerToolLabel(p)}
           </option>
         ))}
       </select>

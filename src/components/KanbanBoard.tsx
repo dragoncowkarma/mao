@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import type { AiProviderConfig } from '../../core/ai/types'
+import { providerToolLabel } from '../../core/ai/provider-options'
 import { previewStageAgent } from '../../core/agent-selection'
 import type { RunOverride } from '../../core/agent-selection'
 import type { GithubTask } from '../../core/github-service'
@@ -60,17 +61,24 @@ function lastStep(task: QueuedTask) {
  */
 function currentAgentLabel(task: QueuedTask, providers: AiProviderConfig[]): string | undefined {
   // Running now, or finished the whole pipeline — either way the card names a real, past-tense agent.
-  const settled = task.active ?? (task.status === 'done' ? task.history[task.history.length - 1] : undefined)
+  const activeStep = task.active
+  const settled = activeStep ?? (task.status === 'done' ? task.history[task.history.length - 1] : undefined)
   const upcoming = settled
     ? undefined
     : previewStageAgent(providers, {
         stage: task.stage,
         previous: task.history[task.history.length - 1],
         override: task.providerOverride,
+        // A task queued behind the single-flight queue already holds the agent the operator picked;
+        // without this the card would advertise the default and then run something else.
+        oneShot: task.nextRunOverride,
       })
   // Nothing resolvable (no providers configured yet) — fall back to whoever last touched the task.
   const step = settled ?? (upcoming ? undefined : lastStep(task))
-  const name = upcoming?.name ?? step?.agentName
+  // Name the tool, not just the operator-chosen provider name, for the agent running now or up next.
+  // A finished stage keeps its recorded name — the provider's kind may have changed since it ran.
+  const live = upcoming ?? (activeStep ? providers.find((p) => p.id === activeStep.agentId) : undefined)
+  const name = live ? providerToolLabel(live) : step?.agentName
   if (!name) return undefined
   const model = upcoming?.model ?? step?.model
   const effort = upcoming?.effort ?? step?.effort

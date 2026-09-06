@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import type { AiProviderConfig } from '../../core/ai/types'
+import { providerToolKind } from '../../core/ai/provider-options'
 import { previewStageAgent } from '../../core/agent-selection'
 import type { RunOverride } from '../../core/agent-selection'
 import type { QueuedTask, RepoRef } from '../../core/workflow-engine'
@@ -36,10 +37,22 @@ function isActiveTask(task: QueuedTask): boolean {
   return task.status === 'running' || task.stage === 'review'
 }
 
-function AgentBadge({ name, model, effort }: { name: string; model?: string; effort?: string }) {
+function AgentBadge({
+  name,
+  kind,
+  model,
+  effort,
+}: {
+  name: string
+  /** The AI tool behind the provider — a provider's name needn't say which CLI it drives. */
+  kind?: string
+  model?: string
+  effort?: string
+}) {
   return (
     <span className="tag tag-neutral inline-flex items-center gap-1">
       {name}
+      {kind && <span className="opacity-60">· {kind}</span>}
       {model && <span className="opacity-60">· {model}</span>}
       {effort && <span className="opacity-60">· {effort} effort</span>}
     </span>
@@ -74,8 +87,14 @@ function TaskCard({
           stage: task.stage,
           previous: task.history[task.history.length - 1],
           override: task.providerOverride,
+          // A task queued behind the single-flight queue already holds the agent the operator
+          // picked; without this the card would advertise the default and then run something else.
+          oneShot: task.nextRunOverride,
         })
       : undefined
+  // A finished stage keeps the name it recorded (the provider's kind may have changed since), but
+  // the agent running right now can be named by its actual tool.
+  const activeProvider = task.active && providers.find((p) => p.id === task.active?.agentId)
 
   return (
     <div className={`card elev-sm ${active ? 'card-active' : ''}`}>
@@ -113,7 +132,12 @@ function TaskCard({
       {upcoming && (
         <div className="flex items-center gap-2">
           <span className="tag tag-stage">{STAGE_LABELS[task.stage]}</span>
-          <AgentBadge name={upcoming.name} model={upcoming.model} effort={upcoming.effort} />
+          <AgentBadge
+            name={upcoming.name}
+            kind={providerToolKind(upcoming)}
+            model={upcoming.model}
+            effort={upcoming.effort}
+          />
           <span className="text-muted text-xs">up next</span>
         </div>
       )}
@@ -122,7 +146,12 @@ function TaskCard({
         <div className="card gap-1 p-2">
           <div className="flex items-center gap-2">
             <span className="live-dot" />
-            <AgentBadge name={task.active.agentName} model={task.active.model} effort={task.active.effort} />
+            <AgentBadge
+              name={task.active.agentName}
+              kind={activeProvider ? providerToolKind(activeProvider) : undefined}
+              model={task.active.model}
+              effort={task.active.effort}
+            />
             <span className="text-muted text-xs">running now</span>
           </div>
           <details>

@@ -148,6 +148,10 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   `model`/`effort` or its active preset. Auto-triggered issues set them via task-level
   `[Model: <id>]` / `[Effort: <level>]` tags in the issue body, parsed by
   `parseProviderOverride()` — the body equivalent of `mao workflow enqueue --model/--effort`.
+  A resolved effort is dropped entirely when the resolved model is flagged `noEffort` in
+  `PROVIDER_OPTIONS` (`core/ai/provider-options.ts`) — no layer of the preference chain knows which
+  model it will land on, and `core/ai/cli-provider.ts` would otherwise append a literal `--effort`
+  flag to an invocation that doesn't take one.
   The model value is passed through verbatim (an unusable one fails provider-side); the
   effort value is validated against `AI_EFFORTS` in `core/ai/types.ts` — that list is the
   single definition the `AiEffort` union is derived from, so a new level must be added

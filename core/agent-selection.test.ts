@@ -112,6 +112,42 @@ describe('resolveStageAgent one-shot handling', () => {
   })
 })
 
+describe('no-effort models', () => {
+  // Regression: every layer of the preference chain can contribute an effort, and none of them knows
+  // which model it lands on — so a no-effort model used to still resolve one, which
+  // core/ai/cli-provider.ts turns into a literal `--effort` flag the invocation does not accept.
+  const claudeCli: AiProviderConfig = {
+    id: 'agent-claude',
+    name: 'Primary Worker',
+    kind: 'cli',
+    command: 'claude',
+    providerKindId: 'claude',
+    effort: 'high',
+  }
+
+  it('drops a provider-level effort when the resolved model takes none', () => {
+    const chosen = resolveStageAgent([claudeCli], { stage: 'issue', oneShot: { model: 'haiku' } })
+    expect(chosen).toMatchObject({ model: 'haiku', effort: undefined })
+  })
+
+  it('drops an explicitly requested effort too, rather than passing a flag the model rejects', () => {
+    const chosen = resolveStageAgent([claudeCli], {
+      stage: 'issue',
+      override: { model: 'haiku', effort: 'max' },
+    })
+    expect(chosen.effort).toBeUndefined()
+  })
+
+  it('still resolves an effort for a model that accepts one', () => {
+    expect(resolveStageAgent([claudeCli], { stage: 'issue', oneShot: { model: 'opus' } }).effort).toBe('high')
+  })
+
+  it('leaves providers with no model catalog (API providers) alone', () => {
+    const api = { ...makeProvider('agent-api'), effort: 'high' as const }
+    expect(resolveStageAgent([api], { stage: 'issue' }).effort).toBe('high')
+  })
+})
+
 describe('previewStageAgent', () => {
   it('mirrors resolveStageAgent for a configuration that resolves', () => {
     const params = { stage: 'pr' as AgentStage, previous: { stage: 'issue' as AgentStage, agentId: 'agent-a' } }

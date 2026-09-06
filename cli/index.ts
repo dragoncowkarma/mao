@@ -9,7 +9,7 @@ import { defaultDataDir } from '../core/paths.ts'
 import { clearPersistenceBrokenMarker, hasPersistenceBrokenMarker } from '../core/persistence-guard.ts'
 import { runSwarm, SwarmRepositoryPathError } from '../core/swarm-runner.ts'
 import type { AiEffort, AiProviderConfig } from '../core/ai/types.ts'
-import type { QueuedTask, RepoRef } from '../core/workflow-engine.ts'
+import type { QueuedTask, RepoRef, RunOverride } from '../core/workflow-engine.ts'
 import type { ThemePreference } from '../core/store.ts'
 
 function log(...args: unknown[]) {
@@ -22,6 +22,18 @@ function logErr(...args: unknown[]) {
 
 function printJson(value: unknown) {
   console.log(JSON.stringify(value, null, 2))
+}
+
+/**
+ * Builds the one-shot override for `workflow retry` / `workflow advance` — the CLI equivalent of the
+ * Tool/Model/Effort dropdowns on a board card. It applies to that single stage execution only and
+ * never touches the task's stored `providerOverride` pin. The engine validates the values (unknown
+ * provider id, unknown effort, or a pick maker-checker forbids all reject the command outright), so
+ * this only has to shape them.
+ */
+function buildRunOverride(opts: { provider?: string; model?: string; effort?: string }): RunOverride | undefined {
+  if (opts.provider === undefined && opts.model === undefined && opts.effort === undefined) return undefined
+  return { providerId: opts.provider, model: opts.model, effort: opts.effort as AiEffort | undefined }
 }
 
 /** Resolves the same per-user data directory `loadApp()` boots against, for commands that need it directly (e.g. the persistence-broken marker). */
@@ -269,18 +281,32 @@ workflow
 workflow
   .command('retry <taskId>')
   .description('Re-attempt the current stage of a failed task')
-  .action((taskId: string) => {
+  .option(
+    '--provider <id>',
+    'run this stage with this provider id, for this run only — still subject to maker-checker, so ' +
+      'it cannot be the agent that ran the preceding stage',
+  )
+  .option('--model <model>', 'model override applied to this run only')
+  .option('--effort <effort>', 'reasoning-effort override applied to this run only')
+  .action((taskId: string, opts: { provider?: string; model?: string; effort?: string }) => {
     const { workflowEngine } = loadApp()
-    const task = workflowEngine.retry(taskId)
+    const task = workflowEngine.retry(taskId, buildRunOverride(opts))
     log(`Retrying task ${task.id} (stage=${task.stage})`)
   })
 
 workflow
   .command('advance <taskId>')
   .description('Run the current stage of a paused task')
-  .action((taskId: string) => {
+  .option(
+    '--provider <id>',
+    'run this stage with this provider id, for this run only — still subject to maker-checker, so ' +
+      'it cannot be the agent that ran the preceding stage',
+  )
+  .option('--model <model>', 'model override applied to this run only')
+  .option('--effort <effort>', 'reasoning-effort override applied to this run only')
+  .action((taskId: string, opts: { provider?: string; model?: string; effort?: string }) => {
     const { workflowEngine } = loadApp()
-    const task = workflowEngine.advance(taskId)
+    const task = workflowEngine.advance(taskId, buildRunOverride(opts))
     log(`Advancing task ${task.id} (stage=${task.stage})`)
   })
 

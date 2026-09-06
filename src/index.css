@@ -200,6 +200,18 @@ a {
   color: rgb(var(--color-text-rgb) / 0.45);
 }
 
+/*
+ * Compact .input for controls that sit inside a task card — the Tool/Model/Effort selects on a board
+ * or queue card (issue #42). Full-size .input controls are 36px tall and 14px, which next to an 11px
+ * .card-meta line would make the dropdowns, not the issue title, the loudest thing on the card.
+ * Width is left to the caller (`w-auto` on an auto-sizing <select>) since .input itself is 100%.
+ */
+.input-sm {
+  min-height: 26px;
+  padding: 2px 6px;
+  font-size: 11px;
+}
+
 .card {
   display: flex;
   flex-direction: column;

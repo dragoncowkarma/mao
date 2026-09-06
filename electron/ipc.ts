@@ -5,7 +5,7 @@ import { createMaoApp } from '../core/app.ts'
 import { startAutoTrigger } from '../core/auto-trigger.ts'
 import { assertCanRelaunchForUpdate, checkForUpdates, countRunningWorkflowTasks } from '../core/self-update.ts'
 import { createAiProvider, type AiProviderConfig } from '../core/ai/index.ts'
-import type { RepoRef } from '../core/workflow-engine.ts'
+import type { RepoRef, RunOverride } from '../core/workflow-engine.ts'
 import type { ThemePreference } from '../core/store.ts'
 
 export function registerIpcHandlers() {
@@ -94,9 +94,13 @@ export function registerIpcHandlers() {
 
   ipcMain.handle('workflow:list', () => workflowEngine.getTasks())
 
-  ipcMain.handle('workflow:retry', (_event, taskId: string) => workflowEngine.retry(taskId))
+  ipcMain.handle('workflow:retry', (_event, taskId: string, runOverride?: RunOverride) =>
+    workflowEngine.retry(taskId, runOverride),
+  )
 
-  ipcMain.handle('workflow:advance', (_event, taskId: string) => workflowEngine.advance(taskId))
+  ipcMain.handle('workflow:advance', (_event, taskId: string, runOverride?: RunOverride) =>
+    workflowEngine.advance(taskId, runOverride),
+  )
 
   ipcMain.handle('workflow:setAutoAdvance', (_event, taskId: string, autoAdvance: boolean) =>
     workflowEngine.setAutoAdvance(taskId, autoAdvance),

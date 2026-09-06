@@ -1,7 +1,7 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import type { AiProviderConfig } from '../core/ai/types.ts'
 import type { GithubTask, GithubTaskDetail } from '../core/github-service.ts'
-import type { QueuedTask, RepoRef } from '../core/workflow-engine.ts'
+import type { QueuedTask, RepoRef, RunOverride } from '../core/workflow-engine.ts'
 import type { AutoTriggerStatus } from '../core/auto-trigger.ts'
 import type { ThemePreference } from '../core/store.ts'
 import type { SelfUpdateCheck } from '../core/self-update.ts'
@@ -46,8 +46,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
       autoAdvance?: boolean,
     ): Promise<QueuedTask> => ipcRenderer.invoke('workflow:enqueueFromIssue', owner, repo, issueNumber, autoAdvance),
     list: (): Promise<QueuedTask[]> => ipcRenderer.invoke('workflow:list'),
-    retry: (taskId: string): Promise<QueuedTask> => ipcRenderer.invoke('workflow:retry', taskId),
-    advance: (taskId: string): Promise<QueuedTask> => ipcRenderer.invoke('workflow:advance', taskId),
+    retry: (taskId: string, runOverride?: RunOverride): Promise<QueuedTask> =>
+      ipcRenderer.invoke('workflow:retry', taskId, runOverride),
+    advance: (taskId: string, runOverride?: RunOverride): Promise<QueuedTask> =>
+      ipcRenderer.invoke('workflow:advance', taskId, runOverride),
     setAutoAdvance: (taskId: string, autoAdvance: boolean): Promise<QueuedTask> =>
       ipcRenderer.invoke('workflow:setAutoAdvance', taskId, autoAdvance),
     clearCompleted: (): Promise<void> => ipcRenderer.invoke('workflow:clearCompleted'),

@@ -1,7 +1,10 @@
 import { randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { createAiProvider } from './ai/index.ts'
+import { AI_EFFORTS } from './ai/types.ts'
 import type { AgentStage, AiEffort, AiProviderConfig } from './ai/types.ts'
+import { resolveStageAgent } from './agent-selection.ts'
+import type { ProviderOverride, RunOverride } from './agent-selection.ts'
 import type { GithubService } from './github-service.ts'
 import { ensureClone, checkoutBranch, hasChanges, commitAndPush } from './git-workspace.ts'
 
@@ -13,15 +16,19 @@ export type WorkflowStageName = AgentStage
 
 const STAGE_ORDER: WorkflowStageName[] = ['issue', 'pr', 'review', 'merge']
 
-/** Which lifecycle "role" (à la swarm_orchestrator.py's Worker/Reviewer/Maintainer tags) owns each stage. */
-export type WorkflowRole = 'worker' | 'reviewer' | 'maintainer'
-
-const STAGE_ROLE: Record<WorkflowStageName, WorkflowRole> = {
-  issue: 'worker',
-  pr: 'worker',
-  review: 'reviewer',
-  merge: 'maintainer',
-}
+/**
+ * Re-exported from core/agent-selection.ts, where the maker-checker rules now live as pure functions
+ * the Electron renderer can call too (a card has to show which agent a stage *will* use, and offer
+ * only the agents it may legally use, before that stage runs). Kept exported from here so existing
+ * importers — core/assignment.ts, the shells — don't have to care where the rules moved.
+ */
+export type {
+  PreviousStep,
+  ProviderOverride,
+  RunOverride,
+  WorkflowRole,
+  WorkflowRoleAssignment,
+} from './agent-selection.ts'
 
 /** Cap on finished (done/error) tasks kept around, so the persisted queue doesn't grow forever. */
 const MAX_FINISHED_TASKS = 50
@@ -36,41 +43,6 @@ export interface RepoRef {
   autoTrigger?: boolean
   /** Auto-trigger poll interval for this repo, in milliseconds. Defaults to the global auto-trigger interval. */
   pollIntervalMs?: number
-}
-
-/**
- * Per-role explicit provider assignment, e.g. parsed from a GitHub issue/PR body via
- * `parseAssignmentTags()` (see core/assignment.ts) — `[Worker: agent-cli]`, `[Reviewer: agent-cli2]`,
- * `[Maintainer: agent-cli2]` — or set directly via CLI flags. `worker` covers both the `issue` and
- * `pr` stages (drafting the issue and implementing the PR that resolves it — both the "making" side
- * of the work); `reviewer` covers `review`; `maintainer` covers `merge`.
- */
-export interface WorkflowRoleAssignment {
-  worker?: string
-  reviewer?: string
-  maintainer?: string
-}
-
-export interface ProviderOverride {
-  /**
-   * Preferred provider id for this task's stages. Only ever influences *which* provider is picked —
-   * maker-checker still wins: a preferred provider that handled the immediately preceding stage is
-   * skipped in favor of another registered provider, same as with no preference at all.
-   */
-  providerId?: string
-  /** Applied to whichever provider ends up selected, without mutating that provider's saved config. */
-  model?: string
-  /** Applied to whichever provider ends up selected, without mutating that provider's saved config. */
-  effort?: AiEffort
-  /**
-   * Per-role provider pins that take priority over `providerId` for the stage(s) they name. A Worker
-   * pin is exempt from the maker-checker guard when it re-selects itself across the `issue -> pr`
-   * boundary (same role, not a check on its own work) — that is the *only* exemption. A Reviewer or
-   * Maintainer pin that would hand a stage back to the agent that ran the immediately preceding stage
-   * is guarded exactly like a plain `providerId` override: passed over for another registered
-   * provider, or the stage fails clearly if none exists — never silently weakened.
-   */
-  roles?: WorkflowRoleAssignment
 }
 
 export interface WorkflowStepResult {
@@ -95,6 +67,14 @@ export interface QueuedTask {
   autoAdvance: boolean
   /** Optional task-level provider/model/effort preference — always subordinate to maker-checker. */
   providerOverride?: ProviderOverride
+  /**
+   * A one-shot tool/model/effort choice for the *next* stage execution only — what the Run/Retry
+   * dropdowns on a board or queue card send through `retry()`/`advance()`. `runStage()` consumes and
+   * clears it before doing any work, so it can never carry into the following stage or into the
+   * provider's saved configuration. Persisted alongside the rest of the task on purpose: a crash
+   * between the click and the run should still honour the operator's choice on resume.
+   */
+  nextRunOverride?: RunOverride
   /** Set while status === 'running' so the UI can show which agent/prompt is currently in flight. */
   active?: {
     agentId: string
@@ -123,6 +103,19 @@ function buildPromptForStage(task: QueuedTask): string {
     case 'merge':
       return `Confirm this pull request is ready to merge and summarize why: ${task.title}`
   }
+}
+
+/**
+ * Drops blank/absent fields so an untouched dropdown row (which posts empty strings) never counts as
+ * an override, and an all-empty one collapses to `undefined` — i.e. a plain, unmodified run.
+ */
+function normalizeRunOverride(runOverride?: RunOverride): RunOverride | undefined {
+  if (!runOverride) return undefined
+  const providerId = runOverride.providerId || undefined
+  const model = runOverride.model || undefined
+  const effort = runOverride.effort || undefined
+  if (providerId === undefined && model === undefined && effort === undefined) return undefined
+  return { providerId, model, effort }
 }
 
 function slugify(text: string): string {
@@ -231,12 +224,42 @@ export class WorkflowEngine extends EventEmitter {
     void this.processQueue()
   }
 
-  /** Re-attempts the current stage of a failed task. */
-  retry(taskId: string): QueuedTask {
+  /**
+   * Validates a one-shot run override and arms it for exactly the next stage execution. Deliberately
+   * runs *before* any task mutation: a bad choice (unknown provider, an effort level this build
+   * doesn't know, a pick maker-checker forbids) rejects the `retry()`/`advance()` call outright, so
+   * the operator sees why on the card they just clicked instead of the task quietly landing in
+   * 'error'. Passing no override clears any previously armed one — a plain run stays a plain run.
+   */
+  private armRunOverride(task: QueuedTask, runOverride?: RunOverride) {
+    const normalized = normalizeRunOverride(runOverride)
+    if (normalized?.effort !== undefined && !(AI_EFFORTS as readonly string[]).includes(normalized.effort)) {
+      throw new Error(`Unknown reasoning effort: ${normalized.effort}`)
+    }
+    // Dry-run the real selection so an impossible choice fails here rather than mid-stage. Only when
+    // an override is actually present: an unmodified retry must stay retryable even with no provider
+    // registered, which runStage() already reports as the task's error exactly as it does today.
+    if (normalized) {
+      resolveStageAgent(this.providers, {
+        stage: task.stage,
+        previous: task.history[task.history.length - 1],
+        override: task.providerOverride,
+        oneShot: normalized,
+      })
+    }
+    task.nextRunOverride = normalized
+  }
+
+  /**
+   * Re-attempts the current stage of a failed task, optionally with a one-shot tool/model/effort
+   * override applied to that single execution and nothing after it (see `RunOverride`).
+   */
+  retry(taskId: string, runOverride?: RunOverride): QueuedTask {
     const task = this.queue.find((t) => t.id === taskId)
     if (!task) throw new Error(`Unknown task: ${taskId}`)
     if (task.status !== 'error') throw new Error(`Task is not in an error state: ${task.status}`)
 
+    this.armRunOverride(task, runOverride)
     task.status = 'pending'
     task.error = undefined
     this.notify()
@@ -244,12 +267,16 @@ export class WorkflowEngine extends EventEmitter {
     return task
   }
 
-  /** Manually runs the current stage of a task that is parked in 'paused' (autoAdvance === false). */
-  advance(taskId: string): QueuedTask {
+  /**
+   * Manually runs the current stage of a task that is parked in 'paused' (autoAdvance === false),
+   * optionally with a one-shot tool/model/effort override for that single execution.
+   */
+  advance(taskId: string, runOverride?: RunOverride): QueuedTask {
     const task = this.queue.find((t) => t.id === taskId)
     if (!task) throw new Error(`Unknown task: ${taskId}`)
     if (task.status !== 'paused') throw new Error(`Task is not paused: ${task.status}`)
 
+    this.armRunOverride(task, runOverride)
     task.status = 'pending'
     this.notify()
     void this.processQueue()
@@ -315,96 +342,21 @@ export class WorkflowEngine extends EventEmitter {
   }
 
   /**
-   * Prevents the AI that handled the previous stage from being assigned the next one (Maker-Checker).
-   * A task-level provider preference (`providerOverride.providerId`, or a per-role pin in
-   * `providerOverride.roles` — the role pin wins when both apply to the current stage) may steer which
-   * provider gets picked, but never at the expense of that guarantee: if the preferred provider is the
-   * one that just ran, it is passed over for another registered provider exactly as if no preference
-   * had been set. The one deliberate exception is a Worker role pin re-selecting itself across the
-   * `issue -> pr` boundary — both stages are the same "making" role, not a check on its own work, so
-   * that specific case is not a maker-checker violation. It is only an error if honoring maker-checker
-   * would require a distinct provider that doesn't exist. `model`/`effort` overrides are applied on top
-   * of whichever provider is selected, on a copy — the caller's stored provider config is never mutated.
+   * Resolves which agent runs this task's current stage, with `model`/`effort` applied on a copy so
+   * the stored provider config is never mutated. The rules themselves — maker-checker, per-role
+   * pins, `allowedStages`, and the stricter handling of a one-shot pick — live in
+   * core/agent-selection.ts so the renderer can preview and filter with the same code the engine
+   * runs; see `resolveStageAgent()` there for the full contract.
    *
-   * Per-provider `allowedStages` restrictions narrow the candidate pool before maker-checker runs.
-   * A provider whose `allowedStages` is absent or empty is eligible for every stage. When no
-   * stage-eligible provider exists at all, a clear error is thrown so the task lands in `error`
-   * (retryable after the operator adds or reconfigures a provider).
+   * `oneShot` is the override armed by `retry()`/`advance()` for this single execution.
    */
-  private selectAgent(task: QueuedTask): AiProviderConfig {
-    if (this.providers.length === 0) throw new Error('No AI providers registered')
-    const previousEntry = task.history[task.history.length - 1]
-    const previousAgentId = previousEntry?.agentId
-    const override = task.providerOverride
-
-    // Filter to providers whose allowedStages permit the current stage.
-    const stageEligible = this.providers.filter(
-      (p) => !p.allowedStages || p.allowedStages.length === 0 || p.allowedStages.includes(task.stage),
-    )
-    if (stageEligible.length === 0) {
-      throw new Error(
-        `No AI provider is configured to handle the "${task.stage}" stage — ` +
-          `add a provider without stage restrictions, or enable this stage for an existing provider.`,
-      )
-    }
-
-    const role = STAGE_ROLE[task.stage]
-    const rolePreferredId = override?.roles?.[role]
-    const preferredId = rolePreferredId ?? override?.providerId
-    // A Worker pin doing both 'issue' and 'pr' is the same role reusing itself, not maker-checker at
-    // all — only guard when the preference came from `roles` AND the previous stage shares that role.
-    const skipGuard = rolePreferredId !== undefined && previousEntry !== undefined && STAGE_ROLE[previousEntry.stage] === role
-
-    let base: AiProviderConfig
-    if (preferredId) {
-      const allRegistered = this.providers.find((p) => p.id === preferredId)
-      if (!allRegistered) throw new Error(`Provider override references unknown provider: ${preferredId}`)
-
-      const preferred = stageEligible.find((p) => p.id === preferredId)
-      if (!preferred) {
-        throw new Error(
-          `Provider override "${preferredId}" is not configured to handle the "${task.stage}" ` +
-            `stage — update its allowed-stages setting or choose a different provider.`,
-        )
-      }
-
-      if (skipGuard || preferred.id !== previousAgentId) {
-        base = preferred
-      } else {
-        const alternative = stageEligible.find((p) => p.id !== previousAgentId)
-        if (!alternative) {
-          if (rolePreferredId !== undefined) {
-            throw new Error(
-              `Provider override "${preferredId}" handled the immediately preceding stage and no other ` +
-                `provider is registered to check its own work — maker-checker requires a distinct provider here.`,
-            )
-          }
-          // No other stage-eligible provider is available — relax maker-checker and use the only
-          // eligible provider. Consistent with the no-override path's `candidates[0] ?? stageEligible[0]`
-          // fallback: when stage restrictions (or a single-provider setup) leave only one option,
-          // stage eligibility takes priority over the consecutive-agent constraint.
-          base = preferred
-        } else {
-          base = alternative
-        }
-      }
-    } else {
-      // Prefer a provider that didn't just run (maker-checker), from the stage-eligible pool.
-      const candidates = stageEligible.filter((p) => p.id !== previousAgentId)
-      // Fall back to the first stage-eligible provider when only one is available — preserves the
-      // existing single-provider behaviour where maker-checker relaxes rather than hard-errors.
-      base = candidates[0] ?? stageEligible[0]
-    }
-
-    const activePreset = base.presets?.find((p) => p.id === base.selectedPresetId) ?? base.presets?.[0]
-    const effectiveModel = override?.model !== undefined ? override.model : (base.model || activePreset?.model)
-    const effectiveEffort = override?.effort !== undefined ? override.effort : (base.effort || activePreset?.effort)
-
-    return {
-      ...base,
-      model: effectiveModel,
-      effort: effectiveEffort,
-    }
+  private selectAgent(task: QueuedTask, oneShot?: RunOverride): AiProviderConfig {
+    return resolveStageAgent(this.providers, {
+      stage: task.stage,
+      previous: task.history[task.history.length - 1],
+      override: task.providerOverride,
+      oneShot,
+    })
   }
 
   private async processQueue() {
@@ -432,13 +384,19 @@ export class WorkflowEngine extends EventEmitter {
 
   private async runStage(task: QueuedTask) {
     task.status = 'running'
+    // A one-shot override belongs to exactly this execution. Read it out and clear it from the task
+    // up front — before the entry notify() persists anything, and before any await — so that neither
+    // a failure in this stage nor the next stage auto-advancing can silently reuse a choice the
+    // operator made for a single run.
+    const oneShot = task.nextRunOverride
+    task.nextRunOverride = undefined
     try {
       // Entry notify lives inside the try: a throwing 'change' listener (e.g. createMaoApp's
       // synchronous store.set) must land the task in 'error' via the catch below instead of
       // leaving it stuck at 'running' forever with no path back to retry().
       this.notify()
 
-      const agentConfig = this.selectAgent(task)
+      const agentConfig = this.selectAgent(task, oneShot)
       const usesCodeEdits = task.stage === 'pr' && agentConfig.kind === 'cli' && !!this.workspaceRoot
       task.active = {
         agentId: agentConfig.id,

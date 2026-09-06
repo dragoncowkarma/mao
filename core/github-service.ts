@@ -1,5 +1,73 @@
 import { Octokit } from 'octokit'
 
+/**
+ * A stalled GitHub socket would otherwise block every repository behind the single-flight queue.
+ * The deadline is per actual fetch attempt, so pagination and plugin retries each get a fresh budget.
+ */
+const GITHUB_REQUEST_TIMEOUT_MS = 60_000
+
+type GithubFetch = typeof globalThis.fetch
+
+function rebuildResponse(response: Response, body: ArrayBuffer): Response {
+  const buffered = new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  })
+  // The Response constructor cannot set these fetch metadata fields, but Octokit exposes `url`.
+  Object.defineProperties(buffered, {
+    url: { value: response.url },
+    redirected: { value: response.redirected },
+    type: { value: response.type },
+  })
+  return buffered
+}
+
+function withRequestTimeout(requestFetch: GithubFetch): GithubFetch {
+  return async (input, init) => {
+    const controller = new AbortController()
+    const upstreamSignal = init?.signal
+    const forwardAbort = () => controller.abort(upstreamSignal?.reason)
+
+    if (upstreamSignal?.aborted) forwardAbort()
+    else upstreamSignal?.addEventListener('abort', forwardAbort, { once: true })
+
+    let cleanedUp = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const cleanup = () => {
+      if (cleanedUp) return
+      cleanedUp = true
+      if (timer) clearTimeout(timer)
+      upstreamSignal?.removeEventListener('abort', forwardAbort)
+    }
+
+    timer = setTimeout(() => {
+      const error = Object.assign(
+        new Error(`GitHub request timed out after ${GITHUB_REQUEST_TIMEOUT_MS / 1000}s`),
+        { name: 'AbortError' },
+      )
+      controller.abort(error)
+      cleanup()
+    }, GITHUB_REQUEST_TIMEOUT_MS)
+
+    try {
+      const response = await requestFetch(input, { ...init, signal: controller.signal })
+      if (!response.body) {
+        cleanup()
+        return response
+      }
+      // Fetch resolves after headers arrive, while Octokit consumes the body later and swallows
+      // body-read failures. Buffer inside this transport boundary so a stalled body rejects here.
+      const body = await response.arrayBuffer()
+      cleanup()
+      return rebuildResponse(response, body)
+    } catch (error) {
+      cleanup()
+      throw error
+    }
+  }
+}
+
 export interface GithubTask {
   id: number
   number: number
@@ -66,9 +134,22 @@ function parseLinkedIssues(body: string): number[] {
 
 export class GithubService {
   private octokit: Octokit | null = null
+  private readonly requestFetch: GithubFetch
+
+  /** The fetch dependency is injectable so timeout behavior can be tested through a real Octokit. */
+  constructor(requestFetch: GithubFetch = globalThis.fetch) {
+    this.requestFetch = requestFetch
+  }
 
   setToken(token: string) {
-    this.octokit = new Octokit({ auth: token })
+    this.octokit = new Octokit({
+      auth: token,
+      // Octokit calls this at the innermost network boundary. Starting the deadline here keeps
+      // retry/throttle waits outside it while bounding every eventual HTTP attempt and page.
+      request: {
+        fetch: withRequestTimeout(this.requestFetch),
+      },
+    })
   }
 
   async fetchTasks(owner: string, repo: string): Promise<GithubTask[]> {

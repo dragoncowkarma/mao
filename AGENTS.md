@@ -155,13 +155,13 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   tag it superseded. Every directive tag is ignored inside code fences, inline code
   spans, HTML comments, and blockquotes, so documenting the syntax never acts as a directive.
 - **Single-flight queue**: `processQueue()` runs one stage at a time globally.
-  Therefore every external call must be time-bounded. Today only the AI-provider
-  calls are: the API provider aborts after 5 min, the CLI provider SIGKILLs after
-  15 min. **Octokit calls (`core/github-service.ts`) and git operations
-  (`core/git-workspace.ts`) have no timeout** — a hang there stalls the whole
-  queue indefinitely. Don't add more unbounded calls; adding timeouts to the
-  existing gaps is welcome. Timeouts must surface as task errors, never silent
-  stalls.
+  Therefore every external call must be time-bounded. The API provider aborts
+  after 5 min, the CLI provider SIGKILLs after 15 min, each actual Octokit HTTP
+  attempt/page in `core/github-service.ts` gets a fresh 60 sec deadline, and every
+  `execFile`-based git operation in `core/git-workspace.ts` has a 15 min watchdog
+  that rejects independently after sending SIGKILL. A top-level Octokit call can
+  take longer than 60 sec across plugin backoff, throttling, or pagination. Don't
+  add unbounded calls. Timeouts must surface as task errors, never silent stalls.
 - **Failures should be retryable states, not crashes**: any throw inside
   `runStage()`'s `try/catch` (including synchronous setup like `selectAgent()` —
   keep it inside) sets `status: 'error'` without advancing the stage, so `retry()`

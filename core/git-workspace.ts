@@ -1,22 +1,84 @@
 import { execFile } from 'node:child_process'
-import { promisify } from 'node:util'
+import type { ExecFileOptionsWithStringEncoding } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 
-const execFileAsync = promisify(execFile)
+/**
+ * A hung Git subprocess would otherwise block the single-flight workflow queue indefinitely.
+ * Fifteen minutes still leaves room for legitimate large clone and push operations.
+ */
+const GIT_OPERATION_TIMEOUT_MS = 15 * 60 * 1000
+
+type GitExecOptions = Pick<ExecFileOptionsWithStringEncoding, 'cwd'>
 
 async function run(
   command: string,
   args: readonly string[],
-  options?: Parameters<typeof execFileAsync>[2],
+  options?: GitExecOptions,
 ): Promise<{ stdout: string; stderr: string }> {
   try {
-    const { stdout, stderr } = await execFileAsync(command, args, options)
-    return {
-      stdout: typeof stdout === 'string' ? stdout : stdout.toString('utf8'),
-      stderr: typeof stderr === 'string' ? stderr : stderr.toString('utf8'),
-    }
+    return await new Promise((resolve, reject) => {
+      let settled = false
+      let timer: ReturnType<typeof setTimeout> | undefined
+
+      const settle = (fn: () => void) => {
+        if (settled) return
+        settled = true
+        if (timer) clearTimeout(timer)
+        fn()
+      }
+
+      let child
+      try {
+        child = execFile(
+          command,
+          args,
+          {
+            ...options,
+            encoding: 'utf8',
+            timeout: GIT_OPERATION_TIMEOUT_MS,
+            killSignal: 'SIGKILL',
+          },
+          (error, stdout, stderr) => {
+            settle(() => {
+              if (error) {
+                Object.assign(error, { stdout, stderr })
+                reject(error)
+                return
+              }
+              resolve({ stdout, stderr })
+            })
+          },
+        )
+      } catch (error) {
+        settle(() => reject(error))
+        return
+      }
+
+      if (settled) return
+      timer = setTimeout(() => {
+        settle(() => {
+          // Reject even if the OS refuses the kill: queue progress must not depend on `close`.
+          try {
+            child.kill('SIGKILL')
+          } catch {
+            // The process may have exited between the watchdog firing and this kill attempt.
+          }
+          reject(Object.assign(new Error('Git operation timed out'), {
+            killed: true,
+            signal: 'SIGKILL',
+          }))
+        })
+      }, GIT_OPERATION_TIMEOUT_MS)
+    })
   } catch (err: any) {
+    if (err?.killed === true && err.signal) {
+      err.message = [
+        `Git operation timed out after ${GIT_OPERATION_TIMEOUT_MS / 1000}s:`,
+        command,
+        ...args,
+      ].join(' ')
+    }
     if (err && typeof err.message === 'string') {
       err.message = err.message.replace(/https:\/\/x-access-token:[^@]+@/g, 'https://x-access-token:[REDACTED]@')
     }

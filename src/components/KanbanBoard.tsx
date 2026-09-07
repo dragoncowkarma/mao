@@ -61,8 +61,7 @@ function lastStep(task: QueuedTask) {
  */
 function currentAgentLabel(task: QueuedTask, providers: AiProviderConfig[]): string | undefined {
   // Running now, or finished the whole pipeline — either way the card names a real, past-tense agent.
-  const activeStep = task.active
-  const settled = activeStep ?? (task.status === 'done' ? task.history[task.history.length - 1] : undefined)
+  const settled = task.active ?? (task.status === 'done' ? task.history[task.history.length - 1] : undefined)
   const upcoming = settled
     ? undefined
     : previewStageAgent(providers, {
@@ -75,10 +74,11 @@ function currentAgentLabel(task: QueuedTask, providers: AiProviderConfig[]): str
       })
   // Nothing resolvable (no providers configured yet) — fall back to whoever last touched the task.
   const step = settled ?? (upcoming ? undefined : lastStep(task))
-  // Name the tool, not just the operator-chosen provider name, for the agent running now or up next.
-  // A finished stage keeps its recorded name — the provider's kind may have changed since it ran.
-  const live = upcoming ?? (activeStep ? providers.find((p) => p.id === activeStep.agentId) : undefined)
-  const name = live ? providerToolLabel(live) : step?.agentName
+  // Name the tool, not just the operator-chosen provider name. A stage that has run carries its own
+  // snapshot of which tool it used; only a prediction reads the (mutable) live provider config.
+  const name = upcoming
+    ? providerToolLabel(upcoming)
+    : step && providerToolLabel({ name: step.agentName, providerKindId: step.providerKindId })
   if (!name) return undefined
   const model = upcoming?.model ?? step?.model
   const effort = upcoming?.effort ?? step?.effort

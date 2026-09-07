@@ -468,6 +468,28 @@ describe('WorkflowEngine', () => {
     })
   })
 
+  it('snapshots the provider kind on each step, so a later provider edit cannot relabel a past run', async () => {
+    const engine = new WorkflowEngine(makeFakeGithub())
+    const claudeCli: AiProviderConfig = {
+      id: 'agent-a',
+      name: 'Primary Worker',
+      kind: 'cli',
+      command: 'claude',
+      providerKindId: 'claude',
+    }
+    engine.setProviders([claudeCli, makeProvider('agent-b')])
+
+    const task = engine.enqueue('Snapshot the tool', repo, false)
+    await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'paused')
+
+    // ai:save replaces the provider list wholesale, and may do so mid-run. The recorded step must
+    // keep describing the tool that actually ran, not whatever that id points at now.
+    engine.setProviders([{ ...claudeCli, providerKindId: 'codex', command: 'codex' }, makeProvider('agent-b')])
+
+    const current = engine.getTasks().find((t) => t.id === task.id)!
+    expect(current.history[0]).toMatchObject({ agentId: 'agent-a', providerKindId: 'claude' })
+  })
+
   describe('one-shot run override (card Tool/Model/Effort dropdowns)', () => {
     /** Runs `title` with autoAdvance off and parks it at the 'pr' stage, having run 'issue'. */
     async function pausedAtPr(engine: WorkflowEngine, title: string) {

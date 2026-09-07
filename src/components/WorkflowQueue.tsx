@@ -92,9 +92,6 @@ function TaskCard({
           oneShot: task.nextRunOverride,
         })
       : undefined
-  // A finished stage keeps the name it recorded (the provider's kind may have changed since), but
-  // the agent running right now can be named by its actual tool.
-  const activeProvider = task.active && providers.find((p) => p.id === task.active?.agentId)
 
   return (
     <div className={`card elev-sm ${active ? 'card-active' : ''}`}>
@@ -148,7 +145,7 @@ function TaskCard({
             <span className="live-dot" />
             <AgentBadge
               name={task.active.agentName}
-              kind={activeProvider ? providerToolKind(activeProvider) : undefined}
+              kind={providerToolKind(task.active)}
               model={task.active.model}
               effort={task.active.effort}
             />
@@ -167,7 +164,12 @@ function TaskCard({
             <div key={i} className="flex flex-col gap-1">
               <div className="flex flex-wrap items-center gap-1.5">
                 <span className="tag tag-stage">{STAGE_LABELS[step.stage]}</span>
-                <AgentBadge name={step.agentName} model={step.model} effort={step.effort} />
+                <AgentBadge
+                  name={step.agentName}
+                  kind={providerToolKind(step)}
+                  model={step.model}
+                  effort={step.effort}
+                />
                 <button
                   onClick={() => setExpanded(expanded === i ? null : i)}
                   className="btn btn-ghost px-1 text-xs"

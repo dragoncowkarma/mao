@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { createAiProvider } from './ai/index.ts'
 import { AI_EFFORTS } from './ai/types.ts'
-import type { AgentStage, AiEffort, AiProviderConfig } from './ai/types.ts'
+import type { AgentStage, AiEffort, AiProviderConfig, ProviderKindId } from './ai/types.ts'
 import { resolveStageAgent } from './agent-selection.ts'
 import type { ProviderOverride, RunOverride } from './agent-selection.ts'
 import type { GithubService } from './github-service.ts'
@@ -49,6 +49,13 @@ export interface WorkflowStepResult {
   stage: WorkflowStageName
   agentId: string
   agentName: string
+  /**
+   * The AI tool the agent actually ran on, snapshotted at selection time. A provider's name is
+   * operator-chosen and needn't identify its tool, so the UI pairs the two — but the provider list is
+   * mutable while a stage runs (`ai:save` replaces it wholesale), so looking the kind up later can
+   * describe a run by a configuration it never used, or lose it entirely if the provider was deleted.
+   */
+  providerKindId?: ProviderKindId
   model?: string
   effort?: AiEffort
   prompt: string
@@ -79,6 +86,8 @@ export interface QueuedTask {
   active?: {
     agentId: string
     agentName: string
+    /** Snapshotted at selection time, for the same reason as `WorkflowStepResult.providerKindId`. */
+    providerKindId?: ProviderKindId
     model?: string
     effort?: AiEffort
     prompt: string
@@ -401,6 +410,7 @@ export class WorkflowEngine extends EventEmitter {
       task.active = {
         agentId: agentConfig.id,
         agentName: agentConfig.name,
+        providerKindId: agentConfig.providerKindId,
         model: agentConfig.model,
         effort: agentConfig.effort,
         prompt: usesCodeEdits ? 'Preparing local checkout…' : buildPromptForStage(task),
@@ -425,6 +435,7 @@ export class WorkflowEngine extends EventEmitter {
         stage: task.stage,
         agentId: agentConfig.id,
         agentName: agentConfig.name,
+        providerKindId: agentConfig.providerKindId,
         model: agentConfig.model,
         effort: agentConfig.effort,
         prompt,

@@ -159,6 +159,13 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   per-match filter: an invalid amendment drops the override instead of falling back to the
   tag it superseded. Every directive tag is ignored inside code fences, inline code
   spans, HTML comments, and blockquotes, so documenting the syntax never acts as a directive.
+- **A step records the tool it ran on, not a pointer to one**: `runStage()` snapshots
+  `providerKindId` onto `task.active` and each `WorkflowStepResult` alongside name/model/effort.
+  `ai:save` replaces the whole provider list at any time — including mid-stage, while a child process
+  is still running on the config `selectAgent()` captured — so resolving a past or in-flight run's
+  tool by looking its `agentId` up in the *current* list can describe it by a configuration it never
+  used, or lose it when the provider is deleted. Only a *prediction* (`previewStageAgent()`) may read
+  the live config, because that is what it is predicting from.
 - **One-shot run overrides (`RunOverride`) are a third, stricter tier**: `retry(taskId, runOverride?)`
   / `advance(taskId, runOverride?)` accept a `{ providerId?, model?, effort? }` choice — what the
   Tool/Model/Effort dropdowns on a board or queue card send. It is stored as

@@ -1,6 +1,6 @@
 import type { AiProviderConfig } from '../core/ai/types'
 import type { GithubTask, GithubTaskDetail } from '../core/github-service'
-import type { QueuedTask, RepoRef } from '../core/workflow-engine'
+import type { QueuedTask, RepoRef, RunOverride } from '../core/workflow-engine'
 import type { AutoTriggerStatus } from '../core/auto-trigger'
 import type { ThemePreference } from '../core/store'
 import type { SelfUpdateCheck } from '../core/self-update'
@@ -40,8 +40,8 @@ declare global {
           autoAdvance?: boolean,
         ) => Promise<QueuedTask>
         list: () => Promise<QueuedTask[]>
-        retry: (taskId: string) => Promise<QueuedTask>
-        advance: (taskId: string) => Promise<QueuedTask>
+        retry: (taskId: string, runOverride?: RunOverride) => Promise<QueuedTask>
+        advance: (taskId: string, runOverride?: RunOverride) => Promise<QueuedTask>
         setAutoAdvance: (taskId: string, autoAdvance: boolean) => Promise<QueuedTask>
         clearCompleted: () => Promise<void>
       }

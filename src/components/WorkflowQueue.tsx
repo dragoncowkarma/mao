@@ -1,5 +1,10 @@
 import { useEffect, useState } from 'react'
+import type { AiProviderConfig } from '../../core/ai/types'
+import { providerToolKind } from '../../core/ai/provider-options'
+import { previewStageAgent } from '../../core/agent-selection'
+import type { RunOverride } from '../../core/agent-selection'
 import type { QueuedTask, RepoRef } from '../../core/workflow-engine'
+import AgentRunControls from './AgentRunControls'
 import TaskDetailModal from './TaskDetailModal'
 
 interface WorkflowQueueProps {
@@ -32,10 +37,22 @@ function isActiveTask(task: QueuedTask): boolean {
   return task.status === 'running' || task.stage === 'review'
 }
 
-function AgentBadge({ name, model, effort }: { name: string; model?: string; effort?: string }) {
+function AgentBadge({
+  name,
+  kind,
+  model,
+  effort,
+}: {
+  name: string
+  /** The AI tool behind the provider — a provider's name needn't say which CLI it drives. */
+  kind?: string
+  model?: string
+  effort?: string
+}) {
   return (
     <span className="tag tag-neutral inline-flex items-center gap-1">
       {name}
+      {kind && <span className="opacity-60">· {kind}</span>}
       {model && <span className="opacity-60">· {model}</span>}
       {effort && <span className="opacity-60">· {effort} effort</span>}
     </span>
@@ -44,19 +61,37 @@ function AgentBadge({ name, model, effort }: { name: string; model?: string; eff
 
 function TaskCard({
   task,
+  providers,
+  busy,
   onRetry,
   onAdvance,
   onToggleAutoAdvance,
   onOpenTask,
 }: {
   task: QueuedTask
-  onRetry: (id: string) => void
-  onAdvance: (id: string) => void
+  /** Registered AI providers, for naming the assigned agent and populating the run dropdowns. */
+  providers: AiProviderConfig[]
+  busy: boolean
+  onRetry: (id: string, runOverride?: RunOverride) => void
+  onAdvance: (id: string, runOverride?: RunOverride) => void
   onToggleAutoAdvance: (id: string, autoAdvance: boolean) => void
   onOpenTask: (number: number, type: 'issue' | 'pull_request') => void
 }) {
   const [expanded, setExpanded] = useState<number | null>(null)
   const active = isActiveTask(task)
+  // Who the *next* stage belongs to. A queued task that has never run has no `active` entry and no
+  // history, so before issue #42 its card named no AI at all until the stage was already underway.
+  const upcoming =
+    task.status === 'pending' && !task.active
+      ? previewStageAgent(providers, {
+          stage: task.stage,
+          previous: task.history[task.history.length - 1],
+          override: task.providerOverride,
+          // A task queued behind the single-flight queue already holds the agent the operator
+          // picked; without this the card would advertise the default and then run something else.
+          oneShot: task.nextRunOverride,
+        })
+      : undefined
 
   return (
     <div className={`card elev-sm ${active ? 'card-active' : ''}`}>
@@ -91,11 +126,29 @@ function TaskCard({
         </div>
       )}
 
+      {upcoming && (
+        <div className="flex items-center gap-2">
+          <span className="tag tag-stage">{STAGE_LABELS[task.stage]}</span>
+          <AgentBadge
+            name={upcoming.name}
+            kind={providerToolKind(upcoming)}
+            model={upcoming.model}
+            effort={upcoming.effort}
+          />
+          <span className="text-muted text-xs">up next</span>
+        </div>
+      )}
+
       {task.status === 'running' && task.active && (
         <div className="card gap-1 p-2">
           <div className="flex items-center gap-2">
             <span className="live-dot" />
-            <AgentBadge name={task.active.agentName} model={task.active.model} effort={task.active.effort} />
+            <AgentBadge
+              name={task.active.agentName}
+              kind={providerToolKind(task.active)}
+              model={task.active.model}
+              effort={task.active.effort}
+            />
             <span className="text-muted text-xs">running now</span>
           </div>
           <details>
@@ -111,7 +164,12 @@ function TaskCard({
             <div key={i} className="flex flex-col gap-1">
               <div className="flex flex-wrap items-center gap-1.5">
                 <span className="tag tag-stage">{STAGE_LABELS[step.stage]}</span>
-                <AgentBadge name={step.agentName} model={step.model} effort={step.effort} />
+                <AgentBadge
+                  name={step.agentName}
+                  kind={providerToolKind(step)}
+                  model={step.model}
+                  effort={step.effort}
+                />
                 <button
                   onClick={() => setExpanded(expanded === i ? null : i)}
                   className="btn btn-ghost px-1 text-xs"
@@ -137,13 +195,20 @@ function TaskCard({
       )}
 
       {task.status === 'paused' && (
-        <div className="flex items-center justify-between gap-2">
+        <div className="flex flex-col gap-1.5">
           <p className="text-muted text-xs">
             Waiting for manual advance before starting the {STAGE_LABELS[task.stage]} stage.
           </p>
-          <button onClick={() => onAdvance(task.id)} className="btn btn-primary shrink-0 px-2.5 py-1 text-xs">
-            Run next stage
-          </button>
+          <AgentRunControls
+            // Remount per task *and* stage so a choice made for one stage never carries into the
+            // next — the same one-run-only rule the engine enforces.
+            key={`${task.id}:${task.stage}:advance`}
+            task={task}
+            providers={providers}
+            actionLabel="Run next stage"
+            busy={busy}
+            onRun={(runOverride) => onAdvance(task.id, runOverride)}
+          />
         </div>
       )}
 
@@ -159,13 +224,18 @@ function TaskCard({
       )}
 
       {task.error && (
-        <div className="mt-1 flex items-center justify-between gap-2">
+        <div className="mt-1 flex flex-col gap-1.5">
           <p className="text-xs" style={{ color: 'var(--color-accent-700)' }}>
             {task.error}
           </p>
-          <button onClick={() => onRetry(task.id)} className="btn btn-secondary shrink-0 px-2.5 py-1 text-xs">
-            Retry
-          </button>
+          <AgentRunControls
+            key={`${task.id}:${task.stage}:retry`}
+            task={task}
+            providers={providers}
+            actionLabel="Retry"
+            busy={busy}
+            onRun={(runOverride) => onRetry(task.id, runOverride)}
+          />
         </div>
       )}
     </div>
@@ -174,15 +244,26 @@ function TaskCard({
 
 export default function WorkflowQueue({ repo }: WorkflowQueueProps) {
   const [tasks, setTasks] = useState<QueuedTask[]>([])
+  const [providers, setProviders] = useState<AiProviderConfig[]>([])
   const [title, setTitle] = useState('')
   const [autoAdvanceNewTask, setAutoAdvanceNewTask] = useState(true)
   const [openTask, setOpenTask] = useState<{ number: number; type: 'issue' | 'pull_request' } | null>(null)
+  const [runningTaskId, setRunningTaskId] = useState<string | null>(null)
+  const [error, setError] = useState('')
 
   useEffect(() => {
     const load = () => window.electronAPI.workflow.list().then(setTasks)
     load()
     const interval = setInterval(load, 2000)
     return () => clearInterval(interval)
+  }, [])
+
+  // Providers change only in Global Settings, so fetch once rather than on the 2s task poll.
+  useEffect(() => {
+    window.electronAPI.ai
+      .list()
+      .then(setProviders)
+      .catch((err) => setError(err instanceof Error ? err.message : String(err)))
   }, [])
 
   const repoTasks = tasks.filter((t) => t.repo.owner === repo.owner && t.repo.repo === repo.repo)
@@ -194,14 +275,30 @@ export default function WorkflowQueue({ repo }: WorkflowQueueProps) {
     setTasks(await window.electronAPI.workflow.list())
   }
 
-  async function retryTask(taskId: string) {
-    await window.electronAPI.workflow.retry(taskId)
-    setTasks(await window.electronAPI.workflow.list())
+  /**
+   * Re-runs a stage with the card's one-shot Tool/Model/Effort choice, if any. The engine validates
+   * the choice and rejects an impossible one (unknown provider, or a pick maker-checker forbids), so
+   * catch that and show it here — otherwise the click would fail silently as an unhandled rejection.
+   */
+  async function runStage(taskId: string, run: () => Promise<unknown>) {
+    setRunningTaskId(taskId)
+    try {
+      await run()
+      setError('')
+      setTasks(await window.electronAPI.workflow.list())
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setRunningTaskId(null)
+    }
   }
 
-  async function advanceTask(taskId: string) {
-    await window.electronAPI.workflow.advance(taskId)
-    setTasks(await window.electronAPI.workflow.list())
+  function retryTask(taskId: string, runOverride?: RunOverride) {
+    void runStage(taskId, () => window.electronAPI.workflow.retry(taskId, runOverride))
+  }
+
+  function advanceTask(taskId: string, runOverride?: RunOverride) {
+    void runStage(taskId, () => window.electronAPI.workflow.advance(taskId, runOverride))
   }
 
   async function toggleAutoAdvance(taskId: string, autoAdvance: boolean) {
@@ -262,6 +359,8 @@ export default function WorkflowQueue({ repo }: WorkflowQueueProps) {
           <TaskCard
             key={task.id}
             task={task}
+            providers={providers}
+            busy={runningTaskId === task.id}
             onRetry={retryTask}
             onAdvance={advanceTask}
             onToggleAutoAdvance={toggleAutoAdvance}
@@ -270,6 +369,12 @@ export default function WorkflowQueue({ repo }: WorkflowQueueProps) {
         ))}
         {repoTasks.length === 0 && <p className="text-muted text-sm">No workflow tasks yet.</p>}
       </div>
+
+      {error && (
+        <p className="mt-2 text-xs" style={{ color: 'var(--color-accent-700)' }}>
+          {error}
+        </p>
+      )}
 
       {openTask && (
         <TaskDetailModal

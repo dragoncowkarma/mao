@@ -95,8 +95,8 @@ npm run cli -- workflow enqueue "<title>" --owner <o> --repo <r> [--no-auto-adva
 npm run cli -- workflow enqueue "<title>" --owner <o> --repo <r> \
   --worker <providerId> --reviewer <providerId> --maintainer <providerId>  # pin specific agents per role
 npm run cli -- workflow list
-npm run cli -- workflow retry <taskId>
-npm run cli -- workflow advance <taskId>
+npm run cli -- workflow retry <taskId> [--provider <id>] [--model <model>] [--effort <level>]
+npm run cli -- workflow advance <taskId> [--provider <id>] [--model <model>] [--effort <level>]
 npm run cli -- workflow clear-completed
 npm run cli -- run                               # foreground: auto-trigger + resume queue
 npm run cli -- swarm --repo-root /path/to/repo --status
@@ -137,6 +137,20 @@ into the issue body instead — `[Worker: <providerId>]`, `[Reviewer: <providerI
 `[Maintainer: <providerId>]` — and `core/assignment.ts` parses them automatically when
 the issue is enqueued; an issue with none of these tags enqueues exactly as before
 (default maker-checker rotation).
+
+**Running one stage with a different agent (one-shot):** `workflow retry` / `workflow advance` take
+`--provider/--model/--effort` — the CLI equivalent of the Tool/Model/Effort dropdowns beside a board
+or queue card's Run/Retry button. These are **one-shot**: they apply to that single stage execution
+and are cleared before it starts, so they change neither the saved provider config nor the task's
+durable `ProviderOverride` pin, and the following stage rotates as if they never existed. Note the
+lifetime difference from the identically-named `enqueue` flags, which set the durable pin instead.
+Maker-checker still applies, and more strictly than for a stored pin: an agent that ran the
+immediately preceding stage is rejected with a clear error rather than quietly swapped for another
+(the exceptions are a Worker carrying on from `issue` to `pr`, and a setup with no other eligible
+provider). `--effort` is validated against `AI_EFFORTS`, and an unknown provider id or a forbidden
+pick rejects the command itself rather than failing the task later. In the GUI the same dropdowns
+also *display* the agent, model, and effort lined up for the next stage — including on a card that
+has never run, which previously named no AI at all.
 
 **Pinning model/effort from an issue body:** the same parser reads task-level
 `[Model: <modelId>]` and `[Effort: <level>]` tags — the auto-trigger equivalent of

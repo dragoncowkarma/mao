@@ -77,6 +77,21 @@ export const PROVIDER_OPTIONS: Record<ProviderKindId, ProviderOptions> = {
   },
 }
 
+/**
+ * The tool identity worth showing next to a provider's name. A provider's `name` is operator-chosen
+ * and needn't say which CLI it drives ("Primary Reviewer" tells you nothing about Codex), so cards
+ * pair the two — but 'custom' (and an unset kind) adds nothing the name doesn't already say.
+ */
+export function providerToolKind(provider: { providerKindId?: ProviderKindId }): ProviderKindId | undefined {
+  return provider.providerKindId && provider.providerKindId !== 'custom' ? provider.providerKindId : undefined
+}
+
+/** A provider's name paired with its tool, for single-string display. See `providerToolKind()`. */
+export function providerToolLabel(provider: { name: string; providerKindId?: ProviderKindId }): string {
+  const kind = providerToolKind(provider)
+  return kind ? `${provider.name} · ${kind}` : provider.name
+}
+
 /** Returns model options for a given provider kind. Falls back to custom if unknown. */
 export function getProviderOptions(kindId?: ProviderKindId): ProviderOptions {
   return kindId ? (PROVIDER_OPTIONS[kindId] ?? PROVIDER_OPTIONS.custom) : PROVIDER_OPTIONS.custom

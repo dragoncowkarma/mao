@@ -27,7 +27,8 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
 
 | Path | Role |
 | --- | --- |
-| `core/workflow-engine.ts` | The state machine: queue, stage progression, maker-checker agent routing, CI gate, pause/advance/retry |
+| `core/workflow-engine.ts` | The state machine: queue, stage progression, CI gate, pause/advance/retry (agent routing itself lives in `core/agent-selection.ts`) |
+| `core/agent-selection.ts` | Pure, renderer-importable agent routing: `resolveStageAgent()` (maker-checker + role pins + `allowedStages` + model/effort resolution), `isStageEligible()`, `eligibleAgentsForRun()`, `previewStageAgent()`, plus the `WorkflowRole`/`STAGE_ROLE`/`ProviderOverride`/`RunOverride` definitions (re-exported by `core/workflow-engine.ts`, so `core/assignment.ts` and the shells import them unchanged) |
 | `core/github-service.ts` | Octokit REST wrapper (issues, PRs, labels, reviews, merge, CI status) |
 | `core/git-workspace.ts` | Local git clone/branch/commit/push via `execFile` (no shell) |
 | `core/swarm-runner.ts` | Shell-free launcher and repository/asset validation for the autonomous Swarm Orchestrator |
@@ -147,6 +148,10 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   `model`/`effort` or its active preset. Auto-triggered issues set them via task-level
   `[Model: <id>]` / `[Effort: <level>]` tags in the issue body, parsed by
   `parseProviderOverride()` — the body equivalent of `mao workflow enqueue --model/--effort`.
+  A resolved effort is dropped entirely when the resolved model is flagged `noEffort` in
+  `PROVIDER_OPTIONS` (`core/ai/provider-options.ts`) — no layer of the preference chain knows which
+  model it will land on, and `core/ai/cli-provider.ts` would otherwise append a literal `--effort`
+  flag to an invocation that doesn't take one.
   The model value is passed through verbatim (an unusable one fails provider-side); the
   effort value is validated against `AI_EFFORTS` in `core/ai/types.ts` — that list is the
   single definition the `AiEffort` union is derived from, so a new level must be added
@@ -154,6 +159,30 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   per-match filter: an invalid amendment drops the override instead of falling back to the
   tag it superseded. Every directive tag is ignored inside code fences, inline code
   spans, HTML comments, and blockquotes, so documenting the syntax never acts as a directive.
+- **A step records the tool it ran on, not a pointer to one**: `runStage()` snapshots
+  `providerKindId` onto `task.active` and each `WorkflowStepResult` alongside name/model/effort.
+  `ai:save` replaces the whole provider list at any time — including mid-stage, while a child process
+  is still running on the config `selectAgent()` captured — so resolving a past or in-flight run's
+  tool by looking its `agentId` up in the *current* list can describe it by a configuration it never
+  used, or lose it when the provider is deleted. Only a *prediction* (`previewStageAgent()`) may read
+  the live config, because that is what it is predicting from.
+- **One-shot run overrides (`RunOverride`) are a third, stricter tier**: `retry(taskId, runOverride?)`
+  / `advance(taskId, runOverride?)` accept a `{ providerId?, model?, effort? }` choice — what the
+  Tool/Model/Effort dropdowns on a board or queue card send. It is stored as
+  `QueuedTask.nextRunOverride`, and `runStage()` reads it into a local and clears it from the task
+  **before the entry `notify()` and before any await**, so it applies to exactly one stage execution:
+  neither a failure in that stage nor the next stage auto-advancing can reuse it, and it never
+  touches the saved provider config or the task's durable `providerOverride`. It deliberately
+  survives `restore()` — a crash between the click and the run should still honor the choice.
+  Its `providerId` outranks both `providerOverride.roles[role]` and `providerOverride.providerId`,
+  and it is guarded *more* strictly than either: where a stored pin that would violate maker-checker
+  is silently passed over for another provider, a one-shot **throws** (the operator named this agent
+  for this run; quietly running a different one would be worse than an error). The two exceptions
+  match the stored rules — a Worker re-picking itself across `issue -> pr` is the same role carrying
+  on, and a setup with no other stage-eligible provider relaxes rather than failing.
+  `retry()`/`advance()` validate the override — effort against `AI_EFFORTS`, plus a dry-run
+  `resolveStageAgent()` — *before* mutating the task, so a bad pick rejects the call itself instead
+  of pushing the task to `'error'`.
 - **Single-flight queue**: `processQueue()` runs one stage at a time globally.
   Therefore every external call must be time-bounded. The API provider aborts
   after 5 min, the CLI provider SIGKILLs after 15 min, each actual Octokit HTTP

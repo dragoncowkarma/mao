@@ -468,6 +468,199 @@ describe('WorkflowEngine', () => {
     })
   })
 
+  it('snapshots the provider kind on each step, so a later provider edit cannot relabel a past run', async () => {
+    const engine = new WorkflowEngine(makeFakeGithub())
+    const claudeCli: AiProviderConfig = {
+      id: 'agent-a',
+      name: 'Primary Worker',
+      kind: 'cli',
+      command: 'claude',
+      providerKindId: 'claude',
+    }
+    engine.setProviders([claudeCli, makeProvider('agent-b')])
+
+    const task = engine.enqueue('Snapshot the tool', repo, false)
+    await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'paused')
+
+    // ai:save replaces the provider list wholesale, and may do so mid-run. The recorded step must
+    // keep describing the tool that actually ran, not whatever that id points at now.
+    engine.setProviders([{ ...claudeCli, providerKindId: 'codex', command: 'codex' }, makeProvider('agent-b')])
+
+    const current = engine.getTasks().find((t) => t.id === task.id)!
+    expect(current.history[0]).toMatchObject({ agentId: 'agent-a', providerKindId: 'claude' })
+  })
+
+  describe('one-shot run override (card Tool/Model/Effort dropdowns)', () => {
+    /** Runs `title` with autoAdvance off and parks it at the 'pr' stage, having run 'issue'. */
+    async function pausedAtPr(engine: WorkflowEngine, title: string) {
+      const task = engine.enqueue(title, repo, false)
+      await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'paused')
+      return task.id
+    }
+
+    it('routes one stage to the picked provider, then rotates normally again', async () => {
+      const engine = new WorkflowEngine(makeFakeGithub())
+      engine.setProviders([makeProvider('agent-a'), makeProvider('agent-b'), makeProvider('agent-c')])
+      const id = await pausedAtPr(engine, 'One-shot A')
+
+      // Default rotation would pick agent-b for 'pr' (first provider that isn't issue's agent-a).
+      engine.advance(id, { providerId: 'agent-c' })
+      await waitFor(() => engine.getTasks().find((t) => t.id === id)?.status === 'paused')
+      const afterPr = engine.getTasks().find((t) => t.id === id)!
+      expect(afterPr.history.map((h) => h.agentId)).toEqual(['agent-a', 'agent-c'])
+      // Consumed by that single execution and gone before the stage even started.
+      expect(afterPr.nextRunOverride).toBeUndefined()
+
+      // The next stage falls back to plain maker-checker rotation, with no trace of the pick.
+      engine.advance(id)
+      await waitFor(() => engine.getTasks().find((t) => t.id === id)?.status === 'paused')
+      const afterReview = engine.getTasks().find((t) => t.id === id)!
+      expect(afterReview.history.map((h) => h.agentId)).toEqual(['agent-a', 'agent-c', 'agent-a'])
+      expect(afterReview.providerOverride).toBeUndefined()
+    })
+
+    it('applies a one-shot model/effort to the selected provider without mutating its saved config', async () => {
+      const engine = new WorkflowEngine(makeFakeGithub())
+      const providerA = makeProvider('agent-a')
+      const providerB = makeProvider('agent-b')
+      engine.setProviders([providerA, providerB])
+      const id = await pausedAtPr(engine, 'One-shot B')
+
+      engine.advance(id, { model: 'one-shot-model', effort: 'max' })
+      await waitFor(() => engine.getTasks().find((t) => t.id === id)?.status === 'paused')
+
+      const task = engine.getTasks().find((t) => t.id === id)!
+      expect(task.history[1].model).toBe('one-shot-model')
+      expect(task.history[1].effort).toBe('max')
+      // ...and the stage after it goes back to the provider's own model with no effort.
+      engine.advance(id)
+      await waitFor(() => engine.getTasks().find((t) => t.id === id)?.status === 'paused')
+      const after = engine.getTasks().find((t) => t.id === id)!
+      expect(after.history[2].model).toBe('agent-a-model')
+      expect(after.history[2].effort).toBeUndefined()
+      // The saved provider configs are untouched by any of it.
+      expect(providerA.effort).toBeUndefined()
+      expect(providerB.model).toBe('agent-b-model')
+    })
+
+    it('does not overwrite the task-level providerOverride pin', async () => {
+      const engine = new WorkflowEngine(makeFakeGithub())
+      engine.setProviders([makeProvider('agent-a'), makeProvider('agent-b'), makeProvider('agent-c')])
+      const task = engine.enqueue('One-shot C', repo, false, { providerId: 'agent-b', model: 'pinned-model' })
+      await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'paused')
+
+      engine.advance(task.id, { providerId: 'agent-c', model: 'just-this-once' })
+      await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'paused')
+
+      const current = engine.getTasks().find((t) => t.id === task.id)!
+      expect(current.history[1]).toMatchObject({ agentId: 'agent-c', model: 'just-this-once' })
+      // The durable pin survives untouched and reasserts itself on the following stage.
+      expect(current.providerOverride).toEqual({ providerId: 'agent-b', model: 'pinned-model' })
+      engine.advance(task.id)
+      await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'paused')
+      const after = engine.getTasks().find((t) => t.id === task.id)!
+      expect(after.history[2]).toMatchObject({ agentId: 'agent-b', model: 'pinned-model' })
+    })
+
+    it('lets a Worker re-pick itself across issue -> pr, but blocks it across a role boundary', async () => {
+      const engine = new WorkflowEngine(makeFakeGithub())
+      engine.setProviders([makeProvider('agent-a'), makeProvider('agent-b')])
+      const id = await pausedAtPr(engine, 'One-shot D')
+
+      // issue -> pr is the same Worker role continuing, not a check on its own work.
+      engine.advance(id, { providerId: 'agent-a' })
+      await waitFor(() => engine.getTasks().find((t) => t.id === id)?.status === 'paused')
+      expect(engine.getTasks().find((t) => t.id === id)!.history.map((h) => h.agentId)).toEqual([
+        'agent-a',
+        'agent-a',
+      ])
+
+      // pr -> review crosses into the Reviewer role, so agent-a may not check itself.
+      expect(() => engine.advance(id, { providerId: 'agent-a' })).toThrow(/maker-checker requires a different/i)
+      const current = engine.getTasks().find((t) => t.id === id)!
+      // The rejected click leaves the task exactly as it was — still paused, still armed with nothing.
+      expect(current.status).toBe('paused')
+      expect(current.stage).toBe('review')
+      expect(current.nextRunOverride).toBeUndefined()
+    })
+
+    it('allows picking the only registered provider even across a role boundary', async () => {
+      const engine = new WorkflowEngine(makeFakeGithub())
+      engine.setProviders([makeProvider('agent-a')])
+      const id = await pausedAtPr(engine, 'One-shot E')
+
+      engine.advance(id, { providerId: 'agent-a' })
+      await waitFor(() => engine.getTasks().find((t) => t.id === id)?.status === 'paused')
+      // 'review' after 'pr' is a role boundary, but there is no one else to hand it to — the same
+      // relaxation the no-preference path applies in a single-provider setup.
+      engine.advance(id, { providerId: 'agent-a' })
+      await waitFor(() => engine.getTasks().find((t) => t.id === id)?.status === 'paused')
+      expect(engine.getTasks().find((t) => t.id === id)!.history.map((h) => h.agentId)).toEqual([
+        'agent-a',
+        'agent-a',
+        'agent-a',
+      ])
+    })
+
+    it('rejects an unknown provider, an unknown effort, and a stage-ineligible pick without touching the task', async () => {
+      const engine = new WorkflowEngine(makeFakeGithub())
+      engine.setProviders([makeProvider('agent-a'), makeProvider('agent-b', ['review'])])
+      const id = await pausedAtPr(engine, 'One-shot F')
+
+      expect(() => engine.advance(id, { providerId: 'nobody' })).toThrow(/unknown provider/i)
+      expect(() => engine.advance(id, { effort: 'turbo' as never })).toThrow(/unknown reasoning effort/i)
+      expect(() => engine.advance(id, { providerId: 'agent-b' })).toThrow(/not configured to handle the "pr" stage/i)
+
+      const current = engine.getTasks().find((t) => t.id === id)!
+      expect(current.status).toBe('paused')
+      expect(current.history).toHaveLength(1)
+      expect(current.nextRunOverride).toBeUndefined()
+    })
+
+    it('carries a one-shot through retry() of a failed stage, and drops it once consumed', async () => {
+      let failNext = true
+      const github = makeFakeGithub({
+        reviewPullRequest: vi.fn(async () => {
+          if (failNext) {
+            failNext = false
+            throw new Error('reviewPullRequest transient failure')
+          }
+        }),
+      })
+      const engine = new WorkflowEngine(github)
+      engine.setProviders([makeProvider('agent-a'), makeProvider('agent-b'), makeProvider('agent-c')])
+
+      const task = engine.enqueue('One-shot G', repo)
+      await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'error')
+      const failed = engine.getTasks().find((t) => t.id === task.id)!
+      expect(failed.stage).toBe('review')
+
+      // 'pr' ran as agent-b, so the default retry would pick agent-a; ask for agent-c instead.
+      engine.retry(task.id, { providerId: 'agent-c', effort: 'high' })
+      await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'done')
+
+      const done = engine.getTasks().find((t) => t.id === task.id)!
+      expect(done.history.map((h) => h.agentId)).toEqual(['agent-a', 'agent-b', 'agent-c', 'agent-a'])
+      expect(done.history[2].effort).toBe('high')
+      // The merge stage that followed is untouched by the one-shot.
+      expect(done.history[3].effort).toBeUndefined()
+      expect(done.nextRunOverride).toBeUndefined()
+    })
+
+    it('treats an all-empty override as no override at all', async () => {
+      const engine = new WorkflowEngine(makeFakeGithub())
+      engine.setProviders([makeProvider('agent-a'), makeProvider('agent-b')])
+      const id = await pausedAtPr(engine, 'One-shot H')
+
+      // What an untouched dropdown row posts.
+      engine.advance(id, { providerId: undefined, model: undefined, effort: undefined })
+      await waitFor(() => engine.getTasks().find((t) => t.id === id)?.status === 'paused')
+      const current = engine.getTasks().find((t) => t.id === id)!
+      expect(current.history.map((h) => h.agentId)).toEqual(['agent-a', 'agent-b'])
+      expect(current.nextRunOverride).toBeUndefined()
+    })
+  })
+
   describe('allowedStages', () => {
     it('restricts a provider to only its allowed stages, routing other stages to an eligible provider', async () => {
       const github = makeFakeGithub()

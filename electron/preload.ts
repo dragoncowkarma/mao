@@ -29,6 +29,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.invoke('github:fetchTasks', owner, repo),
     fetchTaskDetail: (owner: string, repo: string, number: number): Promise<GithubTaskDetail> =>
       ipcRenderer.invoke('github:fetchTaskDetail', owner, repo, number),
+    /** Rejects (leaving the stored list untouched) when a newly added repo fails the write-permission preflight. */
     setRepos: (repos: RepoRef[]): Promise<void> => ipcRenderer.invoke('github:setRepos', repos),
     getRepos: (): Promise<RepoRef[]> => ipcRenderer.invoke('github:getRepos'),
     autoTriggerStatus: (owner: string, repo: string): Promise<AutoTriggerStatus> =>

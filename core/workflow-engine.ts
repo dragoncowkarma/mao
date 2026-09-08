@@ -393,17 +393,29 @@ export class WorkflowEngine extends EventEmitter {
 
   private async runStage(task: QueuedTask) {
     task.status = 'running'
-    // A one-shot override belongs to exactly this execution. Read it out and clear it from the task
-    // up front — before the entry notify() persists anything, and before any await — so that neither
-    // a failure in this stage nor the next stage auto-advancing can silently reuse a choice the
-    // operator made for a single run.
+    // A one-shot override belongs to exactly this execution. Read it out up front, but do NOT clear
+    // it yet — the permission preflight below can reject the stage before any work happens, and
+    // burning the operator's single-run choice on an execution that never ran would be a silent loss.
     const oneShot = task.nextRunOverride
-    task.nextRunOverride = undefined
     try {
       // Entry notify lives inside the try: a throwing 'change' listener (e.g. createMaoApp's
       // synchronous store.set) must land the task in 'error' via the catch below instead of
       // leaving it stuck at 'running' forever with no path back to retry().
       this.notify()
+
+      // Preflight before anything external happens — no AI provider call, no git clone or push, no
+      // GitHub write. This is the single chokepoint every execution path funnels through (direct
+      // enqueue, auto-trigger's enqueueFromIssue, restore/resume, retry(), advance()), so a repo whose
+      // access was revoked after registration, or one enqueued around the registration check, still
+      // cannot reach a write. A failure throws into the catch below: status 'error' at the *same*
+      // stage, so retry() re-runs it unchanged once the grant is restored. Transient lookup failures
+      // (rate limit, 5xx, the 60s request deadline) surface the same way rather than hanging.
+      await this.github.assertRepoWorkflowWritable(task.repo.owner, task.repo.repo)
+
+      // Past the preflight, this execution is really happening — so consume the one-shot now, before
+      // selectAgent() and before any further await. Neither a failure from here on nor the next stage
+      // auto-advancing can then reuse a choice the operator made for a single run.
+      task.nextRunOverride = undefined
 
       const agentConfig = this.selectAgent(task, oneShot)
       const usesCodeEdits = task.stage === 'pr' && agentConfig.kind === 'cli' && !!this.workspaceRoot

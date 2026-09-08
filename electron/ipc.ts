@@ -3,6 +3,7 @@ import path from 'node:path'
 import { store } from './store.ts'
 import { createMaoApp } from '../core/app.ts'
 import { startAutoTrigger } from '../core/auto-trigger.ts'
+import { assertReposRegistrable } from '../core/repo-registry.ts'
 import { assertCanRelaunchForUpdate, checkForUpdates, countRunningWorkflowTasks } from '../core/self-update.ts'
 import { createAiProvider, type AiProviderConfig } from '../core/ai/index.ts'
 import type { RepoRef, RunOverride } from '../core/workflow-engine.ts'
@@ -63,7 +64,11 @@ export function registerIpcHandlers() {
     return githubService.fetchTaskDetail(owner, repo, number)
   })
 
-  ipcMain.handle('github:setRepos', (_event, repos: RepoRef[]) => {
+  // Newly registered repos are preflighted in core before anything is persisted; updates, removals
+  // and reordering are not, so a repo whose access was revoked can still be turned off or removed.
+  // The rule itself lives in core/repo-registry.ts — shared verbatim with `mao repos add`.
+  ipcMain.handle('github:setRepos', async (_event, repos: RepoRef[]) => {
+    await assertReposRegistrable(githubService, store.get('githubRepos'), repos)
     store.set('githubRepos', repos)
   })
 

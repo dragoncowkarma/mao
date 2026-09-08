@@ -366,3 +366,237 @@ describe('GithubService.createPullRequest', () => {
     ).rejects.toThrow(/Validation Failed/)
   })
 })
+
+describe('GithubService.checkRepoWorkflowCapability', () => {
+  const REPO_BODY = {
+    archived: false,
+    disabled: false,
+    has_issues: true,
+    private: true,
+    permissions: { admin: false, push: true, pull: true },
+  }
+
+  /** Drives a real Octokit so header handling and status classification are exercised end to end. */
+  function serviceWith(handler: (url: string) => Response) {
+    const requestFetch = vi.fn(async (input: string | URL | Request) => handler(String(input)))
+    const service = new GithubService(requestFetch as typeof globalThis.fetch)
+    service.setToken('test-token')
+    return { service, requestFetch }
+  }
+
+  it('returns a token-missing verdict without making any request when no token is set', async () => {
+    const requestFetch = vi.fn()
+    const service = new GithubService(requestFetch as unknown as typeof globalThis.fetch)
+
+    const capability = await service.checkRepoWorkflowCapability('acme', 'widgets')
+
+    expect(capability.gaps).toEqual(['token-missing'])
+    expect(requestFetch).not.toHaveBeenCalled()
+  })
+
+  it('passes a writable repo and reads no scopes header as an unidentified credential', async () => {
+    const { service } = serviceWith(() => jsonResponse(REPO_BODY))
+
+    const capability = await service.checkRepoWorkflowCapability('acme', 'widgets')
+
+    expect(capability.ok).toBe(true)
+    expect(capability.observed.credential).toBe('unknown')
+    expect(capability.unverified).toEqual(['issues-write', 'contents-write', 'pull-requests-write'])
+  })
+
+  it('reads x-oauth-scopes off the real response to identify a classic token', async () => {
+    const { service } = serviceWith(() => jsonResponse(REPO_BODY, 200, { 'x-oauth-scopes': 'repo, read:org' }))
+
+    const capability = await service.checkRepoWorkflowCapability('acme', 'widgets')
+
+    expect(capability.observed.credential).toBe('classic')
+    expect(capability.unverified).toEqual([])
+  })
+
+  it('fails a classic token whose scopes cannot write, even though the repo role says push', async () => {
+    const { service } = serviceWith(() => jsonResponse(REPO_BODY, 200, { 'x-oauth-scopes': 'read:user' }))
+
+    const capability = await service.checkRepoWorkflowCapability('acme', 'widgets')
+
+    expect(capability.ok).toBe(false)
+    expect(capability.gaps).toEqual(['oauth-scope-missing'])
+  })
+
+  it('reports a read-only repository as no-push-permission', async () => {
+    const { service } = serviceWith(() =>
+      jsonResponse({ ...REPO_BODY, permissions: { admin: false, push: false, pull: true } }),
+    )
+
+    await expect(service.checkRepoWorkflowCapability('acme', 'widgets')).resolves.toMatchObject({
+      ok: false,
+      gaps: ['no-push-permission'],
+    })
+  })
+
+  it('reports 404 as repo-not-found rather than letting it surface as a raw HTTP error', async () => {
+    const { service } = serviceWith(() => jsonResponse({ message: 'Not Found' }, 404))
+
+    await expect(service.checkRepoWorkflowCapability('acme', 'widgets')).resolves.toMatchObject({
+      gaps: ['repo-not-found'],
+    })
+  })
+
+  it('reports 401 as bad-credentials', async () => {
+    const { service } = serviceWith(() => jsonResponse({ message: 'Bad credentials' }, 401))
+
+    await expect(service.checkRepoWorkflowCapability('acme', 'widgets')).resolves.toMatchObject({
+      gaps: ['bad-credentials'],
+    })
+  })
+
+  it('reports 451 as legally-unavailable instead of retrying a takedown forever', async () => {
+    const { service } = serviceWith(() => jsonResponse({ message: 'Repository access blocked' }, 451))
+
+    await expect(service.checkRepoWorkflowCapability('acme', 'widgets')).resolves.toMatchObject({
+      gaps: ['legally-unavailable'],
+    })
+  })
+
+  describe('403 classification', () => {
+    it('reports a SAML-SSO-protected org as sso-authorization-required', async () => {
+      const { service } = serviceWith(() =>
+        jsonResponse({ message: 'Resource protected by organization SAML enforcement.' }, 403, {
+          'x-github-sso': 'required; url=https://github.com/orgs/acme/sso',
+        }),
+      )
+
+      await expect(service.checkRepoWorkflowCapability('acme', 'widgets')).resolves.toMatchObject({
+        gaps: ['sso-authorization-required'],
+      })
+    })
+
+    it('reports a suspended installation as installation-suspended', async () => {
+      const { service } = serviceWith(() =>
+        jsonResponse({ message: 'This installation has been suspended' }, 403),
+      )
+
+      await expect(service.checkRepoWorkflowCapability('acme', 'widgets')).resolves.toMatchObject({
+        gaps: ['installation-suspended'],
+      })
+    })
+
+    it('reports an ungranted fine-grained token as resource-not-accessible', async () => {
+      // The exact shape of the case issue #48 exists for: the token was never granted this repo.
+      const { service } = serviceWith(() =>
+        jsonResponse({ message: 'Resource not accessible by personal access token' }, 403),
+      )
+
+      await expect(service.checkRepoWorkflowCapability('acme', 'widgets')).resolves.toMatchObject({
+        gaps: ['resource-not-accessible'],
+      })
+    })
+
+    // These go through the fake REST surface rather than a real Octokit: the throttling plugin
+    // *sleeps until the reset* on a genuine rate-limited response, which is correct behavior but
+    // would make the test wait out the clock. The classification itself is what is under test.
+    function serviceThrowing(error: unknown) {
+      const { service } = makeServiceWithFakeOctokit({
+        repos: {
+          get: vi.fn(async () => {
+            throw error
+          }),
+        },
+      })
+      return service
+    }
+
+    it('rethrows a primary rate limit rather than calling it a permission problem', async () => {
+      const service = serviceThrowing(
+        Object.assign(new Error('API rate limit exceeded'), {
+          status: 403,
+          response: { headers: { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': '1788899999' } },
+        }),
+      )
+
+      await expect(service.checkRepoWorkflowCapability('acme', 'widgets')).rejects.toThrow(/rate limit/i)
+    })
+
+    it('rethrows a secondary rate limit identified by Retry-After', async () => {
+      const service = serviceThrowing(
+        Object.assign(new Error('You have exceeded a secondary rate limit'), {
+          status: 403,
+          response: { headers: { 'retry-after': '60' } },
+        }),
+      )
+
+      await expect(service.checkRepoWorkflowCapability('acme', 'widgets')).rejects.toThrow(/secondary rate limit/i)
+    })
+
+    it('prefers the transient reading when a rate-limited response also looks inaccessible', async () => {
+      // Rate limiting is checked first on purpose: mislabeling it as a permanent permission gap
+      // would tell the operator to fix a grant that was never the problem.
+      const service = serviceThrowing(
+        Object.assign(new Error('API rate limit exceeded for installation'), {
+          status: 403,
+          response: { headers: { 'x-ratelimit-remaining': '0', 'x-github-sso': 'required; url=https://example.test' } },
+        }),
+      )
+
+      await expect(service.checkRepoWorkflowCapability('acme', 'widgets')).rejects.toThrow(/rate limit/i)
+    })
+
+    it('rethrows an unrecognized 403 instead of guessing at a permanent gap', async () => {
+      const { service } = serviceWith(() =>
+        jsonResponse({ message: 'Something else entirely' }, 403),
+      )
+
+      await expect(service.checkRepoWorkflowCapability('acme', 'widgets')).rejects.toThrow(/Something else entirely/)
+    })
+  })
+
+  it('lets the 60s request deadline surface as a transient error, not a capability verdict', async () => {
+    accelerateRequestTimeout()
+    const requestFetch = vi.fn((_input: string | URL | Request, init?: RequestInit) => {
+      const signal = requireSignal(init)
+      return new Promise<Response>((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+      })
+    })
+    const service = new GithubService(requestFetch as typeof globalThis.fetch)
+    service.setToken('test-token')
+
+    await expect(service.checkRepoWorkflowCapability('acme', 'widgets')).rejects.toThrow(
+      'GitHub request timed out after 60s',
+    )
+  })
+})
+
+describe('GithubService.assertRepoWorkflowWritable', () => {
+  function serviceReturning(body: unknown, status = 200) {
+    const requestFetch = vi.fn(async () => jsonResponse(body, status))
+    const service = new GithubService(requestFetch as typeof globalThis.fetch)
+    service.setToken('test-token')
+    return service
+  }
+
+  it('resolves with the verdict when the repo has no known blocker', async () => {
+    const service = serviceReturning({ has_issues: true, permissions: { push: true } })
+    await expect(service.assertRepoWorkflowWritable('acme', 'widgets')).resolves.toMatchObject({ ok: true })
+  })
+
+  it('throws an actionable, secret-free error naming the repo and every gap', async () => {
+    const service = serviceReturning({ archived: true, has_issues: false, permissions: { push: false } })
+
+    const error = await captureError(service.assertRepoWorkflowWritable('acme', 'widgets'))
+
+    expect(error.name).toBe('RepoCapabilityError')
+    expect(error.message).toContain('acme/widgets')
+    expect(error.message).toMatch(/archived/)
+    expect(error.message).toMatch(/Issues/)
+    expect(error.message).toMatch(/read-only/)
+    expect(error.message).not.toContain('test-token')
+  })
+
+  it('applies to MAO\'s own repository with no exemption', async () => {
+    const service = serviceReturning({ has_issues: true, permissions: { push: false } })
+
+    await expect(service.assertRepoWorkflowWritable('dragoncowkarma', 'mao')).rejects.toThrow(
+      /dragoncowkarma\/mao is missing permissions/,
+    )
+  })
+})

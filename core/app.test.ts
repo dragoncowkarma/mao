@@ -97,12 +97,15 @@ describe('createMaoApp', () => {
 
     const { workflowEngine } = createMaoApp({ store, workspaceRoot: path.join(dataDir, 'workspaces'), dataDir, resume: true })
 
-    // No AI providers registered, so the resumed stage fails fast and predictably — proving
+    // No GitHub token configured, so runStage's repo-permission preflight rejects the resumed stage
+    // before it reaches provider selection — failing fast and predictably, which is what proves
     // processing actually started (as opposed to the task sitting untouched at 'pending').
     await new Promise((r) => setTimeout(r, 20))
 
     const task = workflowEngine.getTasks().find((t) => t.id === 'leftover-task-2')!
     expect(task.status).toBe('error')
-    expect(task.error).toMatch(/No AI providers registered/)
+    expect(task.error).toMatch(/no GitHub token is configured/)
+    // Still stalled at its own stage, so restoring the token and retrying re-runs it unchanged.
+    expect(task.stage).toBe('issue')
   })
 })

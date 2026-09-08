@@ -29,7 +29,9 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
 | --- | --- |
 | `core/workflow-engine.ts` | The state machine: queue, stage progression, CI gate, pause/advance/retry (agent routing itself lives in `core/agent-selection.ts`) |
 | `core/agent-selection.ts` | Pure, renderer-importable agent routing: `resolveStageAgent()` (maker-checker + role pins + `allowedStages` + model/effort resolution), `isStageEligible()`, `eligibleAgentsForRun()`, `previewStageAgent()`, plus the `WorkflowRole`/`STAGE_ROLE`/`ProviderOverride`/`RunOverride` definitions (re-exported by `core/workflow-engine.ts`, so `core/assignment.ts` and the shells import them unchanged) |
-| `core/github-service.ts` | Octokit REST wrapper (issues, PRs, labels, reviews, merge, CI status) |
+| `core/github-service.ts` | Octokit REST wrapper (issues, PRs, labels, reviews, merge, CI status) — plus the read-only `checkRepoWorkflowCapability()` / `assertRepoWorkflowWritable()` preflight |
+| `core/repo-capabilities.ts` | Pure verdict logic for "can this credential run the pipeline in this repo?" — `evaluateRepoCapability()`, `describeRepoCapability()`, `describeUnverifiedGrants()`, `RepoCapabilityError` |
+| `core/repo-registry.ts` | The single definition of "this repo entry is newly registered" — `reposNeedingCapabilityCheck()` / `assertReposRegistrable()`, shared by `github:setRepos` and `mao repos add` |
 | `core/git-workspace.ts` | Local git clone/branch/commit/push via `execFile` (no shell) |
 | `core/swarm-runner.ts` | Shell-free launcher and repository/asset validation for the autonomous Swarm Orchestrator |
 | `core/auto-trigger.ts` | Per-repo polling scheduler; auto-enqueues new open issues |
@@ -105,6 +107,9 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   `electron/preload.ts` (same channel string, same namespace), `src/electron.d.ts`
   (mirror the signature). Channel strings are duplicated literals; a typo surfaces
   only at runtime.
+- **Repository registration** → the add-vs-update rule lives ONLY in `core/repo-registry.ts`;
+  `electron/ipc.ts`'s `github:setRepos` and `cli/index.ts`'s `repos add` must both stay one-line
+  delegations to it. Re-implementing the diff in either shell is how the two paths silently drift.
 - **New store field** → both `MaoStoreSchema` and `MAO_STORE_DEFAULTS` in
   `core/store.ts` (tsc enforces the pair). `electron/store.ts` and `FileStore` pick
   the field up automatically.
@@ -183,6 +188,23 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   `retry()`/`advance()` validate the override — effort against `AI_EFFORTS`, plus a dry-run
   `resolveStageAgent()` — *before* mutating the task, so a bad pick rejects the call itself instead
   of pushing the task to `'error'`.
+- **Every stage is preflighted for repository write access**: `runStage()` awaits
+  `github.assertRepoWorkflowWritable(task.repo…)` inside its `try`, after the entry `notify()` and
+  **before** `selectAgent()` — so no AI provider call, git clone/push, or GitHub write can happen
+  against a repo this credential cannot write. It is the single chokepoint every execution path
+  funnels through (direct `enqueue`, `enqueueFromIssue`, `restore()`/resume, `retry()`, `advance()`),
+  which is what makes registration-time validation non-bypassable. A failure lands in the existing
+  catch: `'error'` at the *same* stage, retryable once the grant is restored. The verdict comes from
+  one non-mutating `repos.get` — never a create-then-delete write probe — and `ok: true` means "no
+  *known* blocker", not proof: a fine-grained token's or GitHub App installation's per-resource
+  grants are unprovable without a write, so they are reported in `capability.unverified` and never
+  folded into `ok`. Only permanent conditions become gaps; rate limiting, 5xx, socket errors and the
+  60s deadline are rethrown so they stay transient. **No repo is exempt, `dragoncowkarma/mao`
+  included.**
+- **The one-shot `nextRunOverride` is consumed only by a run that actually starts**: `runStage()`
+  reads it before the preflight but clears it *after* the preflight passes. A stage rejected for
+  missing permission never happened, so burning the operator's single-run tool/model/effort choice on
+  it would silently change which agent the post-restore retry uses.
 - **Single-flight queue**: `processQueue()` runs one stage at a time globally.
   Therefore every external call must be time-bounded. The API provider aborts
   after 5 min, the CLI provider SIGKILLs after 15 min, each actual Octokit HTTP
@@ -246,6 +268,12 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   run`, `mao swarm` (except `--dry-run`/`--status`), `refreshRepo`, and the e2e
   harness all count: they drive the pipeline,
   which performs those writes unattended.
+- **Registration and every stage are gated on a read-only permission preflight**
+  (`core/repo-capabilities.ts`). Adding a repo — via the GUI sidebar or `mao repos add` —
+  persists nothing unless the check passes; *updating* and *removing* an already-tracked repo
+  deliberately skip it, so a repo whose access was revoked stays manageable. Auto-trigger runs
+  the same check before `fetchTasks`, so an unauthorized repo yields zero `enqueueFromIssue` and
+  zero `workflow-active` label writes. Never add an exemption list.
 - The pipeline creates real issues, branches, PRs, reviews, and merges. Test only
   against throwaway repos (see SKILL.md).
 - `github:refreshRepo` is **not a pure read**: it calls `autoTrigger.pollNow()`

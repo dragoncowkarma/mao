@@ -1,4 +1,11 @@
 import { Octokit } from 'octokit'
+import {
+  RepoCapabilityError,
+  evaluateRepoCapability,
+  type RepoCapabilityFailure,
+  type RepoCapabilitySnapshot,
+  type RepoWorkflowCapability,
+} from './repo-capabilities.ts'
 
 /**
  * A stalled GitHub socket would otherwise block every repository behind the single-flight queue.
@@ -132,6 +139,58 @@ function parseLinkedIssues(body: string): number[] {
   return [...matches].map((m) => parseInt(m[1], 10))
 }
 
+/**
+ * Reads one response header across the shapes Octokit can hand back (a plain lowercase-keyed object,
+ * or a `Headers`-like with `.get()`). Returns `undefined` only when the header is genuinely absent —
+ * never collapses an empty value to `undefined` or vice versa, because for `x-oauth-scopes` the
+ * distinction between "absent" and "present but empty" is itself part of the verdict.
+ */
+function readHeader(headers: unknown, name: string): string | undefined {
+  if (!headers) return undefined
+  if (typeof (headers as { get?: unknown }).get === 'function') {
+    const value = (headers as { get(header: string): string | null }).get(name)
+    return value === null ? undefined : value
+  }
+  const value = (headers as Record<string, unknown>)[name]
+  if (typeof value === 'string') return value
+  return typeof value === 'number' ? String(value) : undefined
+}
+
+/**
+ * Decides whether a failed `repos.get` is a permanent capability verdict or a transient error to
+ * rethrow. Getting this split right is the whole difference between "you lack permission, fix the
+ * grant" and "GitHub was briefly unhappy, retry" — a task must never be told the former about the
+ * latter, and must never retry forever against the former.
+ *
+ * 404 and 401 are unambiguous. 403 (and 429) are not: GitHub uses them both for rate limiting, which
+ * clears on its own, and for several permanent refusals — SAML SSO the credential was never
+ * authorized for, a suspended App installation, and "Resource not accessible by integration /
+ * personal access token", which is precisely how a fine-grained token reports a grant it never had.
+ * Rate limiting is identified first (it is the only genuinely transient one), then the permanent
+ * cases by their signature headers and messages; anything else falls through to a rethrow rather than
+ * being guessed at. 451 is a legal takedown — permanent, and easily mistaken for a transient 4xx.
+ */
+function classifyLookupFailure(err: unknown): RepoCapabilityFailure | undefined {
+  const status = (err as { status?: number } | null)?.status
+  if (status === 404) return 'not-found'
+  if (status === 401) return 'bad-credentials'
+  if (status === 451) return 'legally-unavailable'
+  if (status !== 403 && status !== 429) return undefined
+
+  const headers = (err as { response?: { headers?: unknown } } | null)?.response?.headers
+  const message = err instanceof Error ? err.message : String(err)
+
+  // Transient: primary rate limit (remaining 0) and secondary rate limit (Retry-After / message).
+  if (readHeader(headers, 'x-ratelimit-remaining') === '0') return undefined
+  if (readHeader(headers, 'retry-after') !== undefined) return undefined
+  if (/rate limit/i.test(message)) return undefined
+
+  if (readHeader(headers, 'x-github-sso') !== undefined) return 'sso-authorization-required'
+  if (/installation has been suspended/i.test(message)) return 'installation-suspended'
+  if (/resource not accessible by/i.test(message)) return 'resource-not-accessible'
+  return undefined
+}
+
 export class GithubService {
   private octokit: Octokit | null = null
   private readonly requestFetch: GithubFetch
@@ -216,6 +275,50 @@ export class GithubService {
         url: comment.html_url,
       })),
     }
+  }
+
+  /**
+   * Read-only preflight: does the current credential have what MAO's pipeline needs in this repo?
+   * One `GET /repos/{owner}/{repo}` supplies every signal GitHub is willing to give without a write —
+   * `archived`, `disabled`, `has_issues`, the `permissions` role block, and (for classic tokens only)
+   * the `x-oauth-scopes` response header. The verdict itself is computed by the pure
+   * `evaluateRepoCapability()` in core/repo-capabilities.ts.
+   *
+   * Only *definitive* negatives become part of the verdict — a missing token plus whatever
+   * `classifyLookupFailure()` recognizes as permanent. Everything else (rate limiting, 5xx, socket
+   * errors, this class's own 60s request deadline) is rethrown so the caller surfaces it as a
+   * transient, retryable failure rather than a permanent "you lack permission".
+   */
+  async checkRepoWorkflowCapability(owner: string, repo: string): Promise<RepoWorkflowCapability> {
+    if (!this.octokit) return evaluateRepoCapability({ owner, repo, failure: 'token-missing' })
+
+    try {
+      const response = await this.octokit.rest.repos.get({ owner, repo })
+      return evaluateRepoCapability({
+        owner,
+        repo,
+        repository: response.data as RepoCapabilitySnapshot,
+        // Passed through verbatim: an absent header and an empty one mean different things to
+        // evaluateRepoCapability(), so this must never be normalized to ''.
+        oauthScopes: readHeader(response.headers, 'x-oauth-scopes'),
+      })
+    } catch (err) {
+      const failure = classifyLookupFailure(err)
+      if (failure) return evaluateRepoCapability({ owner, repo, failure })
+      throw err
+    }
+  }
+
+  /**
+   * `checkRepoWorkflowCapability()` as a guard: throws `RepoCapabilityError` (message names the repo
+   * and every missing capability, no secrets) when the repo cannot host the workflow. Callers put this
+   * in front of every externally-visible side effect — registration, a workflow stage, an auto-trigger
+   * enqueue — so a permission problem costs nothing but one read.
+   */
+  async assertRepoWorkflowWritable(owner: string, repo: string): Promise<RepoWorkflowCapability> {
+    const capability = await this.checkRepoWorkflowCapability(owner, repo)
+    if (!capability.ok) throw new RepoCapabilityError(capability)
+    return capability
   }
 
   async addLabel(owner: string, repo: string, issueNumber: number, label: string) {

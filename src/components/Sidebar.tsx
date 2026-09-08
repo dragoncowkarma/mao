@@ -5,7 +5,8 @@ interface SidebarProps {
   repos: RepoRef[]
   selectedIndex: number | null
   onSelect: (index: number) => void
-  onAddRepo: (repo: RepoRef) => void
+  /** Rejects when the repo fails the main process's write-permission preflight — the message is shown in the form. */
+  onAddRepo: (repo: RepoRef) => Promise<void>
   view: 'project' | 'global-settings'
   onViewChange: (view: 'project' | 'global-settings') => void
 }
@@ -14,15 +15,30 @@ export default function Sidebar({ repos, selectedIndex, onSelect, onAddRepo, vie
   const [adding, setAdding] = useState(false)
   const [owner, setOwner] = useState('')
   const [repo, setRepo] = useState('')
+  const [checking, setChecking] = useState(false)
+  const [addError, setAddError] = useState('')
 
-  function submitAdd() {
+  /**
+   * The main process preflights issue/PR write access before it persists anything, so this can fail
+   * on a real repository. Keep the form open with what the operator typed and show the message —
+   * clearing the fields would make them retype it just to read the reason.
+   */
+  async function submitAdd() {
     const trimmedOwner = owner.trim()
     const trimmedRepo = repo.trim()
-    if (!trimmedOwner || !trimmedRepo) return
-    onAddRepo({ owner: trimmedOwner, repo: trimmedRepo })
-    setOwner('')
-    setRepo('')
-    setAdding(false)
+    if (!trimmedOwner || !trimmedRepo || checking) return
+    setChecking(true)
+    setAddError('')
+    try {
+      await onAddRepo({ owner: trimmedOwner, repo: trimmedRepo })
+      setOwner('')
+      setRepo('')
+      setAdding(false)
+    } catch (err) {
+      setAddError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setChecking(false)
+    }
   }
 
   return (
@@ -34,7 +50,13 @@ export default function Sidebar({ repos, selectedIndex, onSelect, onAddRepo, vie
       <div className="sidebar-section flex-1">
         <div className="flex items-center justify-between mb-1">
           <span className="sidebar-heading">Projects</span>
-          <button onClick={() => setAdding((v) => !v)} className="btn btn-ghost px-1 text-xs">
+          <button
+            onClick={() => {
+              setAdding((v) => !v)
+              setAddError('')
+            }}
+            className="btn btn-ghost px-1 text-xs"
+          >
             + Add
           </button>
         </div>
@@ -56,9 +78,14 @@ export default function Sidebar({ repos, selectedIndex, onSelect, onAddRepo, vie
               onChange={(e) => setRepo(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && submitAdd()}
             />
-            <button onClick={submitAdd} className="btn btn-primary text-xs">
-              Add
+            <button onClick={submitAdd} className="btn btn-primary text-xs" disabled={checking}>
+              {checking ? 'Checking access…' : 'Add'}
             </button>
+            {addError && (
+              <p className="text-xs" style={{ color: 'var(--color-accent-700)' }}>
+                {addError}
+              </p>
+            )}
           </div>
         )}
 

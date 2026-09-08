@@ -26,6 +26,7 @@ declare global {
         setToken: (token: string) => Promise<void>
         fetchTasks: (owner: string, repo: string) => Promise<GithubTask[]>
         fetchTaskDetail: (owner: string, repo: string, number: number) => Promise<GithubTaskDetail>
+        /** Rejects (leaving the stored list untouched) when a newly added repo fails the write-permission preflight. */
         setRepos: (repos: RepoRef[]) => Promise<void>
         getRepos: () => Promise<RepoRef[]>
         autoTriggerStatus: (owner: string, repo: string) => Promise<AutoTriggerStatus>

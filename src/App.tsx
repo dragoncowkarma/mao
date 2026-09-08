@@ -107,11 +107,17 @@ export default function App() {
     }
   }, [repos, selectedIndex])
 
+  /**
+   * Persist first, then mirror into React state. Adding a repository is now preflighted in the main
+   * process (see core/repo-registry.ts), so setRepos can legitimately reject — and an optimistic
+   * setState would leave the sidebar showing a repository the store never accepted.
+   */
   async function persistRepos(next: RepoRef[]) {
-    setRepos(next)
     await window.electronAPI.github.setRepos(next)
+    setRepos(next)
   }
 
+  /** Rejects when the repo fails the write-permission preflight; Sidebar renders the message. */
   async function addRepo(repo: RepoRef) {
     const exists = repos.some((r) => r.owner === repo.owner && r.repo === repo.repo)
     if (exists) return

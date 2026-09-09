@@ -178,6 +178,36 @@ describe('evaluateRepoCapability', () => {
       expect(message).toMatch(/does not exist, or this credential cannot see it/)
     })
 
+    it('tells a rejected credential to be replaced, not to be granted repository access', () => {
+      // A 401 is authentication, not authorization — no repository grant is reachable or relevant.
+      const capability = evaluateRepoCapability({ owner: 'acme', repo: 'widgets', failure: 'bad-credentials' })
+      const message = describeRepoCapability(capability)
+      expect(message).not.toMatch(/is missing permissions|Grant this credential/)
+      expect(message).toMatch(/Configure a working GitHub token/)
+    })
+
+    it('points SAML SSO at the organization authorization, not at a repository grant', () => {
+      const capability = evaluateRepoCapability({
+        owner: 'acme',
+        repo: 'widgets',
+        failure: 'sso-authorization-required',
+      })
+      const message = describeRepoCapability(capability)
+      expect(message).not.toMatch(/is missing permissions|Grant this credential/)
+      expect(message).toMatch(/Authorize this credential for the organization's SAML SSO/)
+    })
+
+    it('points a suspended installation at unsuspending it, not at a repository grant', () => {
+      const capability = evaluateRepoCapability({
+        owner: 'acme',
+        repo: 'widgets',
+        failure: 'installation-suspended',
+      })
+      const message = describeRepoCapability(capability)
+      expect(message).not.toMatch(/is missing permissions|Grant this credential/)
+      expect(message).toMatch(/Unsuspend the GitHub App installation/)
+    })
+
     it('keeps the grant-write-access remedy for verdicts a credential change can actually fix', () => {
       const capability = evaluateRepoCapability({
         owner: 'acme',
@@ -260,6 +290,44 @@ describe('evaluateRepoCapability', () => {
       )
       expect(capability.unverified).toEqual([])
     })
+  })
+})
+
+describe('describeRepoCapability remedy coverage', () => {
+  // This defect class — a gap whose remedy names a fix that cannot work — has recurred three times,
+  // each from a gap nobody remembered to classify. GAP_REMEDY/REMEDY_RANK/REMEDY_TEXT are exhaustive
+  // Records so tsc catches an unclassified gap, and this pins the behaviour that matters: every
+  // verdict must end in a real instruction, and only a missing grant may be called a permissions problem.
+  const everyGap: Array<[string, RepoCapabilityProbe]> = [
+    ['token-missing', { owner: 'acme', repo: 'widgets', failure: 'token-missing' }],
+    ['not-found', { owner: 'acme', repo: 'widgets', failure: 'not-found' }],
+    ['bad-credentials', { owner: 'acme', repo: 'widgets', failure: 'bad-credentials' }],
+    ['sso', { owner: 'acme', repo: 'widgets', failure: 'sso-authorization-required' }],
+    ['installation-suspended', { owner: 'acme', repo: 'widgets', failure: 'installation-suspended' }],
+    ['resource-not-accessible', { owner: 'acme', repo: 'widgets', failure: 'resource-not-accessible' }],
+    ['legally-unavailable', { owner: 'acme', repo: 'widgets', failure: 'legally-unavailable' }],
+    ['archived', { owner: 'acme', repo: 'widgets', repository: { archived: true, has_issues: true, permissions: { push: true } } }],
+    ['disabled', { owner: 'acme', repo: 'widgets', repository: { disabled: true, has_issues: true, permissions: { push: true } } }],
+    ['issues-disabled', { owner: 'acme', repo: 'widgets', repository: { has_issues: false, permissions: { push: true } } }],
+    ['permissions-unknown', { owner: 'acme', repo: 'widgets', repository: { has_issues: true } }],
+    ['no-push-permission', { owner: 'acme', repo: 'widgets', repository: { has_issues: true, permissions: { push: false } } }],
+    ['oauth-scope-missing', { owner: 'acme', repo: 'widgets', oauthScopes: 'gist', repository: { has_issues: true, private: true, permissions: { push: true } } }],
+  ]
+
+  it.each(everyGap)('gives %s a remedy sentence that is actually actionable', (_name, input) => {
+    const capability = evaluateRepoCapability(input)
+    expect(capability.ok).toBe(false)
+    const message = describeRepoCapability(capability)
+
+    // Never an empty or malformed tail, and never the placeholder an unmapped gap would leave.
+    expect(message).not.toMatch(/undefined|: \./)
+    expect(message).toMatch(/(retry\.|track a different repository\.)$/)
+
+    // "missing permissions" is reserved for gaps a repository grant can actually fix.
+    const grantable = ['resource-not-accessible', 'permissions-unknown', 'no-push-permission', 'oauth-scope-missing']
+    const claimsPermissions = message.includes('is missing permissions')
+    expect(claimsPermissions).toBe(capability.gaps.some((gap) => grantable.includes(gap)))
+    expect(message.includes('Grant this credential write access')).toBe(claimsPermissions)
   })
 })
 

@@ -243,70 +243,83 @@ export function evaluateRepoCapability(probe: RepoCapabilityProbe): RepoWorkflow
 }
 
 /**
- * Gaps no credential change can fix — the repository itself is in a state that rejects the workflow.
- * These take precedence when a verdict spans both buckets, because until the repository state is
- * changed on GitHub, granting the credential anything at all still leaves every write refused.
+ * What the operator actually has to change to clear a gap.
+ *
+ * Modelled as exhaustive `Record`s rather than membership arrays on purpose: the same defect — a gap
+ * getting a remedy sentence that names a fix which cannot work — has now been introduced three times
+ * in this one function, each time by a gap that nobody remembered to classify. With the mappings
+ * keyed by the union, forgetting one is a compile error rather than a wrong sentence shown to an
+ * operator at the moment they are already stuck.
  */
-const REPOSITORY_STATE_GAPS: RepoCapabilityGap[] = [
-  'repo-not-found',
-  'archived',
-  'disabled',
-  'issues-disabled',
-  'legally-unavailable',
-]
+type GapRemedy =
+  | 'repository-state'
+  | 'configure-token'
+  | 'replace-token'
+  | 'authorize-sso'
+  | 'unsuspend-installation'
+  | 'grant-write'
 
-/** Gaps a credential change can actually fix. */
-const CREDENTIAL_GAPS: RepoCapabilityGap[] = [
-  'bad-credentials',
-  'sso-authorization-required',
-  'installation-suspended',
-  'resource-not-accessible',
-  'permissions-unknown',
-  'no-push-permission',
-  'oauth-scope-missing',
-]
+const GAP_REMEDY: Record<RepoCapabilityGap, GapRemedy> = {
+  'token-missing': 'configure-token',
+  // A 401 is authentication, not authorization: no repository grant is reachable or relevant.
+  'bad-credentials': 'replace-token',
+  'sso-authorization-required': 'authorize-sso',
+  'installation-suspended': 'unsuspend-installation',
+  'resource-not-accessible': 'grant-write',
+  // The repository itself refuses the workflow; a credential change cannot help while it stands.
+  'repo-not-found': 'repository-state',
+  'legally-unavailable': 'repository-state',
+  archived: 'repository-state',
+  disabled: 'repository-state',
+  'issues-disabled': 'repository-state',
+  'permissions-unknown': 'grant-write',
+  'no-push-permission': 'grant-write',
+  'oauth-scope-missing': 'grant-write',
+}
 
 /**
- * Actionable, secret-free explanation of a failed verdict. Names the repository and every missing
- * capability, and interpolates nothing but the owner/repo pair and this module's own fixed strings —
- * never the token, an authenticated remote URL, or a raw GitHub response. The result is persisted in
- * a task error, printed by both shells, and rendered in the GUI, so it must stay safe to write down.
- *
- * The remediation sentence is derived from the gaps rather than fixed, because only about half of them
- * are credential problems. Telling an operator with no token configured to "grant this credential write
- * access", or saying an archived or non-existent repository is "missing permissions", names a cause
- * that is false and a fix that cannot work — and this string is the feature's primary operator-facing
- * output, so a wrong one sends them to fix the wrong thing.
- *
- * The buckets are checked in precedence order, NOT with an "any credential gap" test: `evaluateRepoCapability()`
- * accumulates gaps, so a read-only collaborator on an archived repository — an ordinary case — produces
- * `['archived', 'no-push-permission']`. An "any" test would hand that the grant-write-access remedy, which
- * is precisely the false advice this derivation exists to avoid, since no grant makes an archived
- * repository writable. Every gap is still named in `reasons`; only the one actionable next step is chosen.
+ * Which remedy wins when one verdict spans several. `evaluateRepoCapability()` accumulates gaps, so a
+ * read-only collaborator on an archived repository — an ordinary case — yields both a repository-state
+ * and a grant gap; the repository state has to come first, because until it changes every write stays
+ * refused no matter what the credential is granted. Lower rank wins.
  */
+const REMEDY_RANK: Record<GapRemedy, number> = {
+  'repository-state': 0,
+  'unsuspend-installation': 1,
+  'authorize-sso': 2,
+  'replace-token': 3,
+  'configure-token': 4,
+  'grant-write': 5,
+}
+
+const REMEDY_TEXT: Record<GapRemedy, string> = {
+  'repository-state': 'Fix that on GitHub, or track a different repository.',
+  'configure-token': 'Configure a GitHub token in Global settings (or `mao config set-token`), then retry.',
+  'replace-token': 'Configure a working GitHub token in Global settings (or `mao config set-token`), then retry.',
+  'authorize-sso': "Authorize this credential for the organization's SAML SSO, then retry.",
+  'unsuspend-installation': 'Unsuspend the GitHub App installation for this repository, then retry.',
+  'grant-write':
+    'Grant this credential write access to the repository (Issues, Contents and Pull requests), then retry.',
+}
+
 export function describeRepoCapability(capability: RepoWorkflowCapability): string {
   const target = `${capability.owner}/${capability.repo}`
   if (capability.ok) return `${target} has no known blocker for the MAO workflow`
 
   const reasons = capability.gaps.map((gap) => GAP_REASONS[gap]).join('; ')
-  const blockedByRepoState = capability.gaps.some((gap) => REPOSITORY_STATE_GAPS.includes(gap))
-  const needsCredential = !blockedByRepoState && capability.gaps.some((gap) => CREDENTIAL_GAPS.includes(gap))
-  const lead = needsCredential
-    ? `${target} is missing permissions MAO needs to run its issue/PR workflow`
-    : `${target} cannot host the MAO issue/PR workflow`
+  // `gaps` is non-empty past the early return, so this reduce needs no seed and no fallback remedy —
+  // there is deliberately no "none of the above" branch left for a future gap to fall through.
+  const remedy = capability.gaps
+    .map((gap) => GAP_REMEDY[gap])
+    .reduce((chosen, kind) => (REMEDY_RANK[chosen] <= REMEDY_RANK[kind] ? chosen : kind))
+  // Only a missing *grant* is a permissions problem. Saying that about a rejected token, an
+  // unauthorized SSO org, a suspended installation, or an archived repository names a false cause.
+  const lead =
+    remedy === 'grant-write'
+      ? `${target} is missing permissions MAO needs to run its issue/PR workflow`
+      : `${target} cannot host the MAO issue/PR workflow`
 
-  let remedy: string
-  if (blockedByRepoState) {
-    remedy = 'Fix that on GitHub, or track a different repository.'
-  } else if (capability.gaps.includes('token-missing')) {
-    remedy = 'Configure a GitHub token in Global settings (or `mao config set-token`), then retry.'
-  } else if (needsCredential) {
-    remedy = 'Grant this credential write access to the repository (Issues, Contents and Pull requests), then retry.'
-  } else {
-    remedy = 'Fix that on GitHub, or track a different repository.'
-  }
-
-  return `${lead}: ${reasons}. ${remedy}`
+  return `${lead}: ${reasons}. ${REMEDY_TEXT[remedy]}`
 }
 
 /**

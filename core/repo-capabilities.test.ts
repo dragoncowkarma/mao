@@ -98,6 +98,43 @@ describe('evaluateRepoCapability', () => {
     expect(describeRepoCapability(capability)).toMatch(/archived.*Issues.*read-only/s)
   })
 
+  describe('a verdict spanning both a repository-state and a credential gap', () => {
+    // Because gaps accumulate, these mixed sets are the *ordinary* shape — a read-only collaborator on
+    // an archived repo hits one immediately. Asserting only the single-gap cases (as the tests below
+    // do) reads like proof the archived case is handled while an "any credential gap" test quietly
+    // hands it the grant-write-access remedy that can never work.
+    const mixed: Array<[string, RepoCapabilityProbe['repository']]> = [
+      ['archived + read-only', { archived: true, has_issues: true, permissions: { push: false } }],
+      ['archived + permissions omitting push', { archived: true, has_issues: true, permissions: { pull: true } }],
+      ['disabled + read-only', { disabled: true, has_issues: true, permissions: { push: false } }],
+      ['Issues off + read-only', { has_issues: false, permissions: { push: false } }],
+    ]
+
+    it.each(mixed)('lets the repository-state gap decide the remedy for %s', (_name, repository) => {
+      const capability = evaluateRepoCapability(probe({ repository }))
+      const message = describeRepoCapability(capability)
+
+      expect(message).toContain('cannot host the MAO issue/PR workflow')
+      expect(message).not.toMatch(/is missing permissions|Grant this credential/)
+      expect(message).toMatch(/Fix that on GitHub, or track a different repository/)
+    })
+
+    it('still names every gap, so nothing is hidden by choosing one next step', () => {
+      const capability = evaluateRepoCapability(
+        probe({ repository: { archived: true, has_issues: true, permissions: { push: false } } }),
+      )
+      expect(capability.gaps).toEqual(['archived', 'no-push-permission'])
+      const message = describeRepoCapability(capability)
+      expect(message).toContain('the repository is archived')
+      expect(message).toContain('read-only access')
+    })
+
+    it('applies the credential remedy once no repository-state gap remains', () => {
+      const capability = evaluateRepoCapability(probe({ repository: { has_issues: true, permissions: { push: false } } }))
+      expect(describeRepoCapability(capability)).toMatch(/is missing permissions.*Grant this credential/s)
+    })
+  })
+
   describe('lookup failures', () => {
     const cases: Array<[RepoCapabilityProbe['failure'], string]> = [
       ['token-missing', 'token-missing'],

@@ -111,14 +111,23 @@ export default function App() {
   }, [repos, selectedIndex])
 
   /**
-   * Mirrors into React state immediately and rolls back if the main process rejects.
+   * Mirrors into React state immediately, and on rejection re-reads the store rather than restoring a
+   * snapshot.
    *
-   * Adding a repository is preflighted in the main process (see core/repo-registry.ts), so setRepos
-   * can now legitimately reject — but the update path cannot wait for that round trip: ProjectSettings
-   * renders fully controlled inputs off this state, and deferring the mirror until after the IPC
-   * makes React restore each keystroke to the last rendered value, so the poll-interval field reverts
-   * as it is typed. Optimistic-plus-rollback keeps those inputs responsive while still leaving the
-   * list exactly as it was whenever the store refuses the write.
+   * Optimistic on the success path because the update path cannot wait for the round trip:
+   * ProjectSettings renders fully controlled inputs off this state, and deferring the mirror until
+   * after the IPC makes React restore each keystroke to the last rendered value, so the poll-interval
+   * field reverts as it is typed. (For the same reason the success path must NOT re-read either — a
+   * round trip that lands mid-typing would stomp newer keystrokes with the value it persisted.)
+   *
+   * Rolling back to a captured `previous` is wrong, though: that snapshot is this render's optimistic
+   * mirror, not the store, and `setRepos` writes the whole list, so several writes can be in flight at
+   * once — an add's preflight is a multi-second network call during which the settings panel stays
+   * live. Restoring a stale snapshot can then resurrect an entry the store refused, or erase one a
+   * concurrent write just persisted, and since the renderer reads the list only once at mount that
+   * divergence never heals. `github:getRepos` is a pure `store.get`, so asking it what actually
+   * survived is both cheap and authoritative — and it is the re-fetch-after-mutation model AGENTS.md
+   * prescribes for the renderer.
    */
   async function persistRepos(next: RepoRef[]): Promise<RepoWorkflowCapability[]> {
     const previous = repos
@@ -126,7 +135,9 @@ export default function App() {
     try {
       return await window.electronAPI.github.setRepos(next)
     } catch (err) {
-      setRepos(previous)
+      // Fall back to the snapshot only if even the read fails; showing a stale list beats showing one
+      // built from a write we know was refused.
+      setRepos(await window.electronAPI.github.getRepos().catch(() => previous))
       throw err
     }
   }

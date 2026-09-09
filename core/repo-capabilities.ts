@@ -242,7 +242,20 @@ export function evaluateRepoCapability(probe: RepoCapabilityProbe): RepoWorkflow
   }
 }
 
-/** Gaps a credential change can actually fix. The rest need a token, a different repo, or a GitHub-side change. */
+/**
+ * Gaps no credential change can fix — the repository itself is in a state that rejects the workflow.
+ * These take precedence when a verdict spans both buckets, because until the repository state is
+ * changed on GitHub, granting the credential anything at all still leaves every write refused.
+ */
+const REPOSITORY_STATE_GAPS: RepoCapabilityGap[] = [
+  'repo-not-found',
+  'archived',
+  'disabled',
+  'issues-disabled',
+  'legally-unavailable',
+]
+
+/** Gaps a credential change can actually fix. */
 const CREDENTIAL_GAPS: RepoCapabilityGap[] = [
   'bad-credentials',
   'sso-authorization-required',
@@ -264,19 +277,28 @@ const CREDENTIAL_GAPS: RepoCapabilityGap[] = [
  * access", or saying an archived or non-existent repository is "missing permissions", names a cause
  * that is false and a fix that cannot work — and this string is the feature's primary operator-facing
  * output, so a wrong one sends them to fix the wrong thing.
+ *
+ * The buckets are checked in precedence order, NOT with an "any credential gap" test: `evaluateRepoCapability()`
+ * accumulates gaps, so a read-only collaborator on an archived repository — an ordinary case — produces
+ * `['archived', 'no-push-permission']`. An "any" test would hand that the grant-write-access remedy, which
+ * is precisely the false advice this derivation exists to avoid, since no grant makes an archived
+ * repository writable. Every gap is still named in `reasons`; only the one actionable next step is chosen.
  */
 export function describeRepoCapability(capability: RepoWorkflowCapability): string {
   const target = `${capability.owner}/${capability.repo}`
   if (capability.ok) return `${target} has no known blocker for the MAO workflow`
 
   const reasons = capability.gaps.map((gap) => GAP_REASONS[gap]).join('; ')
-  const needsCredential = capability.gaps.some((gap) => CREDENTIAL_GAPS.includes(gap))
+  const blockedByRepoState = capability.gaps.some((gap) => REPOSITORY_STATE_GAPS.includes(gap))
+  const needsCredential = !blockedByRepoState && capability.gaps.some((gap) => CREDENTIAL_GAPS.includes(gap))
   const lead = needsCredential
     ? `${target} is missing permissions MAO needs to run its issue/PR workflow`
     : `${target} cannot host the MAO issue/PR workflow`
 
   let remedy: string
-  if (capability.gaps.includes('token-missing')) {
+  if (blockedByRepoState) {
+    remedy = 'Fix that on GitHub, or track a different repository.'
+  } else if (capability.gaps.includes('token-missing')) {
     remedy = 'Configure a GitHub token in Global settings (or `mao config set-token`), then retry.'
   } else if (needsCredential) {
     remedy = 'Grant this credential write access to the repository (Issues, Contents and Pull requests), then retry.'

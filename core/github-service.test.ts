@@ -378,7 +378,7 @@ describe('GithubService.checkRepoWorkflowCapability', () => {
 
   /** Drives a real Octokit so header handling and status classification are exercised end to end. */
   function serviceWith(handler: (url: string) => Response) {
-    const requestFetch = vi.fn(async (input: string | URL | Request) => handler(String(input)))
+    const requestFetch = vi.fn(async (input: string | URL | Request, _init?: RequestInit) => handler(String(input)))
     const service = new GithubService(requestFetch as typeof globalThis.fetch)
     service.setToken('test-token')
     return { service, requestFetch }
@@ -402,6 +402,20 @@ describe('GithubService.checkRepoWorkflowCapability', () => {
     expect(capability.ok).toBe(true)
     expect(capability.observed.credential).toBe('unknown')
     expect(capability.unverified).toEqual(['issues-write', 'contents-write', 'pull-requests-write'])
+  })
+
+  it('is exactly one non-mutating GET — never a create-then-delete write probe', async () => {
+    // Issue #48 requirement 4. Without asserting the request itself, a regression that added a probe
+    // issue/branch/PR (or any extra call) would leave every other test in this block green.
+    const { service, requestFetch } = serviceWith(() => jsonResponse(REPO_BODY))
+
+    await service.checkRepoWorkflowCapability('acme', 'widgets')
+
+    expect(requestFetch).toHaveBeenCalledTimes(1)
+    const [url, init] = requestFetch.mock.calls[0]
+    expect(String(url)).toContain('/repos/acme/widgets')
+    expect((init as RequestInit | undefined)?.method ?? 'GET').toBe('GET')
+    expect((init as RequestInit | undefined)?.body ?? null).toBeNull()
   })
 
   it('reads x-oauth-scopes off the real response to identify a classic token', async () => {

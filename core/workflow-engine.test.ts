@@ -1106,9 +1106,11 @@ describe('WorkflowEngine repository permission preflight', () => {
     expect(github.createIssue).toHaveBeenCalledTimes(1)
   })
 
-  it('keeps the one-shot run override armed when the preflight rejects the run', async () => {
-    // The override is the operator's choice for one execution. A run that never happened must not
-    // consume it, or the retry after the grant is restored silently uses a different agent.
+  it('consumes the one-shot run override on a preflight rejection, and never reuses it silently', async () => {
+    // The override is armed for one *attempt*, not one success. Keeping it armed past a rejected
+    // attempt would only look like it survived: retry()/advance() re-arm from their own argument, so
+    // the plain retry an operator actually clicks discards it anyway (armRunOverride), while the card
+    // would go on advertising an agent that run will not use.
     const assertRepoWorkflowWritable = vi
       .fn()
       .mockResolvedValueOnce(writable)
@@ -1126,9 +1128,27 @@ describe('WorkflowEngine repository permission preflight', () => {
 
     const blocked = engine.getTasks().find((t) => t.id === task.id)!
     expect(blocked.stage).toBe('pr')
-    expect(blocked.nextRunOverride).toEqual({ providerId: 'agent-b', model: undefined, effort: 'high' })
+    expect(blocked.nextRunOverride).toBeUndefined()
 
-    engine.retry(task.id, { providerId: 'agent-b', effort: 'high' })
+    // A plain retry therefore runs plain — no agent silently pinned by a choice made for an attempt
+    // that never happened.
+    engine.retry(task.id)
+    await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.stage === 'review')
+
+    const ran = engine.getTasks().find((t) => t.id === task.id)!
+    expect(ran.history[1].effort).toBeUndefined()
+    expect(ran.nextRunOverride).toBeUndefined()
+  })
+
+  it('still applies a one-shot override to the run that clears the preflight', async () => {
+    const github = makeFakeGithub()
+    const engine = new WorkflowEngine(github)
+    engine.setProviders([makeProvider('agent-a'), makeProvider('agent-b')])
+
+    const task = engine.enqueue('Add feature X', repo, false)
+    await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'paused')
+
+    engine.advance(task.id, { providerId: 'agent-b', effort: 'high' })
     await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.stage === 'review')
 
     const ran = engine.getTasks().find((t) => t.id === task.id)!

@@ -6,6 +6,7 @@ import ProjectSettings from './components/ProjectSettings'
 import GlobalSettings from './components/GlobalSettings'
 import UpdateBanner from './components/UpdateBanner'
 import type { RepoRef } from '../core/workflow-engine'
+import type { RepoWorkflowCapability } from '../core/repo-capabilities'
 import type { ThemePreference } from '../core/store'
 import type { AppUpdateCheck } from './electron'
 
@@ -20,6 +21,8 @@ export default function App() {
   const [theme, setThemeState] = useState<ThemePreference>('system')
   const [update, setUpdate] = useState<AppUpdateCheck | null>(null)
   const [dismissedUpdateSha, setDismissedUpdateSha] = useState<string | null>(null)
+  /** Surfaces a failed settings edit or removal, which are otherwise silent (no preflight, no form). */
+  const [repoError, setRepoError] = useState('')
 
   useEffect(() => {
     window.electronAPI.github.getRepos().then((savedRepos) => {
@@ -108,36 +111,64 @@ export default function App() {
   }, [repos, selectedIndex])
 
   /**
-   * Persist first, then mirror into React state. Adding a repository is now preflighted in the main
-   * process (see core/repo-registry.ts), so setRepos can legitimately reject — and an optimistic
-   * setState would leave the sidebar showing a repository the store never accepted.
+   * Mirrors into React state immediately and rolls back if the main process rejects.
+   *
+   * Adding a repository is preflighted in the main process (see core/repo-registry.ts), so setRepos
+   * can now legitimately reject — but the update path cannot wait for that round trip: ProjectSettings
+   * renders fully controlled inputs off this state, and deferring the mirror until after the IPC
+   * makes React restore each keystroke to the last rendered value, so the poll-interval field reverts
+   * as it is typed. Optimistic-plus-rollback keeps those inputs responsive while still leaving the
+   * list exactly as it was whenever the store refuses the write.
    */
-  async function persistRepos(next: RepoRef[]) {
-    await window.electronAPI.github.setRepos(next)
+  async function persistRepos(next: RepoRef[]): Promise<RepoWorkflowCapability[]> {
+    const previous = repos
     setRepos(next)
+    try {
+      return await window.electronAPI.github.setRepos(next)
+    } catch (err) {
+      setRepos(previous)
+      throw err
+    }
   }
 
-  /** Rejects when the repo fails the write-permission preflight; Sidebar renders the message. */
-  async function addRepo(repo: RepoRef) {
+  /**
+   * Rejects when the repo fails the write-permission preflight; Sidebar renders the message. Resolves
+   * with the verdicts so Sidebar can show the caveat for grants the preflight could not prove.
+   */
+  async function addRepo(repo: RepoRef): Promise<RepoWorkflowCapability[]> {
     const exists = repos.some((r) => r.owner === repo.owner && r.repo === repo.repo)
-    if (exists) return
+    if (exists) return []
     const next = [...repos, repo]
-    await persistRepos(next)
+    const checked = await persistRepos(next)
     setSelectedIndex(next.length - 1)
     setView('project')
     setProjectTab('board')
+    return checked
   }
 
+  // Settings edits and removals skip the preflight by design, but the store write can still fail —
+  // and an inert checkbox with an unhandled rejection in the console tells the operator nothing.
   async function updateSelectedRepo(patch: Partial<RepoRef>) {
     if (selectedIndex === null) return
     const next = repos.map((r, i) => (i === selectedIndex ? { ...r, ...patch } : r))
-    await persistRepos(next)
+    setRepoError('')
+    try {
+      await persistRepos(next)
+    } catch (err) {
+      setRepoError(err instanceof Error ? err.message : String(err))
+    }
   }
 
   async function removeSelectedRepo() {
     if (selectedIndex === null) return
     const next = repos.filter((_, i) => i !== selectedIndex)
-    await persistRepos(next)
+    setRepoError('')
+    try {
+      await persistRepos(next)
+    } catch (err) {
+      setRepoError(err instanceof Error ? err.message : String(err))
+      return
+    }
     setSelectedIndex(next.length > 0 ? 0 : null)
     setProjectTab('board')
   }
@@ -189,6 +220,12 @@ export default function App() {
                 {selected.owner}/{selected.repo}
               </h2>
             </div>
+
+            {repoError && (
+              <p className="mb-3 text-xs" style={{ color: 'var(--color-accent-700)' }}>
+                {repoError}
+              </p>
+            )}
 
             <div className="tabs">
               <button

@@ -113,11 +113,20 @@ individual Issues/Contents/Pull-requests grants, so those print as an explicit "
 and a real write can still fail. Rate limits, 5xx and the 60s deadline stay transient errors rather
 than being reported as missing permission.
 
+Because the check needs a credential, **set the GitHub token before registering repositories** —
+`mao config set-token` (or the Electron Global settings pane); otherwise `repos add` and the GUI's
+Add form both fail with "no GitHub token is configured".
+
 Only a *new* owner/repo pair is checked. Re-running `repos add` on a repo you already track (the
 CLI's only way to flip `--no-auto-trigger` / `--poll-interval-ms`) and `repos remove` both skip it
 on purpose, so a repo whose access was revoked can still be turned off or removed. The GUI's
 sidebar Add form and its project-settings toggles follow the identical rule — both shells delegate
 to `reposNeedingCapabilityCheck()` in `core/repo-registry.ts`.
+
+The GUI shows the same unverified-grants caveat the CLI prints (`github:setRepos` returns the
+verdicts), and the board's **Refresh** surfaces a failed preflight instead of reporting a clean sync —
+`github:refreshRepo` drives a real poll, so its verdict has to reach the operator. The board's own 30s
+listing poll is unaffected, so the cards stay visible while the error is shown.
 
 The same check runs before **every** workflow stage (`runStage()`) and before auto-trigger enqueues
 anything, so a grant revoked after registration, or a task enqueued directly, still cannot reach an

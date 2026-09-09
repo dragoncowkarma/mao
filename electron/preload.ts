@@ -1,6 +1,7 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import type { AiProviderConfig } from '../core/ai/types.ts'
 import type { GithubTask, GithubTaskDetail } from '../core/github-service.ts'
+import type { RepoWorkflowCapability } from '../core/repo-capabilities.ts'
 import type { QueuedTask, RepoRef, RunOverride } from '../core/workflow-engine.ts'
 import type { AutoTriggerStatus } from '../core/auto-trigger.ts'
 import type { ThemePreference } from '../core/store.ts'
@@ -29,8 +30,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.invoke('github:fetchTasks', owner, repo),
     fetchTaskDetail: (owner: string, repo: string, number: number): Promise<GithubTaskDetail> =>
       ipcRenderer.invoke('github:fetchTaskDetail', owner, repo, number),
-    /** Rejects (leaving the stored list untouched) when a newly added repo fails the write-permission preflight. */
-    setRepos: (repos: RepoRef[]): Promise<void> => ipcRenderer.invoke('github:setRepos', repos),
+    /**
+     * Rejects (leaving the stored list untouched) when a newly added repo fails the write-permission
+     * preflight. Resolves with the verdict for each newly registered repo, whose `unverified` grants
+     * the caller should surface — a pass is not proof of write access.
+     */
+    setRepos: (repos: RepoRef[]): Promise<RepoWorkflowCapability[]> =>
+      ipcRenderer.invoke('github:setRepos', repos),
     getRepos: (): Promise<RepoRef[]> => ipcRenderer.invoke('github:getRepos'),
     autoTriggerStatus: (owner: string, repo: string): Promise<AutoTriggerStatus> =>
       ipcRenderer.invoke('github:autoTriggerStatus', owner, repo),

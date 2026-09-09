@@ -40,6 +40,16 @@ describe('evaluateRepoCapability', () => {
     expect(capability.observed.push).toBe(false)
   })
 
+  it('treats a permissions block that omits push as unknown, not as a definite read-only', () => {
+    // Reporting "the credential has read-only access" from a block that never mentioned push would
+    // name the wrong cause; absent knowledge belongs in permissions-unknown.
+    const capability = evaluateRepoCapability(
+      probe({ repository: { has_issues: true, permissions: { pull: true } } }),
+    )
+    expect(capability.gaps).toEqual(['permissions-unknown'])
+    expect(capability.observed.push).toBeNull()
+  })
+
   it('treats an absent permissions block as unknown, never as granted', () => {
     // Defensive: GitHub sends `permissions` on every authenticated request, so reaching this means
     // the response was not what we assumed — which must fail closed rather than pass.
@@ -47,6 +57,16 @@ describe('evaluateRepoCapability', () => {
     expect(capability.ok).toBe(false)
     expect(capability.gaps).toEqual(['permissions-unknown'])
     expect(capability.observed.push).toBeNull()
+  })
+
+  it('does not tell the operator to grant write access on an archived repo, where no grant can help', () => {
+    const capability = evaluateRepoCapability(
+      probe({ repository: { archived: true, has_issues: true, permissions: { push: true } } }),
+    )
+    const message = describeRepoCapability(capability)
+    expect(message).toContain('cannot host the MAO issue/PR workflow')
+    expect(message).not.toMatch(/Grant this credential/)
+    expect(message).toMatch(/Fix that on GitHub, or track a different repository/)
   })
 
   it('rejects an archived repo even though the role still says push', () => {
@@ -104,9 +124,32 @@ describe('evaluateRepoCapability', () => {
       })
     })
 
-    it('explains a missing token without inventing repository facts', () => {
+    it('tells a tokenless operator to configure a token, not to grant a credential write access', () => {
+      // This string is the feature's primary operator-facing output; naming a credential that does not
+      // exist would send them to change GitHub grants that are not the problem.
       const capability = evaluateRepoCapability({ owner: 'acme', repo: 'widgets', failure: 'token-missing' })
-      expect(describeRepoCapability(capability)).toMatch(/acme\/widgets.*no GitHub token is configured/)
+      expect(describeRepoCapability(capability)).toBe(
+        'acme/widgets cannot host the MAO issue/PR workflow: no GitHub token is configured. ' +
+          'Configure a GitHub token in Global settings (or `mao config set-token`), then retry.',
+      )
+    })
+
+    it('does not blame permissions for a repository that does not exist', () => {
+      const capability = evaluateRepoCapability({ owner: 'acme', repo: 'typo', failure: 'not-found' })
+      const message = describeRepoCapability(capability)
+      expect(message).not.toMatch(/missing permissions|Grant this credential/)
+      expect(message).toMatch(/does not exist, or this credential cannot see it/)
+    })
+
+    it('keeps the grant-write-access remedy for verdicts a credential change can actually fix', () => {
+      const capability = evaluateRepoCapability({
+        owner: 'acme',
+        repo: 'widgets',
+        failure: 'resource-not-accessible',
+      })
+      expect(describeRepoCapability(capability)).toMatch(
+        /is missing permissions.*Grant this credential write access/s,
+      )
     })
   })
 
@@ -119,6 +162,13 @@ describe('evaluateRepoCapability', () => {
       expect(capability.observed.credential).toBe('unknown')
       expect(capability.unverified).toEqual(['issues-write', 'contents-write', 'pull-requests-write'])
       expect(describeUnverifiedGrants(capability)).toMatch(/Issues: write.*unverified/s)
+    })
+
+    it('treats a whitespace-only scopes header as ambiguous rather than a classic token with no scopes', () => {
+      const capability = evaluateRepoCapability(probe({ oauthScopes: '  ' }))
+      expect(capability.ok).toBe(true)
+      expect(capability.gaps).toEqual([])
+      expect(capability.observed.credential).toBe('unknown')
     })
 
     it('treats a present-but-empty scopes header as ambiguous, not as a token with no access', () => {
@@ -183,9 +233,14 @@ describe('describeRepoCapability', () => {
     const capability = evaluateRepoCapability(
       probe({ owner: 'acme', repo: 'widgets', repository: { has_issues: true, permissions: { push: false } } }),
     )
-    const message = describeRepoCapability(capability)
-    expect(message).toContain('acme/widgets')
-    expect(message).not.toMatch(/ghp_|github_pat_|x-access-token|Authorization|https:\/\//)
+    // Pinned exactly rather than pattern-matched: a `not.toMatch(/ghp_.../)` on an input that never
+    // contained a secret passes no matter what the function does. Any new interpolation — a raw GitHub
+    // response, a remote URL, a header — changes this string and fails here.
+    expect(describeRepoCapability(capability)).toBe(
+      'acme/widgets is missing permissions MAO needs to run its issue/PR workflow: the credential has ' +
+        'read-only access to the repository (push is false). Grant this credential write access to the ' +
+        'repository (Issues, Contents and Pull requests), then retry.',
+    )
   })
 
   it('applies to every repository including MAO\'s own, with no exemption', () => {

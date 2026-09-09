@@ -1,8 +1,25 @@
-import { describe, expect, it, vi } from 'vitest'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { assertReposRegistrable, reposNeedingCapabilityCheck, sameRepoRef } from './repo-registry.ts'
 import { RepoCapabilityError, evaluateRepoCapability } from './repo-capabilities.ts'
+import { FileStore } from './store.ts'
 import type { GithubService } from './github-service.ts'
 import type { RepoRef } from './workflow-engine.ts'
+
+const tmpDirs: string[] = []
+
+afterEach(() => {
+  while (tmpDirs.length) fs.rmSync(tmpDirs.pop()!, { recursive: true, force: true })
+})
+
+/** A real on-disk store, so "the stored list is unchanged" is asserted against actual persistence. */
+function makeRealStore(): FileStore {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mao-registry-test-'))
+  tmpDirs.push(dir)
+  return new FileStore(path.join(dir, 'config.json'))
+}
 
 const widgets: RepoRef = { owner: 'acme', repo: 'widgets' }
 const gadgets: RepoRef = { owner: 'acme', repo: 'gadgets' }
@@ -61,8 +78,12 @@ describe('reposNeedingCapabilityCheck', () => {
     expect(reposNeedingCapabilityCheck([widgets, gadgets], [gadgets, widgets])).toEqual([])
   })
 
-  it('checks a repo that was removed and later re-added', () => {
-    expect(reposNeedingCapabilityCheck([], [widgets])).toEqual([widgets])
+  it('re-checks a repo that was removed and is later added again', () => {
+    // Model the actual sequence: the removal leaves it out of `previous`, so the second add is a
+    // genuine registration again rather than an exempt settings edit.
+    const afterRemoval = reposNeedingCapabilityCheck([widgets, gadgets], [gadgets])
+    expect(afterRemoval).toEqual([])
+    expect(reposNeedingCapabilityCheck([gadgets], [gadgets, widgets])).toEqual([widgets])
   })
 })
 
@@ -82,17 +103,38 @@ describe('assertReposRegistrable', () => {
     expect(github.assertRepoWorkflowWritable).not.toHaveBeenCalled()
   })
 
-  it('throws the actionable capability error so the caller never reaches its store write', async () => {
+  it('leaves a real on-disk store untouched when a registration is refused', async () => {
+    // Both shells run guard-then-`store.set('githubRepos', next)`. Asserting that against a real
+    // FileStore (rather than a lambda defined in the test) is what actually proves issue #48's
+    // "store unchanged on registration failure" criterion — vitest cannot reach either shell.
+    const store = makeRealStore()
+    store.set('githubRepos', [gadgets])
     const github = rejectingGithub('widgets')
-    const stored: RepoRef[][] = []
-    const persist = (next: RepoRef[]) => stored.push(next)
+    const next = [gadgets, widgets]
 
     await expect(
-      assertReposRegistrable(github, [], [widgets]).then(() => persist([widgets])),
+      assertReposRegistrable(github, store.get('githubRepos'), next).then(() =>
+        store.set('githubRepos', next),
+      ),
     ).rejects.toThrow(/acme\/widgets is missing permissions/)
 
-    // The point of the guard: the store was never written.
-    expect(stored).toEqual([])
+    expect(store.get('githubRepos')).toEqual([gadgets])
+    // And durably so — re-reading the file, not just the in-memory copy.
+    expect(new FileStore((store as unknown as { filePath: string }).filePath).get('githubRepos')).toEqual([
+      gadgets,
+    ])
+  })
+
+  it('persists the full list once every new entry passes', async () => {
+    const store = makeRealStore()
+    store.set('githubRepos', [gadgets])
+    const github = passingGithub()
+    const next = [gadgets, widgets]
+
+    await assertReposRegistrable(github, store.get('githubRepos'), next)
+    store.set('githubRepos', next)
+
+    expect(store.get('githubRepos')).toEqual(next)
   })
 
   it('aborts on the first failure rather than checking the rest', async () => {

@@ -141,9 +141,9 @@ function parseLinkedIssues(body: string): number[] {
 
 /**
  * Reads one response header across the shapes Octokit can hand back (a plain lowercase-keyed object,
- * or a `Headers`-like with `.get()`). Returns `undefined` only when the header is genuinely absent —
- * never collapses an empty value to `undefined` or vice versa, because for `x-oauth-scopes` the
- * distinction between "absent" and "present but empty" is itself part of the verdict.
+ * or a `Headers`-like with `.get()`). Returns `undefined` only when the header is genuinely absent,
+ * never collapsing a present-but-empty value into it: `classifyLookupFailure()` tests `retry-after`
+ * and `x-github-sso` with `!== undefined`, so an empty value must still read as present.
  */
 function readHeader(headers: unknown, name: string): string | undefined {
   if (!headers) return undefined
@@ -298,8 +298,9 @@ export class GithubService {
         owner,
         repo,
         repository: response.data as RepoCapabilitySnapshot,
-        // Passed through verbatim: an absent header and an empty one mean different things to
-        // evaluateRepoCapability(), so this must never be normalized to ''.
+        // Passed through verbatim rather than normalized to '': absent and empty are deliberately
+        // equivalent for the verdict (both mean an unidentified credential — see RepoCredentialKind),
+        // but normalizing here would hide a real, non-empty value if this ever changed shape.
         oauthScopes: readHeader(response.headers, 'x-oauth-scopes'),
       })
     } catch (err) {

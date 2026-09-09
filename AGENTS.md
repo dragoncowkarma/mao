@@ -108,8 +108,11 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   (mirror the signature). Channel strings are duplicated literals; a typo surfaces
   only at runtime.
 - **Repository registration** → the add-vs-update rule lives ONLY in `core/repo-registry.ts`;
-  `electron/ipc.ts`'s `github:setRepos` and `cli/index.ts`'s `repos add` must both stay one-line
+  `electron/ipc.ts`'s `github:setRepos` and `cli/index.ts`'s `repos add` must both stay thin
   delegations to it. Re-implementing the diff in either shell is how the two paths silently drift.
+  Both shells must also surface `describeUnverifiedGrants()` for the verdicts it returns — a passing
+  preflight is not proof of write access, and a shell that stays silent about that claims more than
+  the check established.
 - **New store field** → both `MaoStoreSchema` and `MAO_STORE_DEFAULTS` in
   `core/store.ts` (tsc enforces the pair). `electron/store.ts` and `FileStore` pick
   the field up automatically.
@@ -200,11 +203,10 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   grants are unprovable without a write, so they are reported in `capability.unverified` and never
   folded into `ok`. Only permanent conditions become gaps; rate limiting, 5xx, socket errors and the
   60s deadline are rethrown so they stay transient. **No repo is exempt, `dragoncowkarma/mao`
-  included.**
-- **The one-shot `nextRunOverride` is consumed only by a run that actually starts**: `runStage()`
-  reads it before the preflight but clears it *after* the preflight passes. A stage rejected for
-  missing permission never happened, so burning the operator's single-run tool/model/effort choice on
-  it would silently change which agent the post-restore retry uses.
+  included.** It sits *after* the one-shot `nextRunOverride` is read and cleared (see the bullet
+  above), so a preflight rejection consumes that choice along with the attempt — deliberately:
+  keeping it armed would only look like it survived, because `retry()`/`advance()` re-arm from their
+  own argument and the plain retry an operator actually clicks discards it anyway.
 - **Single-flight queue**: `processQueue()` runs one stage at a time globally.
   Therefore every external call must be time-bounded. The API provider aborts
   after 5 min, the CLI provider SIGKILLs after 15 min, each actual Octokit HTTP

@@ -198,9 +198,15 @@ export function evaluateRepoCapability(probe: RepoCapabilityProbe): RepoWorkflow
   }
 
   const repository = probe.repository ?? {}
-  // Only a non-empty scopes header establishes a classic token. Absent and empty are both ambiguous.
-  const credential: RepoCredentialKind = probe.oauthScopes ? 'classic' : 'unknown'
-  const push = repository.permissions ? repository.permissions.push === true : null
+  // Only a header carrying at least one actual scope establishes a classic token. Absent, empty and
+  // whitespace-only are all ambiguous — a truthiness test would read `' '` as a classic token with
+  // zero scopes and hard-fail it on `oauth-scope-missing`.
+  const scopes = parseScopes(probe.oauthScopes ?? '')
+  const credential: RepoCredentialKind = scopes.size > 0 ? 'classic' : 'unknown'
+  // `typeof`, not a truthiness/`=== true` test on the block: a permissions object that omits `push`
+  // tells us nothing about push, and reporting that as a definite "read-only" would name the wrong
+  // cause. Absent knowledge is 'permissions-unknown'; only an explicit false is 'no-push-permission'.
+  const push = typeof repository.permissions?.push === 'boolean' ? repository.permissions.push : null
 
   const gaps: RepoCapabilityGap[] = []
   if (repository.archived === true) gaps.push('archived')
@@ -213,7 +219,6 @@ export function evaluateRepoCapability(probe: RepoCapabilityProbe): RepoWorkflow
   // when the repository role would allow it. `public_repo` is accepted whenever the repository is not
   // known to be private — an absent `private` field must not turn a working token into a failure.
   if (credential === 'classic') {
-    const scopes = parseScopes(probe.oauthScopes ?? '')
     const canWrite = scopes.has('repo') || (repository.private !== true && scopes.has('public_repo'))
     if (!canWrite) gaps.push('oauth-scope-missing')
   }
@@ -237,20 +242,49 @@ export function evaluateRepoCapability(probe: RepoCapabilityProbe): RepoWorkflow
   }
 }
 
+/** Gaps a credential change can actually fix. The rest need a token, a different repo, or a GitHub-side change. */
+const CREDENTIAL_GAPS: RepoCapabilityGap[] = [
+  'bad-credentials',
+  'sso-authorization-required',
+  'installation-suspended',
+  'resource-not-accessible',
+  'permissions-unknown',
+  'no-push-permission',
+  'oauth-scope-missing',
+]
+
 /**
  * Actionable, secret-free explanation of a failed verdict. Names the repository and every missing
  * capability, and interpolates nothing but the owner/repo pair and this module's own fixed strings —
  * never the token, an authenticated remote URL, or a raw GitHub response. The result is persisted in
- * a task error and printed by both shells, so it must stay safe to write down.
+ * a task error, printed by both shells, and rendered in the GUI, so it must stay safe to write down.
+ *
+ * The remediation sentence is derived from the gaps rather than fixed, because only about half of them
+ * are credential problems. Telling an operator with no token configured to "grant this credential write
+ * access", or saying an archived or non-existent repository is "missing permissions", names a cause
+ * that is false and a fix that cannot work — and this string is the feature's primary operator-facing
+ * output, so a wrong one sends them to fix the wrong thing.
  */
 export function describeRepoCapability(capability: RepoWorkflowCapability): string {
   const target = `${capability.owner}/${capability.repo}`
   if (capability.ok) return `${target} has no known blocker for the MAO workflow`
+
   const reasons = capability.gaps.map((gap) => GAP_REASONS[gap]).join('; ')
-  return (
-    `${target} is missing permissions MAO needs to run its issue/PR workflow: ${reasons}. ` +
-    'Grant this credential write access to the repository (Issues, Contents and Pull requests), then retry.'
-  )
+  const needsCredential = capability.gaps.some((gap) => CREDENTIAL_GAPS.includes(gap))
+  const lead = needsCredential
+    ? `${target} is missing permissions MAO needs to run its issue/PR workflow`
+    : `${target} cannot host the MAO issue/PR workflow`
+
+  let remedy: string
+  if (capability.gaps.includes('token-missing')) {
+    remedy = 'Configure a GitHub token in Global settings (or `mao config set-token`), then retry.'
+  } else if (needsCredential) {
+    remedy = 'Grant this credential write access to the repository (Issues, Contents and Pull requests), then retry.'
+  } else {
+    remedy = 'Fix that on GitHub, or track a different repository.'
+  }
+
+  return `${lead}: ${reasons}. ${remedy}`
 }
 
 /**

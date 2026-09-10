@@ -3,7 +3,6 @@ import path from 'node:path'
 import { store } from './store.ts'
 import { createMaoApp } from '../core/app.ts'
 import { startAutoTrigger } from '../core/auto-trigger.ts'
-import { assertReposRegistrable } from '../core/repo-registry.ts'
 import { assertCanRelaunchForUpdate, checkForUpdates, countRunningWorkflowTasks } from '../core/self-update.ts'
 import { createAiProvider, type AiProviderConfig } from '../core/ai/index.ts'
 import type { RepoRef, RunOverride } from '../core/workflow-engine.ts'
@@ -13,7 +12,7 @@ export function registerIpcHandlers() {
   const buildSha = process.env.MAO_BUILD_SHA ?? ''
   if (buildSha) store.set('buildSha', buildSha)
 
-  const { githubService, workflowEngine } = createMaoApp({
+  const { githubService, workflowEngine, updateRepos } = createMaoApp({
     store,
     workspaceRoot: path.join(app.getPath('userData'), 'workspaces'),
     dataDir: app.getPath('userData'),
@@ -71,11 +70,7 @@ export function registerIpcHandlers() {
   // Returns the passing verdicts so the renderer can show the same "these grants are unverified"
   // caveat `mao repos add` prints. Dropping them would make a passing preflight look in the GUI like
   // proof of write access, which is exactly what core/repo-capabilities.ts exists to avoid.
-  ipcMain.handle('github:setRepos', async (_event, repos: RepoRef[]) => {
-    const checked = await assertReposRegistrable(githubService, store.get('githubRepos'), repos)
-    store.set('githubRepos', repos)
-    return checked
-  })
+  ipcMain.handle('github:setRepos', (_event, repos: RepoRef[]) => updateRepos(() => repos))
 
   ipcMain.handle('github:getRepos', () => store.get('githubRepos'))
 

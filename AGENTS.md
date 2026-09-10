@@ -108,8 +108,8 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   (mirror the signature). Channel strings are duplicated literals; a typo surfaces
   only at runtime.
 - **Repository registration** → the add-vs-update rule lives ONLY in `core/repo-registry.ts`;
-  `electron/ipc.ts`'s `github:setRepos` and `cli/index.ts`'s `repos add` must both stay thin
-  delegations to it. Re-implementing the diff in either shell is how the two paths silently drift.
+  `electron/ipc.ts`'s `github:setRepos` and `cli/index.ts`'s `repos add`/`repos remove` must all stay
+  thin delegations to `createMaoApp()`'s `updateRepos`. Re-implementing the diff in either shell is how the two paths silently drift.
   Both shells must also surface `describeUnverifiedGrants()` for the verdicts it returns — a passing
   preflight is not proof of write access, and a shell that stays silent about that claims more than
   the check established.
@@ -270,6 +270,13 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   run`, `mao swarm` (except `--dry-run`/`--status`), `refreshRepo`, and the e2e
   harness all count: they drive the pipeline,
   which performs those writes unattended.
+- **`githubRepos` has exactly one writer: `updateRepos` (`core/repo-registry.ts`).** It reads,
+  preflights and writes as one *serialized* unit. The preflight is a network call, so it puts an await
+  between the read and the write; without the queue a second update that arrives during it completes
+  first, and the slow one then writes the list it was handed at request time — resurrecting a repo the
+  operator removed while its registration was still checking (the store keeps it, the sidebar does
+  not, and auto-trigger keeps polling it). Never write `githubRepos` through `store` directly, and
+  never move this sequence into a shell.
 - **Registration and every stage are gated on a read-only permission preflight**
   (`core/repo-capabilities.ts`). Adding a repo — via the GUI sidebar or `mao repos add` —
   persists nothing unless the check passes; *updating* and *removing* an already-tracked repo

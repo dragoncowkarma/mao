@@ -1,4 +1,5 @@
 import { GithubService } from './github-service.ts'
+import { createRepoRegistrar } from './repo-registry.ts'
 import { WorkflowEngine, type QueuedTask } from './workflow-engine.ts'
 import type { MaoStore } from './store.ts'
 import { hasPersistenceBrokenMarker, writePersistenceBrokenMarker } from './persistence-guard.ts'
@@ -31,6 +32,12 @@ export interface MaoApp {
   githubService: GithubService
   workflowEngine: WorkflowEngine
   store: MaoStore
+  /**
+   * The only supported way to change the tracked-repository list. Reads, preflights and writes as one
+   * serialized unit (see core/repo-registry.ts) — writing `githubRepos` through `store` directly
+   * reopens the late-write race that lets a slow registration resurrect a removed repository.
+   */
+  updateRepos: ReturnType<typeof createRepoRegistrar>
 }
 
 /**
@@ -79,5 +86,5 @@ export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOp
   const safeToResume = resume && !hasPersistenceBrokenMarker(dataDir)
   workflowEngine.restore(store.get('workflowTasks'), { resume: safeToResume })
 
-  return { githubService, workflowEngine, store }
+  return { githubService, workflowEngine, store, updateRepos: createRepoRegistrar(githubService, store) }
 }

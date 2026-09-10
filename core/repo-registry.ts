@@ -1,5 +1,6 @@
 import type { GithubService } from './github-service.ts'
 import type { RepoWorkflowCapability } from './repo-capabilities.ts'
+import type { MaoStore } from './store.ts'
 import type { RepoRef } from './workflow-engine.ts'
 
 /**
@@ -54,4 +55,46 @@ export async function assertReposRegistrable(
     capabilities.push(await github.assertRepoWorkflowWritable(repo.owner, repo.repo))
   }
   return capabilities
+}
+
+/** Computes the list to persist from the list currently in the store. */
+export type RepoListUpdate = (previous: RepoRef[]) => RepoRef[]
+
+/**
+ * Serializes read -> preflight -> write of the tracked-repository list, and owns that sequence so
+ * neither shell has to.
+ *
+ * The preflight is a network call, which puts an await between reading the stored list and writing
+ * the new one. Without serialization a second update that arrives during that await runs to
+ * completion first, and the slow one then writes the list it was handed at request time — resurrecting
+ * a repository the operator removed in the meantime. That is not hypothetical: the GUI shows a
+ * repository optimistically while its preflight is still running, so removing it right then is a
+ * couple of clicks. The store would keep it, the sidebar would not, and auto-trigger would go on
+ * polling a repository the operator believes is gone.
+ *
+ * Queueing rather than rejecting on conflict is deliberate: each update is computed from the caller's
+ * latest view, so letting the later one land last is exactly the operator's most recent intent. The
+ * update is applied to the list read *inside* the critical section, so a queued call never plans
+ * against a list that has since changed, and `assertReposRegistrable()` still preflights whatever is
+ * new relative to that fresh read.
+ */
+export function createRepoRegistrar(
+  github: Pick<GithubService, 'assertRepoWorkflowWritable'>,
+  store: Pick<MaoStore, 'get' | 'set'>,
+) {
+  let queue: Promise<unknown> = Promise.resolve()
+
+  return function updateRepos(update: RepoListUpdate): Promise<RepoWorkflowCapability[]> {
+    const run = queue.then(async () => {
+      const previous = store.get('githubRepos')
+      const next = update(previous)
+      const checked = await assertReposRegistrable(github, previous, next)
+      store.set('githubRepos', next)
+      return checked
+    })
+    // A rejected update must not wedge the queue for every update after it, and its rejection belongs
+    // to its own caller — so the chain follows the settled promise while `run` keeps the error.
+    queue = run.catch(() => undefined)
+    return run
+  }
 }

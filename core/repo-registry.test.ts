@@ -2,7 +2,12 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { assertReposRegistrable, reposNeedingCapabilityCheck, sameRepoRef } from './repo-registry.ts'
+import {
+  assertReposRegistrable,
+  createRepoRegistrar,
+  reposNeedingCapabilityCheck,
+  sameRepoRef,
+} from './repo-registry.ts'
 import { RepoCapabilityError, evaluateRepoCapability } from './repo-capabilities.ts'
 import { FileStore } from './store.ts'
 import type { GithubService } from './github-service.ts'
@@ -151,5 +156,99 @@ describe('assertReposRegistrable', () => {
     } as unknown as Pick<GithubService, 'assertRepoWorkflowWritable'>
 
     await expect(assertReposRegistrable(github, [], [widgets])).rejects.toThrow(/timed out after 60s/)
+  })
+})
+
+describe('createRepoRegistrar', () => {
+  /**
+   * A preflight the test can hold mid-flight. `release()` also opens every *later* call, because a
+   * queued update does not even reach its preflight until the one ahead of it finishes.
+   */
+  function deferredGithub() {
+    let open = false
+    const waiting: Array<() => void> = []
+    const github = {
+      assertRepoWorkflowWritable: vi.fn(
+        (owner: string, repo: string) =>
+          new Promise((resolve) => {
+            const settle = () =>
+              resolve(
+                evaluateRepoCapability({ owner, repo, repository: { has_issues: true, permissions: { push: true } } }),
+              )
+            if (open) settle()
+            else waiting.push(settle)
+          }),
+      ),
+    } as unknown as Pick<GithubService, 'assertRepoWorkflowWritable'>
+    return { github, release: () => { open = true; waiting.splice(0).forEach((settle) => settle()) } }
+  }
+
+  it('does not resurrect a repo removed while its registration was still being preflighted', async () => {
+    // The regression the review asked for, in the shape the GUI actually produces: the renderer sends
+    // the whole list each time, computed from what it is optimistically showing. Before serialization
+    // the removal (no new entries, so no preflight) completed first, and the slow add then wrote the
+    // list it was handed at request time — putting widgets back after the operator removed it. The
+    // store kept a repository the sidebar no longer showed, and auto-trigger went on polling it.
+    const store = makeRealStore()
+    store.set('githubRepos', [gadgets])
+    const { github, release } = deferredGithub()
+    const updateRepos = createRepoRegistrar(github, store)
+
+    const adding = updateRepos(() => [gadgets, widgets])
+    const removing = updateRepos(() => [gadgets])
+
+    release()
+    await adding
+    await removing
+
+    expect(store.get('githubRepos')).toEqual([gadgets])
+    expect(new FileStore((store as unknown as { filePath: string }).filePath).get('githubRepos')).toEqual([gadgets])
+  })
+
+  it('applies each update to the list read inside its own turn, not to a stale snapshot', async () => {
+    const store = makeRealStore()
+    store.set('githubRepos', [])
+    const { github, release } = deferredGithub()
+    const updateRepos = createRepoRegistrar(github, store)
+
+    const first = updateRepos((previous) => [...previous, gadgets])
+    const second = updateRepos((previous) => [...previous, widgets])
+
+    release()
+    await first
+    await second
+
+    // The second update never saw the empty list, so it added to gadgets rather than replacing it.
+    expect(store.get('githubRepos')).toEqual([gadgets, widgets])
+  })
+
+  it('preflights only what is new relative to the fresh read, and persists once it passes', async () => {
+    const store = makeRealStore()
+    store.set('githubRepos', [gadgets])
+    const github = passingGithub()
+    const updateRepos = createRepoRegistrar(github, store)
+
+    const checked = await updateRepos((previous) => [...previous, widgets])
+
+    expect(github.assertRepoWorkflowWritable).toHaveBeenCalledTimes(1)
+    expect(github.assertRepoWorkflowWritable).toHaveBeenCalledWith('acme', 'widgets')
+    expect(checked.map((c) => c.repo)).toEqual(['widgets'])
+    expect(store.get('githubRepos')).toEqual([gadgets, widgets])
+  })
+
+  it('leaves the store untouched on a refused registration and keeps serving later updates', async () => {
+    // A rejected update must reach its own caller and must not wedge the queue behind it.
+    const store = makeRealStore()
+    store.set('githubRepos', [gadgets])
+    const updateRepos = createRepoRegistrar(rejectingGithub('widgets'), store)
+
+    await expect(updateRepos((previous) => [...previous, widgets])).rejects.toThrow(
+      /acme\/widgets is missing permissions/,
+    )
+    expect(store.get('githubRepos')).toEqual([gadgets])
+
+    // Removal still works afterwards — the queue is not stuck on the failure above.
+    await updateRepos((previous) => previous.filter((r) => !sameRepoRef(r, gadgets)))
+    expect(store.get('githubRepos')).toEqual([])
   })
 })

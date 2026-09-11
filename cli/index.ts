@@ -8,6 +8,7 @@ import { FileStore } from '../core/store.ts'
 import { defaultDataDir } from '../core/paths.ts'
 import { clearPersistenceBrokenMarker, hasPersistenceBrokenMarker } from '../core/persistence-guard.ts'
 import { runSwarm, SwarmRepositoryPathError } from '../core/swarm-runner.ts'
+import { describeUnverifiedGrants } from '../core/repo-capabilities.ts'
 import type { AiEffort, AiProviderConfig } from '../core/ai/types.ts'
 import type { QueuedTask, RepoRef, RunOverride } from '../core/workflow-engine.ts'
 import type { ThemePreference } from '../core/store.ts'
@@ -147,23 +148,41 @@ const repos = program.command('repos').description('Manage GitHub repositories t
 
 repos
   .command('add <owner> <repo>')
-  .description('Start tracking a repo (adds or replaces its entry)')
+  .description(
+    'Start tracking a repo (adds or replaces its entry). A first-time add is preflighted for ' +
+      'issue/PR write access; re-adding an already-tracked repo to change its settings is not.',
+  )
   .option('--no-auto-trigger', 'do not auto-poll this repo for new issues')
   .option('--poll-interval-ms <ms>', 'override the default poll interval', (v) => parseInt(v, 10))
-  .action((owner: string, repo: string, opts: { autoTrigger: boolean; pollIntervalMs?: number }) => {
-    const { store } = loadApp()
+  .action(async (owner: string, repo: string, opts: { autoTrigger: boolean; pollIntervalMs?: number }) => {
+    const { updateRepos } = loadApp()
     const ref: RepoRef = { owner, repo, autoTrigger: opts.autoTrigger, pollIntervalMs: opts.pollIntervalMs }
-    const existing = store.get('githubRepos').filter((r) => !(r.owner === owner && r.repo === repo))
-    store.set('githubRepos', [...existing, ref])
+    // Same serialized core path the GUI's github:setRepos uses, so the two shells agree on what counts
+    // as a new registration and on read/preflight/write being one unit. `repos add` doubles as this
+    // CLI's only settings editor, so re-adding an already-tracked repo to flip --no-auto-trigger stays
+    // possible after its access is revoked — exactly as toggling it in the GUI does. A failure throws
+    // before the write, leaving the stored list untouched.
+    const checked = await updateRepos((previous) => [
+      ...previous.filter((r) => !(r.owner === owner && r.repo === repo)),
+      ref,
+    ])
     log(`Tracking ${owner}/${repo}`)
+    // A passing preflight is not a proof of write access — say so rather than let `Tracking …` imply it.
+    for (const capability of checked) {
+      const caveat = describeUnverifiedGrants(capability)
+      if (caveat) log(caveat)
+    }
   })
 
 repos
   .command('remove <owner> <repo>')
   .description('Stop tracking a repo')
-  .action((owner: string, repo: string) => {
-    const { store } = loadApp()
-    store.set('githubRepos', store.get('githubRepos').filter((r) => !(r.owner === owner && r.repo === repo)))
+  .action(async (owner: string, repo: string) => {
+    const { updateRepos } = loadApp()
+    // Through the same serialized core path as `add`, so `githubRepos` has exactly one writer. A
+    // removal introduces no new entry, so it never preflights — removing a repo whose access was
+    // revoked (or removing one with no token configured at all) keeps working.
+    await updateRepos((previous) => previous.filter((r) => !(r.owner === owner && r.repo === repo)))
     log(`Stopped tracking ${owner}/${repo}`)
   })
 

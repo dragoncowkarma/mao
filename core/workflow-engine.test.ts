@@ -1,15 +1,38 @@
-import { describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { WorkflowEngine, type QueuedTask, type RepoRef } from './workflow-engine.ts'
+import { RepoCapabilityError, evaluateRepoCapability } from './repo-capabilities.ts'
 import type { AgentStage, AiProviderConfig } from './ai/types.ts'
 import type { GithubService } from './github-service.ts'
 
-vi.mock('./ai/index.ts', () => ({
-  createAiProvider: (config: AiProviderConfig) => ({
+/**
+ * Hoisted so tests can assert the provider factory was never reached — "zero AI provider calls" is
+ * one of the guarantees the repo-permission preflight has to deliver, and a spy created *inside* the
+ * factory can only be inspected once the factory has already run.
+ */
+const ai = vi.hoisted(() => ({
+  createAiProvider: vi.fn((config: { id: string; name: string }) => ({
     id: config.id,
     name: config.name,
     run: vi.fn(async () => `output-from-${config.id}`),
-  }),
+  })),
 }))
+
+vi.mock('./ai/index.ts', () => ({ createAiProvider: ai.createAiProvider }))
+
+/** Mocked so the real-checkout `pr` path can assert that no clone or push happened. */
+const git = vi.hoisted(() => ({
+  ensureClone: vi.fn(async () => '/tmp/mao-test-clone'),
+  checkoutBranch: vi.fn(async () => {}),
+  hasChanges: vi.fn(async () => true),
+  commitAndPush: vi.fn(async () => {}),
+}))
+
+vi.mock('./git-workspace.ts', () => git)
+
+beforeEach(() => {
+  ai.createAiProvider.mockClear()
+  for (const fn of Object.values(git)) fn.mockClear()
+})
 
 const repo: RepoRef = { owner: 'acme', repo: 'widgets' }
 
@@ -25,8 +48,30 @@ function makeProvider(id: string, allowedStages?: AgentStage[]): AiProviderConfi
   }
 }
 
+/** A passing preflight verdict — what GithubService returns for a repo with no known blocker. */
+function makeCapability(owner = 'acme', repo = 'widgets') {
+  return {
+    owner,
+    repo,
+    ok: true,
+    gaps: [],
+    unverified: [],
+    observed: {
+      archived: false,
+      disabled: false,
+      hasIssues: true,
+      push: true,
+      private: false,
+      credential: 'unknown' as const,
+    },
+  }
+}
+
 function makeFakeGithub(overrides: Partial<Record<string, unknown>> = {}) {
   return {
+    // runStage() preflights every stage against this before it touches an AI provider, git, or
+    // GitHub — a fake without it makes every stage fail (see the repo-permission preflight tests).
+    assertRepoWorkflowWritable: vi.fn(async (owner: string, repo: string) => makeCapability(owner, repo)),
     createIssue: vi.fn(async () => ({ number: 1, html_url: 'https://github.com/acme/widgets/issues/1' })),
     addLabel: vi.fn(async () => {}),
     getDefaultBranch: vi.fn(async () => 'main'),
@@ -897,5 +942,253 @@ describe('WorkflowEngine', () => {
       await new Promise((r) => setTimeout(r, 20))
       expect(engine.getTasks().find((t) => t.id === 'sentinel-task')!.status).toBe('pending')
     })
+  })
+})
+
+describe('WorkflowEngine repository permission preflight', () => {
+  const readOnly = evaluateRepoCapability({
+    owner: 'acme',
+    repo: 'widgets',
+    repository: { has_issues: true, permissions: { push: false } },
+  })
+  const writable = evaluateRepoCapability({
+    owner: 'acme',
+    repo: 'widgets',
+    repository: { has_issues: true, permissions: { push: true } },
+  })
+
+  /** A fake whose preflight rejects with the same error GithubService would raise. */
+  function unauthorizedGithub(overrides: Partial<Record<string, unknown>> = {}) {
+    return makeFakeGithub({
+      assertRepoWorkflowWritable: vi.fn(async () => {
+        throw new RepoCapabilityError(readOnly)
+      }),
+      ...overrides,
+    })
+  }
+
+  /** Every GitHub method that writes — none may be called when the preflight fails. */
+  function expectNoGithubWrites(github: GithubService) {
+    const writes = [
+      'createIssue',
+      'addLabel',
+      'createBranch',
+      'commitFile',
+      'createPullRequest',
+      'reviewPullRequest',
+      'commentOnIssue',
+      'mergePullRequest',
+    ] as const
+    for (const write of writes) {
+      expect(github[write], `${write} must not run without permission`).not.toHaveBeenCalled()
+    }
+  }
+
+  it('fails a directly enqueued task at its own stage without touching AI, git, or GitHub', async () => {
+    const github = unauthorizedGithub()
+    const engine = new WorkflowEngine(github)
+    engine.setProviders([makeProvider('agent-a'), makeProvider('agent-b')])
+
+    const task = engine.enqueue('Add feature X', repo)
+    await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'error')
+
+    const current = engine.getTasks().find((t) => t.id === task.id)!
+    expect(current.stage).toBe('issue')
+    expect(current.error).toMatch(/acme\/widgets is missing permissions/)
+    expect(current.history).toHaveLength(0)
+    expect(ai.createAiProvider).not.toHaveBeenCalled()
+    expect(git.ensureClone).not.toHaveBeenCalled()
+    expect(git.commitAndPush).not.toHaveBeenCalled()
+    expectNoGithubWrites(github)
+  })
+
+  it('runs the preflight before agent selection, so an unauthorized repo reports permission even with no providers', async () => {
+    // Ordering matters: reporting "No AI providers registered" here would send the operator to fix
+    // the wrong thing entirely.
+    const github = unauthorizedGithub()
+    const engine = new WorkflowEngine(github)
+
+    const task = engine.enqueue('Add feature X', repo)
+    await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'error')
+
+    expect(engine.getTasks().find((t) => t.id === task.id)!.error).toMatch(/missing permissions/)
+  })
+
+  it('blocks the real-checkout pr path before any clone or force-push', async () => {
+    const github = unauthorizedGithub()
+    const engine = new WorkflowEngine(github)
+    engine.setGithubToken('test-token')
+    engine.setWorkspaceRoot('/tmp/mao-test-workspaces')
+    engine.setProviders([
+      { id: 'agent-cli', name: 'agent-cli', kind: 'cli', command: 'claude' },
+      makeProvider('agent-b'),
+    ])
+
+    const task = engine.enqueueFromIssue(7, 'https://github.com/acme/widgets/issues/7', 'Fix it', repo)
+    await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'error')
+
+    expect(engine.getTasks().find((t) => t.id === task.id)!.stage).toBe('pr')
+    expect(git.ensureClone).not.toHaveBeenCalled()
+    expect(git.checkoutBranch).not.toHaveBeenCalled()
+    expect(git.commitAndPush).not.toHaveBeenCalled()
+    expect(ai.createAiProvider).not.toHaveBeenCalled()
+    expectNoGithubWrites(github)
+  })
+
+  it('preflights a task restored from a previous session before resuming it', async () => {
+    const github = unauthorizedGithub()
+    const engine = new WorkflowEngine(github)
+    engine.setProviders([makeProvider('agent-a'), makeProvider('agent-b')])
+
+    engine.restore(
+      [
+        {
+          id: 'restored-task',
+          title: 'Left over',
+          repo,
+          stage: 'review',
+          history: [],
+          status: 'pending',
+          autoAdvance: true,
+          github: { issueNumber: 7, prNumber: 2 },
+        },
+      ],
+      { resume: true },
+    )
+    await waitFor(() => engine.getTasks()[0].status === 'error')
+
+    expect(engine.getTasks()[0].stage).toBe('review')
+    expect(ai.createAiProvider).not.toHaveBeenCalled()
+    expectNoGithubWrites(github)
+  })
+
+  it('blocks advance() on a paused task the same way', async () => {
+    const assertRepoWorkflowWritable = vi
+      .fn()
+      .mockResolvedValueOnce(writable)
+      .mockRejectedValue(new RepoCapabilityError(readOnly))
+    const github = makeFakeGithub({ assertRepoWorkflowWritable })
+    const engine = new WorkflowEngine(github)
+    engine.setProviders([makeProvider('agent-a'), makeProvider('agent-b')])
+
+    const task = engine.enqueue('Add feature X', repo, false)
+    await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'paused')
+    expect(github.createIssue).toHaveBeenCalledTimes(1)
+
+    engine.advance(task.id)
+    await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'error')
+
+    const current = engine.getTasks().find((t) => t.id === task.id)!
+    expect(current.stage).toBe('pr')
+    expect(current.history).toHaveLength(1)
+    expect(github.createPullRequest).not.toHaveBeenCalled()
+  })
+
+  it('retries the same stage successfully once the permission is restored', async () => {
+    const assertRepoWorkflowWritable = vi
+      .fn()
+      .mockRejectedValueOnce(new RepoCapabilityError(readOnly))
+      .mockResolvedValue(writable)
+    const github = makeFakeGithub({ assertRepoWorkflowWritable })
+    const engine = new WorkflowEngine(github)
+    engine.setProviders([makeProvider('agent-a'), makeProvider('agent-b')])
+
+    const task = engine.enqueue('Add feature X', repo)
+    await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'error')
+    expect(github.createIssue).not.toHaveBeenCalled()
+
+    engine.retry(task.id)
+    await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'done')
+
+    const current = engine.getTasks().find((t) => t.id === task.id)!
+    expect(current.error).toBeUndefined()
+    expect(current.history.map((h) => h.stage)).toEqual(['issue', 'pr', 'review', 'merge'])
+    expect(github.createIssue).toHaveBeenCalledTimes(1)
+  })
+
+  it('consumes the one-shot run override on a preflight rejection, and never reuses it silently', async () => {
+    // The override is armed for one *attempt*, not one success. Keeping it armed past a rejected
+    // attempt would only look like it survived: retry()/advance() re-arm from their own argument, so
+    // the plain retry an operator actually clicks discards it anyway (armRunOverride), while the card
+    // would go on advertising an agent that run will not use.
+    const assertRepoWorkflowWritable = vi
+      .fn()
+      .mockResolvedValueOnce(writable)
+      .mockRejectedValueOnce(new RepoCapabilityError(readOnly))
+      .mockResolvedValue(writable)
+    const github = makeFakeGithub({ assertRepoWorkflowWritable })
+    const engine = new WorkflowEngine(github)
+    engine.setProviders([makeProvider('agent-a'), makeProvider('agent-b')])
+
+    const task = engine.enqueue('Add feature X', repo, false)
+    await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'paused')
+
+    engine.advance(task.id, { providerId: 'agent-b', effort: 'high' })
+    await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'error')
+
+    const blocked = engine.getTasks().find((t) => t.id === task.id)!
+    expect(blocked.stage).toBe('pr')
+    expect(blocked.nextRunOverride).toBeUndefined()
+
+    // A plain retry therefore runs plain — no agent silently pinned by a choice made for an attempt
+    // that never happened.
+    engine.retry(task.id)
+    await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.stage === 'review')
+
+    const ran = engine.getTasks().find((t) => t.id === task.id)!
+    expect(ran.history[1].effort).toBeUndefined()
+    expect(ran.nextRunOverride).toBeUndefined()
+  })
+
+  it('still applies a one-shot override to the run that clears the preflight', async () => {
+    const github = makeFakeGithub()
+    const engine = new WorkflowEngine(github)
+    engine.setProviders([makeProvider('agent-a'), makeProvider('agent-b')])
+
+    const task = engine.enqueue('Add feature X', repo, false)
+    await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'paused')
+
+    engine.advance(task.id, { providerId: 'agent-b', effort: 'high' })
+    await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.stage === 'review')
+
+    const ran = engine.getTasks().find((t) => t.id === task.id)!
+    expect(ran.history[1].agentId).toBe('agent-b')
+    expect(ran.history[1].effort).toBe('high')
+    // Consumed exactly once — the next stage rotates as if it never existed.
+    expect(ran.nextRunOverride).toBeUndefined()
+  })
+
+  it('surfaces a transient preflight failure as a retryable task error rather than a hang', async () => {
+    const assertRepoWorkflowWritable = vi
+      .fn()
+      .mockRejectedValueOnce(
+        Object.assign(new Error('GitHub request timed out after 60s'), { name: 'AbortError' }),
+      )
+      .mockResolvedValue(writable)
+    const github = makeFakeGithub({ assertRepoWorkflowWritable })
+    const engine = new WorkflowEngine(github)
+    engine.setProviders([makeProvider('agent-a'), makeProvider('agent-b')])
+
+    const task = engine.enqueue('Add feature X', repo)
+    await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'error')
+
+    expect(engine.getTasks().find((t) => t.id === task.id)!.error).toMatch(/timed out after 60s/)
+    expect(github.createIssue).not.toHaveBeenCalled()
+
+    engine.retry(task.id)
+    await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'done')
+  })
+
+  it('checks the task\'s own repository, including MAO\'s, with no exemption', async () => {
+    const github = makeFakeGithub()
+    const engine = new WorkflowEngine(github)
+    engine.setProviders([makeProvider('agent-a'), makeProvider('agent-b')])
+
+    const task = engine.enqueue('Self-hosted change', { owner: 'dragoncowkarma', repo: 'mao' })
+    await waitFor(() => engine.getTasks().find((t) => t.id === task.id)?.status === 'done')
+
+    expect(github.assertRepoWorkflowWritable).toHaveBeenCalledWith('dragoncowkarma', 'mao')
+    // Once per stage, so a grant revoked mid-pipeline stops the very next stage.
+    expect(github.assertRepoWorkflowWritable).toHaveBeenCalledTimes(4)
   })
 })

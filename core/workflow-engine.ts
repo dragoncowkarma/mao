@@ -396,7 +396,10 @@ export class WorkflowEngine extends EventEmitter {
     // A one-shot override belongs to exactly this execution. Read it out and clear it from the task
     // up front — before the entry notify() persists anything, and before any await — so that neither
     // a failure in this stage nor the next stage auto-advancing can silently reuse a choice the
-    // operator made for a single run.
+    // operator made for a single run. That includes a rejection from the permission preflight below:
+    // keeping it armed for the retry would only look like it survived, because retry()/advance()
+    // re-arm from their own argument, so the plain retry an operator actually clicks would discard it
+    // anyway (see armRunOverride) while the card kept advertising an agent that run would not use.
     const oneShot = task.nextRunOverride
     task.nextRunOverride = undefined
     try {
@@ -404,6 +407,15 @@ export class WorkflowEngine extends EventEmitter {
       // synchronous store.set) must land the task in 'error' via the catch below instead of
       // leaving it stuck at 'running' forever with no path back to retry().
       this.notify()
+
+      // Preflight before anything external happens — no AI provider call, no git clone or push, no
+      // GitHub write. This is the single chokepoint every execution path funnels through (direct
+      // enqueue, auto-trigger's enqueueFromIssue, restore/resume, retry(), advance()), so a repo whose
+      // access was revoked after registration, or one enqueued around the registration check, still
+      // cannot reach a write. A failure throws into the catch below: status 'error' at the *same*
+      // stage, so retry() re-runs it unchanged once the grant is restored. Transient lookup failures
+      // (rate limit, 5xx, the 60s request deadline) surface the same way rather than hanging.
+      await this.github.assertRepoWorkflowWritable(task.repo.owner, task.repo.repo)
 
       const agentConfig = this.selectAgent(task, oneShot)
       const usesCodeEdits = task.stage === 'pr' && agentConfig.kind === 'cli' && !!this.workspaceRoot

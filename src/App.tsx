@@ -6,6 +6,7 @@ import ProjectSettings from './components/ProjectSettings'
 import GlobalSettings from './components/GlobalSettings'
 import UpdateBanner from './components/UpdateBanner'
 import type { RepoRef } from '../core/workflow-engine'
+import type { RepoWorkflowCapability } from '../core/repo-capabilities'
 import type { ThemePreference } from '../core/store'
 import type { AppUpdateCheck } from './electron'
 
@@ -20,6 +21,8 @@ export default function App() {
   const [theme, setThemeState] = useState<ThemePreference>('system')
   const [update, setUpdate] = useState<AppUpdateCheck | null>(null)
   const [dismissedUpdateSha, setDismissedUpdateSha] = useState<string | null>(null)
+  /** Surfaces a failed settings edit or removal, which are otherwise silent (no preflight, no form). */
+  const [repoError, setRepoError] = useState('')
 
   useEffect(() => {
     window.electronAPI.github.getRepos().then((savedRepos) => {
@@ -107,31 +110,76 @@ export default function App() {
     }
   }, [repos, selectedIndex])
 
-  async function persistRepos(next: RepoRef[]) {
+  /**
+   * Mirrors into React state immediately, and on rejection re-reads the store rather than restoring a
+   * snapshot.
+   *
+   * Optimistic on the success path because the update path cannot wait for the round trip:
+   * ProjectSettings renders fully controlled inputs off this state, and deferring the mirror until
+   * after the IPC makes React restore each keystroke to the last rendered value, so the poll-interval
+   * field reverts as it is typed. (For the same reason the success path must NOT re-read either — a
+   * round trip that lands mid-typing would stomp newer keystrokes with the value it persisted.)
+   *
+   * Rolling back to a captured `previous` is wrong, though: that snapshot is this render's optimistic
+   * mirror, not the store, and `setRepos` writes the whole list, so several writes can be in flight at
+   * once — an add's preflight is a multi-second network call during which the settings panel stays
+   * live. Restoring a stale snapshot can then resurrect an entry the store refused, or erase one a
+   * concurrent write just persisted, and since the renderer reads the list only once at mount that
+   * divergence never heals. `github:getRepos` is a pure `store.get`, so asking it what actually
+   * survived is both cheap and authoritative — and it is the re-fetch-after-mutation model AGENTS.md
+   * prescribes for the renderer.
+   */
+  async function persistRepos(next: RepoRef[]): Promise<RepoWorkflowCapability[]> {
+    const previous = repos
     setRepos(next)
-    await window.electronAPI.github.setRepos(next)
+    try {
+      return await window.electronAPI.github.setRepos(next)
+    } catch (err) {
+      // Fall back to the snapshot only if even the read fails; showing a stale list beats showing one
+      // built from a write we know was refused.
+      setRepos(await window.electronAPI.github.getRepos().catch(() => previous))
+      throw err
+    }
   }
 
-  async function addRepo(repo: RepoRef) {
+  /**
+   * Rejects when the repo fails the write-permission preflight; Sidebar renders the message. Resolves
+   * with the verdicts so Sidebar can show the caveat for grants the preflight could not prove.
+   */
+  async function addRepo(repo: RepoRef): Promise<RepoWorkflowCapability[]> {
     const exists = repos.some((r) => r.owner === repo.owner && r.repo === repo.repo)
-    if (exists) return
+    if (exists) return []
     const next = [...repos, repo]
-    await persistRepos(next)
+    const checked = await persistRepos(next)
     setSelectedIndex(next.length - 1)
     setView('project')
     setProjectTab('board')
+    return checked
   }
 
+  // Settings edits and removals skip the preflight by design, but the store write can still fail —
+  // and an inert checkbox with an unhandled rejection in the console tells the operator nothing.
   async function updateSelectedRepo(patch: Partial<RepoRef>) {
     if (selectedIndex === null) return
     const next = repos.map((r, i) => (i === selectedIndex ? { ...r, ...patch } : r))
-    await persistRepos(next)
+    setRepoError('')
+    try {
+      await persistRepos(next)
+    } catch (err) {
+      setRepoError(err instanceof Error ? err.message : String(err))
+    }
   }
 
   async function removeSelectedRepo() {
     if (selectedIndex === null) return
     const next = repos.filter((_, i) => i !== selectedIndex)
-    await persistRepos(next)
+    setRepoError('')
+    try {
+      await persistRepos(next)
+    } catch (err) {
+      setRepoError(err instanceof Error ? err.message : String(err))
+      return
+    }
     setSelectedIndex(next.length > 0 ? 0 : null)
     setProjectTab('board')
   }
@@ -183,6 +231,12 @@ export default function App() {
                 {selected.owner}/{selected.repo}
               </h2>
             </div>
+
+            {repoError && (
+              <p className="mb-3 text-xs" style={{ color: 'var(--color-accent-700)' }}>
+                {repoError}
+              </p>
+            )}
 
             <div className="tabs">
               <button

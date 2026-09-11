@@ -87,7 +87,7 @@ State lives at `$MAO_DATA_DIR/config.json` (default: the platform data dir from
 npm run cli -- config set-token <token>          # store GitHub token
 npm run cli -- config import-providers <file>    # JSON array of AiProviderConfig
 npm run cli -- config show                       # secrets redacted as '[set]'
-npm run cli -- repos add <owner> <repo> [--no-auto-trigger] [--poll-interval-ms <ms>]
+npm run cli -- repos add <owner> <repo> [--no-auto-trigger] [--poll-interval-ms <ms>]  # preflights write access
 npm run cli -- repos list
 npm run cli -- github check <owner> <repo>       # open issues/PRs as JSON
 npm run cli -- github view <owner> <repo> <number>  # full body + comments for one issue/PR as JSON
@@ -102,6 +102,36 @@ npm run cli -- run                               # foreground: auto-trigger + re
 npm run cli -- swarm --repo-root /path/to/repo --status
 npm run cli -- swarm --repo-root /path/to/repo --dry-run --once
 ```
+
+**Repository write-permission preflight.** `repos add` refuses to register a repo the current
+GitHub credential cannot run the pipeline against, leaving the stored list untouched and printing
+the repo name plus every missing capability. It is one non-mutating `GET /repos/{owner}/{repo}` —
+never a create-then-delete probe — checking that the repo exists, is not archived/disabled/legally
+unavailable, has Issues enabled, and reports `permissions.push`. A *passing* result is not proof:
+GitHub exposes no non-mutating way to enumerate a fine-grained token's or GitHub App installation's
+individual Issues/Contents/Pull-requests grants, so those print as an explicit "unverified" caveat
+and a real write can still fail. Rate limits, 5xx and the 60s deadline stay transient errors rather
+than being reported as missing permission.
+
+Because the check needs a credential, **set the GitHub token before registering repositories** —
+`mao config set-token` (or the Electron Global settings pane); otherwise `repos add` and the GUI's
+Add form both fail with "no GitHub token is configured".
+
+Only a *new* owner/repo pair is checked. Re-running `repos add` on a repo you already track (the
+CLI's only way to flip `--no-auto-trigger` / `--poll-interval-ms`) and `repos remove` both skip it
+on purpose, so a repo whose access was revoked can still be turned off or removed. The GUI's
+sidebar Add form and its project-settings toggles follow the identical rule — both shells delegate
+to `reposNeedingCapabilityCheck()` in `core/repo-registry.ts`.
+
+The GUI shows the same unverified-grants caveat the CLI prints (`github:setRepos` returns the
+verdicts), and the board's **Refresh** surfaces a failed preflight instead of reporting a clean sync —
+`github:refreshRepo` drives a real poll, so its verdict has to reach the operator. The board's own 30s
+listing poll is unaffected, so the cards stay visible while the error is shown.
+
+The same check runs before **every** workflow stage (`runStage()`) and before auto-trigger enqueues
+anything, so a grant revoked after registration, or a task enqueued directly, still cannot reach an
+AI call, a `git push`, or a GitHub write — the task parks in a retryable `error` at the same stage
+and succeeds on `workflow retry` once the grant is restored. `dragoncowkarma/mao` gets no exemption.
 
 ⚠️ `workflow enqueue` without `--no-auto-advance` runs the **entire pipeline
 unattended** (real GitHub writes) in the foreground with no progress output; only

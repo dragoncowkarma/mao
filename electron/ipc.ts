@@ -12,7 +12,7 @@ export function registerIpcHandlers() {
   const buildSha = process.env.MAO_BUILD_SHA ?? ''
   if (buildSha) store.set('buildSha', buildSha)
 
-  const { githubService, workflowEngine } = createMaoApp({
+  const { githubService, workflowEngine, updateRepos } = createMaoApp({
     store,
     workspaceRoot: path.join(app.getPath('userData'), 'workspaces'),
     dataDir: app.getPath('userData'),
@@ -63,9 +63,14 @@ export function registerIpcHandlers() {
     return githubService.fetchTaskDetail(owner, repo, number)
   })
 
-  ipcMain.handle('github:setRepos', (_event, repos: RepoRef[]) => {
-    store.set('githubRepos', repos)
-  })
+  // Newly registered repos are preflighted in core before anything is persisted; updates, removals
+  // and reordering are not, so a repo whose access was revoked can still be turned off or removed.
+  // The rule itself lives in core/repo-registry.ts — shared verbatim with `mao repos add`.
+  //
+  // Returns the passing verdicts so the renderer can show the same "these grants are unverified"
+  // caveat `mao repos add` prints. Dropping them would make a passing preflight look in the GUI like
+  // proof of write access, which is exactly what core/repo-capabilities.ts exists to avoid.
+  ipcMain.handle('github:setRepos', (_event, repos: RepoRef[]) => updateRepos(() => repos))
 
   ipcMain.handle('github:getRepos', () => store.get('githubRepos'))
 
@@ -73,9 +78,16 @@ export function registerIpcHandlers() {
     autoTrigger.getStatus(owner, repo),
   )
 
+  // Refresh drives a real poll, so its verdict has to reach the operator. pollNow() swallows every
+  // failure into auto-trigger's lastError map, which nothing in the renderer reads — so without this
+  // the GUI would report a clean sync for a repository MAO cannot write to, and on revoked access
+  // would show fetchTasks' opaque 404 instead of the message the preflight just produced. Rejecting
+  // here surfaces it in the board's existing error slot; the board's own 30s fetchTasks poll keeps
+  // the card list populated meanwhile.
   ipcMain.handle('github:refreshRepo', async (_event, owner: string, repo: string) => {
     const repos = store.get('githubRepos')
     const repoRef = repos.find((r) => r.owner === owner && r.repo === repo) ?? { owner, repo }
+    await githubService.assertRepoWorkflowWritable(owner, repo)
     await autoTrigger.pollNow(repoRef)
     return githubService.fetchTasks(owner, repo)
   })

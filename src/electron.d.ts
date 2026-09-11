@@ -1,5 +1,6 @@
 import type { AiProviderConfig } from '../core/ai/types'
 import type { GithubTask, GithubTaskDetail } from '../core/github-service'
+import type { RepoWorkflowCapability } from '../core/repo-capabilities'
 import type { QueuedTask, RepoRef, RunOverride } from '../core/workflow-engine'
 import type { AutoTriggerStatus } from '../core/auto-trigger'
 import type { ThemePreference } from '../core/store'
@@ -26,7 +27,12 @@ declare global {
         setToken: (token: string) => Promise<void>
         fetchTasks: (owner: string, repo: string) => Promise<GithubTask[]>
         fetchTaskDetail: (owner: string, repo: string, number: number) => Promise<GithubTaskDetail>
-        setRepos: (repos: RepoRef[]) => Promise<void>
+        /**
+         * Rejects (leaving the stored list untouched) when a newly added repo fails the write-permission
+         * preflight. Resolves with the verdict for each newly registered repo, whose `unverified` grants
+         * the caller should surface — a pass is not proof of write access.
+         */
+        setRepos: (repos: RepoRef[]) => Promise<RepoWorkflowCapability[]>
         getRepos: () => Promise<RepoRef[]>
         autoTriggerStatus: (owner: string, repo: string) => Promise<AutoTriggerStatus>
         refreshRepo: (owner: string, repo: string) => Promise<GithubTask[]>

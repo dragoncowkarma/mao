@@ -25,6 +25,13 @@ export function startAutoTrigger(
   const pollRepo = async ({ owner, repo }: RepoRef) => {
     const key = `${owner}/${repo}`
     try {
+      // Before any read that could lead to a write, and deliberately before fetchTasks: an
+      // unauthorized repo makes listForRepo fail with an opaque 404 that says nothing about the
+      // missing grant, whereas this yields a verdict naming the repo and every gap. A failure throws
+      // straight to the catch below, so this poll performs zero enqueueFromIssue and zero addLabel
+      // calls — the two side effects issue #48 requires be unreachable without permission.
+      await githubService.assertRepoWorkflowWritable(owner, repo)
+
       const tasks = await githubService.fetchTasks(owner, repo)
       for (const task of tasks) {
         if (task.type !== 'issue' || task.state !== 'open') continue
@@ -46,7 +53,9 @@ export function startAutoTrigger(
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       lastError.set(key, message)
-      console.error(`[auto-trigger] poll failed for ${key}`, err)
+      // Message only, never the error object: an Octokit failure carries its whole request — headers
+      // included — and this line ends up in shared terminal and agent logs.
+      console.error(`[auto-trigger] poll failed for ${key}: ${message}`)
     } finally {
       lastPolledAt.set(key, Date.now())
     }

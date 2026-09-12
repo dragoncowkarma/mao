@@ -1,4 +1,5 @@
 import { parseProviderOverride } from './assignment.ts'
+import { canonicalRepoList } from './repo-registry.ts'
 import type { GithubService } from './github-service.ts'
 import { WORKFLOW_ACTIVE_LABEL, type RepoRef, type WorkflowEngine } from './workflow-engine.ts'
 
@@ -63,7 +64,15 @@ export function startAutoTrigger(
 
   const tick = async () => {
     const now = Date.now()
-    for (const repoRef of getRepos()) {
+    // Canonicalised per tick, not trusted as stored. A store written before repository identity became
+    // case-insensitive can hold one repository twice, and iterating it raw is precisely the harm that
+    // motivated the fix: two pollers for one repo, each enqueueing before the best-effort
+    // workflow-active label lands, producing two branches and PRs for a single issue. Only a list
+    // write heals the store itself, and an unattended `mao run` never performs one — so the scheduler
+    // has to stop double-polling on its own. Read-only: nothing here writes `githubRepos`, which keeps
+    // `updateRepos` the single writer.
+    const repos = getRepos()
+    for (const repoRef of canonicalRepoList(repos, repos)) {
       const { owner, repo, autoTrigger = true, pollIntervalMs = DEFAULT_POLL_INTERVAL_MS } = repoRef
       if (!owner || !repo || !autoTrigger) continue
 

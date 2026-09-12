@@ -123,6 +123,24 @@ on purpose, so a repo whose access was revoked can still be turned off or remove
 sidebar Add form and its project-settings toggles follow the identical rule — both shells delegate
 to `reposNeedingCapabilityCheck()` in `core/repo-registry.ts`.
 
+"Already tracked" is case-insensitive, matching how GitHub resolves owner/repo: `repos add
+DragonCowKarma MAO` updates a tracked `dragoncowkarma/mao` instead of registering it twice, and
+`repos remove DRAGONCOWKARMA mao` removes it. The stored entry keeps the spelling it was first
+registered under — that is the spelling the preflight vouched for, it is what the sidebar shows, and
+it is what already-queued tasks carry — so `Tracking …` echoes that rather than what you typed. A
+store that already holds one repository twice is folded back to a single entry by the next list write
+from either shell, keeping the spelling of whichever entry comes first in the stored list (not
+necessarily the one registered earliest — `repos add` moves the entry it replaces to the end). Until
+that write happens the duplicate stays on disk, but `mao run`'s scheduler deduplicates the list it
+polls, so it will not poll one repository twice.
+
+Re-adding from the **GUI** sidebar leaves a tracked repo's settings alone, whichever case you type:
+the Add form submits only owner/repo, and core merges that onto the tracked entry rather than over it,
+so `autoTrigger` and the poll interval survive. `mao repos add` is the opposite by design — it "adds or
+replaces its entry", so the flags you pass (or omit) win, and omitting `--no-auto-trigger` re-enables
+polling. Where two entries for one repository disagree about `autoTrigger`, the fold resolves to
+`false`: re-enabling unattended polling by accident is far worse than leaving it off.
+
 The GUI shows the same unverified-grants caveat the CLI prints (`github:setRepos` returns the
 verdicts), and the board's **Refresh** surfaces a failed preflight instead of reporting a clean sync —
 `github:refreshRepo` drives a real poll, so its verdict has to reach the operator. The board's own 30s

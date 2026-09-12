@@ -9,6 +9,7 @@ import { defaultDataDir } from '../core/paths.ts'
 import { clearPersistenceBrokenMarker, hasPersistenceBrokenMarker } from '../core/persistence-guard.ts'
 import { runSwarm, SwarmRepositoryPathError } from '../core/swarm-runner.ts'
 import { describeUnverifiedGrants } from '../core/repo-capabilities.ts'
+import { sameRepoRef } from '../core/repo-registry.ts'
 import type { AiEffort, AiProviderConfig } from '../core/ai/types.ts'
 import type { QueuedTask, RepoRef, RunOverride } from '../core/workflow-engine.ts'
 import type { ThemePreference } from '../core/store.ts'
@@ -155,18 +156,22 @@ repos
   .option('--no-auto-trigger', 'do not auto-poll this repo for new issues')
   .option('--poll-interval-ms <ms>', 'override the default poll interval', (v) => parseInt(v, 10))
   .action(async (owner: string, repo: string, opts: { autoTrigger: boolean; pollIntervalMs?: number }) => {
-    const { updateRepos } = loadApp()
+    const { store, updateRepos } = loadApp()
     const ref: RepoRef = { owner, repo, autoTrigger: opts.autoTrigger, pollIntervalMs: opts.pollIntervalMs }
     // Same serialized core path the GUI's github:setRepos uses, so the two shells agree on what counts
     // as a new registration and on read/preflight/write being one unit. `repos add` doubles as this
     // CLI's only settings editor, so re-adding an already-tracked repo to flip --no-auto-trigger stays
     // possible after its access is revoked — exactly as toggling it in the GUI does. A failure throws
     // before the write, leaving the stored list untouched.
-    const checked = await updateRepos((previous) => [
-      ...previous.filter((r) => !(r.owner === owner && r.repo === repo)),
-      ref,
-    ])
-    log(`Tracking ${owner}/${repo}`)
+    //
+    // The entry this add replaces is matched with core's `sameRepoRef`, which is case-insensitive as
+    // GitHub is: `repos add DragonCowKarma MAO` updates a tracked dragoncowkarma/mao rather than
+    // registering the same repository a second time for auto-trigger to poll twice.
+    const checked = await updateRepos((previous) => [...previous.filter((r) => !sameRepoRef(r, ref)), ref])
+    // Report the spelling that is actually tracked: core keeps the one the repository was registered
+    // (and preflighted) under, which for a re-add is not necessarily the one just typed.
+    const tracked = store.get('githubRepos').find((r) => sameRepoRef(r, ref)) ?? ref
+    log(`Tracking ${tracked.owner}/${tracked.repo}`)
     // A passing preflight is not a proof of write access — say so rather than let `Tracking …` imply it.
     for (const capability of checked) {
       const caveat = describeUnverifiedGrants(capability)
@@ -176,14 +181,20 @@ repos
 
 repos
   .command('remove <owner> <repo>')
-  .description('Stop tracking a repo')
+  .description('Stop tracking a repo (owner/repo match GitHub\'s own case-insensitive resolution)')
   .action(async (owner: string, repo: string) => {
-    const { updateRepos } = loadApp()
+    const { store, updateRepos } = loadApp()
     // Through the same serialized core path as `add`, so `githubRepos` has exactly one writer. A
     // removal introduces no new entry, so it never preflights — removing a repo whose access was
     // revoked (or removing one with no token configured at all) keeps working.
-    await updateRepos((previous) => previous.filter((r) => !(r.owner === owner && r.repo === repo)))
-    log(`Stopped tracking ${owner}/${repo}`)
+    const target: RepoRef = { owner, repo }
+    // Report the spelling that was actually tracked, and say so plainly when nothing matched — `add`
+    // echoes the stored spelling, so `remove` claiming to have removed a name the store never held
+    // would be the one place the two commands disagree about what a repository is called.
+    const tracked = store.get('githubRepos').filter((r) => sameRepoRef(r, target))
+    await updateRepos((previous) => previous.filter((r) => !sameRepoRef(r, target)))
+    if (tracked.length === 0) log(`No tracked repo matches ${owner}/${repo}`)
+    else for (const r of tracked) log(`Stopped tracking ${r.owner}/${r.repo}`)
   })
 
 repos

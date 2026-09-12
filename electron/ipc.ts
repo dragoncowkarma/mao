@@ -3,6 +3,7 @@ import path from 'node:path'
 import { store } from './store.ts'
 import { createMaoApp } from '../core/app.ts'
 import { startAutoTrigger } from '../core/auto-trigger.ts'
+import { sameRepoRef } from '../core/repo-registry.ts'
 import { assertCanRelaunchForUpdate, checkForUpdates, countRunningWorkflowTasks } from '../core/self-update.ts'
 import { createAiProvider, type AiProviderConfig } from '../core/ai/index.ts'
 import type { RepoRef, RunOverride } from '../core/workflow-engine.ts'
@@ -86,7 +87,7 @@ export function registerIpcHandlers() {
   // the card list populated meanwhile.
   ipcMain.handle('github:refreshRepo', async (_event, owner: string, repo: string) => {
     const repos = store.get('githubRepos')
-    const repoRef = repos.find((r) => r.owner === owner && r.repo === repo) ?? { owner, repo }
+    const repoRef = repos.find((r) => sameRepoRef(r, { owner, repo })) ?? { owner, repo }
     await githubService.assertRepoWorkflowWritable(owner, repo)
     await autoTrigger.pollNow(repoRef)
     return githubService.fetchTasks(owner, repo)

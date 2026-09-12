@@ -31,7 +31,7 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
 | `core/agent-selection.ts` | Pure, renderer-importable agent routing: `resolveStageAgent()` (maker-checker + role pins + `allowedStages` + model/effort resolution), `isStageEligible()`, `eligibleAgentsForRun()`, `previewStageAgent()`, plus the `WorkflowRole`/`STAGE_ROLE`/`ProviderOverride`/`RunOverride` definitions (re-exported by `core/workflow-engine.ts`, so `core/assignment.ts` and the shells import them unchanged) |
 | `core/github-service.ts` | Octokit REST wrapper (issues, PRs, labels, reviews, merge, CI status) — plus the read-only `checkRepoWorkflowCapability()` / `assertRepoWorkflowWritable()` preflight |
 | `core/repo-capabilities.ts` | Pure verdict logic for "can this credential run the pipeline in this repo?" — `evaluateRepoCapability()`, `describeRepoCapability()`, `describeUnverifiedGrants()`, `RepoCapabilityError` |
-| `core/repo-registry.ts` | The single definition of "this repo entry is newly registered" — `reposNeedingCapabilityCheck()` / `assertReposRegistrable()`, shared by `github:setRepos` and `mao repos add` |
+| `core/repo-registry.ts` | Pure, renderer-importable repository identity plus the single definition of "this repo entry is newly registered" — `repoRefKey()`/`sameRepoRef()` (case-insensitive, as GitHub resolves owner/repo), `canonicalRepoList()`, `reposNeedingCapabilityCheck()` / `assertReposRegistrable()`, and the serialized `createRepoRegistrar()` both `github:setRepos` and `mao repos add`/`remove` write through |
 | `core/git-workspace.ts` | Local git clone/branch/commit/push via `execFile` (no shell) |
 | `core/swarm-runner.ts` | Shell-free launcher and repository/asset validation for the autonomous Swarm Orchestrator |
 | `core/auto-trigger.ts` | Per-repo polling scheduler; auto-enqueues new open issues |
@@ -110,6 +110,8 @@ There is no codegen — these couplings are maintained by hand and only `npm run
 - **Repository registration** → the add-vs-update rule lives ONLY in `core/repo-registry.ts`;
   `electron/ipc.ts`'s `github:setRepos` and `cli/index.ts`'s `repos add`/`repos remove` must all stay
   thin delegations to `createMaoApp()`'s `updateRepos`. Re-implementing the diff in either shell is how the two paths silently drift.
+  A shell's update callback may match entries with core's `sameRepoRef`, but must never normalise or
+  deduplicate the list itself — `updateRepos` owns that (see the identity invariant below).
   Both shells must also surface `describeUnverifiedGrants()` for the verdicts it returns — a passing
   preflight is not proof of write access, and a shell that stays silent about that claims more than
   the check established.
@@ -277,6 +279,38 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   operator removed while its registration was still checking (the store keeps it, the sidebar does
   not, and auto-trigger keeps polling it). Never write `githubRepos` through `store` directly, and
   never move this sequence into a shell.
+- **Repository identity is case-insensitive, and the list is canonicalised before it is stored**:
+  GitHub resolves owner/repo without regard to case, so `sameRepoRef()`/`repoRefKey()` lower-case
+  both halves — otherwise `mao repos add DragonCowKarma MAO` registered a *second* entry for an
+  already-tracked `dragoncowkarma/mao`, `startAutoTrigger` polled it twice, and (auto-trigger
+  enqueues before writing the best-effort `workflow-active` label) both pollers could enqueue one
+  issue and open two branches and PRs for it; `repos remove` spelled the other way matched neither
+  entry. A case-insensitive comparison **alone** is unsafe: it makes `reposNeedingCapabilityCheck()`
+  read a case variant as already-tracked, and the write would then persist a pair the preflight never
+  checked. So `updateRepos` runs `canonicalRepoList()` inside its critical section, *before* the
+  preflight — folding each entry that names an already-registered repo back onto the **stored**
+  owner/repo strings and collapsing duplicates. Checked list and stored list are therefore the same
+  bytes, and the guarantee holds by construction. Two details there are load-bearing, both with
+  regression tests. When one list names a repository twice, the **earlier** occurrence keeps every
+  setting it defines and the later fills in only the rest — the later is characteristically the less
+  informed (a bare `{owner, repo}` from the sidebar's Add form, or a stale row from a pre-fix
+  duplicate), and letting it win blanked a tracked repo's `autoTrigger`/`pollIntervalMs` and silently
+  restarted unattended polling. `mao repos add` still replaces settings outright, because its callback
+  drops the entry it supersedes so only one occurrence arrives. `autoTrigger: false` is the exception
+  that wins from either side: the two ways of guessing wrong are not symmetric, since one of them
+  resumes a pipeline that opens branches, PRs and merges unattended. The entry first in stored order
+  supplies the surviving spelling. That is *not* enough to protect queued work on its own — both
+  duplicate rows were live, so tasks can carry either spelling — which is why the board and queue match
+  tasks with `sameRepoRef`, and why `startAutoTrigger` deduplicates the list it polls rather than
+  waiting for a list write to heal the store (an unattended `mao run` never performs one). An update
+  callback must also **delete by identity, never by array position**: omitting one row of a duplicated
+  pair hands core a list that still names the repository, so it stays tracked *and* inherits the other
+  row's settings — which is how the GUI's Remove button re-enabled polling on a repo it was asked to
+  delete. Keep
+  canonicalisation there, not in a shell. Deliberately **not** a lower-casing of stored entries:
+  `QueuedTask.repo` is snapshotted at enqueue time and the board and queue views filter tasks by an
+  exact `t.repo.owner === repo.owner`, so rewriting stored spellings would hide every task queued
+  before the change — and it would misspell repositories back at the operator in the sidebar.
 - **Registration and every stage are gated on a read-only permission preflight**
   (`core/repo-capabilities.ts`). Adding a repo — via the GUI sidebar or `mao repos add` —
   persists nothing unless the check passes; *updating* and *removing* an already-tracked repo

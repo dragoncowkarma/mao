@@ -7,6 +7,7 @@ import GlobalSettings from './components/GlobalSettings'
 import UpdateBanner from './components/UpdateBanner'
 import type { RepoRef } from '../core/workflow-engine'
 import type { RepoWorkflowCapability } from '../core/repo-capabilities'
+import { sameRepoRef } from '../core/repo-registry'
 import type { ThemePreference } from '../core/store'
 import type { AppUpdateCheck } from './electron'
 
@@ -147,20 +148,24 @@ export default function App() {
    * with the verdicts so Sidebar can show the caveat for grants the preflight could not prove.
    */
   async function addRepo(repo: RepoRef): Promise<RepoWorkflowCapability[]> {
-    // A convenience short-circuit, not the rule: it saves an IPC round trip for the obvious repeat.
-    // Correctness lives in core because a renderer-side check could never cover `mao repos add`, which
-    // reaches the same store with no renderer involved at all — so this stays deliberately simple and
-    // is allowed to miss. It does miss the case it cannot see, that `DragonCowKarma/MAO` and
-    // `dragoncowkarma/mao` are one repository; core catches that, merging the entry onto the tracked
-    // one rather than adding a second (see canonicalRepoList in core/repo-registry.ts).
-    // Built from what the store actually holds, not this component's mirror. `setRepos` writes the whole
-    // list, and core can only protect a tracked repo's settings from a bare Add-form submission when the
-    // tracked entry is *in* that list to be merged onto. The mirror is read once at mount, so a repo
-    // added by `mao repos add` in a terminal since then would be missing — and the bare entry would
-    // then be the sole occurrence, which core treats as the deliberate replace `repos add` performs.
+    // Decided against what the store actually holds, not this component's mirror, which is read once at
+    // mount: a repo added by `mao repos add` in a terminal since then would be missing from it. That
+    // matters twice over — core can only protect a tracked repo's settings from a bare Add-form
+    // submission when the tracked entry is in the list being written, and an unseen repo would
+    // otherwise make this look like a first registration.
     const current = await window.electronAPI.github.getRepos().catch(() => repos)
-    const exists = current.some((r) => r.owner === repo.owner && r.repo === repo.repo)
-    if (exists) return []
+    const existing = current.findIndex((r) => sameRepoRef(r, repo))
+    if (existing !== -1) {
+      // Already tracked — including under a different capitalisation, which is one repository to
+      // GitHub and to core. Adopt the authoritative list and navigate rather than returning silently:
+      // the repo may be one this component has never seen, and leaving the mirror stale would hide a
+      // repository that really is being tracked and polled until the app restarts.
+      setRepos(current)
+      setSelectedIndex(existing)
+      setView('project')
+      setProjectTab('board')
+      return []
+    }
     const checked = await persistRepos([...current, repo])
     // Re-read instead of deriving the selection from the optimistic copy: the fold means the stored
     // list can be shorter than the one just sent, and selecting into a list the store does not have
@@ -175,9 +180,11 @@ export default function App() {
     // the form reads "Checking access…", whereas a phantom sidebar row is certain whenever the add is
     // folded — so it is the better trade, not a free one. Core keeps the last occurrence of a
     // repository, so the entry just registered (or the existing one it merged into) is last.
-    const stored = await window.electronAPI.github.getRepos().catch(() => [...repos, repo])
+    const stored = await window.electronAPI.github.getRepos().catch(() => [...current, repo])
     setRepos(stored)
-    setSelectedIndex(stored.length - 1)
+    // By identity rather than by position: the fold can reorder the list, not only shorten it.
+    const added = stored.findIndex((r) => sameRepoRef(r, repo))
+    setSelectedIndex(added === -1 ? (stored.length > 0 ? stored.length - 1 : null) : added)
     setView('project')
     setProjectTab('board')
     return checked
@@ -187,6 +194,8 @@ export default function App() {
   // and an inert checkbox with an unhandled rejection in the console tells the operator nothing.
   async function updateSelectedRepo(patch: Partial<RepoRef>) {
     if (selectedIndex === null) return
+    const target = repos[selectedIndex]
+    if (!target) return
     const next = repos.map((r, i) => (i === selectedIndex ? { ...r, ...patch } : r))
     setRepoError('')
     try {
@@ -202,12 +211,26 @@ export default function App() {
     // re-sending it, so an edit that lost the duplicate tie-break could never be re-applied. Adopting
     // only the structural change heals the list without touching any value being typed.
     const stored = await window.electronAPI.github.getRepos().catch(() => next)
-    if (stored.length !== next.length) setRepos(stored)
+    if (stored.length !== next.length) {
+      setRepos(stored)
+      // Collapsing a duplicate reorders as well as shortens — the surviving entry takes the *last*
+      // occurrence's position — so the index that was selected can now name a different repository,
+      // and the next keystroke would edit that one. Re-find the selection by identity.
+      const moved = stored.findIndex((r) => sameRepoRef(r, target))
+      setSelectedIndex(moved === -1 ? (stored.length > 0 ? 0 : null) : moved)
+    }
   }
 
   async function removeSelectedRepo() {
     if (selectedIndex === null) return
-    const next = repos.filter((_, i) => i !== selectedIndex)
+    const target = repos[selectedIndex]
+    if (!target) return
+    // Every row naming this repository, not just the selected index. A store written before repository
+    // identity was case-insensitive can hold it twice, and dropping one row hands core a list that
+    // still names it: "Remove" would leave the repo tracked, and the surviving row's settings would
+    // take over — re-enabling unattended polling the operator had switched off, on the repository they
+    // just tried to delete. `mao repos remove` already deletes by identity; the GUI has to agree.
+    const next = repos.filter((r) => !sameRepoRef(r, target))
     setRepoError('')
     try {
       await persistRepos(next)

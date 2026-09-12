@@ -302,7 +302,11 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   supplies the surviving spelling. That is *not* enough to protect queued work on its own — both
   duplicate rows were live, so tasks can carry either spelling — which is why the board and queue match
   tasks with `sameRepoRef`, and why `startAutoTrigger` deduplicates the list it polls rather than
-  waiting for a list write to heal the store (an unattended `mao run` never performs one). Keep
+  waiting for a list write to heal the store (an unattended `mao run` never performs one). An update
+  callback must also **delete by identity, never by array position**: omitting one row of a duplicated
+  pair hands core a list that still names the repository, so it stays tracked *and* inherits the other
+  row's settings — which is how the GUI's Remove button re-enabled polling on a repo it was asked to
+  delete. Keep
   canonicalisation there, not in a shell. Deliberately **not** a lower-casing of stored entries:
   `QueuedTask.repo` is snapshotted at enqueue time and the board and queue views filter tasks by an
   exact `t.repo.owner === repo.owner`, so rewriting stored spellings would hide every task queued

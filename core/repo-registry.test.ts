@@ -149,6 +149,16 @@ describe('canonicalRepoList', () => {
     expect(canonicalRepoList([tracked], [bare])).toEqual([{ ...bare, owner: 'acme', repo: 'widgets' }])
   })
 
+  it('tolerates a non-object stored entry, and lets a write clear it', () => {
+    // `config.json` is unvalidated JSON and can hold `null` where an object belongs. Canonicalisation
+    // walks `previous` on every list write, so one such value threw on all of them — including the
+    // empty-list write that used to be the only way to get rid of it.
+    const broken = [null, widgets] as unknown as RepoRef[]
+    expect(() => canonicalRepoList(broken, broken)).not.toThrow()
+    expect(canonicalRepoList(broken, broken)).toEqual([widgets])
+    expect(canonicalRepoList([null] as unknown as RepoRef[], [])).toEqual([])
+  })
+
   it('does not throw on a malformed stored entry, so the list stays editable', () => {
     // `config.json` is unvalidated JSON. The `===` this replaced returned false for a half-written
     // entry; a bare .toLowerCase() would throw, and since every write funnels through here that would
@@ -485,6 +495,33 @@ describe('createRepoRegistrar', () => {
 
     expect(github.assertRepoWorkflowWritable).toHaveBeenCalledWith('ACME', 'Widgets')
     expect(store.get('githubRepos')).toEqual([widgetsShouted])
+  })
+
+  it('keeps a repository when an update merely omits one of its two rows', async () => {
+    // Pins why a caller must delete by identity rather than by array position. With a pre-fix
+    // duplicate on disk, dropping just the selected row still hands core a list that names the
+    // repository, so it stays tracked — and the surviving row's settings take over, which for
+    // `autoTrigger` means polling the operator had switched off resumes on the repository they were
+    // trying to remove. The GUI's Remove button did exactly this.
+    const store = makeRealStore()
+    const off = { owner: 'acme', repo: 'widgets', autoTrigger: false }
+    const on = { owner: 'ACME', repo: 'Widgets', autoTrigger: true }
+    store.set('githubRepos', [off, on])
+    const updateRepos = createRepoRegistrar(passingGithub(), store)
+
+    await updateRepos((previous) => previous.filter((_, i) => i !== 0))
+
+    expect(store.get('githubRepos')).toEqual([{ owner: 'acme', repo: 'widgets', autoTrigger: true }])
+  })
+
+  it('removes every row of a duplicated repository when the update deletes by identity', async () => {
+    const store = makeRealStore()
+    store.set('githubRepos', [{ ...widgets, autoTrigger: false }, widgetsShouted, gadgets])
+    const updateRepos = createRepoRegistrar(passingGithub(), store)
+
+    await updateRepos((previous) => previous.filter((r) => !sameRepoRef(r, widgetsShouted)))
+
+    expect(store.get('githubRepos')).toEqual([gadgets])
   })
 
   it('removes a repository whatever case the caller spells it in', async () => {

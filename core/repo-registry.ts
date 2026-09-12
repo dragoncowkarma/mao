@@ -109,15 +109,32 @@ function mergeOccurrences(earlier: RepoRef, later: RepoRef): RepoRef {
   return merged
 }
 
+/**
+ * Whether a stored value can be treated as a repository entry at all.
+ *
+ * `repoRefKey()` already tolerates an entry missing `owner` or `repo`, but `config.json` is
+ * unvalidated JSON and can hold `null` or a bare string where an object belongs — which would throw on
+ * property access before the key is ever built. Since canonicalisation walks `previous` on *every*
+ * list write, one such value would wedge writes entirely, including the empty-list write that used to
+ * be the way to clear it. Unusable entries are therefore dropped rather than preserved: they cannot be
+ * polled (`startAutoTrigger` skips anything without both halves) and cannot be named on a command
+ * line, so keeping them would only re-wedge the next write.
+ */
+function isRepoRef(ref: unknown): ref is RepoRef {
+  return typeof ref === 'object' && ref !== null
+}
+
 export function canonicalRepoList(previous: RepoRef[], next: RepoRef[]): RepoRef[] {
   const stored = new Map<string, RepoRef>()
   for (const ref of previous) {
+    if (!isRepoRef(ref)) continue
     const key = repoRefKey(ref)
     if (!stored.has(key)) stored.set(key, ref)
   }
 
   const canonical = new Map<string, RepoRef>()
   for (const candidate of next) {
+    if (!isRepoRef(candidate)) continue
     const key = repoRefKey(candidate)
     const earlier = canonical.get(key)
     const merged = earlier ? mergeOccurrences(earlier, candidate) : candidate

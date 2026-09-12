@@ -15,22 +15,80 @@ import type { RepoRef } from './workflow-engine.ts'
  * either shape changed.
  */
 
-/** Repository identity is the owner/repo pair — nothing else. See `reposNeedingCapabilityCheck()`. */
+/**
+ * The identity of a repository entry, as GitHub itself resolves it: owner and repo compared without
+ * regard to case. `GET /repos/DragonCowKarma/MAO` and `GET /repos/dragoncowkarma/mao` address one
+ * repository, so treating the two spellings as different entries produced a duplicate registration
+ * that `startAutoTrigger` polled twice — and because auto-trigger enqueues *before* it writes the
+ * best-effort `workflow-active` label, the two pollers could each enqueue the same issue and open two
+ * branches and PRs for it. `mao repos remove` spelled the other way then matched neither entry.
+ *
+ * `toLowerCase()` rather than `toLocaleLowerCase()` on purpose: the mapping must not depend on the
+ * machine's locale, or the same store would compare differently under a Turkish locale (`I` -> `ı`).
+ */
+export function repoRefKey(ref: RepoRef): string {
+  return `${ref.owner.toLowerCase()}/${ref.repo.toLowerCase()}`
+}
+
+/** Repository identity is the owner/repo pair, case-insensitively — nothing else. */
 export function sameRepoRef(a: RepoRef, b: RepoRef): boolean {
-  return a.owner === b.owner && a.repo === b.repo
+  return repoRefKey(a) === repoRefKey(b)
 }
 
 /**
- * The entries in `next` whose owner/repo pair is absent from `previous` — i.e. genuine registrations.
+ * `next`, rewritten into the list that is actually safe to store: at most one entry per repository,
+ * and every entry naming an already-registered repository carrying the *stored* owner/repo spelling
+ * rather than whatever the caller typed.
+ *
+ * That second half is what keeps case-insensitive identity from quietly defeating the preflight.
+ * Comparing case-insensitively alone would make `DragonCowKarma/MAO` look already-tracked to
+ * `reposNeedingCapabilityCheck()`, and the write would then persist that never-checked pair — the
+ * exact bypass `assertReposRegistrable()` exists to prevent. Folding the entry back onto the stored
+ * spelling instead means an owner/repo pair only ever reaches the store after being preflighted with
+ * those same strings, so the guarantee holds by construction rather than by an argument about how
+ * GitHub happens to resolve names.
+ *
+ * Deliberately *not* a lower-casing normalisation of the whole list. Rewriting stored entries would
+ * change strings that other state already copied verbatim — `QueuedTask.repo` is snapshotted at
+ * enqueue time, and the board and queue views filter tasks by an exact `t.repo.owner === repo.owner`
+ * comparison — so canonicalising the sidebar's spelling would hide every task queued before the
+ * change. It would also misspell repositories back at the operator (`microsoft/typescript`), and the
+ * casing shown in the sidebar is the one they registered.
+ *
+ * The last occurrence of a repository wins, keeping its settings *and* its position. That matches
+ * `mao repos add`'s documented "adds or replaces its entry" — the replacement moves to the end — and
+ * it lets the GUI's add path find the entry it just registered at the end of the stored list.
+ */
+export function canonicalRepoList(previous: RepoRef[], next: RepoRef[]): RepoRef[] {
+  const stored = new Map(previous.map((ref) => [repoRefKey(ref), ref]))
+  const canonical = new Map<string, RepoRef>()
+  for (const candidate of next) {
+    const key = repoRefKey(candidate)
+    const known = stored.get(key)
+    // Re-inserting an existing key would keep the *first* insertion's position, so drop it first.
+    canonical.delete(key)
+    canonical.set(key, known ? { ...candidate, owner: known.owner, repo: known.repo } : candidate)
+  }
+  return [...canonical.values()]
+}
+
+/**
+ * The entries in `next` whose repository is absent from `previous` — i.e. genuine registrations.
  *
  * Identity deliberately ignores `autoTrigger` and `pollIntervalMs`. Comparing whole objects would
  * re-run the credential check on every settings edit, which would make an already-tracked repository
  * *unmanageable* the moment its access was revoked: the operator could no longer turn its polling
  * off, even though issue #48 exempts removal for exactly that reason. Editing settings on a repo you
  * already registered is not a new registration; removal and reordering are not either.
+ *
+ * `next` is canonicalised first rather than trusted, so the answer cannot depend on a caller having
+ * remembered to call `canonicalRepoList()` — and so the returned entries carry exactly the strings
+ * that will be persisted for them.
  */
 export function reposNeedingCapabilityCheck(previous: RepoRef[], next: RepoRef[]): RepoRef[] {
-  return next.filter((candidate) => !previous.some((existing) => sameRepoRef(existing, candidate)))
+  return canonicalRepoList(previous, next).filter(
+    (candidate) => !previous.some((existing) => sameRepoRef(existing, candidate)),
+  )
 }
 
 /**
@@ -44,6 +102,11 @@ export function reposNeedingCapabilityCheck(previous: RepoRef[], next: RepoRef[]
  *
  * Returns the passing verdicts so a caller can surface their `unverified` grants (see
  * `describeUnverifiedGrants()`) without paying for a second lookup.
+ *
+ * Checks whatever is new relative to `previous` *after canonicalisation*, so a caller must persist
+ * `canonicalRepoList(previous, next)` rather than its own `next` — otherwise it can store a spelling
+ * this never checked. `createRepoRegistrar()` below is the only supported writer for exactly that
+ * reason; call this directly only from tests.
  */
 export async function assertReposRegistrable(
   github: Pick<GithubService, 'assertRepoWorkflowWritable'>,
@@ -87,7 +150,11 @@ export function createRepoRegistrar(
   return function updateRepos(update: RepoListUpdate): Promise<RepoWorkflowCapability[]> {
     const run = queue.then(async () => {
       const previous = store.get('githubRepos')
-      const next = update(previous)
+      // Canonicalised inside the critical section, before the preflight — so the list that gets
+      // checked is byte-for-byte the list that gets stored. This is the single chokepoint that keeps
+      // a differently capitalised duplicate from reaching the store unchecked, which is why neither
+      // shell has to know the rule exists (see canonicalRepoList()).
+      const next = canonicalRepoList(previous, update(previous))
       const checked = await assertReposRegistrable(github, previous, next)
       store.set('githubRepos', next)
       return checked

@@ -4,7 +4,9 @@ import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   assertReposRegistrable,
+  canonicalRepoList,
   createRepoRegistrar,
+  repoRefKey,
   reposNeedingCapabilityCheck,
   sameRepoRef,
 } from './repo-registry.ts'
@@ -28,6 +30,8 @@ function makeRealStore(): FileStore {
 
 const widgets: RepoRef = { owner: 'acme', repo: 'widgets' }
 const gadgets: RepoRef = { owner: 'acme', repo: 'gadgets' }
+/** The same repository as `widgets` — GitHub resolves owner/repo without regard to case. */
+const widgetsShouted: RepoRef = { owner: 'ACME', repo: 'Widgets' }
 
 function passingGithub() {
   return {
@@ -56,6 +60,51 @@ describe('sameRepoRef', () => {
     expect(sameRepoRef(widgets, { ...widgets, autoTrigger: false, pollIntervalMs: 90_000 })).toBe(true)
     expect(sameRepoRef(widgets, gadgets)).toBe(false)
   })
+
+  it('ignores case, because GitHub does', () => {
+    expect(sameRepoRef(widgets, widgetsShouted)).toBe(true)
+    expect(repoRefKey(widgetsShouted)).toBe(repoRefKey(widgets))
+    expect(sameRepoRef(widgetsShouted, gadgets)).toBe(false)
+  })
+})
+
+describe('canonicalRepoList', () => {
+  it('rewrites a differently cased entry to the spelling already stored', () => {
+    // The stored spelling is the one the preflight vouched for, so it is the only one safe to keep.
+    expect(canonicalRepoList([widgets], [{ ...widgetsShouted, autoTrigger: false }])).toEqual([
+      { ...widgets, autoTrigger: false },
+    ])
+  })
+
+  it('keeps the spelling of a repository that is not registered yet', () => {
+    expect(canonicalRepoList([], [widgetsShouted])).toEqual([widgetsShouted])
+  })
+
+  it('collapses two spellings of one repository into a single entry', () => {
+    const collapsed = canonicalRepoList([], [widgets, { ...widgetsShouted, pollIntervalMs: 90_000 }])
+    expect(collapsed).toHaveLength(1)
+    expect(collapsed[0].pollIntervalMs).toBe(90_000)
+  })
+
+  it('lets the last occurrence win, settings and position alike', () => {
+    // Matches `mao repos add`'s documented "adds or replaces its entry", and is what lets the GUI's
+    // add path select the entry it just registered at the end of the stored list.
+    const previous = [widgets, gadgets]
+    const list = canonicalRepoList(previous, [...previous, { ...widgetsShouted, autoTrigger: false }])
+    expect(list).toEqual([gadgets, { ...widgets, autoTrigger: false }])
+  })
+
+  it('heals a store that already holds one repository twice', () => {
+    // The duplicate this fix prevents could already have been written by an earlier build; the next
+    // list write folds it away rather than requiring the operator to notice and remove it.
+    const healed = canonicalRepoList([widgets, widgetsShouted], [widgets, widgetsShouted])
+    expect(healed).toHaveLength(1)
+    expect(sameRepoRef(healed[0], widgets)).toBe(true)
+  })
+
+  it('leaves an ordinary list untouched', () => {
+    expect(canonicalRepoList([widgets], [widgets, gadgets])).toEqual([widgets, gadgets])
+  })
 })
 
 describe('reposNeedingCapabilityCheck', () => {
@@ -81,6 +130,19 @@ describe('reposNeedingCapabilityCheck', () => {
 
   it('does not check a reorder', () => {
     expect(reposNeedingCapabilityCheck([widgets, gadgets], [gadgets, widgets])).toEqual([])
+  })
+
+  it('treats a differently cased spelling of a tracked repo as already registered', () => {
+    expect(reposNeedingCapabilityCheck([widgets], [widgetsShouted])).toEqual([])
+  })
+
+  it('checks a differently cased spelling of an untracked repo, as typed', () => {
+    // Nothing has vouched for this repository yet, so the pair about to be stored is the one checked.
+    expect(reposNeedingCapabilityCheck([gadgets], [gadgets, widgetsShouted])).toEqual([widgetsShouted])
+  })
+
+  it('checks one repository once when a list names it twice', () => {
+    expect(reposNeedingCapabilityCheck([], [widgets, widgetsShouted])).toHaveLength(1)
   })
 
   it('re-checks a repo that was removed and is later added again', () => {
@@ -250,5 +312,103 @@ describe('createRepoRegistrar', () => {
     // Removal still works afterwards — the queue is not stuck on the failure above.
     await updateRepos((previous) => previous.filter((r) => !sameRepoRef(r, gadgets)))
     expect(store.get('githubRepos')).toEqual([])
+  })
+
+  it('never stores an owner/repo pair it did not preflight or already have', async () => {
+    // The invariant the whole module exists for, asserted against the store rather than through one
+    // scenario: making identity case-insensitive must not let an unchecked spelling reach disk. A
+    // naive lower-cased comparison inside sameRepoRef(), with no canonicalisation of what gets
+    // written, passes almost every other test here and fails this one.
+    const store = makeRealStore()
+    const previous = [widgets, gadgets]
+    store.set('githubRepos', previous)
+    const github = passingGithub()
+    const updateRepos = createRepoRegistrar(github, store)
+
+    await updateRepos(() => [gadgets, widgetsShouted, { owner: 'Acme', repo: 'Sprockets' }])
+
+    const vouchedFor = new Set([
+      ...previous.map((r) => `${r.owner}/${r.repo}`),
+      ...(github.assertRepoWorkflowWritable as unknown as { mock: { calls: string[][] } }).mock.calls.map(
+        ([owner, repo]) => `${owner}/${repo}`,
+      ),
+    ])
+    for (const stored of store.get('githubRepos')) {
+      expect(vouchedFor).toContain(`${stored.owner}/${stored.repo}`)
+    }
+  })
+
+  it('does not register a second entry for a repo respelled in another case', async () => {
+    // `mao repos add ACME Widgets` (or the same typed into the GUI's Add form) against a tracked
+    // acme/widgets. Two entries meant startAutoTrigger polled one repository twice, and because it
+    // enqueues before writing the best-effort workflow-active label, both pollers could enqueue the
+    // same issue and open two branches and PRs for it.
+    const store = makeRealStore()
+    store.set('githubRepos', [widgets])
+    const github = passingGithub()
+    const updateRepos = createRepoRegistrar(github, store)
+
+    await updateRepos((previous) => [
+      ...previous.filter((r) => !sameRepoRef(r, widgetsShouted)),
+      widgetsShouted,
+    ])
+
+    expect(store.get('githubRepos')).toHaveLength(1)
+  })
+
+  it('applies the settings of a differently cased re-add without preflighting it again', async () => {
+    // The stored spelling survives, so the pair on disk stays one the preflight vouched for — and the
+    // settings-edit exemption still holds, keeping a repo manageable after its access is revoked.
+    const store = makeRealStore()
+    store.set('githubRepos', [widgets])
+    const github = passingGithub()
+    const updateRepos = createRepoRegistrar(github, store)
+
+    await updateRepos((previous) => [
+      ...previous.filter((r) => !sameRepoRef(r, widgetsShouted)),
+      { ...widgetsShouted, autoTrigger: false },
+    ])
+
+    expect(github.assertRepoWorkflowWritable).not.toHaveBeenCalled()
+    expect(store.get('githubRepos')).toEqual([{ ...widgets, autoTrigger: false }])
+  })
+
+  it('preflights a first-time registration under the spelling it stores', async () => {
+    const store = makeRealStore()
+    store.set('githubRepos', [])
+    const github = passingGithub()
+    const updateRepos = createRepoRegistrar(github, store)
+
+    await updateRepos(() => [widgetsShouted])
+
+    expect(github.assertRepoWorkflowWritable).toHaveBeenCalledWith('ACME', 'Widgets')
+    expect(store.get('githubRepos')).toEqual([widgetsShouted])
+  })
+
+  it('removes a repository whatever case the caller spells it in', async () => {
+    // `mao repos remove ACME Widgets` against a tracked acme/widgets, in the update shape the CLI
+    // actually passes. Before this it matched nothing and the entry stayed, still being polled.
+    const store = makeRealStore()
+    store.set('githubRepos', [widgets, gadgets])
+    const updateRepos = createRepoRegistrar(passingGithub(), store)
+
+    await updateRepos((previous) => previous.filter((r) => !sameRepoRef(r, widgetsShouted)))
+
+    expect(store.get('githubRepos')).toEqual([gadgets])
+  })
+
+  it('folds away a duplicate an earlier build already stored, without preflighting it', async () => {
+    const store = makeRealStore()
+    store.set('githubRepos', [widgets, widgetsShouted])
+    const github = passingGithub()
+    const updateRepos = createRepoRegistrar(github, store)
+
+    // Any list write heals it — here a settings edit that touches the other repository entirely.
+    await updateRepos((previous) => [...previous, gadgets])
+
+    expect(github.assertRepoWorkflowWritable).toHaveBeenCalledTimes(1)
+    expect(github.assertRepoWorkflowWritable).toHaveBeenCalledWith('acme', 'gadgets')
+    expect(store.get('githubRepos')).toHaveLength(2)
+    expect(store.get('githubRepos').filter((r) => sameRepoRef(r, widgets))).toHaveLength(1)
   })
 })

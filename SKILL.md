@@ -123,6 +123,14 @@ on purpose, so a repo whose access was revoked can still be turned off or remove
 sidebar Add form and its project-settings toggles follow the identical rule — both shells delegate
 to `reposNeedingCapabilityCheck()` in `core/repo-registry.ts`.
 
+"Already tracked" is case-insensitive, matching how GitHub resolves owner/repo: `repos add
+DragonCowKarma MAO` updates a tracked `dragoncowkarma/mao` instead of registering it twice, and
+`repos remove DRAGONCOWKARMA mao` removes it. The stored entry keeps the spelling it was first
+registered under — that is the spelling the preflight vouched for, it is what the sidebar shows, and
+it is what already-queued tasks carry — so `Tracking …` echoes that rather than what you typed. A
+store that already holds one repository twice is folded back to a single entry by the next list
+write from either shell.
+
 The GUI shows the same unverified-grants caveat the CLI prints (`github:setRepos` returns the
 verdicts), and the board's **Refresh** surfaces a failed preflight instead of reporting a clean sync —
 `github:refreshRepo` drives a real poll, so its verdict has to reach the operator. The board's own 30s

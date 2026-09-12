@@ -147,21 +147,28 @@ export default function App() {
    * with the verdicts so Sidebar can show the caveat for grants the preflight could not prove.
    */
   async function addRepo(repo: RepoRef): Promise<RepoWorkflowCapability[]> {
-    // A convenience short-circuit, not the rule: it saves an IPC round trip for the obvious repeat,
-    // while core stays the single authority on repository identity. It cannot see that
-    // `DragonCowKarma/MAO` and `dragoncowkarma/mao` are one repository — core can, and folds the
-    // duplicate onto the entry already tracked — and AGENTS.md rule 6 keeps `src/` from importing
-    // `sameRepoRef` itself, so this must never be relied on for correctness.
+    // A convenience short-circuit, not the rule: it saves an IPC round trip for the obvious repeat.
+    // Correctness lives in core because a renderer-side check could never cover `mao repos add`, which
+    // reaches the same store with no renderer involved at all — so this stays deliberately simple and
+    // is allowed to miss. It does miss the case it cannot see, that `DragonCowKarma/MAO` and
+    // `dragoncowkarma/mao` are one repository; core catches that, merging the entry onto the tracked
+    // one rather than adding a second (see canonicalRepoList in core/repo-registry.ts).
     const exists = repos.some((r) => r.owner === repo.owner && r.repo === repo.repo)
     if (exists) return []
     const checked = await persistRepos([...repos, repo])
-    // Re-read instead of deriving the selection from the optimistic copy: that fold means the stored
+    // Re-read instead of deriving the selection from the optimistic copy: the fold means the stored
     // list can be shorter than the one just sent, and selecting into a list the store does not have
     // would leave the sidebar showing a row that is not there. This is the re-fetch-after-mutation
-    // model rule 6 prescribes, and it is safe exactly where persistRepos' success path is not — the
-    // add form submits and closes, so no controlled input is still taking keystrokes for a late round
-    // trip to stomp. Core keeps the last occurrence of a repository, so the entry just registered (or
-    // the existing one it was folded into) is the last of that list.
+    // model AGENTS.md prescribes for the renderer, and `github:getRepos` is a pure `store.get`, so it
+    // resolves immediately after our own write — which `updateRepos` has already serialized, meaning
+    // any settings write queued before this one has landed and is included.
+    //
+    // Not free of risk, unlike what persistRepos' success path avoids: a settings edit made *during*
+    // the add's multi-second preflight is queued behind it, so this read can return the pre-edit value
+    // and revert that field in the renderer. That window is narrow and needs a deliberate edit while
+    // the form reads "Checking access…", whereas a phantom sidebar row is certain whenever the add is
+    // folded — so it is the better trade, not a free one. Core keeps the last occurrence of a
+    // repository, so the entry just registered (or the existing one it merged into) is last.
     const stored = await window.electronAPI.github.getRepos().catch(() => [...repos, repo])
     setRepos(stored)
     setSelectedIndex(stored.length - 1)

@@ -289,8 +289,15 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   read a case variant as already-tracked, and the write would then persist a pair the preflight never
   checked. So `updateRepos` runs `canonicalRepoList()` inside its critical section, *before* the
   preflight — folding each entry that names an already-registered repo back onto the **stored**
-  owner/repo strings and dropping duplicates (last occurrence wins, settings and position). Checked
-  list and stored list are therefore the same bytes, and the guarantee holds by construction. Keep
+  owner/repo strings and collapsing duplicates. Checked list and stored list are therefore the same
+  bytes, and the guarantee holds by construction. Two details there are load-bearing, both with
+  regression tests: a later occurrence **merges over** an earlier one rather than replacing it (the
+  sidebar's Add form submits a bare `{owner, repo}` appended to the list it is showing, so replacing
+  would blank a tracked repo's `autoTrigger`/`pollIntervalMs` and silently restart unattended polling
+  at the default interval — `mao repos add` still replaces, because its callback drops the entry it
+  supersedes so only one occurrence arrives); and when `previous` names one repo twice, the **first**
+  stored entry supplies the surviving spelling, because that is the one `QueuedTask.repo` already
+  carries for work queued before the heal. Keep
   canonicalisation there, not in a shell. Deliberately **not** a lower-casing of stored entries:
   `QueuedTask.repo` is snapshotted at enqueue time and the board and queue views filter tasks by an
   exact `t.repo.owner === repo.owner`, so rewriting stored spellings would hide every task queued

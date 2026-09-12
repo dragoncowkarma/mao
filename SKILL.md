@@ -128,8 +128,13 @@ DragonCowKarma MAO` updates a tracked `dragoncowkarma/mao` instead of registerin
 `repos remove DRAGONCOWKARMA mao` removes it. The stored entry keeps the spelling it was first
 registered under — that is the spelling the preflight vouched for, it is what the sidebar shows, and
 it is what already-queued tasks carry — so `Tracking …` echoes that rather than what you typed. A
-store that already holds one repository twice is folded back to a single entry by the next list
-write from either shell.
+store that already holds one repository twice is folded back to a single entry — keeping the spelling
+it was registered under first — by the next list write from either shell.
+
+Re-adding from the **GUI** sidebar never changes a tracked repo's settings, whichever case you type:
+the Add form submits only owner/repo, so `autoTrigger` and the poll interval are preserved. `mao repos
+add` is the opposite by design — it "adds or replaces its entry", so the flags you pass (or omit) win,
+and omitting `--no-auto-trigger` re-enables polling.
 
 The GUI shows the same unverified-grants caveat the CLI prints (`github:setRepos` returns the
 verdicts), and the board's **Refresh** surfaces a failed preflight instead of reporting a clean sync —

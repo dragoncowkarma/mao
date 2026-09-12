@@ -94,12 +94,41 @@ describe('canonicalRepoList', () => {
     expect(list).toEqual([gadgets, { ...widgets, autoTrigger: false }])
   })
 
-  it('heals a store that already holds one repository twice', () => {
+  it('heals a store that already holds one repository twice, keeping the first-registered spelling', () => {
     // The duplicate this fix prevents could already have been written by an earlier build; the next
-    // list write folds it away rather than requiring the operator to notice and remove it.
-    const healed = canonicalRepoList([widgets, widgetsShouted], [widgets, widgetsShouted])
-    expect(healed).toHaveLength(1)
-    expect(sameRepoRef(healed[0], widgets)).toBe(true)
+    // list write folds it away rather than requiring the operator to notice and remove it. Asserted on
+    // the exact strings, not with the (now case-insensitive) sameRepoRef, because *which* spelling
+    // survives is the point: tasks queued before the heal carry the one it was first registered under,
+    // and the board and queue filter them with an exact `t.repo.owner === repo.owner`.
+    expect(canonicalRepoList([widgets, widgetsShouted], [widgets, widgetsShouted])).toEqual([widgets])
+    // Order of the stored duplicate decides it — not which spelling happens to sort first.
+    expect(canonicalRepoList([widgetsShouted, widgets], [widgetsShouted, widgets])).toEqual([widgetsShouted])
+  })
+
+  it('merges a bare re-add over the tracked entry instead of blanking its settings', () => {
+    // Exactly what the sidebar's Add form produces: `App.addRepo` appends the bare {owner, repo} the
+    // form submits to the list it is already showing. Replacing wholesale dropped autoTrigger and
+    // pollIntervalMs, so a repo whose polling the operator had switched off silently resumed
+    // auto-enqueuing issues at the 30s default — unattended GitHub writes they had turned off.
+    const tracked = { owner: 'acme', repo: 'widgets', autoTrigger: false, pollIntervalMs: 900_000 }
+    expect(canonicalRepoList([tracked], [tracked, { owner: 'ACME', repo: 'Widgets' }])).toEqual([tracked])
+  })
+
+  it('still lets an explicit re-add replace settings, which is what `mao repos add` does', () => {
+    // The CLI's update callback drops the entry it supersedes, so only one occurrence arrives and
+    // there is nothing to merge — `repos add <owner> <repo>` with no flags must reset the settings.
+    const tracked = { owner: 'acme', repo: 'widgets', autoTrigger: false, pollIntervalMs: 900_000 }
+    const readded = { owner: 'ACME', repo: 'Widgets', autoTrigger: true, pollIntervalMs: undefined }
+    expect(canonicalRepoList([tracked], [readded])).toEqual([{ ...readded, owner: 'acme', repo: 'widgets' }])
+  })
+
+  it('does not throw on a malformed stored entry, so the list stays editable', () => {
+    // `config.json` is unvalidated JSON. The `===` this replaced returned false for a half-written
+    // entry; a bare .toLowerCase() would throw, and since every write funnels through here that would
+    // wedge `repos remove` as well, leaving no way to delete the bad entry from inside the app.
+    const malformed = { owner: 'acme' } as unknown as RepoRef
+    expect(() => canonicalRepoList([malformed], [malformed])).not.toThrow()
+    expect(canonicalRepoList([malformed, widgets], [widgets])).toEqual([widgets])
   })
 
   it('leaves an ordinary list untouched', () => {
@@ -141,8 +170,14 @@ describe('reposNeedingCapabilityCheck', () => {
     expect(reposNeedingCapabilityCheck([gadgets], [gadgets, widgetsShouted])).toEqual([widgetsShouted])
   })
 
-  it('checks one repository once when a list names it twice', () => {
-    expect(reposNeedingCapabilityCheck([], [widgets, widgetsShouted])).toHaveLength(1)
+  it('checks one repository once when a list names it twice, under the spelling that will be stored', () => {
+    // The identity of the returned entry matters, not just the count: it is the pair the preflight is
+    // run against, and it has to be the pair canonicalRepoList will persist or the check vouches for
+    // a string the store never sees.
+    expect(reposNeedingCapabilityCheck([], [widgets, widgetsShouted])).toEqual([widgetsShouted])
+    expect(reposNeedingCapabilityCheck([], [widgets, widgetsShouted])).toEqual(
+      canonicalRepoList([], [widgets, widgetsShouted]),
+    )
   })
 
   it('re-checks a repo that was removed and is later added again', () => {
@@ -336,6 +371,45 @@ describe('createRepoRegistrar', () => {
     for (const stored of store.get('githubRepos')) {
       expect(vouchedFor).toContain(`${stored.owner}/${stored.repo}`)
     }
+  })
+
+  it('does not blank a tracked repo\'s settings when the GUI Add form names it in another case', async () => {
+    // End-to-end in the shape the renderer actually sends: App.addRepo appends the bare {owner, repo}
+    // the sidebar form submits to the list it is already showing. Before the merge fix this stored
+    // {acme/widgets} with no settings, so auto-trigger's `autoTrigger = true` / 30s defaults took over
+    // and a repository the operator had switched off resumed auto-enqueuing issues unattended.
+    const store = makeRealStore()
+    const tracked = { owner: 'acme', repo: 'widgets', autoTrigger: false, pollIntervalMs: 900_000 }
+    store.set('githubRepos', [tracked])
+    const github = passingGithub()
+    const updateRepos = createRepoRegistrar(github, store)
+
+    await updateRepos((previous) => [...previous, { owner: 'ACME', repo: 'Widgets' }])
+
+    expect(github.assertRepoWorkflowWritable).not.toHaveBeenCalled()
+    expect(store.get('githubRepos')).toEqual([tracked])
+  })
+
+  it('canonicalises against the list read inside its own turn, not one read before the queue', async () => {
+    // The headline safety claim is that the checked list and the stored list are the same bytes, which
+    // only holds if canonicalisation folds against the `previous` read *inside* the critical section.
+    // Hoisting that read out survives every other test here: the second update would no longer see the
+    // first one's entry, so it would both re-preflight the repository and store the other spelling.
+    const store = makeRealStore()
+    store.set('githubRepos', [])
+    const { github, release } = deferredGithub()
+    const updateRepos = createRepoRegistrar(github, store)
+
+    const first = updateRepos(() => [widgetsShouted])
+    const ref = { ...widgets, autoTrigger: false }
+    const second = updateRepos((previous) => [...previous.filter((r) => !sameRepoRef(r, ref)), ref])
+
+    release()
+    await first
+    await second
+
+    expect(github.assertRepoWorkflowWritable).toHaveBeenCalledTimes(1)
+    expect(store.get('githubRepos')).toEqual([{ ...ref, owner: 'ACME', repo: 'Widgets' }])
   })
 
   it('does not register a second entry for a repo respelled in another case', async () => {

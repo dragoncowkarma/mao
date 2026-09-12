@@ -25,9 +25,15 @@ import type { RepoRef } from './workflow-engine.ts'
  *
  * `toLowerCase()` rather than `toLocaleLowerCase()` on purpose: the mapping must not depend on the
  * machine's locale, or the same store would compare differently under a Turkish locale (`I` -> `ı`).
+ *
+ * Coerced rather than trusted, because the store is unvalidated JSON: `RepoRef` says both halves are
+ * strings, but a hand-edited or older-build `config.json` can hold an entry missing one. The `===`
+ * this replaced merely returned false for such an entry, whereas a bare `.toLowerCase()` would throw
+ * — and since every list write funnels through here, that would wedge `repos remove` too, leaving the
+ * operator no way to delete the bad entry from inside the app.
  */
 export function repoRefKey(ref: RepoRef): string {
-  return `${ref.owner.toLowerCase()}/${ref.repo.toLowerCase()}`
+  return `${String(ref.owner ?? '').toLowerCase()}/${String(ref.repo ?? '').toLowerCase()}`
 }
 
 /** Repository identity is the owner/repo pair, case-insensitively — nothing else. */
@@ -55,19 +61,41 @@ export function sameRepoRef(a: RepoRef, b: RepoRef): boolean {
  * change. It would also misspell repositories back at the operator (`microsoft/typescript`), and the
  * casing shown in the sidebar is the one they registered.
  *
- * The last occurrence of a repository wins, keeping its settings *and* its position. That matches
- * `mao repos add`'s documented "adds or replaces its entry" — the replacement moves to the end — and
- * it lets the GUI's add path find the entry it just registered at the end of the stored list.
+ * The last occurrence of a repository wins its position, and *merges over* the earlier one rather
+ * than replacing it. Position matches `mao repos add`'s documented "adds or replaces its entry" — the
+ * replacement moves to the end — and lets the GUI's add path find the entry it just registered at the
+ * end of the stored list. Merging is what keeps that from being destructive: the sidebar's Add form
+ * submits a bare `{owner, repo}` appended to the list it is already showing, so a wholesale replace
+ * would silently drop the tracked repository's `autoTrigger`/`pollIntervalMs` — turning unattended
+ * polling back *on* for a repo the operator had deliberately switched off, at the default interval.
+ * `mao repos add` still replaces settings wholesale, as documented, because its update callback drops
+ * the entry it supersedes: only one occurrence reaches this function, so there is nothing to merge.
+ *
+ * When `previous` itself names one repository twice — the duplicate an earlier build could write, and
+ * the reason this heals rather than only prevents — the *first* stored entry supplies the surviving
+ * spelling. That is the one the repository was originally registered under, so it is the spelling
+ * `QueuedTask.repo` already carries for work queued before the heal; keeping the later one would
+ * rename the project and make the board and queue filters (exact `t.repo.owner === repo.owner`) hide
+ * every one of those tasks. A settings edit that collides with such a duplicate is genuinely
+ * ambiguous — nothing in `RepoRef` marks which row the operator touched — so the later occurrence
+ * wins and the edit can be lost once; the same write removes the duplicate, so it sticks on retry.
  */
 export function canonicalRepoList(previous: RepoRef[], next: RepoRef[]): RepoRef[] {
-  const stored = new Map(previous.map((ref) => [repoRefKey(ref), ref]))
+  const stored = new Map<string, RepoRef>()
+  for (const ref of previous) {
+    const key = repoRefKey(ref)
+    if (!stored.has(key)) stored.set(key, ref)
+  }
+
   const canonical = new Map<string, RepoRef>()
   for (const candidate of next) {
     const key = repoRefKey(candidate)
-    const known = stored.get(key)
+    const earlier = canonical.get(key)
+    const merged = earlier ? { ...earlier, ...candidate } : candidate
+    const spelling = stored.get(key) ?? merged
     // Re-inserting an existing key would keep the *first* insertion's position, so drop it first.
     canonical.delete(key)
-    canonical.set(key, known ? { ...candidate, owner: known.owner, repo: known.repo } : candidate)
+    canonical.set(key, { ...merged, owner: spelling.owner, repo: spelling.repo })
   }
   return [...canonical.values()]
 }

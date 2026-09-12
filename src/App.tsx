@@ -153,9 +153,15 @@ export default function App() {
     // is allowed to miss. It does miss the case it cannot see, that `DragonCowKarma/MAO` and
     // `dragoncowkarma/mao` are one repository; core catches that, merging the entry onto the tracked
     // one rather than adding a second (see canonicalRepoList in core/repo-registry.ts).
-    const exists = repos.some((r) => r.owner === repo.owner && r.repo === repo.repo)
+    // Built from what the store actually holds, not this component's mirror. `setRepos` writes the whole
+    // list, and core can only protect a tracked repo's settings from a bare Add-form submission when the
+    // tracked entry is *in* that list to be merged onto. The mirror is read once at mount, so a repo
+    // added by `mao repos add` in a terminal since then would be missing — and the bare entry would
+    // then be the sole occurrence, which core treats as the deliberate replace `repos add` performs.
+    const current = await window.electronAPI.github.getRepos().catch(() => repos)
+    const exists = current.some((r) => r.owner === repo.owner && r.repo === repo.repo)
     if (exists) return []
-    const checked = await persistRepos([...repos, repo])
+    const checked = await persistRepos([...current, repo])
     // Re-read instead of deriving the selection from the optimistic copy: the fold means the stored
     // list can be shorter than the one just sent, and selecting into a list the store does not have
     // would leave the sidebar showing a row that is not there. This is the re-fetch-after-mutation
@@ -187,7 +193,16 @@ export default function App() {
       await persistRepos(next)
     } catch (err) {
       setRepoError(err instanceof Error ? err.message : String(err))
+      return
     }
+    // A settings edit leaves the list's shape alone, and re-reading after every one would let a slow
+    // round trip stomp a newer keystroke — the reason persistRepos' success path does not (see there).
+    // The exception is a store still holding a pre-fix duplicate: this write collapses it, so the row
+    // count drops. Without adopting that, the mirror keeps a row the store no longer has and keeps
+    // re-sending it, so an edit that lost the duplicate tie-break could never be re-applied. Adopting
+    // only the structural change heals the list without touching any value being typed.
+    const stored = await window.electronAPI.github.getRepos().catch(() => next)
+    if (stored.length !== next.length) setRepos(stored)
   }
 
   async function removeSelectedRepo() {

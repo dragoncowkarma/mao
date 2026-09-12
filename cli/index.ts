@@ -183,13 +183,18 @@ repos
   .command('remove <owner> <repo>')
   .description('Stop tracking a repo (owner/repo match GitHub\'s own case-insensitive resolution)')
   .action(async (owner: string, repo: string) => {
-    const { updateRepos } = loadApp()
+    const { store, updateRepos } = loadApp()
     // Through the same serialized core path as `add`, so `githubRepos` has exactly one writer. A
     // removal introduces no new entry, so it never preflights — removing a repo whose access was
     // revoked (or removing one with no token configured at all) keeps working.
     const target: RepoRef = { owner, repo }
+    // Report the spelling that was actually tracked, and say so plainly when nothing matched — `add`
+    // echoes the stored spelling, so `remove` claiming to have removed a name the store never held
+    // would be the one place the two commands disagree about what a repository is called.
+    const tracked = store.get('githubRepos').filter((r) => sameRepoRef(r, target))
     await updateRepos((previous) => previous.filter((r) => !sameRepoRef(r, target)))
-    log(`Stopped tracking ${owner}/${repo}`)
+    if (tracked.length === 0) log(`No tracked repo matches ${owner}/${repo}`)
+    else for (const r of tracked) log(`Stopped tracking ${r.owner}/${r.repo}`)
   })
 
 repos

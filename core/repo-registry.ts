@@ -61,25 +61,54 @@ export function sameRepoRef(a: RepoRef, b: RepoRef): boolean {
  * change. It would also misspell repositories back at the operator (`microsoft/typescript`), and the
  * casing shown in the sidebar is the one they registered.
  *
- * The last occurrence of a repository wins its position, and *merges over* the earlier one rather
- * than replacing it. Position matches `mao repos add`'s documented "adds or replaces its entry" — the
- * replacement moves to the end — and lets the GUI's add path find the entry it just registered at the
- * end of the stored list. Merging is what keeps that from being destructive: the sidebar's Add form
- * submits a bare `{owner, repo}` appended to the list it is already showing, so a wholesale replace
- * would silently drop the tracked repository's `autoTrigger`/`pollIntervalMs` — turning unattended
- * polling back *on* for a repo the operator had deliberately switched off, at the default interval.
- * `mao repos add` still replaces settings wholesale, as documented, because its update callback drops
- * the entry it supersedes: only one occurrence reaches this function, so there is nothing to merge.
+ * The last occurrence of a repository wins its *position*, matching `mao repos add`'s documented "adds
+ * or replaces its entry" and letting the GUI's add path find the entry it just registered at the end
+ * of the stored list. Its *settings* do not: see `mergeOccurrences()`.
  *
  * When `previous` itself names one repository twice — the duplicate an earlier build could write, and
- * the reason this heals rather than only prevents — the *first* stored entry supplies the surviving
- * spelling. That is the one the repository was originally registered under, so it is the spelling
- * `QueuedTask.repo` already carries for work queued before the heal; keeping the later one would
- * rename the project and make the board and queue filters (exact `t.repo.owner === repo.owner`) hide
- * every one of those tasks. A settings edit that collides with such a duplicate is genuinely
- * ambiguous — nothing in `RepoRef` marks which row the operator touched — so the later occurrence
- * wins and the edit can be lost once; the same write removes the duplicate, so it sticks on retry.
+ * the reason this heals rather than only prevents — the entry appearing **first in stored order**
+ * supplies the surviving spelling. (First in order, not necessarily first ever registered: `mao repos
+ * add` moves the entry it replaces to the end; for a repository nothing has registered yet, the first
+ * occurrence in `next` supplies it instead.) Keeping the later one instead would rename the
+ * project, which matters because `QueuedTask.repo` is snapshotted at enqueue time and never rewritten.
+ * Note that this only narrows the problem: both duplicate rows were live, so tasks can carry either
+ * spelling, and a heal drops one of the rows. That is why the board and queue match a task to its
+ * repo with `sameRepoRef` rather than `===` — otherwise healing would hide every task queued under
+ * the losing spelling, with no row left to reach them from while they kept running.
  */
+/**
+ * Combines two entries in the same list that name one repository.
+ *
+ * The earlier occurrence wins every field it defines and the later fills in the rest, because the
+ * later is characteristically the *less* informed of the two: the sidebar's Add form submits a bare
+ * `{owner, repo}` which `App.addRepo` appends to the list it is already showing, and a stale second
+ * row left over from a pre-fix duplicate carries whatever settings it had when it was written. Taking
+ * the later wholesale is what blanked a tracked repo's `autoTrigger`/`pollIntervalMs` and restarted
+ * unattended polling at the default interval. `mao repos add` still replaces settings outright, as
+ * documented, because its update callback drops the entry it supersedes — only one occurrence reaches
+ * the fold, so nothing is merged.
+ *
+ * `autoTrigger: false` is then the one field that wins from *either* side. Direction alone cannot make
+ * this safe: the disagreement is genuinely ambiguous — nothing in `RepoRef` records which row the
+ * operator touched — and getting it wrong in the permissive direction silently resumes an unattended
+ * pipeline that opens branches, PRs and merges on a repository whose polling was deliberately switched
+ * off. Getting it wrong the other way leaves polling off until the operator turns it back on. Those
+ * costs are not symmetric, so the tie breaks toward not polling.
+ *
+ * The residual ambiguity is real and deliberately not papered over: an edit to a *second* duplicate
+ * row's poll interval is dropped in favour of the first row's. It is reachable only from a store an
+ * earlier build wrote, and the same write that drops it removes the duplicate, so re-applying it on
+ * the now-single entry sticks — which holds only because `App.updateSelectedRepo` adopts the collapsed
+ * list. Without that the renderer would keep re-sending the duplicate and the edit would never take.
+ */
+function mergeOccurrences(earlier: RepoRef, later: RepoRef): RepoRef {
+  const merged: RepoRef = { ...later, ...earlier }
+  if (earlier.autoTrigger === undefined) merged.autoTrigger = later.autoTrigger
+  if (earlier.pollIntervalMs === undefined) merged.pollIntervalMs = later.pollIntervalMs
+  if (earlier.autoTrigger === false || later.autoTrigger === false) merged.autoTrigger = false
+  return merged
+}
+
 export function canonicalRepoList(previous: RepoRef[], next: RepoRef[]): RepoRef[] {
   const stored = new Map<string, RepoRef>()
   for (const ref of previous) {
@@ -91,7 +120,7 @@ export function canonicalRepoList(previous: RepoRef[], next: RepoRef[]): RepoRef
   for (const candidate of next) {
     const key = repoRefKey(candidate)
     const earlier = canonical.get(key)
-    const merged = earlier ? { ...earlier, ...candidate } : candidate
+    const merged = earlier ? mergeOccurrences(earlier, candidate) : candidate
     const spelling = stored.get(key) ?? merged
     // Re-inserting an existing key would keep the *first* insertion's position, so drop it first.
     canonical.delete(key)

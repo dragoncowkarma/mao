@@ -31,7 +31,7 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
 | `core/agent-selection.ts` | Pure, renderer-importable agent routing: `resolveStageAgent()` (maker-checker + role pins + `allowedStages` + model/effort resolution), `isStageEligible()`, `eligibleAgentsForRun()`, `previewStageAgent()`, plus the `WorkflowRole`/`STAGE_ROLE`/`ProviderOverride`/`RunOverride` definitions (re-exported by `core/workflow-engine.ts`, so `core/assignment.ts` and the shells import them unchanged) |
 | `core/github-service.ts` | Octokit REST wrapper (issues, PRs, labels, reviews, merge, CI status) — plus the read-only `checkRepoWorkflowCapability()` / `assertRepoWorkflowWritable()` preflight |
 | `core/repo-capabilities.ts` | Pure verdict logic for "can this credential run the pipeline in this repo?" — `evaluateRepoCapability()`, `describeRepoCapability()`, `describeUnverifiedGrants()`, `RepoCapabilityError` |
-| `core/repo-registry.ts` | Repository identity and the single definition of "this repo entry is newly registered" — `repoRefKey()`/`sameRepoRef()` (case-insensitive, as GitHub resolves owner/repo), `canonicalRepoList()`, `reposNeedingCapabilityCheck()` / `assertReposRegistrable()`, and the serialized `createRepoRegistrar()` both `github:setRepos` and `mao repos add`/`remove` write through |
+| `core/repo-registry.ts` | Pure, renderer-importable repository identity plus the single definition of "this repo entry is newly registered" — `repoRefKey()`/`sameRepoRef()` (case-insensitive, as GitHub resolves owner/repo), `canonicalRepoList()`, `reposNeedingCapabilityCheck()` / `assertReposRegistrable()`, and the serialized `createRepoRegistrar()` both `github:setRepos` and `mao repos add`/`remove` write through |
 | `core/git-workspace.ts` | Local git clone/branch/commit/push via `execFile` (no shell) |
 | `core/swarm-runner.ts` | Shell-free launcher and repository/asset validation for the autonomous Swarm Orchestrator |
 | `core/auto-trigger.ts` | Per-repo polling scheduler; auto-enqueues new open issues |
@@ -291,13 +291,18 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   preflight — folding each entry that names an already-registered repo back onto the **stored**
   owner/repo strings and collapsing duplicates. Checked list and stored list are therefore the same
   bytes, and the guarantee holds by construction. Two details there are load-bearing, both with
-  regression tests: a later occurrence **merges over** an earlier one rather than replacing it (the
-  sidebar's Add form submits a bare `{owner, repo}` appended to the list it is showing, so replacing
-  would blank a tracked repo's `autoTrigger`/`pollIntervalMs` and silently restart unattended polling
-  at the default interval — `mao repos add` still replaces, because its callback drops the entry it
-  supersedes so only one occurrence arrives); and when `previous` names one repo twice, the **first**
-  stored entry supplies the surviving spelling, because that is the one `QueuedTask.repo` already
-  carries for work queued before the heal. Keep
+  regression tests. When one list names a repository twice, the **earlier** occurrence keeps every
+  setting it defines and the later fills in only the rest — the later is characteristically the less
+  informed (a bare `{owner, repo}` from the sidebar's Add form, or a stale row from a pre-fix
+  duplicate), and letting it win blanked a tracked repo's `autoTrigger`/`pollIntervalMs` and silently
+  restarted unattended polling. `mao repos add` still replaces settings outright, because its callback
+  drops the entry it supersedes so only one occurrence arrives. `autoTrigger: false` is the exception
+  that wins from either side: the two ways of guessing wrong are not symmetric, since one of them
+  resumes a pipeline that opens branches, PRs and merges unattended. The entry first in stored order
+  supplies the surviving spelling. That is *not* enough to protect queued work on its own — both
+  duplicate rows were live, so tasks can carry either spelling — which is why the board and queue match
+  tasks with `sameRepoRef`, and why `startAutoTrigger` deduplicates the list it polls rather than
+  waiting for a list write to heal the store (an unattended `mao run` never performs one). Keep
   canonicalisation there, not in a shell. Deliberately **not** a lower-casing of stored entries:
   `QueuedTask.repo` is snapshotted at enqueue time and the board and queue views filter tasks by an
   exact `t.repo.owner === repo.owner`, so rewriting stored spellings would hide every task queued

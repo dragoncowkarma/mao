@@ -86,12 +86,34 @@ describe('canonicalRepoList', () => {
     expect(collapsed[0].pollIntervalMs).toBe(90_000)
   })
 
-  it('lets the last occurrence win, settings and position alike', () => {
+  it('lets the last occurrence win its position', () => {
     // Matches `mao repos add`'s documented "adds or replaces its entry", and is what lets the GUI's
-    // add path select the entry it just registered at the end of the stored list.
+    // add path select the entry it just registered at the end of the stored list. Position only —
+    // settings are resolved by mergeOccurrences, covered below.
     const previous = [widgets, gadgets]
     const list = canonicalRepoList(previous, [...previous, { ...widgetsShouted, autoTrigger: false }])
     expect(list).toEqual([gadgets, { ...widgets, autoTrigger: false }])
+  })
+
+  it('lets the earlier occurrence keep the settings it defines, the later filling only the rest', () => {
+    // Direction is the whole point and nothing else pins it: the earlier occurrence is characteristically
+    // the better-informed one (the later is a bare Add-form submission, or a stale row from a pre-fix
+    // duplicate). Reversing this assertion is what blanked a tracked repo's settings.
+    const earlier = { owner: 'acme', repo: 'widgets', pollIntervalMs: 900_000 }
+    const later = { owner: 'ACME', repo: 'Widgets', pollIntervalMs: 60_000, autoTrigger: true }
+    expect(canonicalRepoList([], [earlier, later])).toEqual([
+      { owner: 'acme', repo: 'widgets', pollIntervalMs: 900_000, autoTrigger: true },
+    ])
+  })
+
+  it('resolves a disagreement about autoTrigger by not polling, from either side', () => {
+    // The asymmetry that justifies overriding the direction rule for this one field: guessing wrong
+    // toward polling restarts an unattended pipeline that opens branches, PRs and merges against a repo
+    // whose polling was deliberately switched off. Guessing wrong the other way just leaves it off.
+    const off = { owner: 'acme', repo: 'widgets', autoTrigger: false, pollIntervalMs: 900_000 }
+    const on = { owner: 'ACME', repo: 'Widgets', autoTrigger: true }
+    expect(canonicalRepoList([off, on], [off, on])[0].autoTrigger).toBe(false)
+    expect(canonicalRepoList([on, off], [on, off])[0].autoTrigger).toBe(false)
   })
 
   it('heals a store that already holds one repository twice, keeping the first-registered spelling', () => {
@@ -117,9 +139,14 @@ describe('canonicalRepoList', () => {
   it('still lets an explicit re-add replace settings, which is what `mao repos add` does', () => {
     // The CLI's update callback drops the entry it supersedes, so only one occurrence arrives and
     // there is nothing to merge — `repos add <owner> <repo>` with no flags must reset the settings.
+    // Asserted with values that differ from the stored ones in BOTH directions, so the test fails if a
+    // future edit quietly starts merging the *stored* entry in as if it were an earlier occurrence.
     const tracked = { owner: 'acme', repo: 'widgets', autoTrigger: false, pollIntervalMs: 900_000 }
-    const readded = { owner: 'ACME', repo: 'Widgets', autoTrigger: true, pollIntervalMs: undefined }
+    const readded = { owner: 'ACME', repo: 'Widgets', autoTrigger: true, pollIntervalMs: 60_000 }
     expect(canonicalRepoList([tracked], [readded])).toEqual([{ ...readded, owner: 'acme', repo: 'widgets' }])
+    // …including when the flags are omitted entirely, which commander renders as an undefined interval.
+    const bare = { owner: 'ACME', repo: 'Widgets', autoTrigger: true, pollIntervalMs: undefined }
+    expect(canonicalRepoList([tracked], [bare])).toEqual([{ ...bare, owner: 'acme', repo: 'widgets' }])
   })
 
   it('does not throw on a malformed stored entry, so the list stays editable', () => {
@@ -173,8 +200,9 @@ describe('reposNeedingCapabilityCheck', () => {
   it('checks one repository once when a list names it twice, under the spelling that will be stored', () => {
     // The identity of the returned entry matters, not just the count: it is the pair the preflight is
     // run against, and it has to be the pair canonicalRepoList will persist or the check vouches for
-    // a string the store never sees.
-    expect(reposNeedingCapabilityCheck([], [widgets, widgetsShouted])).toEqual([widgetsShouted])
+    // a string the store never sees. For a repository nothing has registered yet, that is the first
+    // occurrence's spelling — the same "first one wins" the stored-duplicate fold uses.
+    expect(reposNeedingCapabilityCheck([], [widgets, widgetsShouted])).toEqual([widgets])
     expect(reposNeedingCapabilityCheck([], [widgets, widgetsShouted])).toEqual(
       canonicalRepoList([], [widgets, widgetsShouted]),
     )

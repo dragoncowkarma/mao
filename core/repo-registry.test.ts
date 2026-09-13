@@ -62,6 +62,17 @@ describe('sameRepoRef', () => {
     expect(sameRepoRef(widgets, gadgets)).toBe(false)
   })
 
+  it('gives a malformed entry no identity at all', () => {
+    // repoRefKey coerces so that a malformed entry cannot throw, which on its own manufactures a
+    // collision: {owner:'acme', repo:123} keys as the same 'acme/123' a genuinely new repository would.
+    // Identity has to reject it, or the coercion that exists for safety becomes a way past the
+    // registration preflight.
+    const coercible = { owner: 'acme', repo: 123 } as unknown as RepoRef
+    expect(sameRepoRef(coercible, { owner: 'acme', repo: '123' })).toBe(false)
+    expect(sameRepoRef(coercible, coercible)).toBe(false)
+    expect(sameRepoRef(null as unknown as RepoRef, null as unknown as RepoRef)).toBe(false)
+  })
+
   it('ignores case, because GitHub does', () => {
     expect(sameRepoRef(widgets, widgetsShouted)).toBe(true)
     expect(repoRefKey(widgetsShouted)).toBe(repoRefKey(widgets))
@@ -565,6 +576,21 @@ describe('createRepoRegistrar', () => {
     expect(store.get('githubRepos')).toEqual([widgets])
     // Dropping the malformed entry is not a registration, so nothing is preflighted for it.
     expect(github.assertRepoWorkflowWritable).not.toHaveBeenCalled()
+  })
+
+  it('preflights a new repo that a malformed stored entry would coerce into matching', async () => {
+    // The bypass this is guarding: with {owner:'acme', repo:123} on disk, registering the real
+    // acme/123 looked already-tracked, so it was persisted having never been checked for write access
+    // — the single guarantee the module exists for, defeated by a type the store never validates.
+    const store = makeRealStore()
+    store.set('githubRepos', [{ owner: 'acme', repo: 123 }] as unknown as RepoRef[])
+    const github = passingGithub()
+    const updateRepos = createRepoRegistrar(github, store)
+
+    await updateRepos((previous) => [...previous, { owner: 'acme', repo: '123' }])
+
+    expect(github.assertRepoWorkflowWritable).toHaveBeenCalledWith('acme', '123')
+    expect(store.get('githubRepos')).toEqual([{ owner: 'acme', repo: '123' }])
   })
 
   it('removes a repository whatever case the caller spells it in', async () => {

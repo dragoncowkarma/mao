@@ -25,25 +25,31 @@ export default function App() {
   /** Surfaces a failed settings edit or removal, which are otherwise silent (no preflight, no form). */
   const [repoError, setRepoError] = useState('')
   /**
-   * Always-current mirror of `selectedIndex`, for async continuations only.
+   * Counts every change of selection, so an async continuation can ask "has the selection moved since
+   * I started?" — the question none of the obvious candidates actually answer.
    *
-   * A repo-list write can take seconds — an add's preflight is a network call, and `updateRepos`
-   * serializes everything behind it — so the code after an `await` may run long after the render that
-   * started it, and the operator may have selected another project since. This answers "is the
-   * operator still where they were when this write started", which the stale closure cannot.
-   *
-   * Deliberately only the index. A mirror of `repos` would be no help and is actively misleading:
-   * `persistRepos` writes the new list optimistically, so by the time a continuation runs, `repos`
-   * already reflects *this* write — looking up the selected index in it yields whatever shifted into
-   * that slot, not the repository the operator had selected. Never read during render.
+   * A repo-list write can take seconds (an add's preflight is a network call and `updateRepos`
+   * serializes everything behind it), so a continuation may run long after the render that began it.
+   * Comparing the *index* is not enough: it is a position, not an identity, so a different repository
+   * can legitimately occupy it by then — an add completing first re-points the same index at the repo it
+   * just registered, and a settings continuation comparing 2 === 2 would then drag the selection back.
+   * Comparing the selected *repository* is worse: `persistRepos` applies its write optimistically, so by
+   * continuation time the list already reflects that write and the index resolves to whatever shifted
+   * into the slot. A counter depends on neither, and any selection change — the operator's, the
+   * clamping effect's, or another continuation's — invalidates it. Never read during render.
    */
-  const selectedIndexRef = useRef(selectedIndex)
-  selectedIndexRef.current = selectedIndex
+  const selectionGeneration = useRef(0)
+
+  /** The only way selection changes, so `selectionGeneration` cannot silently miss one. */
+  function selectIndex(index: number | null) {
+    selectionGeneration.current += 1
+    setSelectedIndex(index)
+  }
 
   useEffect(() => {
     window.electronAPI.github.getRepos().then((savedRepos) => {
       setRepos(savedRepos)
-      if (savedRepos.length > 0) setSelectedIndex(0)
+      if (savedRepos.length > 0) selectIndex(0)
     })
   }, [])
 
@@ -122,7 +128,7 @@ export default function App() {
 
   useEffect(() => {
     if (selectedIndex !== null && selectedIndex >= repos.length) {
-      setSelectedIndex(repos.length > 0 ? 0 : null)
+      selectIndex(repos.length > 0 ? 0 : null)
     }
   }, [repos, selectedIndex])
 
@@ -176,7 +182,7 @@ export default function App() {
       // the repo may be one this component has never seen, and leaving the mirror stale would hide a
       // repository that really is being tracked and polled until the app restarts.
       setRepos(current)
-      setSelectedIndex(existing)
+      selectIndex(existing)
       setView('project')
       setProjectTab('board')
       return []
@@ -199,7 +205,7 @@ export default function App() {
     setRepos(stored)
     // By identity rather than by position: the fold can reorder the list, not only shorten it.
     const added = stored.findIndex((r) => sameRepoRef(r, repo))
-    setSelectedIndex(added === -1 ? (stored.length > 0 ? stored.length - 1 : null) : added)
+    selectIndex(added === -1 ? (stored.length > 0 ? stored.length - 1 : null) : added)
     setView('project')
     setProjectTab('board')
     return checked
@@ -211,7 +217,7 @@ export default function App() {
     if (selectedIndex === null) return
     const target = repos[selectedIndex]
     if (!target) return
-    const startedAt = selectedIndex
+    const startedAt = selectionGeneration.current
     const next = repos.map((r, i) => (i === selectedIndex ? { ...r, ...patch } : r))
     setRepoError('')
     try {
@@ -233,13 +239,13 @@ export default function App() {
       // occurrence's position — so the index that was selected can now name a different repository,
       // and the next keystroke would edit that one. Re-point it by identity.
       //
-      // Only while the operator is still on the row this write started from, though: a slow write must
-      // not drag them back to a project they have since left. Any deliberate selection change moves the
-      // index, so comparing it is enough — and comparing indices keeps this decision independent of
-      // whether React has committed our own optimistic list write yet.
-      if (selectedIndexRef.current === startedAt) {
+      // Only while the selection has not moved since this write started, though: a slow write must not
+      // drag the operator back to a project they have since left, nor over an add that finished first
+      // and legitimately selected the repo it registered — which an index comparison would miss when
+      // the new selection lands on the same position.
+      if (selectionGeneration.current === startedAt) {
         const moved = stored.findIndex((r) => sameRepoRef(r, target))
-        setSelectedIndex(moved === -1 ? (stored.length > 0 ? 0 : null) : moved)
+        selectIndex(moved === -1 ? (stored.length > 0 ? 0 : null) : moved)
       }
     }
   }
@@ -270,12 +276,12 @@ export default function App() {
     // predictable rule. Deliberately *not* "follow the current selection": `persistRepos` has already
     // applied the removal optimistically, so the selected index now points at whatever shifted up into
     // that slot, and following it would land on a neighbouring project chosen by React commit timing.
-    setSelectedIndex(stored.length > 0 ? 0 : null)
+    selectIndex(stored.length > 0 ? 0 : null)
     setProjectTab('board')
   }
 
   function selectProject(index: number) {
-    setSelectedIndex(index)
+    selectIndex(index)
     setView('project')
     setProjectTab('board')
   }

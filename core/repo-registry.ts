@@ -62,8 +62,20 @@ export function repoRefKey(ref: RepoRef): string {
   return `${String(entry?.owner ?? '').toLowerCase()}/${String(entry?.repo ?? '').toLowerCase()}`
 }
 
-/** Repository identity is the owner/repo pair, case-insensitively — nothing else. */
+/**
+ * Repository identity is the owner/repo pair, case-insensitively — nothing else.
+ *
+ * An entry that cannot name a repository has no identity, so it matches nothing, not even another
+ * malformed entry. Without that rule `repoRefKey()`'s `String()` coercion — which exists so a malformed
+ * entry cannot throw — quietly manufactures a collision: a stored `{owner:'acme', repo:123}` keys as
+ * `acme/123`, so registering the genuinely new `acme/123` looked already-tracked to
+ * `reposNeedingCapabilityCheck()` and was persisted **without a write-permission preflight**. That is
+ * the one guarantee this module exists to provide, defeated by a type the store's JSON never validates.
+ * Comparing rather than keying is the right place for the rule: `canonicalRepoList()` drops invalid
+ * entries before it keys anything, so only identity *comparisons* can meet one.
+ */
 export function sameRepoRef(a: RepoRef, b: RepoRef): boolean {
+  if (!isRepoRef(a) || !isRepoRef(b)) return false
   return repoRefKey(a) === repoRefKey(b)
 }
 

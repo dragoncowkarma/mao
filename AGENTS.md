@@ -81,8 +81,14 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
    `setInterval` keeps the process alive forever; only long-lived hosts
    (`electron/ipc.ts`, `mao run`) start it themselves.
 6. **Renderer isolation.** `src/` never imports Node/Electron modules and reaches
-   the main process only through `window.electronAPI`. It imports **types only**
-   from `core/` (`import type`, extensionless). There are no IPC push events — the
+   the main process only through `window.electronAPI`. From `core/` it imports
+   types, plus values from the modules marked *renderer-importable* in the
+   architecture map above — `core/agent-selection.ts`, `core/ai/provider-options.ts`
+   and `core/repo-registry.ts`, which are pure and whose own `core/` imports are all
+   `import type`, so nothing Node-side is pulled into the bundle. Importing a value
+   from any other `core/` module is not allowed; re-implementing one of these rules
+   in `src/` instead is worse, and is what let the board and the registry disagree
+   about whether two spellings were the same repository. Imports stay extensionless. There are no IPC push events — the
    UI polls and re-fetches after each mutation; keep that pull model.
 7. **Electron security posture.** `webPreferences` set only `preload` so Electron 33
    defaults apply (contextIsolation on, nodeIntegration off, sandbox on) — never

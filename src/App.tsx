@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import Sidebar from './components/Sidebar'
 import KanbanBoard from './components/KanbanBoard'
 import WorkflowQueue from './components/WorkflowQueue'
@@ -24,6 +24,21 @@ export default function App() {
   const [dismissedUpdateSha, setDismissedUpdateSha] = useState<string | null>(null)
   /** Surfaces a failed settings edit or removal, which are otherwise silent (no preflight, no form). */
   const [repoError, setRepoError] = useState('')
+  /**
+   * Always-current mirror of `selectedIndex`, for async continuations only.
+   *
+   * A repo-list write can take seconds — an add's preflight is a network call, and `updateRepos`
+   * serializes everything behind it — so the code after an `await` may run long after the render that
+   * started it, and the operator may have selected another project since. This answers "is the
+   * operator still where they were when this write started", which the stale closure cannot.
+   *
+   * Deliberately only the index. A mirror of `repos` would be no help and is actively misleading:
+   * `persistRepos` writes the new list optimistically, so by the time a continuation runs, `repos`
+   * already reflects *this* write — looking up the selected index in it yields whatever shifted into
+   * that slot, not the repository the operator had selected. Never read during render.
+   */
+  const selectedIndexRef = useRef(selectedIndex)
+  selectedIndexRef.current = selectedIndex
 
   useEffect(() => {
     window.electronAPI.github.getRepos().then((savedRepos) => {
@@ -196,6 +211,7 @@ export default function App() {
     if (selectedIndex === null) return
     const target = repos[selectedIndex]
     if (!target) return
+    const startedAt = selectedIndex
     const next = repos.map((r, i) => (i === selectedIndex ? { ...r, ...patch } : r))
     setRepoError('')
     try {
@@ -215,9 +231,16 @@ export default function App() {
       setRepos(stored)
       // Collapsing a duplicate reorders as well as shortens — the surviving entry takes the *last*
       // occurrence's position — so the index that was selected can now name a different repository,
-      // and the next keystroke would edit that one. Re-find the selection by identity.
-      const moved = stored.findIndex((r) => sameRepoRef(r, target))
-      setSelectedIndex(moved === -1 ? (stored.length > 0 ? 0 : null) : moved)
+      // and the next keystroke would edit that one. Re-point it by identity.
+      //
+      // Only while the operator is still on the row this write started from, though: a slow write must
+      // not drag them back to a project they have since left. Any deliberate selection change moves the
+      // index, so comparing it is enough — and comparing indices keeps this decision independent of
+      // whether React has committed our own optimistic list write yet.
+      if (selectedIndexRef.current === startedAt) {
+        const moved = stored.findIndex((r) => sameRepoRef(r, target))
+        setSelectedIndex(moved === -1 ? (stored.length > 0 ? 0 : null) : moved)
+      }
     }
   }
 
@@ -243,6 +266,10 @@ export default function App() {
     // this path navigates to the board rather than leaving an input mid-edit.
     const stored = await window.electronAPI.github.getRepos().catch(() => next)
     setRepos(stored)
+    // The selected repository is the one just removed, so fall back to the first row — a flat,
+    // predictable rule. Deliberately *not* "follow the current selection": `persistRepos` has already
+    // applied the removal optimistically, so the selected index now points at whatever shifted up into
+    // that slot, and following it would land on a neighbouring project chosen by React commit timing.
     setSelectedIndex(stored.length > 0 ? 0 : null)
     setProjectTab('board')
   }

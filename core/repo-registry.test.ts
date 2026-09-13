@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   assertReposRegistrable,
   canonicalRepoList,
+  isRepoRef,
   createRepoRegistrar,
   repoRefKey,
   reposNeedingCapabilityCheck,
@@ -147,6 +148,30 @@ describe('canonicalRepoList', () => {
     // …including when the flags are omitted entirely, which commander renders as an undefined interval.
     const bare = { owner: 'ACME', repo: 'Widgets', autoTrigger: true, pollIntervalMs: undefined }
     expect(canonicalRepoList([tracked], [bare])).toEqual([{ ...bare, owner: 'acme', repo: 'widgets' }])
+  })
+
+  it('compares a malformed entry without throwing, wherever identity is used', () => {
+    // sameRepoRef is walked over the *raw* stored list in places canonicalisation never reaches —
+    // reposNeedingCapabilityCheck re-scans `previous`, and both shells' update callbacks filter it — so
+    // guarding only inside canonicalRepoList still let one malformed entry wedge every write.
+    const broken = null as unknown as RepoRef
+    expect(() => sameRepoRef(broken, widgets)).not.toThrow()
+    expect(sameRepoRef(broken, widgets)).toBe(false)
+    expect(() => repoRefKey(broken)).not.toThrow()
+    expect(() => [broken, widgets].filter((r) => !sameRepoRef(r, widgets))).not.toThrow()
+  })
+
+  it('drops every stored shape that cannot name a repository', () => {
+    // Not just `null`. An array passes a bare typeof check and would be *rewritten* by the fold's
+    // spread into {"0":"acme","1":"widgets"} junk, and a half-written object would persist as an
+    // unpollable row the CLI can never name for removal — so "unusable entries are dropped" has to mean
+    // all of them, not only the ones that happen to throw.
+    const junk = [null, undefined, 'acme/widgets', 42, ['acme', 'widgets'], {}, { owner: 'acme' }]
+    for (const entry of junk) expect(isRepoRef(entry)).toBe(false)
+    expect(isRepoRef(widgets)).toBe(true)
+    expect(canonicalRepoList(junk as unknown as RepoRef[], junk as unknown as RepoRef[])).toEqual([])
+    const withValid = [...junk, widgets] as unknown as RepoRef[]
+    expect(canonicalRepoList(withValid, withValid)).toEqual([widgets])
   })
 
   it('tolerates a non-object stored entry, and lets a write clear it', () => {
@@ -522,6 +547,24 @@ describe('createRepoRegistrar', () => {
     await updateRepos((previous) => previous.filter((r) => !sameRepoRef(r, widgetsShouted)))
 
     expect(store.get('githubRepos')).toEqual([gadgets])
+  })
+
+  it('drops a malformed stored entry while keeping the valid repos, on the real path', async () => {
+    // The recovery that actually matters, and the one a canonicalRepoList-only guard did not deliver:
+    // clearing everything worked, but a write that kept the good repos still threw inside
+    // reposNeedingCapabilityCheck, so the operator could not get rid of the bad entry without losing
+    // the rest.
+    const store = makeRealStore()
+    store.set('githubRepos', [null, widgets, gadgets] as unknown as RepoRef[])
+    const github = passingGithub()
+    const updateRepos = createRepoRegistrar(github, store)
+
+    const drop = (previous: RepoRef[]) => previous.filter((r) => !sameRepoRef(r, gadgets))
+    await expect(updateRepos(drop)).resolves.toEqual([])
+
+    expect(store.get('githubRepos')).toEqual([widgets])
+    // Dropping the malformed entry is not a registration, so nothing is preflighted for it.
+    expect(github.assertRepoWorkflowWritable).not.toHaveBeenCalled()
   })
 
   it('removes a repository whatever case the caller spells it in', async () => {

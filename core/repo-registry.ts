@@ -16,6 +16,28 @@ import type { RepoRef } from './workflow-engine.ts'
  */
 
 /**
+ * Whether a stored value can name a repository at all: an object (not an array) carrying a non-empty
+ * `owner` and `repo`.
+ *
+ * `config.json` is unvalidated JSON — hand-edited, or written by an older build — so an element can be
+ * `null`, a bare string, an array, or a half-written object. None of those can be polled
+ * (`startAutoTrigger` needs both halves), named on a command line, or cloned, so `canonicalRepoList()`
+ * drops them instead of carrying them forward. Dropping rather than preserving is deliberate: keeping
+ * them would leave the operator a row they can never remove, and spreading one into a new object (what
+ * the fold does to every entry it keeps) rewrites an array element into `{"0":"acme","1":"widgets"}`
+ * junk rather than leaving it recognisable.
+ *
+ * Exported because the Electron shell filters the list it hands the renderer with it: `src/` renders
+ * `{r.owner}/{r.repo}` without guarding, and there is no error boundary, so one `null` element
+ * white-screens the whole app — leaving no way to reach the Remove button that would have healed it.
+ */
+export function isRepoRef(ref: unknown): ref is RepoRef {
+  if (typeof ref !== 'object' || ref === null || Array.isArray(ref)) return false
+  const { owner, repo } = ref as Partial<RepoRef>
+  return typeof owner === 'string' && owner !== '' && typeof repo === 'string' && repo !== ''
+}
+
+/**
  * The identity of a repository entry, as GitHub itself resolves it: owner and repo compared without
  * regard to case. `GET /repos/DragonCowKarma/MAO` and `GET /repos/dragoncowkarma/mao` address one
  * repository, so treating the two spellings as different entries produced a duplicate registration
@@ -26,14 +48,18 @@ import type { RepoRef } from './workflow-engine.ts'
  * `toLowerCase()` rather than `toLocaleLowerCase()` on purpose: the mapping must not depend on the
  * machine's locale, or the same store would compare differently under a Turkish locale (`I` -> `ı`).
  *
- * Coerced rather than trusted, because the store is unvalidated JSON: `RepoRef` says both halves are
- * strings, but a hand-edited or older-build `config.json` can hold an entry missing one. The `===`
- * this replaced merely returned false for such an entry, whereas a bare `.toLowerCase()` would throw
- * — and since every list write funnels through here, that would wedge `repos remove` too, leaving the
- * operator no way to delete the bad entry from inside the app.
+ * Total rather than trusting, and total *here* rather than at each call site. Every identity
+ * comparison runs through `sameRepoRef()`, and several walk the raw stored list before canonicalisation
+ * ever sees it: `reposNeedingCapabilityCheck()` re-scans `previous`, and both shells' update callbacks
+ * filter it (`repos add`, `repos remove`, the GUI's remove). Guarding only inside `canonicalRepoList()`
+ * left every one of those throwing on a malformed element, so a single bad entry still wedged the whole
+ * registrar — writes could no longer drop it while keeping the good repos, which is the recovery that
+ * matters. Note this guards property *access* only: a half-written `{owner:'acme'}` still keys as
+ * `acme/`, so it compares as itself rather than collapsing onto every other malformed entry.
  */
 export function repoRefKey(ref: RepoRef): string {
-  return `${String(ref.owner ?? '').toLowerCase()}/${String(ref.repo ?? '').toLowerCase()}`
+  const entry = typeof ref === 'object' && ref !== null ? (ref as Partial<RepoRef>) : undefined
+  return `${String(entry?.owner ?? '').toLowerCase()}/${String(entry?.repo ?? '').toLowerCase()}`
 }
 
 /** Repository identity is the owner/repo pair, case-insensitively — nothing else. */
@@ -109,21 +135,6 @@ function mergeOccurrences(earlier: RepoRef, later: RepoRef): RepoRef {
   return merged
 }
 
-/**
- * Whether a stored value can be treated as a repository entry at all.
- *
- * `repoRefKey()` already tolerates an entry missing `owner` or `repo`, but `config.json` is
- * unvalidated JSON and can hold `null` or a bare string where an object belongs — which would throw on
- * property access before the key is ever built. Since canonicalisation walks `previous` on *every*
- * list write, one such value would wedge writes entirely, including the empty-list write that used to
- * be the way to clear it. Unusable entries are therefore dropped rather than preserved: they cannot be
- * polled (`startAutoTrigger` skips anything without both halves) and cannot be named on a command
- * line, so keeping them would only re-wedge the next write.
- */
-function isRepoRef(ref: unknown): ref is RepoRef {
-  return typeof ref === 'object' && ref !== null
-}
-
 export function canonicalRepoList(previous: RepoRef[], next: RepoRef[]): RepoRef[] {
   const stored = new Map<string, RepoRef>()
   for (const ref of previous) {
@@ -132,6 +143,9 @@ export function canonicalRepoList(previous: RepoRef[], next: RepoRef[]): RepoRef
     if (!stored.has(key)) stored.set(key, ref)
   }
 
+  // Unusable entries are dropped rather than carried forward: they cannot be polled
+  // (`startAutoTrigger` skips anything without both halves) and cannot be named on a command line, so
+  // preserving them would only leave the operator with something they can never remove.
   const canonical = new Map<string, RepoRef>()
   for (const candidate of next) {
     if (!isRepoRef(candidate)) continue

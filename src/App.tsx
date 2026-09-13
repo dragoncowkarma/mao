@@ -14,9 +14,18 @@ import type { AppUpdateCheck } from './electron'
 type ProjectTab = 'board' | 'queue' | 'settings'
 type View = 'project' | 'global-settings'
 
+/**
+ * Prefer the exact legacy row while it still exists, then follow its canonical repository identity
+ * after a write folds case-variant duplicates into one entry.
+ */
+function selectedRepoIndex(repos: RepoRef[], selected: RepoRef): number {
+  const exact = repos.findIndex((repo) => repo.owner === selected.owner && repo.repo === selected.repo)
+  return exact === -1 ? repos.findIndex((repo) => sameRepoRef(repo, selected)) : exact
+}
+
 export default function App() {
   const [repos, setRepos] = useState<RepoRef[]>([])
-  const [selectedIndex, setSelectedIndex] = useState<number | null>(null)
+  const [selectedRepo, setSelectedRepo] = useState<RepoRef | null>(null)
   const [view, setView] = useState<View>('project')
   const [projectTab, setProjectTab] = useState<ProjectTab>('board')
   const [theme, setThemeState] = useState<ThemePreference>('system')
@@ -25,31 +34,45 @@ export default function App() {
   /** Surfaces a failed settings edit or removal, which are otherwise silent (no preflight, no form). */
   const [repoError, setRepoError] = useState('')
   /**
-   * Counts every change of selection, so an async continuation can ask "has the selection moved since
-   * I started?" — the question none of the obvious candidates actually answer.
+   * Counts every navigation choice, so an async add can ask whether the operator moved elsewhere
+   * while its permission preflight was running.
    *
    * A repo-list write can take seconds (an add's preflight is a network call and `updateRepos`
-   * serializes everything behind it), so a continuation may run long after the render that began it.
-   * Comparing the *index* is not enough: it is a position, not an identity, so a different repository
-   * can legitimately occupy it by then — an add completing first re-points the same index at the repo it
-   * just registered, and a settings continuation comparing 2 === 2 would then drag the selection back.
-   * Comparing the selected *repository* is worse: `persistRepos` applies its write optimistically, so by
-   * continuation time the list already reflects that write and the index resolves to whatever shifted
-   * into the slot. A counter depends on neither, and any selection change — the operator's, the
-   * clamping effect's, or another continuation's — invalidates it. Never read during render.
+   * serializes everything behind it), so the completion must not drag the operator back from another
+   * project, tab, or global settings. The selected repository itself is stored by identity below, but
+   * identity cannot tell whether opening the newly added repository is still wanted. Never read this
+   * counter during render.
    */
-  const selectionGeneration = useRef(0)
+  const navigationGeneration = useRef(0)
 
-  /** The only way selection changes, so `selectionGeneration` cannot silently miss one. */
-  function selectIndex(index: number | null) {
-    selectionGeneration.current += 1
-    setSelectedIndex(index)
+  /** Store identity, not position: registration can fold duplicates and reorder the list. */
+  function selectRepo(repo: RepoRef | null) {
+    navigationGeneration.current += 1
+    setSelectedRepo(repo)
   }
+
+  function selectIndex(index: number | null, candidates = repos) {
+    selectRepo(index === null ? null : candidates[index] ?? null)
+  }
+
+  function selectView(next: View) {
+    navigationGeneration.current += 1
+    setView(next)
+  }
+
+  function selectProjectTab(next: ProjectTab) {
+    navigationGeneration.current += 1
+    setProjectTab(next)
+  }
+
+  const matchingSelectedIndex = selectedRepo === null ? null : selectedRepoIndex(repos, selectedRepo)
+  const selectedIndex = matchingSelectedIndex === -1 ? null : matchingSelectedIndex
+  const selected = selectedIndex === null ? undefined : repos[selectedIndex]
 
   useEffect(() => {
     window.electronAPI.github.getRepos().then((savedRepos) => {
       setRepos(savedRepos)
-      if (savedRepos.length > 0) selectIndex(0)
+      if (savedRepos.length > 0) setSelectedRepo(savedRepos[0])
     })
   }, [])
 
@@ -127,10 +150,15 @@ export default function App() {
   }
 
   useEffect(() => {
-    if (selectedIndex !== null && selectedIndex >= repos.length) {
-      selectIndex(repos.length > 0 ? 0 : null)
+    if (repos.length === 0) {
+      if (selectedRepo !== null) setSelectedRepo(null)
+    } else if (selectedRepo === null || selectedIndex === null) {
+      // This is reconciliation, not an operator navigation choice. In particular, the optimistic
+      // first add reaches here while its preflight is still pending and must not invalidate its own
+      // completion's intent to open the newly registered project.
+      setSelectedRepo(repos[0])
     }
-  }, [repos, selectedIndex])
+  }, [repos, selectedIndex, selectedRepo])
 
   /**
    * Mirrors into React state immediately, and on rejection re-reads the store rather than restoring a
@@ -169,6 +197,7 @@ export default function App() {
    * with the verdicts so Sidebar can show the caveat for grants the preflight could not prove.
    */
   async function addRepo(repo: RepoRef): Promise<RepoWorkflowCapability[]> {
+    const startedAt = navigationGeneration.current
     // Decided against what the store actually holds, not this component's mirror, which is read once at
     // mount: a repo added by `mao repos add` in a terminal since then would be missing from it. That
     // matters twice over — core can only protect a tracked repo's settings from a bare Add-form
@@ -182,9 +211,11 @@ export default function App() {
       // the repo may be one this component has never seen, and leaving the mirror stale would hide a
       // repository that really is being tracked and polled until the app restarts.
       setRepos(current)
-      selectIndex(existing)
-      setView('project')
-      setProjectTab('board')
+      if (navigationGeneration.current === startedAt) {
+        selectIndex(existing, current)
+        setView('project')
+        setProjectTab('board')
+      }
       return []
     }
     const checked = await persistRepos([...current, repo])
@@ -203,11 +234,14 @@ export default function App() {
     // repository, so the entry just registered (or the existing one it merged into) is last.
     const stored = await window.electronAPI.github.getRepos().catch(() => [...current, repo])
     setRepos(stored)
-    // By identity rather than by position: the fold can reorder the list, not only shorten it.
-    const added = stored.findIndex((r) => sameRepoRef(r, repo))
-    selectIndex(added === -1 ? (stored.length > 0 ? stored.length - 1 : null) : added)
-    setView('project')
-    setProjectTab('board')
+    // Open the added repository only if the operator has not navigated elsewhere during the preflight.
+    // Selection is written as identity, so later list folding cannot silently retarget it.
+    if (navigationGeneration.current === startedAt) {
+      const added = stored.findIndex((r) => sameRepoRef(r, repo))
+      selectIndex(added === -1 ? (stored.length > 0 ? stored.length - 1 : null) : added, stored)
+      setView('project')
+      setProjectTab('board')
+    }
     return checked
   }
 
@@ -217,7 +251,6 @@ export default function App() {
     if (selectedIndex === null) return
     const target = repos[selectedIndex]
     if (!target) return
-    const startedAt = selectionGeneration.current
     const next = repos.map((r, i) => (i === selectedIndex ? { ...r, ...patch } : r))
     setRepoError('')
     try {
@@ -235,18 +268,9 @@ export default function App() {
     const stored = await window.electronAPI.github.getRepos().catch(() => next)
     if (stored.length !== next.length) {
       setRepos(stored)
-      // Collapsing a duplicate reorders as well as shortens — the surviving entry takes the *last*
-      // occurrence's position — so the index that was selected can now name a different repository,
-      // and the next keystroke would edit that one. Re-point it by identity.
-      //
-      // Only while the selection has not moved since this write started, though: a slow write must not
-      // drag the operator back to a project they have since left, nor over an add that finished first
-      // and legitimately selected the repo it registered — which an index comparison would miss when
-      // the new selection lands on the same position.
-      if (selectionGeneration.current === startedAt) {
-        const moved = stored.findIndex((r) => sameRepoRef(r, target))
-        selectIndex(moved === -1 ? (stored.length > 0 ? 0 : null) : moved)
-      }
+      // `selectedRepo` remains the authoritative identity. Whether it is this edit's target or a
+      // project selected while the write was pending, deriving the index from `stored` preserves it
+      // across the fold instead of letting the old numeric position silently name another project.
     }
   }
 
@@ -261,10 +285,23 @@ export default function App() {
     // just tried to delete. `mao repos remove` already deletes by identity; the GUI has to agree.
     const next = repos.filter((r) => !sameRepoRef(r, target))
     setRepoError('')
+    // The selected identity is being removed. Pick the deterministic fallback before the await so a
+    // later user navigation always wins over this operation's completion.
+    selectIndex(next.length > 0 ? 0 : null, next)
+    setProjectTab('board')
+    const fallbackGeneration = navigationGeneration.current
     try {
       await persistRepos(next)
     } catch (err) {
       setRepoError(err instanceof Error ? err.message : String(err))
+      // If nothing else was selected while the write was pending, return to the repository whose
+      // removal failed so the settings error is visible. A concurrent external removal is harmless:
+      // the identity-fallback effect will choose an entry that still exists.
+      if (navigationGeneration.current === fallbackGeneration) {
+        selectRepo(target)
+        setView('project')
+        setProjectTab('settings')
+      }
       return
     }
     // Re-read for the same reason as addRepo, and with the same safety: a list that still held a
@@ -272,21 +309,13 @@ export default function App() {
     // this path navigates to the board rather than leaving an input mid-edit.
     const stored = await window.electronAPI.github.getRepos().catch(() => next)
     setRepos(stored)
-    // The selected repository is the one just removed, so fall back to the first row — a flat,
-    // predictable rule. Deliberately *not* "follow the current selection": `persistRepos` has already
-    // applied the removal optimistically, so the selected index now points at whatever shifted up into
-    // that slot, and following it would land on a neighbouring project chosen by React commit timing.
-    selectIndex(stored.length > 0 ? 0 : null)
-    setProjectTab('board')
   }
 
   function selectProject(index: number) {
-    selectIndex(index)
+    selectIndex(index, repos)
     setView('project')
     setProjectTab('board')
   }
-
-  const selected = selectedIndex !== null ? repos[selectedIndex] : undefined
 
   return (
     <div className="min-h-screen w-screen flex">
@@ -296,7 +325,7 @@ export default function App() {
         onSelect={selectProject}
         onAddRepo={addRepo}
         view={view}
-        onViewChange={setView}
+        onViewChange={selectView}
       />
 
       <main className="flex-1 mx-auto w-full max-w-[1120px] px-6 py-8">
@@ -337,19 +366,19 @@ export default function App() {
             <div className="tabs">
               <button
                 className={`tab ${projectTab === 'board' ? 'active' : ''}`}
-                onClick={() => setProjectTab('board')}
+                onClick={() => selectProjectTab('board')}
               >
                 Board
               </button>
               <button
                 className={`tab ${projectTab === 'queue' ? 'active' : ''}`}
-                onClick={() => setProjectTab('queue')}
+                onClick={() => selectProjectTab('queue')}
               >
                 Queue
               </button>
               <button
                 className={`tab ${projectTab === 'settings' ? 'active' : ''}`}
-                onClick={() => setProjectTab('settings')}
+                onClick={() => selectProjectTab('settings')}
               >
                 Settings
               </button>

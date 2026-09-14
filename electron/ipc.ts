@@ -3,6 +3,7 @@ import path from 'node:path'
 import { store } from './store.ts'
 import { createMaoApp } from '../core/app.ts'
 import { startAutoTrigger } from '../core/auto-trigger.ts'
+import { isRepoRef, sameRepoRef } from '../core/repo-registry.ts'
 import { assertCanRelaunchForUpdate, checkForUpdates, countRunningWorkflowTasks } from '../core/self-update.ts'
 import { createAiProvider, type AiProviderConfig } from '../core/ai/index.ts'
 import type { RepoRef, RunOverride } from '../core/workflow-engine.ts'
@@ -72,7 +73,12 @@ export function registerIpcHandlers() {
   // proof of write access, which is exactly what core/repo-capabilities.ts exists to avoid.
   ipcMain.handle('github:setRepos', (_event, repos: RepoRef[]) => updateRepos(() => repos))
 
-  ipcMain.handle('github:getRepos', () => store.get('githubRepos'))
+  // Filtered, not raw. `config.json` is unvalidated JSON, and the renderer draws each row as
+  // `{r.owner}/{r.repo}` with no guard and no error boundary above it — so a single `null` element
+  // throws during render and blanks the whole window, taking with it the Remove button that would have
+  // healed the store. Dropping unusable entries here costs nothing (they can be neither polled nor
+  // named) and the next list write persists the same list core would have canonicalised anyway.
+  ipcMain.handle('github:getRepos', () => store.get('githubRepos').filter(isRepoRef))
 
   ipcMain.handle('github:autoTriggerStatus', (_event, owner: string, repo: string) =>
     autoTrigger.getStatus(owner, repo),
@@ -86,7 +92,7 @@ export function registerIpcHandlers() {
   // the card list populated meanwhile.
   ipcMain.handle('github:refreshRepo', async (_event, owner: string, repo: string) => {
     const repos = store.get('githubRepos')
-    const repoRef = repos.find((r) => r.owner === owner && r.repo === repo) ?? { owner, repo }
+    const repoRef = repos.find((r) => sameRepoRef(r, { owner, repo })) ?? { owner, repo }
     await githubService.assertRepoWorkflowWritable(owner, repo)
     await autoTrigger.pollNow(repoRef)
     return githubService.fetchTasks(owner, repo)

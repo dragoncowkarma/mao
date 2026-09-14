@@ -142,3 +142,45 @@ describe('auto-trigger repository preflight', () => {
     expect(engine.enqueueFromIssue).toHaveBeenCalledTimes(1)
   })
 })
+
+describe('auto-trigger duplicate repositories', () => {
+  /**
+   * Runs the scheduler's own immediate tick against `repos` — not `pollNow`, because the tick is what
+   * dedupes. Every collaborator is a resolved-promise mock, so draining the macrotask queue a few times
+   * settles the whole chain; deliberately not `vi.waitFor` on a call count, which would pass a
+   * "nothing was polled" assertion only by timing out.
+   */
+  async function tickOnce(github: GithubService, engine: WorkflowEngine, repos: RepoRef[]) {
+    const trigger = startAutoTrigger(github, engine, () => repos)
+    handles.push(trigger.handle)
+    for (let i = 0; i < 5; i++) await new Promise((resolve) => setTimeout(resolve, 0))
+    return trigger
+  }
+
+  it('polls a repository once when the store holds it under two spellings', async () => {
+    // The exact harm that motivated case-insensitive identity. A store written by an earlier build can
+    // still hold the duplicate, and only a list write heals it — an unattended `mao run` never performs
+    // one, so the scheduler has to stop double-polling on its own. Polling twice means two
+    // enqueueFromIssue calls for one issue (the workflow-active label is written after the enqueue and
+    // is best-effort), i.e. two branches and two PRs.
+    const github = makeGithub()
+    const engine = makeEngine()
+
+    await tickOnce(github, engine, [repo, { owner: 'ACME', repo: 'Widgets' }])
+
+    expect(github.fetchTasks).toHaveBeenCalledTimes(1)
+    expect(engine.enqueueFromIssue).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not poll a duplicated repository that either entry switched off', async () => {
+    // Healing merges the two rows, and an explicit "do not poll this" wins from either side — the
+    // scheduler must agree, or the repo is polled for as long as the duplicate survives on disk.
+    const github = makeGithub()
+    const engine = makeEngine()
+
+    await tickOnce(github, engine, [{ ...repo, autoTrigger: false }, { owner: 'ACME', repo: 'Widgets' }])
+
+    expect(github.fetchTasks).not.toHaveBeenCalled()
+    expect(engine.enqueueFromIssue).not.toHaveBeenCalled()
+  })
+})

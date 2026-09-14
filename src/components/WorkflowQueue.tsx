@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import type { AiProviderConfig } from '../../core/ai/types'
 import { providerToolKind } from '../../core/ai/provider-options'
 import { previewStageAgent } from '../../core/agent-selection'
+import { sameRepoRef } from '../../core/repo-registry'
 import type { RunOverride } from '../../core/agent-selection'
 import type { QueuedTask, RepoRef } from '../../core/workflow-engine'
 import AgentRunControls from './AgentRunControls'
@@ -266,7 +267,9 @@ export default function WorkflowQueue({ repo }: WorkflowQueueProps) {
       .catch((err) => setError(err instanceof Error ? err.message : String(err)))
   }, [])
 
-  const repoTasks = tasks.filter((t) => t.repo.owner === repo.owner && t.repo.repo === repo.repo)
+  // sameRepoRef, not ===: see the matching note in KanbanBoard — a task carries the spelling it was
+  // enqueued with, which need not be the one now stored for the same repository.
+  const repoTasks = tasks.filter((t) => sameRepoRef(t.repo, repo))
 
   async function startWorkflow() {
     if (!title.trim()) return

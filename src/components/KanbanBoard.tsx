@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import type { AiProviderConfig } from '../../core/ai/types'
 import { providerToolLabel } from '../../core/ai/provider-options'
 import { previewStageAgent } from '../../core/agent-selection'
+import { sameRepoRef } from '../../core/repo-registry'
 import type { RunOverride } from '../../core/agent-selection'
 import type { GithubTask } from '../../core/github-service'
 import type { QueuedTask, RepoRef } from '../../core/workflow-engine'
@@ -283,7 +284,11 @@ export default function KanbanBoard({ repo }: KanbanBoardProps) {
   const loadWorkflowTasks = () =>
     window.electronAPI.workflow
       .list()
-      .then((all) => setWorkflowTasks(all.filter((t) => t.repo.owner === repo.owner && t.repo.repo === repo.repo)))
+      // sameRepoRef, not ===: a task's repo is snapshotted at enqueue time and never rewritten, so it can
+      // carry a different capitalisation than the entry now in the store — after a duplicate is healed, or
+      // from `mao workflow enqueue --owner/--repo`. An exact match would hide those tasks with no row left
+      // to reach them from, while they kept running.
+      .then((all) => setWorkflowTasks(all.filter((t) => sameRepoRef(t.repo, repo))))
 
   useEffect(() => {
     loadWorkflowTasks()

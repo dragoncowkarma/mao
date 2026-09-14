@@ -45,9 +45,12 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
 | `electron/preload.ts` | `contextBridge` exposing `window.electronAPI` |
 | `electron/store.ts` | 7-line `electron-store` adapter satisfying `MaoStore` |
 | `src/` | React 18 renderer (Vite + Tailwind); `App.tsx` owns all cross-view state |
+| `src/electron-api.ts` | The renderer's only door to the preload bridge: `setElectronApi()` binds it (production from `src/main.tsx`, tests from a stub), `electronApi()` reads it |
+| `src/test/` | Renderer test harness — `setup.ts` (jsdom polyfills, unmount + unbind between tests) and `electron-api-stub.ts` (a typed fake bridge, `satisfies ElectronApi`) |
 | `cli/index.ts` | Commander CLI: `config` / `repos` / `github` / `workflow` / `run` / `swarm` |
 | `.agents/workflows/swarm_orchestrator.py` | Autonomous Worker/Reviewer/Maintainer lifecycle, isolated worktrees, process registry, retry/cooldown, and safe merged-task cleanup; copied beside the CLI bundle by `scripts/build-cli.mjs` |
 | `.agents/workflows/swarm_orchestrator_test.py` | Standalone Python worktree-safety regressions, included in `npm run test` |
+| `core/node-environment.test.ts` | Architecture rule 8 as a test: asserts the `core` vitest project still runs with no DOM in scope |
 | `scripts/test-workflow.ts` | Standalone e2e harness against a real (throwaway) repo |
 | `scripts/check-origin.mjs` | Publish-preflight guard: validates every effective `origin` fetch/push URL against an expected host/owner/repo; failure output is fixed-category-only, never remote-derived strings (see SKILL.md) |
 | `scripts/check-origin.test.mjs` | Committed negative/positive matrix for the guard incl. its no-leak contract — `npm run test:origin`, also run in CI |
@@ -80,8 +83,14 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
 5. **Never start the auto-trigger poller inside `createMaoApp()`.** Its
    `setInterval` keeps the process alive forever; only long-lived hosts
    (`electron/ipc.ts`, `mao run`) start it themselves.
-6. **Renderer isolation.** `src/` never imports Node/Electron modules and reaches
-   the main process only through `window.electronAPI`. From `core/` it imports
+6. **Renderer isolation.** `src/` never imports Node/Electron modules (its **tests** are
+   the one exception: they run in a Node-hosted jsdom environment that is never shipped,
+   and `src/electron-api.test.ts` walks the tree with `node:fs`), and reaches the main
+   process only through `electronApi()` (`src/electron-api.ts`) — the single accessor for
+   the preload bridge, bound once by `src/main.tsx`. Reading `window.electronAPI` anywhere
+   else in `src/` is a **test failure** (`src/electron-api.test.ts`), not a style note: a
+   component wired to the global is a component no renderer test can hand a fake. From
+   `core/` it imports
    types, plus values from the modules marked *renderer-importable* in the
    architecture map above — `core/agent-selection.ts`, `core/ai/provider-options.ts`
    and `core/repo-registry.ts`, which are pure and whose own `core/` imports are all
@@ -94,14 +103,36 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
    defaults apply (contextIsolation on, nodeIntegration off, sandbox on) — never
    weaken them. `setWindowOpenHandler` must keep returning `{ action: 'deny' }` and
    routing http/https to `shell.openExternal`.
-8. **Tests must stay runnable under plain Node.** `vitest.config.ts` is deliberately
-   separate from `vite.config.ts` (the electron/renderer plugins shim node builtins
-   and break `core/` under Node). Vitest tests live in `core/**/*.test.ts` only;
-   the one exception to the vitest layout is `scripts/check-origin.test.mjs`, a
-   dependency-free standalone matrix invoked as `npm run test:origin`.
-   The autonomous Swarm asset is the second explicit exception: its worktree-safety
-   regressions live in `.agents/workflows/swarm_orchestrator_test.py` and run through
-   `npm run test`, so Python 3 is required for the repository test matrix.
+8. **`core/` tests must stay runnable under plain Node.** `vitest.config.ts` is
+   deliberately separate from `vite.config.ts` (the electron/renderer plugins shim node
+   builtins and break `core/` under Node). It declares **two projects**, and a project
+   inherits nothing from the root config unless it opts in with `extends` — that is what
+   keeps them apart, by construction rather than by convention:
+   - **`core`** — `core/**/*.test.ts`, `environment: 'node'`, **zero** vite plugins.
+   - **`renderer`** — `src/**/*.test.ts(x)`, `environment: 'jsdom'`, `@vitejs/plugin-react`
+     and `src/test/setup.ts`, exercising real components through Testing Library.
+
+   Never give the `core` project a plugin, a DOM environment, or an `extends`; never pull
+   `vite-plugin-electron`/`-renderer` into the `renderer` project — they exist to shim node
+   builtins for the packaged bundle, which is the drift this rule is written against.
+   `npm run test` runs the two projects as two `vitest run` invocations, deliberately: a
+   combined run **tolerates a project whose `include` matches nothing** — it is not even
+   named in the output and the run still exits 0 — so renaming test files out from under a
+   glob would retire an entire suite with CI green. Selecting a project that found nothing
+   exits 1, which is the only form that fails loudly (`passWithNoTests: false` does not
+   help, at either level). `core/node-environment.test.ts` pins the half a test can reach:
+   give the `core` project a DOM — by setting `environment` on it, by collapsing the two
+   projects back into one root `test` block, or by pointing `extends` at a config that has
+   one — and it fails, instead of the boundary dissolving with every suite still green.
+   Note what is *not* a route: a root-level `test.environment` sitting beside `projects`
+   never reaches an inline project, and neither does a root plugin (vitest builds each
+   project's server from that project's own plugin list). A stray plugin therefore leaves
+   nothing for a test to observe; keep that one out by reading the config.
+   Two test suites sit outside vitest entirely: `scripts/check-origin.test.mjs`, a
+   dependency-free standalone matrix invoked as `npm run test:origin`, and the autonomous
+   Swarm asset's worktree-safety regressions in
+   `.agents/workflows/swarm_orchestrator_test.py`, which run through `npm run test` — so
+   Python 3 is required for the repository test matrix.
 
 ## Files that must change together
 
@@ -112,7 +143,10 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   (`ipcMain.handle('<domain>:<camelCaseAction>', …)`, domains `ai`/`github`/`workflow`),
   `electron/preload.ts` (same channel string, same namespace), `src/electron.d.ts`
   (mirror the signature). Channel strings are duplicated literals; a typo surfaces
-  only at runtime.
+  only at runtime. A fourth file follows automatically:
+  `src/test/electron-api-stub.ts` builds its fake bridge with `satisfies ElectronApi`,
+  so tsc refuses to compile until the new channel is stubbed there too — that one you
+  find at lint time rather than at runtime.
 - **Repository registration** → the add-vs-update rule lives ONLY in `core/repo-registry.ts`;
   `electron/ipc.ts`'s `github:setRepos` and `cli/index.ts`'s `repos add`/`repos remove` must all stay
   thin delegations to `createMaoApp()`'s `updateRepos`. Re-implementing the diff in either shell is how the two paths silently drift.
@@ -385,7 +419,10 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   tweaks on top. The design is intentionally sharp-cornered (`--radius-md: 0px`) —
   no `rounded-*`. Plain `useState`/`useEffect`, props-down/callbacks-up, no
   context/store/data-fetching libraries. Polling effects must `clearInterval` in
-  cleanup and tolerate StrictMode double-invocation.
+  cleanup and tolerate StrictMode double-invocation. A renderer **behaviour** change
+  needs a test under `src/**/*.test.tsx` — mount the real component against
+  `createElectronApiStub()` and assert what the operator sees. `tsc --noEmit` and a
+  green `vite build` prove nothing about what the UI does.
 
 ## Git conventions
 

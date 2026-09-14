@@ -22,7 +22,7 @@ Use `npm install` only when intentionally changing dependencies + lockfile.
 | --- | --- |
 | `npm run dev` | Electron + Vite dev server with hot reload |
 | `npm run lint` | `tsc --noEmit` — the only automated style/type gate (no ESLint/Prettier) |
-| `npm run test` | Vitest (`core/**/*.test.ts`) plus Python Swarm worktree-safety tests |
+| `npm run test` | Vitest, one run per project — `core` (`core/**/*.test.ts`, plain Node) then `renderer` (`src/**/*.test.ts(x)`, jsdom + Testing Library) — plus Python Swarm worktree-safety tests. Two runs on purpose: a combined run exits 0 when a project's `include` matches nothing |
 | `npm run test:origin` | Standalone matrix for `scripts/check-origin.mjs` (verdicts + no-credential-leak contract) |
 | `npm run build` | `vite build` + `electron-builder --dir` (fast unpacked build → `release/`) |
 | `npm run dist` | Full distributable (dmg/zip on mac) |
@@ -66,6 +66,11 @@ Additionally, because CI does **not** cover them:
 - Touched `cli/` or `core/`? → also run `npm run build:cli` and smoke-test
   `node dist-cli/index.cjs --help` (CLI bundle breakage is invisible to CI).
 - Iterating on the engine? → focused run: `npx vitest run core/workflow-engine.test.ts`.
+- Touched `src/`? → focused run: `npx vitest run --project renderer`. Nothing else in
+  the matrix sees renderer *behaviour*: `tsc --noEmit` reads types, `npx vite build`
+  proves the bundle links, and both stay green for code that stack-overflows the moment
+  a project is clicked (issue #58). A renderer change with no test under `src/` is an
+  untested change.
 - Touched `scripts/`? → note `scripts/` is not in `tsconfig.json`'s `include`, so
   tsc/CI never typechecks it — verify by actually running the harness. For
   `scripts/build-cli.mjs`, `npm run build:cli` is the required execution check.
@@ -248,8 +253,11 @@ Two traps:
    one-line delegation (domains: `ai`, `github`, `workflow`).
 3. `electron/preload.ts` — same channel string, same namespace, positional args.
 4. `src/electron.d.ts` — mirror the method signature.
-5. If the CLI should have parity, add the matching subcommand in `cli/index.ts`.
-6. `npm run lint`, then smoke-test in `npm run dev` (typos fail only at runtime).
+5. `src/test/electron-api-stub.ts` — add the channel to the fake bridge. It is written
+   with `satisfies ElectronApi`, so `npm run lint` fails until you do; stub it as
+   `notStubbed('<domain>.<action>')` unless a test actually needs it to answer.
+6. If the CLI should have parity, add the matching subcommand in `cli/index.ts`.
+7. `npm run lint`, then smoke-test in `npm run dev` (typos fail only at runtime).
 
 ### Add a store field
 
@@ -267,6 +275,39 @@ Two traps:
    `src/components/WorkflowQueue.tsx` (duplicated by convention).
 3. Extend `core/workflow-engine.test.ts` — stage progression, maker-checker
    alternation, and error/retry behavior against the existing fakes.
+
+### Add a renderer regression test
+
+1. Put it beside what it covers: `src/App.test.tsx`, `src/components/<Name>.test.tsx`.
+   The `renderer` vitest project picks up `src/**/*.test.ts` and `src/**/*.test.tsx`.
+2. `const stub = createElectronApiStub([...repos])` (`src/test/electron-api-stub.ts`)
+   binds a fake preload bridge and returns its mocks. Channels it does not implement
+   throw by name rather than answering with an empty value.
+3. Mount the real component — `render(<StrictMode><App /></StrictMode>)` — because
+   `src/main.tsx` does. StrictMode double-invokes effects under `npm run dev` and in these
+   tests, never in the packaged build, but it is the check AGENTS.md requires polling
+   effects to survive, so running tests under it is what makes that rule observed rather
+   than asserted. The doubling is the price: every mount-path IPC call is made twice, so
+   assert on what the operator sees, or on `toHaveBeenCalledWith`, never on a bare
+   `toHaveBeenCalledTimes`.
+4. Query the way an operator sees it (`getByRole('heading', …)`,
+   `getByRole('button', { name: 'Confirm remove' })`); there are no test ids in the
+   markup and none are needed.
+5. Staging a slow IPC round trip — the shape most renderer races take — is
+   `stub.setRepos.mockImplementationOnce(async (next) => { await deferred; stub.applyRepos(next); return [] })`,
+   then asserting on the UI *after* a signal that the continuation has actually run (the
+   Add form closing, or one more `stub.getRepos` call) — never a bare `waitFor` on the
+   assertion itself, which passes before the code under test reaches it.
+6. Keep **real** timers. Every polling interval is cleared on unmount, a real-timer linger
+   produces no `act()` warnings, and `vi.useFakeTimers()` plus `@testing-library/user-event`
+   deadlocks — a single `user.click` hangs to the test timeout. If you must test polling,
+   drive it with `fireEvent` and
+   `await act(async () => { await vi.advanceTimersByTimeAsync(...) })`.
+7. `src/test/setup.ts` unmounts and unbinds the bridge after every test; do not register
+   your own cleanup for those.
+8. Prove the test is load-bearing: revert the behaviour it describes and watch it fail. A
+   renderer test that passes both ways is the problem issue #58 described. Say in the PR
+   which mutation you ran — and say so too when a test turns out *not* to discriminate.
 
 ### Add an AI provider integration
 
@@ -402,7 +443,8 @@ Two traps:
 ### Review a PR (checker role)
 
 Per AGENTS.md, the reviewer should be a different agent than the implementer.
-Check, in order: architecture rules (core Electron-free? logic in shells?),
+Check, in order: architecture rules (core Electron-free? logic in shells? does the
+`core` vitest project still run with no plugins and no DOM?),
 lockstep files all updated (IPC 3-file chain, store pair, STAGE_LABELS × 2),
 domain invariants (maker-checker, CI gate, timeouts, error-not-crash), secrets
 hygiene, then style (match surrounding code — there is no autoformatter).

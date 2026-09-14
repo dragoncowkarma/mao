@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { electronApi } from '../electron-api'
 import type { AiProviderConfig } from '../../core/ai/types'
 import { providerToolKind } from '../../core/ai/provider-options'
 import { previewStageAgent } from '../../core/agent-selection'
@@ -253,7 +254,7 @@ export default function WorkflowQueue({ repo }: WorkflowQueueProps) {
   const [error, setError] = useState('')
 
   useEffect(() => {
-    const load = () => window.electronAPI.workflow.list().then(setTasks)
+    const load = () => electronApi().workflow.list().then(setTasks)
     load()
     const interval = setInterval(load, 2000)
     return () => clearInterval(interval)
@@ -261,8 +262,8 @@ export default function WorkflowQueue({ repo }: WorkflowQueueProps) {
 
   // Providers change only in Global Settings, so fetch once rather than on the 2s task poll.
   useEffect(() => {
-    window.electronAPI.ai
-      .list()
+    electronApi()
+      .ai.list()
       .then(setProviders)
       .catch((err) => setError(err instanceof Error ? err.message : String(err)))
   }, [])
@@ -273,9 +274,9 @@ export default function WorkflowQueue({ repo }: WorkflowQueueProps) {
 
   async function startWorkflow() {
     if (!title.trim()) return
-    await window.electronAPI.workflow.enqueue(title.trim(), repo, autoAdvanceNewTask)
+    await electronApi().workflow.enqueue(title.trim(), repo, autoAdvanceNewTask)
     setTitle('')
-    setTasks(await window.electronAPI.workflow.list())
+    setTasks(await electronApi().workflow.list())
   }
 
   /**
@@ -288,7 +289,7 @@ export default function WorkflowQueue({ repo }: WorkflowQueueProps) {
     try {
       await run()
       setError('')
-      setTasks(await window.electronAPI.workflow.list())
+      setTasks(await electronApi().workflow.list())
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     } finally {
@@ -297,21 +298,21 @@ export default function WorkflowQueue({ repo }: WorkflowQueueProps) {
   }
 
   function retryTask(taskId: string, runOverride?: RunOverride) {
-    void runStage(taskId, () => window.electronAPI.workflow.retry(taskId, runOverride))
+    void runStage(taskId, () => electronApi().workflow.retry(taskId, runOverride))
   }
 
   function advanceTask(taskId: string, runOverride?: RunOverride) {
-    void runStage(taskId, () => window.electronAPI.workflow.advance(taskId, runOverride))
+    void runStage(taskId, () => electronApi().workflow.advance(taskId, runOverride))
   }
 
   async function toggleAutoAdvance(taskId: string, autoAdvance: boolean) {
-    await window.electronAPI.workflow.setAutoAdvance(taskId, autoAdvance)
-    setTasks(await window.electronAPI.workflow.list())
+    await electronApi().workflow.setAutoAdvance(taskId, autoAdvance)
+    setTasks(await electronApi().workflow.list())
   }
 
   async function clearCompleted() {
-    await window.electronAPI.workflow.clearCompleted()
-    setTasks(await window.electronAPI.workflow.list())
+    await electronApi().workflow.clearCompleted()
+    setTasks(await electronApi().workflow.list())
   }
 
   const finishedCount = repoTasks.filter((t) => t.status === 'done' || t.status === 'error').length

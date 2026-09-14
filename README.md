@@ -105,9 +105,15 @@ scripts/
 ## Unit tests
 
 ```bash
-npm run test        # vitest run — WorkflowEngine stage progression, maker-checker,
-                     # retry, CI gating, and manual pause/advance, all against fakes
+npm run test        # one vitest run per project, then the Python Swarm matrix:
+                    #   core     — WorkflowEngine stage progression, maker-checker, retry,
+                    #              CI gating and manual pause/advance, all against fakes
+                    #   renderer — src/ mounted in jsdom (Testing Library) against a fake
+                    #              preload bridge: project selection, repo add/remove, and
+                    #              slow writes that must not steal a newer selection
 ```
+
+Focused runs: `npx vitest run --project core` / `npx vitest run --project renderer`.
 
 ## Testing against a real repo
 

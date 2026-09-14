@@ -48,6 +48,7 @@
 - [ ] Design tokens use CSS variables from `src/index.css`, no hardcoded hex
 - [ ] Semantic classes (`.btn`, `.card`, `.tag`) used where appropriate
 - [ ] No `rounded-*` (project uses `--radius-md: 0px`)
+- [ ] Renderer **behaviour** change → covered by a test under `src/**/*.test.tsx`, mounted against `createElectronApiStub()` (`tsc --noEmit` and a green `vite build` prove nothing about what the UI does)
 
 ## Screenshots / recordings
 

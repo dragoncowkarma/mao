@@ -5,6 +5,7 @@ import WorkflowQueue from './components/WorkflowQueue'
 import ProjectSettings from './components/ProjectSettings'
 import GlobalSettings from './components/GlobalSettings'
 import UpdateBanner from './components/UpdateBanner'
+import { electronApi } from './electron-api'
 import type { RepoRef } from '../core/workflow-engine'
 import type { RepoWorkflowCapability } from '../core/repo-capabilities'
 import { sameRepoRef } from '../core/repo-registry'
@@ -70,14 +71,14 @@ export default function App() {
   const selected = selectedIndex === null ? undefined : repos[selectedIndex]
 
   useEffect(() => {
-    window.electronAPI.github.getRepos().then((savedRepos) => {
+    electronApi().github.getRepos().then((savedRepos) => {
       setRepos(savedRepos)
       if (savedRepos.length > 0) setSelectedRepo(savedRepos[0])
     })
   }, [])
 
   useEffect(() => {
-    window.electronAPI.ui.getTheme().then(setThemeState)
+    electronApi().ui.getTheme().then(setThemeState)
   }, [])
 
   // Applies the effective light/dark scheme to <html data-theme>, which src/index.css keys its dark
@@ -105,7 +106,7 @@ export default function App() {
 
   async function setTheme(next: ThemePreference) {
     setThemeState(next)
-    await window.electronAPI.ui.setTheme(next)
+    await electronApi().ui.setTheme(next)
   }
 
   useEffect(() => {
@@ -113,7 +114,7 @@ export default function App() {
 
     async function checkUpdate() {
       try {
-        const result = await window.electronAPI.app.checkUpdate()
+        const result = await electronApi().app.checkUpdate()
         if (cancelled) return
         if (result.updateAvailable && result.latestSha !== dismissedUpdateSha) {
           setUpdate(result)
@@ -140,11 +141,11 @@ export default function App() {
       window.confirm(`${update.runningTaskCount} workflow task(s) are still running. Restart anyway?`)
     if (!force) return
     try {
-      await window.electronAPI.app.relaunch(update.runningTaskCount > 0)
+      await electronApi().app.relaunch(update.runningTaskCount > 0)
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       if (window.confirm(`${message}. Restart anyway?`)) {
-        await window.electronAPI.app.relaunch(true)
+        await electronApi().app.relaunch(true)
       }
     }
   }
@@ -183,11 +184,11 @@ export default function App() {
     const previous = repos
     setRepos(next)
     try {
-      return await window.electronAPI.github.setRepos(next)
+      return await electronApi().github.setRepos(next)
     } catch (err) {
       // Fall back to the snapshot only if even the read fails; showing a stale list beats showing one
       // built from a write we know was refused.
-      setRepos(await window.electronAPI.github.getRepos().catch(() => previous))
+      setRepos(await electronApi().github.getRepos().catch(() => previous))
       throw err
     }
   }
@@ -203,7 +204,7 @@ export default function App() {
     // matters twice over — core can only protect a tracked repo's settings from a bare Add-form
     // submission when the tracked entry is in the list being written, and an unseen repo would
     // otherwise make this look like a first registration.
-    const current = await window.electronAPI.github.getRepos().catch(() => repos)
+    const current = await electronApi().github.getRepos().catch(() => repos)
     const existing = current.findIndex((r) => sameRepoRef(r, repo))
     if (existing !== -1) {
       // Already tracked — including under a different capitalisation, which is one repository to
@@ -232,7 +233,7 @@ export default function App() {
     // the form reads "Checking access…", whereas a phantom sidebar row is certain whenever the add is
     // folded — so it is the better trade, not a free one. Core keeps the last occurrence of a
     // repository, so the entry just registered (or the existing one it merged into) is last.
-    const stored = await window.electronAPI.github.getRepos().catch(() => [...current, repo])
+    const stored = await electronApi().github.getRepos().catch(() => [...current, repo])
     setRepos(stored)
     // Open the added repository only if the operator has not navigated elsewhere during the preflight.
     // Selection is written as identity, so later list folding cannot silently retarget it.
@@ -265,7 +266,7 @@ export default function App() {
     // count drops. Without adopting that, the mirror keeps a row the store no longer has and keeps
     // re-sending it, so an edit that lost the duplicate tie-break could never be re-applied. Adopting
     // only the structural change heals the list without touching any value being typed.
-    const stored = await window.electronAPI.github.getRepos().catch(() => next)
+    const stored = await electronApi().github.getRepos().catch(() => next)
     if (stored.length !== next.length) {
       setRepos(stored)
       // `selectedRepo` remains the authoritative identity. Whether it is this edit's target or a
@@ -307,7 +308,7 @@ export default function App() {
     // Re-read for the same reason as addRepo, and with the same safety: a list that still held a
     // duplicate written by an earlier build comes back one entry shorter once core folds it away, and
     // this path navigates to the board rather than leaving an input mid-edit.
-    const stored = await window.electronAPI.github.getRepos().catch(() => next)
+    const stored = await electronApi().github.getRepos().catch(() => next)
     setRepos(stored)
   }
 

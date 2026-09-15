@@ -9,6 +9,12 @@ import type { RepoRef } from '../core/workflow-engine'
 const ONE: RepoRef = { owner: 'acme', repo: 'one' }
 const TWO: RepoRef = { owner: 'acme', repo: 'two' }
 const THREE: RepoRef = { owner: 'acme', repo: 'three' }
+/**
+ * The same repository as TWO — GitHub resolves owner/repo case-insensitively, and so does
+ * `sameRepoRef`. A store written before repository identity was case-insensitive can hold both rows,
+ * with different settings, which is the state the removal test below is about.
+ */
+const TWO_SHOUTED: RepoRef = { owner: 'ACME', repo: 'TWO', autoTrigger: false }
 
 /**
  * Mounts the real App against a fake bridge, inside StrictMode because that is what `src/main.tsx`
@@ -89,10 +95,11 @@ describe('App project selection', () => {
    * The three-repository case, where the removed row is neither the fallback nor the last entry, so
    * "ends up on the first project" and "ends up on a neighbour" are distinguishable outcomes.
    *
-   * Honest about its reach: with selection stored by identity, two mechanisms agree here — the
-   * handler's fallback and the reconciliation effect that re-points a selection whose repository has
-   * left the list — and deleting either one alone leaves this green. What it pins that nothing else
-   * does is the list actually written: removal is by identity, not by array position.
+   * Honest about its reach: every repository here has a distinct identity, so the list it asserts on
+   * is the same one an index-based removal would produce — `removal drops every row naming the
+   * repository` below is what pins that. And with selection stored by identity, two mechanisms agree
+   * on where the operator lands (the handler's fallback, and the reconciliation effect that re-points
+   * a selection whose repository has left the list), so deleting either alone leaves this green.
    */
   it('falls back to the first project when a middle project is removed', async () => {
     const { stub, user } = await renderApp([ONE, TWO, THREE])
@@ -107,6 +114,35 @@ describe('App project selection', () => {
     expect(screen.queryByRole('button', { name: 'acme/two' })).toBeNull()
     expect(sidebarProject(THREE)).toBeInTheDocument()
     expect(stub.setRepos).toHaveBeenCalledWith([ONE, THREE])
+  })
+
+  /**
+   * Remove has to delete by repository identity, not by array position.
+   *
+   * A store written before identity was case-insensitive can hold one repository twice under
+   * different spellings, each row carrying its own settings. Dropping only the selected row hands
+   * core a list that still names the repository: "Remove" leaves it tracked, and the surviving row's
+   * settings take over — here that means re-enabling the unattended polling the operator had switched
+   * off, on the project they just tried to delete.
+   *
+   * Every other fixture in this file uses distinct repositories, so an index-based removal produces
+   * the identical list and the regression goes unnoticed. This is the one that discriminates: revert
+   * the filter to `repos.filter((_, index) => index !== selectedIndex)` and only this test fails.
+   */
+  it('removes every row naming the repository, not just the selected one', async () => {
+    const { stub, user } = await renderApp([ONE, TWO, TWO_SHOUTED, THREE])
+
+    await user.click(sidebarProject(TWO))
+    await projectHeading(TWO)
+    await openSettings(user)
+    await user.click(screen.getByRole('button', { name: 'Remove acme/two' }))
+    await user.click(screen.getByRole('button', { name: 'Confirm remove' }))
+
+    expect(await projectHeading(ONE)).toBeInTheDocument()
+    expect(stub.setRepos).toHaveBeenCalledWith([ONE, THREE])
+    expect(stub.storedRepos()).toEqual([ONE, THREE])
+    expect(screen.queryByRole('button', { name: 'acme/two' })).toBeNull()
+    expect(screen.queryByRole('button', { name: /ACME\/TWO/ })).toBeNull()
   })
 
   /**

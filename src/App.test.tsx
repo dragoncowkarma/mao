@@ -15,6 +15,12 @@ const THREE: RepoRef = { owner: 'acme', repo: 'three' }
  * with different settings, which is the state the removal test below is about.
  */
 const TWO_SHOUTED: RepoRef = { owner: 'ACME', repo: 'TWO', autoTrigger: false }
+/**
+ * A *different* repository that happens to share TWO's name. The negative control for the removal
+ * test: identity is the `owner/repo` pair, and without a row like this one an implementation that
+ * compared repo names alone would pass every assertion in this file.
+ */
+const OTHER_TWO: RepoRef = { owner: 'other', repo: 'two' }
 
 /**
  * Mounts the real App against a fake bridge, inside StrictMode because that is what `src/main.tsx`
@@ -126,11 +132,13 @@ describe('App project selection', () => {
    * off, on the project they just tried to delete.
    *
    * Every other fixture in this file uses distinct repositories, so an index-based removal produces
-   * the identical list and the regression goes unnoticed. This is the one that discriminates: revert
-   * the filter to `repos.filter((_, index) => index !== selectedIndex)` and only this test fails.
+   * the identical list and the regression goes unnoticed. This is the one that discriminates, on both
+   * axes of the identity: `ACME/TWO` must go with `acme/two` (same repository, different spelling),
+   * and `other/two` must stay (different repository, same name). Revert the filter to array position,
+   * to a case-sensitive compare, or to a repo-name-only compare, and only this test fails.
    */
   it('removes every row naming the repository, not just the selected one', async () => {
-    const { stub, user } = await renderApp([ONE, TWO, TWO_SHOUTED, THREE])
+    const { stub, user } = await renderApp([ONE, TWO, TWO_SHOUTED, OTHER_TWO, THREE])
 
     await user.click(sidebarProject(TWO))
     await projectHeading(TWO)
@@ -139,10 +147,11 @@ describe('App project selection', () => {
     await user.click(screen.getByRole('button', { name: 'Confirm remove' }))
 
     expect(await projectHeading(ONE)).toBeInTheDocument()
-    expect(stub.setRepos).toHaveBeenCalledWith([ONE, THREE])
-    expect(stub.storedRepos()).toEqual([ONE, THREE])
+    expect(stub.setRepos).toHaveBeenCalledWith([ONE, OTHER_TWO, THREE])
+    expect(stub.storedRepos()).toEqual([ONE, OTHER_TWO, THREE])
     expect(screen.queryByRole('button', { name: 'acme/two' })).toBeNull()
     expect(screen.queryByRole('button', { name: /ACME\/TWO/ })).toBeNull()
+    expect(sidebarProject(OTHER_TWO)).toBeInTheDocument()
   })
 
   /**

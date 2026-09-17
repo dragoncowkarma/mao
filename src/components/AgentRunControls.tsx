@@ -8,7 +8,7 @@ import type { QueuedTask } from '../../core/workflow-engine'
 
 interface AgentRunControlsProps {
   task: QueuedTask
-  /** Every registered provider, as returned by `window.electronAPI.ai.list()`. */
+  /** Every registered provider, as returned by `electronApi().ai.list()`. */
   providers: AiProviderConfig[]
   /** Text for the action button — 'Run' for a paused stage, 'Retry' for a failed one. */
   actionLabel: string

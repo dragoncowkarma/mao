@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { electronApi } from '../electron-api'
 import type { AgentStage, AiProviderConfig, ModelEffortPreset, ProviderKindId } from '../../core/ai/types'
 import { PROVIDER_OPTIONS } from '../../core/ai/provider-options'
 import type { ThemePreference } from '../../core/store'
@@ -386,7 +387,7 @@ export default function GlobalSettings({ theme, onThemeChange }: GlobalSettingsP
   const [saveError, setSaveError] = useState('')
 
   useEffect(() => {
-    window.electronAPI.ai.list().then(setProviders)
+    electronApi().ai.list().then(setProviders)
   }, [])
 
   function updateProvider(id: string, patch: Partial<AiProviderConfig>) {
@@ -411,8 +412,8 @@ export default function GlobalSettings({ theme, onThemeChange }: GlobalSettingsP
     }
 
     try {
-      await window.electronAPI.ai.save(providers)
-      if (githubToken) await window.electronAPI.github.setToken(githubToken)
+      await electronApi().ai.save(providers)
+      if (githubToken) await electronApi().github.setToken(githubToken)
       setSavedMessage('Saved')
       setTimeout(() => setSavedMessage(''), 1500)
     } catch (err) {

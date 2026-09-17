@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { electronApi } from '../electron-api'
 import type { GithubTask, GithubTaskDetail } from '../../core/github-service'
 import type { RepoRef } from '../../core/workflow-engine'
 
@@ -63,8 +64,8 @@ export default function TaskDetailModal({
     setDetail(null)
     setError('')
     setLoading(true)
-    window.electronAPI.github
-      .fetchTaskDetail(repo.owner, repo.repo, number)
+    electronApi()
+      .github.fetchTaskDetail(repo.owner, repo.repo, number)
       .then((result) => {
         if (!cancelled) setDetail(result)
       })
@@ -98,7 +99,7 @@ export default function TaskDetailModal({
   async function waitForImmediateFailure(taskId: string): Promise<string | null> {
     for (let i = 0; i < 10; i++) {
       if (!mountedRef.current) return null
-      const tasks = await window.electronAPI.workflow.list()
+      const tasks = await electronApi().workflow.list()
       if (!mountedRef.current) return null
       const task = tasks.find((t) => t.id === taskId)
       if (task?.status === 'error') return task.error ?? 'Task failed to start'
@@ -112,7 +113,7 @@ export default function TaskDetailModal({
     setEnqueueing(true)
     setEnqueueError('')
     try {
-      const task = await window.electronAPI.workflow.enqueueFromIssue(repo.owner, repo.repo, number, autoAdvance)
+      const task = await electronApi().workflow.enqueueFromIssue(repo.owner, repo.repo, number, autoAdvance)
       const immediateError = await waitForImmediateFailure(task.id)
       if (!mountedRef.current) return
       if (immediateError) {

@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { electronApi } from '../electron-api'
 import type { AiProviderConfig } from '../../core/ai/types'
 import { providerToolLabel } from '../../core/ai/provider-options'
 import { previewStageAgent } from '../../core/agent-selection'
@@ -282,8 +283,8 @@ export default function KanbanBoard({ repo }: KanbanBoardProps) {
   const [runningTaskId, setRunningTaskId] = useState<string | null>(null)
 
   const loadWorkflowTasks = () =>
-    window.electronAPI.workflow
-      .list()
+    electronApi()
+      .workflow.list()
       // sameRepoRef, not ===: a task's repo is snapshotted at enqueue time and never rewritten, so it can
       // carry a different capitalisation than the entry now in the store — after a duplicate is healed, or
       // from `mao workflow enqueue --owner/--repo`. An exact match would hide those tasks with no row left
@@ -298,8 +299,8 @@ export default function KanbanBoard({ repo }: KanbanBoardProps) {
 
   // Providers change only in Global Settings, so fetch once rather than on the 2s task poll.
   useEffect(() => {
-    window.electronAPI.ai
-      .list()
+    electronApi()
+      .ai.list()
       .then(setProviders)
       .catch((err) => setError(err instanceof Error ? err.message : String(err)))
   }, [])
@@ -313,8 +314,8 @@ export default function KanbanBoard({ repo }: KanbanBoardProps) {
   async function runTask(task: QueuedTask, runOverride?: RunOverride) {
     setRunningTaskId(task.id)
     try {
-      if (task.status === 'error') await window.electronAPI.workflow.retry(task.id, runOverride)
-      else if (task.status === 'paused') await window.electronAPI.workflow.advance(task.id, runOverride)
+      if (task.status === 'error') await electronApi().workflow.retry(task.id, runOverride)
+      else if (task.status === 'paused') await electronApi().workflow.advance(task.id, runOverride)
       setError('')
       await loadWorkflowTasks()
     } catch (err) {
@@ -328,7 +329,7 @@ export default function KanbanBoard({ repo }: KanbanBoardProps) {
     let cancelled = false
     async function load() {
       try {
-        const result = await window.electronAPI.github.fetchTasks(repo.owner, repo.repo)
+        const result = await electronApi().github.fetchTasks(repo.owner, repo.repo)
         if (!cancelled) {
           setTasks(result)
           setError('')
@@ -356,7 +357,7 @@ export default function KanbanBoard({ repo }: KanbanBoardProps) {
   async function refreshNow() {
     setRefreshing(true)
     try {
-      const result = await window.electronAPI.github.refreshRepo(repo.owner, repo.repo)
+      const result = await electronApi().github.refreshRepo(repo.owner, repo.repo)
       setTasks(result)
       setError('')
       setLastSyncedAt(Date.now())

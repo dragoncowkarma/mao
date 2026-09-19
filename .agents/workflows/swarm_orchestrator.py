@@ -29,6 +29,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -253,6 +254,51 @@ class TaskPR:
     head_sha: str = ""
     issue_number: Optional[int] = None
     reviewer: Optional[RoleAssignment] = None
+
+
+@dataclass(frozen=True)
+class RepoWorkflowCapability:
+    """Read-only verdict for the active gh CLI credential in this repository."""
+    repository: str
+    ok: bool
+    gaps: tuple[str, ...]
+    unverified: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class GitHubRepoTarget:
+    """The GitHub repository selected by this checkout's origin remote."""
+    host: str
+    owner: str
+    repo: str
+
+    @property
+    def name(self) -> str:
+        return f"{self.owner}/{self.repo}"
+
+    @property
+    def gh_context(self) -> str:
+        return f"{self.host}/{self.name}"
+
+
+class SwarmPreflightError(RuntimeError):
+    """Base class for safe, operator-facing write-preflight failures."""
+
+
+class SwarmCapabilityError(SwarmPreflightError):
+    """A permanent repository or credential blocker."""
+
+    def __init__(self, capability: RepoWorkflowCapability):
+        self.capability = capability
+        super().__init__(describe_repo_workflow_capability(capability))
+
+
+class SwarmPreflightTransientError(SwarmPreflightError):
+    """A transient or indeterminate lookup failure, never a permission verdict."""
+
+
+class SwarmPreflightConfigError(SwarmPreflightError):
+    """A local prerequisite failure, such as a missing gh executable."""
 
 
 @dataclass
@@ -749,42 +795,398 @@ def reset_process_history():
 # GitHub CLI Helpers
 # ---------------------------------------------------------------------------
 
-def gh(args: list[str], check: bool = True) -> str:
-    """Run a gh CLI command and return stdout."""
+
+_CAPABILITY_GAP_REASONS = {
+    "gh-not-authenticated": "the gh CLI is not authenticated",
+    "repo-not-found": (
+        "the repository does not exist, or the active gh credential cannot see it "
+        "(GitHub reports both as 404)"
+    ),
+    "bad-credentials": "GitHub rejected the active gh CLI credential",
+    "sso-authorization-required": (
+        "the organization enforces SAML SSO and the active gh credential is not authorized for it"
+    ),
+    "installation-suspended": "the GitHub App installation for this repository is suspended",
+    "resource-not-accessible": (
+        "GitHub reports that the active gh credential was not granted access to this repository"
+    ),
+    "legally-unavailable": "the repository is unavailable for legal reasons",
+    "archived": "the repository is archived, so GitHub rejects every write",
+    "disabled": "the repository is disabled",
+    "issues-disabled": "the Issues feature is disabled, so swarm cannot manage task issues",
+    "permissions-unknown": (
+        "GitHub returned no permissions.push value, so Contents: write cannot be established"
+    ),
+    "no-push-permission": (
+        "the active gh credential has read-only repository access "
+        "(permissions.push is false; Contents: write is missing)"
+    ),
+    "oauth-scope-missing": (
+        "the classic gh token has neither repo nor applicable public_repo write scope"
+    ),
+}
+_UNVERIFIED_GRANT_LABELS = {
+    "issues-write": "Issues: write",
+    "contents-write": "Contents: write",
+    "pull-requests-write": "Pull requests: write",
+}
+_PIPELINE_GRANTS = ("issues-write", "contents-write", "pull-requests-write")
+_ACTIVE_GH_REPO_CONTEXT: Optional[str] = None
+
+
+def _bound_gh_environment(repo_context: Optional[str] = None) -> dict[str, str]:
+    """Pin gh repository selection while preserving the credential-bearing environment."""
+    environment = os.environ.copy()
+    selected = repo_context or _ACTIVE_GH_REPO_CONTEXT
+    if selected:
+        environment["GH_REPO"] = selected
+        host, separator, _ = selected.partition("/")
+        if separator:
+            environment["GH_HOST"] = host
+    return environment
+
+
+def _resolve_origin_repository() -> GitHubRepoTarget:
+    """Resolve origin without ever returning or logging its potentially secret-bearing URL."""
+    try:
+        result = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        raise SwarmPreflightConfigError(
+            "git is required for mao swarm; install it and retry",
+        ) from None
+    except OSError:
+        raise SwarmPreflightConfigError(
+            "git could not inspect the selected checkout's origin; retry after fixing the local "
+            "Git installation",
+        ) from None
+    if result.returncode != 0 or not result.stdout.strip():
+        raise SwarmPreflightConfigError(
+            "The selected checkout has no readable origin remote. Configure its GitHub origin, "
+            "then retry.",
+        )
+
+    remote = result.stdout.strip()
+    host = ""
+    path = ""
+    try:
+        if "://" in remote:
+            parsed = urlsplit(remote)
+            host = parsed.hostname or ""
+            path = parsed.path
+        else:
+            match = re.match(r"^(?:[^@/:]+@)?(?P<host>[^:/]+):(?P<path>.+)$", remote)
+            if match:
+                host = match.group("host")
+                path = match.group("path")
+    except (UnicodeError, ValueError):
+        raise SwarmPreflightConfigError(
+            "The selected checkout's origin is not a supported GitHub repository URL. "
+            "Configure a GitHub origin, then retry.",
+        ) from None
+
+    parts = path.removesuffix(".git").strip("/").split("/")
+    if (
+        not host
+        or len(parts) != 2
+        or not all(re.fullmatch(r"[A-Za-z0-9_.-]+", part) for part in parts)
+    ):
+        raise SwarmPreflightConfigError(
+            "The selected checkout's origin is not a supported GitHub repository URL. "
+            "Configure a GitHub origin, then retry.",
+        )
+    return GitHubRepoTarget(host.lower(), parts[0], parts[1])
+
+
+def _gh_operation(args: list[str]) -> str:
+    """Return a fixed, non-sensitive label instead of logging arbitrary argv."""
+    if not args:
+        return "gh"
+    if args[0] in {"issue", "pr", "repo"} and len(args) > 1:
+        return f"gh {args[0]} {args[1]}"
+    return f"gh {args[0]}"
+
+
+def _run_gh(
+    args: list[str],
+    repo_context: Optional[str] = None,
+) -> subprocess.CompletedProcess:
+    """Run gh while keeping raw argv/stdout/stderr out of logs and raised errors."""
     cmd = ["gh"] + args
-    log.debug("Running: %s", " ".join(cmd))
+    operation = _gh_operation(args)
+    log.debug("Running %s", operation)
     try:
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
             cwd=REPO_ROOT,
+            env=_bound_gh_environment(repo_context),
             check=False,
             timeout=GH_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired:
-        log.error(
-            "gh command timed out after %ds: %s", GH_TIMEOUT_SECONDS, " ".join(cmd),
-        )
+        log.error("%s timed out after %ds", operation, GH_TIMEOUT_SECONDS)
+        raise subprocess.TimeoutExpired([operation], GH_TIMEOUT_SECONDS) from None
+    except FileNotFoundError:
+        log.error("gh CLI executable was not found")
+        raise FileNotFoundError("gh CLI executable was not found") from None
+    except OSError as error:
+        log.error("%s could not be started", operation)
+        raise OSError(error.errno, "gh CLI operation could not be started") from None
+
+    if result.returncode != 0:
+        log.error("%s failed with exit %d", operation, result.returncode)
+    return result
+
+
+def gh(args: list[str], check: bool = True) -> str:
+    """Run a gh CLI command and return stdout without exposing raw failure data."""
+    try:
+        result = _run_gh(args)
+    except (subprocess.TimeoutExpired, OSError):
         if check:
             raise
         return ""
+
     if result.returncode != 0:
-        log.error(
-            "gh command failed (exit %d): %s\nstderr: %s",
-            result.returncode,
-            " ".join(cmd),
-            result.stderr.strip() or "(empty)",
-        )
         if check:
             raise subprocess.CalledProcessError(
                 result.returncode,
-                cmd,
-                output=result.stdout,
-                stderr=result.stderr,
+                [_gh_operation(args)],
+                output="",
+                stderr="",
             )
         return ""
     return result.stdout.strip()
+
+
+def _parse_gh_api_response(raw: str) -> tuple[int, dict[str, str], dict]:
+    """Parse `gh api --include` output without ever logging its raw headers or body."""
+    normalized = raw.replace("\r\n", "\n")
+    header_text, separator, body_text = normalized.partition("\n\n")
+    status_match = re.match(r"HTTP/\S+\s+(\d{3})\b", header_text)
+    if not separator or not status_match:
+        raise ValueError("gh API response did not contain an HTTP envelope")
+
+    headers: dict[str, str] = {}
+    for line in header_text.splitlines()[1:]:
+        name, colon, value = line.partition(":")
+        if colon:
+            headers[name.strip().lower()] = value.strip()
+    body = json.loads(body_text)
+    if not isinstance(body, dict):
+        raise ValueError("gh API response body was not an object")
+    return int(status_match.group(1)), headers, body
+
+
+def _failure_capability(repository: str, gap: str) -> RepoWorkflowCapability:
+    return RepoWorkflowCapability(repository, False, (gap,), ())
+
+
+def _evaluate_repo_workflow_capability(
+    repository: str,
+    snapshot: dict,
+    oauth_scopes: Optional[str],
+) -> RepoWorkflowCapability:
+    permissions = snapshot.get("permissions")
+    push = permissions.get("push") if isinstance(permissions, dict) else None
+    if not isinstance(push, bool):
+        push = None
+
+    gaps: list[str] = []
+    if snapshot.get("archived") is True:
+        gaps.append("archived")
+    if snapshot.get("disabled") is True:
+        gaps.append("disabled")
+    if snapshot.get("has_issues") is False:
+        gaps.append("issues-disabled")
+    if push is None:
+        gaps.append("permissions-unknown")
+    elif not push:
+        gaps.append("no-push-permission")
+
+    scopes = {
+        scope.strip()
+        for scope in (oauth_scopes or "").split(",")
+        if scope.strip()
+    }
+    credential_is_classic = bool(scopes)
+    if credential_is_classic:
+        can_write = "repo" in scopes or (
+            snapshot.get("private") is not True and "public_repo" in scopes
+        )
+        if not can_write:
+            gaps.append("oauth-scope-missing")
+
+    unverified = _PIPELINE_GRANTS if not gaps and not credential_is_classic else ()
+    return RepoWorkflowCapability(repository, not gaps, tuple(gaps), tuple(unverified))
+
+
+def _classify_gh_api_failure(
+    repository: str,
+    result: subprocess.CompletedProcess,
+) -> RepoWorkflowCapability:
+    raw_diagnostic = f"{result.stdout}\n{result.stderr}"
+    status: Optional[int] = None
+    headers: dict[str, str] = {}
+    try:
+        status, headers, _ = _parse_gh_api_response(result.stdout)
+    except (ValueError, json.JSONDecodeError):
+        matches = re.findall(r"(?:HTTP/\S+\s+|HTTP\s+)(\d{3})\b", raw_diagnostic)
+        if matches:
+            status = int(matches[-1])
+
+    diagnostic = raw_diagnostic.lower()
+    if headers.get("x-ratelimit-remaining") == "0":
+        raise SwarmPreflightTransientError(
+            f"{repository}: GitHub rate limit is exhausted; retry after it resets",
+        )
+    if "retry-after" in headers or "rate limit" in diagnostic:
+        raise SwarmPreflightTransientError(
+            f"{repository}: GitHub rate-limited the preflight; retry later",
+        )
+
+    if result.returncode == 4 or re.search(
+        r"not logged in|authentication required|gh auth login|no oauth token",
+        diagnostic,
+    ):
+        return _failure_capability(repository, "gh-not-authenticated")
+    if status == 404:
+        return _failure_capability(repository, "repo-not-found")
+    if status == 401 or "bad credentials" in diagnostic:
+        return _failure_capability(repository, "bad-credentials")
+    if status == 451:
+        return _failure_capability(repository, "legally-unavailable")
+    if status in {403, 429}:
+        if "x-github-sso" in headers:
+            return _failure_capability(repository, "sso-authorization-required")
+        if "installation has been suspended" in diagnostic:
+            return _failure_capability(repository, "installation-suspended")
+        if "resource not accessible by" in diagnostic:
+            return _failure_capability(repository, "resource-not-accessible")
+
+    raise SwarmPreflightTransientError(
+        f"{repository}: GitHub write preflight was inconclusive (gh exit {result.returncode}); "
+        "retry later. No permanent authorization verdict was inferred",
+    )
+
+
+def check_repo_workflow_capability() -> RepoWorkflowCapability:
+    """Probe the active gh credential with one non-mutating repository GET."""
+    global _ACTIVE_GH_REPO_CONTEXT
+    _ACTIVE_GH_REPO_CONTEXT = None
+    target = _resolve_origin_repository()
+    try:
+        result = _run_gh([
+            "api",
+            "--include",
+            "--method", "GET",
+            "repos/{owner}/{repo}",
+            "--jq", "{full_name,archived,disabled,has_issues,private,permissions}",
+        ], repo_context=target.gh_context)
+    except FileNotFoundError as error:
+        raise SwarmPreflightConfigError(
+            "gh CLI is required for mao swarm; install it and run `gh auth login`, then retry",
+        ) from error
+    except subprocess.TimeoutExpired as error:
+        raise SwarmPreflightTransientError(
+            f"{target.name}: GitHub write preflight timed out after "
+            f"{GH_TIMEOUT_SECONDS}s; retry later",
+        ) from error
+    except OSError as error:
+        raise SwarmPreflightTransientError(
+            f"{target.name}: gh CLI could not start the GitHub write preflight; retry later",
+        ) from error
+
+    if result.returncode != 0:
+        return _classify_gh_api_failure(target.name, result)
+
+    try:
+        status, headers, snapshot = _parse_gh_api_response(result.stdout)
+    except (ValueError, json.JSONDecodeError) as error:
+        raise SwarmPreflightTransientError(
+            f"{target.name}: GitHub returned an unreadable preflight response; retry later",
+        ) from error
+    if status < 200 or status >= 300:
+        raise SwarmPreflightTransientError(
+            f"{target.name}: GitHub returned unexpected HTTP {status}; retry later",
+        )
+
+    repository = snapshot.get("full_name")
+    if not isinstance(repository, str) or not repository.strip():
+        raise SwarmPreflightTransientError(
+            f"{target.name}: GitHub omitted the repository name from the preflight response; "
+            "retry later",
+        )
+    repository = repository.strip()
+    if repository.lower() != target.name.lower():
+        raise SwarmPreflightConfigError(
+            f"The selected checkout origin is {target.name}, but gh resolved {repository}. "
+            "Clear the conflicting gh repository context, then retry.",
+        )
+    _ACTIVE_GH_REPO_CONTEXT = target.gh_context
+    return _evaluate_repo_workflow_capability(
+        repository,
+        snapshot,
+        headers.get("x-oauth-scopes"),
+    )
+
+
+def describe_repo_workflow_capability(capability: RepoWorkflowCapability) -> str:
+    if capability.ok:
+        return f"{capability.repository} has no known blocker for mao swarm"
+
+    reasons = "; ".join(_CAPABILITY_GAP_REASONS[gap] for gap in capability.gaps)
+    gaps = set(capability.gaps)
+    if gaps & {"archived", "disabled", "issues-disabled", "repo-not-found", "legally-unavailable"}:
+        remedy = "Fix the repository state or select a different repository, then retry."
+    elif "installation-suspended" in gaps:
+        remedy = "Unsuspend the GitHub App installation, then retry."
+    elif "sso-authorization-required" in gaps:
+        remedy = "Authorize the active gh credential for the organization's SAML SSO, then retry."
+    elif gaps & {"gh-not-authenticated", "bad-credentials"}:
+        remedy = "Run `gh auth login` with a working write credential, then retry."
+    else:
+        remedy = (
+            "Grant the active gh CLI credential Issues, Contents and Pull requests write access, "
+            "then retry."
+        )
+    return (
+        f"{capability.repository} cannot run mao swarm with the active gh CLI credential: "
+        f"{reasons}. {remedy}"
+    )
+
+
+def describe_unverified_grants(capability: RepoWorkflowCapability) -> Optional[str]:
+    if not capability.unverified:
+        return None
+    grants = ", ".join(_UNVERIFIED_GRANT_LABELS[grant] for grant in capability.unverified)
+    return (
+        f"{capability.repository}: repository push permission is necessary but not sufficient, and "
+        "GitHub exposes no non-mutating way to confirm this gh credential's individual "
+        f"{grants} grants. They remain unverified, so a write can still fail."
+    )
+
+
+def assert_repo_workflow_writable() -> RepoWorkflowCapability:
+    capability = check_repo_workflow_capability()
+    if not capability.ok:
+        raise SwarmCapabilityError(capability)
+
+    log.info(
+        "Swarm write preflight passed for %s using the active gh CLI credential.",
+        capability.repository,
+    )
+    caveat = describe_unverified_grants(capability)
+    if caveat:
+        log.warning("%s", caveat)
+    return capability
 
 
 _CURRENT_GH_USER: Optional[str] = None
@@ -1215,9 +1617,11 @@ def cleanup_worktree(issue_number: int, branch_name: str):
         cwd=REPO_ROOT, capture_output=True, text=True, check=False,
     )
     if result.returncode != 0:
-        stderr = result.stderr.strip()
-        if stderr:
-            log.warning("Failed to delete branch '%s': %s", branch_name, stderr)
+        log.warning(
+            "Failed to delete branch '%s' (git branch exited %d).",
+            branch_name,
+            result.returncode,
+        )
 
 
 def sync_main_branch(dry_run: bool = False):
@@ -1240,8 +1644,8 @@ def sync_main_branch(dry_run: bool = False):
     if fetch.returncode != 0:
         log_blocker(
             "main-sync:fetch",
-            "Failed to fetch origin/main: %s",
-            fetch.stderr.strip() or "(unknown error)",
+            "Failed to fetch origin/main (git fetch exited %d).",
+            fetch.returncode,
             level=logging.WARNING,
         )
         return
@@ -1296,8 +1700,8 @@ def sync_main_branch(dry_run: bool = False):
         else:
             log_blocker(
                 "main-sync:ff",
-                "Failed to fast-forward main: %s",
-                merge.stderr.strip(),
+                "Failed to fast-forward main (git merge exited %d).",
+                merge.returncode,
                 level=logging.WARNING,
             )
     elif ahead and not behind:
@@ -1622,6 +2026,18 @@ def _format_argv_for_log(argv: list[str]) -> str:
     return " ".join(parts)
 
 
+def _spawn_ai_process(argv, cwd, stdout_file, stderr_file, stdin_source):
+    """Launch every agent with the repository and host established by preflight."""
+    return subprocess.Popen(
+        argv,
+        cwd=cwd,
+        env=_bound_gh_environment(),
+        stdout=stdout_file,
+        stderr=stderr_file,
+        stdin=stdin_source,
+    )
+
+
 def dispatch_worker(
     issue: TaskIssue,
     dry_run: bool = False,
@@ -1692,12 +2108,12 @@ def dispatch_worker(
             pf = open(prompt_file, 'r', encoding='utf-8')
             stdin_source = pf
 
-        proc = subprocess.Popen(
+        proc = _spawn_ai_process(
             argv,
-            cwd=str(worktree_path),
-            stdout=stdout_file,
-            stderr=stderr_file,
-            stdin=stdin_source,
+            str(worktree_path),
+            stdout_file,
+            stderr_file,
+            stdin_source,
         )
         if pf:
             pf.close()
@@ -1793,12 +2209,12 @@ def dispatch_reviewer(
             pf = open(prompt_file, 'r', encoding='utf-8')
             stdin_source = pf
 
-        proc = subprocess.Popen(
+        proc = _spawn_ai_process(
             argv,
-            cwd=str(REPO_ROOT),
-            stdout=stdout_file,
-            stderr=stderr_file,
-            stdin=stdin_source,
+            str(REPO_ROOT),
+            stdout_file,
+            stderr_file,
+            stdin_source,
         )
         if pf:
             pf.close()
@@ -1889,12 +2305,12 @@ def dispatch_maintainer(
             pf = open(prompt_file, 'r', encoding='utf-8')
             stdin_source = pf
 
-        proc = subprocess.Popen(
+        proc = _spawn_ai_process(
             argv,
-            cwd=str(REPO_ROOT),
-            stdout=stdout_file,
-            stderr=stderr_file,
-            stdin=stdin_source,
+            str(REPO_ROOT),
+            stdout_file,
+            stderr_file,
+            stdin_source,
         )
         if pf:
             pf.close()
@@ -2000,12 +2416,12 @@ def dispatch_worker_revision(
             pf = open(prompt_file, 'r', encoding='utf-8')
             stdin_source = pf
 
-        proc = subprocess.Popen(
+        proc = _spawn_ai_process(
             argv,
-            cwd=str(worktree_path),
-            stdout=stdout_file,
-            stderr=stderr_file,
-            stdin=stdin_source,
+            str(worktree_path),
+            stdout_file,
+            stderr_file,
+            stdin_source,
         )
         if pf:
             pf.close()
@@ -2566,6 +2982,17 @@ def main():
         if args.reset:
             log.info("[DRY RUN] Would reset process history")
     else:
+        try:
+            assert_repo_workflow_writable()
+        except SwarmCapabilityError as error:
+            log.error("Swarm write preflight failed: %s", error)
+            return 1
+        except SwarmPreflightConfigError as error:
+            log.error("Swarm write preflight configuration error: %s", error)
+            return 1
+        except SwarmPreflightTransientError as error:
+            log.error("Swarm write preflight unavailable (transient): %s", error)
+            return 1
         enable_runtime_writes()
         if args.reset:
             reset_process_history()

@@ -174,6 +174,23 @@ the persisted dispatch history, not Git branches or worktrees. On the first real
 adds only these runtime paths to the checkout's local `.git/info/exclude`; it never edits
 or commits the target repository's shared `.gitignore`.
 
+Before any real-run runtime files, Git sync, worktree creation, AI dispatch, or direct GitHub write,
+Swarm sends one read-only `GET /repos/{owner}/{repo}` through the active `gh` CLI credential. This is
+the credential used by the orchestrator's `gh` commands and inherited by dispatched agents; MAO's
+stored `githubToken` is deliberately ignored because it is a different credential. The target comes
+from the selected checkout's `origin`; Swarm overrides any inherited `GH_REPO` and `GH_HOST` with
+that identity for its own `gh` calls and every dispatched agent, preventing a successful check of one
+repository or host from authorizing work against another. A permanent repository or permission gap
+exits non-zero with an actionable error, while rate limits, timeouts, 5xx responses, and unclassified
+403s are reported as transient rather than mislabeled as missing permission. `--status` remains
+offline and `--dry-run` remains read-only, so neither requires this write preflight.
+
+A passing Swarm preflight is not proof of every eventual write. When GitHub cannot expose the active
+credential's individual Issues, Contents, and Pull requests grants without a write probe, the CLI
+reports them as unverified. `git push` may also use SSH or a separate Git credential helper instead
+of the `gh` credential; the non-mutating API probe cannot establish that transport credential, so a
+push can still fail even after the GitHub API check passes.
+
 Worktree handling is preservation-first: a branch already checked out elsewhere is a
 hard blocker; a damaged checkout is repaired with `git worktree repair`; and a
 non-empty damaged or mismatched directory is retained for human inspection rather

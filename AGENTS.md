@@ -68,7 +68,10 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
    The one scoped exception is Issue #31's CLI-only autonomous Swarm engine:
    `.agents/workflows/swarm_orchestrator.py` owns that long-lived process lifecycle,
    while `cli/index.ts` must remain a thin delegation to `core/swarm-runner.ts` for
-   validation and shell-free launch. Do not duplicate Swarm behavior in the CLI shell.
+   validation and shell-free launch. Its repository write preflight also stays in Python:
+   Swarm writes with the active `gh` CLI credential, not the store's `githubToken`, so routing
+   this check through `GithubService` would validate the wrong credential. Do not duplicate
+   Swarm behavior in the CLI shell.
 3. **`createMaoApp()` (`core/app.ts`) is the only boot path.** Both shells call it;
    it wires token/providers/workspace, subscribes queue persistence to the engine's
    `'change'` event, and restores tasks. Workflow mutations must go through
@@ -357,6 +360,18 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   deliberately skip it, so a repo whose access was revoked stays manageable. Auto-trigger runs
   the same check before `fetchTasks`, so an unauthorized repo yields zero `enqueueFromIssue` and
   zero `workflow-active` label writes. Never add an exemption list.
+- **Real `mao swarm` runs have their own credential-aligned preflight.** Before runtime files,
+  Git sync, worktree creation, AI dispatch, or direct `gh` writes, the Python orchestrator performs
+  one non-mutating repository GET with the same active `gh` CLI credential inherited by dispatched
+  agents. The orchestrator derives the repository from `origin` and overrides inherited `GH_REPO`
+  and `GH_HOST` for both its own calls and agent subprocesses, so a caller cannot preflight one
+  repository or host and dispatch against another. `--status` and `--dry-run` deliberately bypass
+  this write gate. A
+  passing verdict means only that GitHub exposed no known blocker: fine-grained
+  Issues/Contents/Pull-requests grants stay explicitly unverified when the API cannot prove them.
+  Git transport is a separate boundary too —
+  `git push` may use SSH or another credential helper, so the `gh` preflight never claims to prove
+  that credential. The store's `githubToken` is intentionally not consulted for Swarm.
 - The pipeline creates real issues, branches, PRs, reviews, and merges. Test only
   against throwaway repos (see SKILL.md).
 - `github:refreshRepo` is **not a pure read**: it calls `autoTrigger.pollNow()`

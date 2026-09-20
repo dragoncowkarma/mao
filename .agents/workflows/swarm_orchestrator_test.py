@@ -66,7 +66,7 @@ class WorktreeSafetyTest(unittest.TestCase):
         cls.import_changed_excludes = exclude_path.read_text() != exclude_before
         cls.swarm.enable_runtime_writes()
 
-    def setUp(self):
+    def _bind_test_target(self):
         target = self.swarm.GitHubRepoTarget(
             "github.com",
             "acme",
@@ -75,6 +75,7 @@ class WorktreeSafetyTest(unittest.TestCase):
         )
         self.swarm._ACTIVE_GH_REPO_CONTEXT = target.gh_context
         self.swarm._ACTIVE_REPO_TARGET = target
+        return target
 
     @classmethod
     def tearDownClass(cls):
@@ -99,6 +100,7 @@ class WorktreeSafetyTest(unittest.TestCase):
             )
 
     def test_reuses_only_the_expected_registered_worktree(self):
+        self._bind_test_target()
         with patch.object(
             self.swarm,
             "_assert_worktree_push_target",
@@ -172,7 +174,7 @@ class WorktreeSafetyTest(unittest.TestCase):
         self.assertIn("git push --set-upstream origin worker/99-codex-dry-run", prompt)
         self.assertIn("never use a remote-less `git push`", prompt)
 
-    def test_worker_revision_rejects_shell_metacharacter_branch(self):
+    def test_worker_revision_shell_quotes_arbitrary_valid_head_branch(self):
         sentinel = "touch-pwned"
         issue = self.swarm.TaskIssue(
             number=99,
@@ -184,23 +186,44 @@ class WorktreeSafetyTest(unittest.TestCase):
             number=101,
             title="[PR] unsafe branch",
             body="No writes",
-            head_branch=f"worker/99-safe;$({sentinel})",
+            head_branch=f"codex/fix;$({sentinel})",
         )
-        with (
-            patch.object(self.swarm, "create_worktree") as create_worktree,
-            patch.object(self.swarm, "build_ai_argv") as build_ai_argv,
-            patch.object(self.swarm.log, "warning") as warning,
-        ):
+        with patch.object(
+            self.swarm,
+            "build_ai_argv",
+            return_value=([], False),
+        ) as build_ai_argv:
             self.swarm.dispatch_worker_revision(
                 pr,
                 issue,
                 "Please revise",
-                dry_run=False,
+                dry_run=True,
             )
 
-        create_worktree.assert_not_called()
-        build_ai_argv.assert_not_called()
-        self.assertNotIn(sentinel, str(warning.call_args))
+        prompt = build_ai_argv.call_args.kwargs["prompt_text"]
+        quoted_branch = f"'codex/fix;$({sentinel})'"
+        self.assertIn(f"git push --set-upstream origin {quoted_branch}", prompt)
+        self.assertIn(f"rebase {quoted_branch} onto", prompt)
+
+    def test_worker_normalizes_unicode_provider_for_generated_branch(self):
+        issue = self.swarm.TaskIssue(
+            number=99,
+            title="한글 작업",
+            body="No writes",
+            worker=self.swarm.RoleAssignment("코덱스", "5.6", "high"),
+        )
+        with patch.object(
+            self.swarm,
+            "build_ai_argv",
+            return_value=([], False),
+        ) as build_ai_argv:
+            self.swarm.dispatch_worker(issue, dry_run=True)
+
+        prompt = build_ai_argv.call_args.kwargs["prompt_text"]
+        self.assertIn(
+            "git push --set-upstream origin worker/99-worker-task-99",
+            prompt,
+        )
 
     def test_dry_run_skips_git_sync(self):
         with patch.object(self.swarm.subprocess, "run") as run:
@@ -238,6 +261,36 @@ class WorktreeSafetyTest(unittest.TestCase):
             )
 
         preflight.assert_called_once_with()
+
+    def test_real_loop_polls_children_before_transient_preflight_failure(self):
+        events = []
+
+        def poll_children():
+            events.append("poll")
+
+        def fail_preflight():
+            events.append("preflight")
+            raise self.swarm.SwarmPreflightTransientError("try later")
+
+        with (
+            patch.object(self.swarm.signal, "signal"),
+            patch.object(self.swarm.tracker, "poll_all", side_effect=poll_children),
+            patch.object(
+                self.swarm,
+                "assert_repo_workflow_writable",
+                side_effect=fail_preflight,
+            ),
+            patch.object(self.swarm, "sync_main_branch") as sync_main,
+            patch.object(self.swarm, "process_polling_cycle") as poll_remote,
+            patch.object(self.swarm.time, "sleep", side_effect=KeyboardInterrupt),
+            patch.object(self.swarm.log, "error"),
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                self.swarm.run_loop(interval=30, dry_run=False)
+
+        self.assertEqual(events, ["poll", "preflight"])
+        sync_main.assert_not_called()
+        poll_remote.assert_not_called()
 
     def test_once_subprocess_failure_returns_nonzero_without_traceback(self):
         with (
@@ -333,11 +386,66 @@ class WorktreeSafetyTest(unittest.TestCase):
         preflight.assert_not_called()
         enable_runtime_writes.assert_not_called()
         run_once.assert_called_once_with(True)
-        resolve_origin.assert_called_once_with()
+        resolve_origin.assert_called_once_with(verify_transport=False)
         self.assertEqual(
             self.swarm._ACTIVE_GH_REPO_CONTEXT,
             "github.com/acme/widgets",
         )
+
+    def test_dry_run_allows_custom_ssh_transport_while_binding_origin(self):
+        ssh_config = subprocess.CompletedProcess(
+            ["ssh", "-G", "--", "github.com"],
+            0,
+            "user git\nhostname github.com\nport 22\n",
+            "",
+        )
+        with (
+            patch.dict(os.environ, {"GIT_SSH_COMMAND": "ssh -i deploy-key"}, clear=False),
+            patch.object(
+                self.swarm.sys,
+                "argv",
+                ["swarm_orchestrator.py", "--dry-run", "--once"],
+            ),
+            patch.object(
+                self.swarm,
+                "_read_origin_urls",
+                side_effect=[
+                    ["git@github.com:acme/widgets.git"],
+                    ["git@github.com:acme/widgets.git"],
+                ],
+            ),
+            patch.object(self.swarm.subprocess, "run", return_value=ssh_config),
+            patch.object(self.swarm, "run_once", return_value=0) as run_once,
+        ):
+            result = self.swarm.main()
+
+        self.assertEqual(result, 0)
+        run_once.assert_called_once_with(True)
+        self.assertEqual(
+            self.swarm._ACTIVE_GH_REPO_CONTEXT,
+            "github.com/acme/widgets",
+        )
+
+    def test_dry_run_reports_transient_origin_resolution_failure(self):
+        with (
+            patch.object(
+                self.swarm.sys,
+                "argv",
+                ["swarm_orchestrator.py", "--dry-run", "--once"],
+            ),
+            patch.object(
+                self.swarm,
+                "_bind_origin_repository",
+                side_effect=self.swarm.SwarmPreflightTransientError("try later"),
+            ),
+            patch.object(self.swarm, "run_once") as run_once,
+            patch.object(self.swarm.log, "error") as log_error,
+        ):
+            result = self.swarm.main()
+
+        self.assertEqual(result, 1)
+        run_once.assert_not_called()
+        self.assertIn("transient", repr(log_error.mock_calls).lower())
 
     def test_real_dry_run_cycle_performs_reads_without_mutating(self):
         calls = []
@@ -425,27 +533,53 @@ class WorktreeSafetyTest(unittest.TestCase):
         self.assertIn("Issues, Contents and Pull requests write access", rendered)
 
     def test_real_once_enters_runtime_after_successful_preflight(self):
-        capability = self.swarm.RepoWorkflowCapability(
-            "acme/widgets",
-            True,
-            (),
-            (),
+        response = gh_api_response(
+            {
+                "full_name": "acme/widgets",
+                "archived": False,
+                "disabled": False,
+                "has_issues": True,
+                "private": False,
+                "permissions": {"push": True},
+            },
+            headers={"X-OAuth-Scopes": "repo"},
         )
+        probe = subprocess.CompletedProcess(["gh", "api"], 0, response, "")
+
+        def run_once_after_binding(dry_run):
+            self.assertFalse(dry_run)
+            self.assertEqual(
+                self.swarm._ACTIVE_GH_REPO_CONTEXT,
+                "github.com/acme/widgets",
+            )
+            self.assertIsNotNone(self.swarm._ACTIVE_REPO_TARGET)
+            return 0
+
         with (
             patch.object(self.swarm.sys, "argv", ["swarm_orchestrator.py", "--once"]),
             patch.object(
                 self.swarm,
-                "assert_repo_workflow_writable",
-                return_value=capability,
-            ) as preflight,
+                "_resolve_origin_repository",
+                return_value=self.swarm.GitHubRepoTarget(
+                    "github.com",
+                    "acme",
+                    "widgets",
+                    http_endpoint=self.swarm.HttpEndpoint("https", "github.com", 443),
+                ),
+            ),
+            patch.object(self.swarm, "_run_gh", return_value=probe) as run_gh,
             patch.object(self.swarm, "enable_runtime_writes") as enable_runtime_writes,
             patch.object(self.swarm, "cleanup_old_task_logs") as cleanup_old_task_logs,
-            patch.object(self.swarm, "run_once", return_value=0) as run_once,
+            patch.object(
+                self.swarm,
+                "run_once",
+                side_effect=run_once_after_binding,
+            ) as run_once,
         ):
             result = self.swarm.main()
 
         self.assertEqual(result, 0)
-        preflight.assert_called_once_with()
+        run_gh.assert_called_once()
         enable_runtime_writes.assert_called_once_with()
         cleanup_old_task_logs.assert_called_once_with()
         run_once.assert_called_once_with(False)
@@ -562,16 +696,23 @@ class WorktreeSafetyTest(unittest.TestCase):
 
     def test_origin_resolution_rejects_unbound_http_authority(self):
         sentinel = "credential-bearing-query"
-        remotes = (
-            "http://github.example/acme/widgets.git",
-            "https://github.example:8443/acme/widgets.git",
-            f"https://github.example/acme/widgets.git?{sentinel}",
+        authorities = (
+            ("http://github.example/acme/widgets.git", "HTTP origin"),
+            ("https://github.example:8443/acme/widgets.git", "non-default HTTPS"),
         )
-        for remote in remotes:
+        for remote, expected_reason in authorities:
             with self.subTest(remote=remote):
                 with self.assertRaises(self.swarm.SwarmPreflightConfigError) as raised:
                     self.swarm._parse_github_remote(remote)
+                self.assertIn(expected_reason, str(raised.exception))
                 self.assertNotIn(sentinel, str(raised.exception))
+
+        with self.assertRaises(self.swarm.SwarmPreflightConfigError) as raised:
+            self.swarm._parse_github_remote(
+                f"https://github.example/acme/widgets.git?{sentinel}",
+            )
+        self.assertIn("not a supported GitHub repository URL", str(raised.exception))
+        self.assertNotIn(sentinel, str(raised.exception))
 
     def test_origin_resolution_uses_every_fetch_and_push_url(self):
         fetch = subprocess.CompletedProcess(
@@ -606,6 +747,14 @@ class WorktreeSafetyTest(unittest.TestCase):
             target = self.swarm._resolve_origin_repository()
 
         self.assertEqual(target, self.swarm.GitHubRepoTarget("github.com", "acme", "widgets"))
+        self.assertEqual(
+            target.http_endpoint,
+            self.swarm.HttpEndpoint("https", "github.com", 443),
+        )
+        self.assertEqual(
+            target.ssh_endpoint,
+            self.swarm.SshEndpoint("github.com", "git", 22),
+        )
         self.assertEqual(
             run.call_args_list[0].args[0],
             ["git", "remote", "get-url", "--all", "origin"],
@@ -760,7 +909,23 @@ class WorktreeSafetyTest(unittest.TestCase):
         self.assertIn("core.sshCommand", str(raised.exception))
         self.assertNotIn(sentinel, str(raised.exception))
 
+    def test_ssh_resolution_timeout_is_transient(self):
+        with (
+            patch.object(self.swarm, "_assert_standard_git_ssh_context"),
+            patch.object(
+                self.swarm.subprocess,
+                "run",
+                side_effect=subprocess.TimeoutExpired(
+                    ["ssh", "-G"],
+                    self.swarm.GH_TIMEOUT_SECONDS,
+                ),
+            ),
+        ):
+            with self.assertRaises(self.swarm.SwarmPreflightTransientError):
+                self.swarm._resolve_ssh_endpoint("github.com")
+
     def test_worktree_push_target_rejects_non_origin_default_without_leak(self):
+        self._bind_test_target()
         sentinel = "credential-bearing-remote"
         with (
             patch.object(
@@ -789,6 +954,7 @@ class WorktreeSafetyTest(unittest.TestCase):
         self.assertNotIn(sentinel, str(raised.exception))
 
     def test_worktree_push_target_rejects_branch_scoped_origin_drift(self):
+        self._bind_test_target()
         with (
             patch.object(
                 self.swarm,
@@ -961,6 +1127,13 @@ class WorktreeSafetyTest(unittest.TestCase):
             self.swarm._bound_gh_environment()
 
         self.assertIn("not bound", str(raised.exception))
+
+    def test_gh_check_false_soft_fails_before_origin_binding(self):
+        self.swarm._ACTIVE_GH_REPO_CONTEXT = None
+
+        self.assertEqual(self.swarm.gh(["pr", "view", "1"], check=False), "")
+        with self.assertRaises(self.swarm.SwarmPreflightConfigError):
+            self.swarm.gh(["pr", "view", "1"])
 
     def test_dispatched_agent_inherits_preflight_repo_context(self):
         issue = self.swarm.TaskIssue(
@@ -1240,7 +1413,28 @@ class WorktreeSafetyTest(unittest.TestCase):
         self.assertNotIn("credential-secret", observed)
         self.assertNotIn("x-access-token", observed)
 
+    def test_gh_failure_logs_only_fixed_actionable_hint(self):
+        sentinel = "TOP-SECRET-GH-DIAGNOSTIC"
+        self.swarm._ACTIVE_GH_REPO_CONTEXT = "github.com/acme/widgets"
+        raw_result = subprocess.CompletedProcess(
+            ["gh", "pr", "list"],
+            1,
+            "",
+            f"Resource not accessible by integration: {sentinel}",
+        )
+        with (
+            patch.object(self.swarm.subprocess, "run", return_value=raw_result),
+            patch.object(self.swarm.log, "error") as log_error,
+        ):
+            with self.assertRaises(subprocess.CalledProcessError):
+                self.swarm.gh(["pr", "list"])
+
+        observed = repr(log_error.mock_calls)
+        self.assertIn("verify the active credential", observed)
+        self.assertNotIn(sentinel, observed)
+
     def test_blocks_a_branch_checked_out_at_another_path(self):
+        self._bind_test_target()
         other = self.repo / "other-worktree"
         subprocess.run(
             ["git", "-C", str(self.repo), "worktree", "add", "-b", "worker/2-test", str(other)],
@@ -1251,6 +1445,7 @@ class WorktreeSafetyTest(unittest.TestCase):
             self.swarm.create_worktree(2, "worker/2-test")
 
     def test_preserves_files_in_a_damaged_worktree(self):
+        self._bind_test_target()
         worktree = self.swarm.create_worktree(3, "worker/3-test")
         (worktree / ".git").unlink()
         marker = worktree / "keep-me.txt"
@@ -1262,6 +1457,7 @@ class WorktreeSafetyTest(unittest.TestCase):
         self.assertTrue(self.swarm.local_branch_exists("worker/3-test"))
 
     def test_prunes_only_metadata_when_the_worktree_directory_is_already_gone(self):
+        self._bind_test_target()
         worktree = self.swarm.create_worktree(4, "worker/4-test")
         shutil.rmtree(worktree)
 

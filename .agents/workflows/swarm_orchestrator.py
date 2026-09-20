@@ -19,6 +19,7 @@ import logging
 import logging.handlers
 import os
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -879,12 +880,6 @@ _CAPABILITY_REMEDY_TEXT = {
         "then retry."
     ),
 }
-if set(_CAPABILITY_GAP_REASONS) != set(_CAPABILITY_GAP_REMEDIES):
-    raise RuntimeError("Every swarm capability gap must define both a reason and a remedy")
-if set(_CAPABILITY_GAP_REMEDIES.values()) != set(_CAPABILITY_REMEDY_RANK):
-    raise RuntimeError("Every swarm capability remedy must define a priority")
-if set(_CAPABILITY_REMEDY_RANK) != set(_CAPABILITY_REMEDY_TEXT):
-    raise RuntimeError("Every swarm capability remedy must define operator guidance")
 _UNVERIFIED_GRANT_LABELS = {
     "issues-write": "Issues: write",
     "contents-write": "Contents: write",
@@ -980,9 +975,11 @@ def _resolve_ssh_endpoint(
     user: Optional[str] = None,
     port: Optional[int] = None,
     repo_root: Path = REPO_ROOT,
+    verify_transport: bool = True,
 ) -> SshEndpoint:
     """Resolve the exact SSH host, user, and port Git will use for this remote."""
-    _assert_standard_git_ssh_context(repo_root)
+    if verify_transport:
+        _assert_standard_git_ssh_context(repo_root)
     args = ["ssh", "-G"]
     if user:
         args.extend(["-l", user])
@@ -1003,7 +1000,7 @@ def _resolve_ssh_endpoint(
             "ssh is required to resolve this checkout's SSH origin; install it and retry",
         ) from None
     except subprocess.TimeoutExpired:
-        raise SwarmPreflightConfigError(
+        raise SwarmPreflightTransientError(
             "ssh timed out while resolving the selected checkout's origin host.",
         ) from None
     except OSError:
@@ -1048,6 +1045,7 @@ def _parse_github_remote(
         dict[tuple[str, str, Optional[int]], SshEndpoint]
     ] = None,
     repo_root: Path = REPO_ROOT,
+    verify_transport: bool = True,
 ) -> GitHubRepoTarget:
     """Parse one remote as data, resolving SSH aliases without logging the input."""
 
@@ -1077,8 +1075,16 @@ def _parse_github_remote(
                 effective_port = parsed.port or (443 if scheme == "https" else 80)
                 # gh API host binding defaults to HTTPS. A non-default web authority cannot be
                 # proven equivalent without additional host configuration, so fail closed.
-                if scheme != "https" or effective_port != 443:
-                    raise ValueError("unbound HTTP authority")
+                if scheme != "https":
+                    raise SwarmPreflightConfigError(
+                        "Swarm cannot bind gh to an HTTP origin. Use an HTTPS origin on port "
+                        "443 or an SSH origin, then retry.",
+                    )
+                if effective_port != 443:
+                    raise SwarmPreflightConfigError(
+                        "Swarm cannot prove that a non-default HTTPS origin authority matches "
+                        "gh. Use HTTPS on port 443 or an SSH origin, then retry.",
+                    )
                 http_endpoint = HttpEndpoint("https", host.lower(), 443)
         else:
             match = re.match(
@@ -1121,6 +1127,7 @@ def _parse_github_remote(
                 user=ssh_user,
                 port=ssh_port,
                 repo_root=repo_root,
+                verify_transport=verify_transport,
             )
         ssh_endpoint = cache[cache_key]
         resolved_host = ssh_endpoint.host
@@ -1136,15 +1143,28 @@ def _parse_github_remote(
     )
 
 
-def _resolve_origin_repository(repo_root: Path = REPO_ROOT) -> GitHubRepoTarget:
+def _resolve_origin_repository(
+    repo_root: Path = REPO_ROOT,
+    verify_transport: bool = True,
+) -> GitHubRepoTarget:
     """Resolve and cross-check every effective origin fetch and push URL."""
     ssh_host_cache: dict[tuple[str, str, Optional[int]], SshEndpoint] = {}
     fetch_targets = [
-        _parse_github_remote(url, ssh_host_cache, repo_root)
+        _parse_github_remote(
+            url,
+            ssh_host_cache,
+            repo_root,
+            verify_transport=verify_transport,
+        )
         for url in _read_origin_urls(push=False, repo_root=repo_root)
     ]
     push_targets = [
-        _parse_github_remote(url, ssh_host_cache, repo_root)
+        _parse_github_remote(
+            url,
+            ssh_host_cache,
+            repo_root,
+            verify_transport=verify_transport,
+        )
         for url in _read_origin_urls(push=True, repo_root=repo_root)
     ]
     targets = [*fetch_targets, *push_targets]
@@ -1220,6 +1240,8 @@ def _read_git_config_values(key: str, repo_root: Path) -> tuple[str, ...]:
 
 def _assert_worktree_push_target(worktree_path: Path, branch_name: str) -> None:
     """Revalidate branch-scoped origin and bare-push selectors before agent dispatch."""
+    # Deliberately re-resolve instead of caching: includeIf/onbranch and SSH config can change
+    # between polling cycles, and stale endpoint data would weaken the dispatch boundary.
     target = _resolve_origin_repository(worktree_path)
     if not _ACTIVE_REPO_TARGET:
         raise SwarmPreflightConfigError(
@@ -1257,12 +1279,12 @@ def _assert_worktree_push_target(worktree_path: Path, branch_name: str) -> None:
         )
 
 
-def _bind_origin_repository() -> GitHubRepoTarget:
+def _bind_origin_repository(verify_transport: bool = True) -> GitHubRepoTarget:
     """Bind local gh context without performing a network permission probe."""
     global _ACTIVE_GH_REPO_CONTEXT, _ACTIVE_REPO_TARGET
     _ACTIVE_GH_REPO_CONTEXT = None
     _ACTIVE_REPO_TARGET = None
-    target = _resolve_origin_repository()
+    target = _resolve_origin_repository(verify_transport=verify_transport)
     _ACTIVE_GH_REPO_CONTEXT = target.gh_context
     _ACTIVE_REPO_TARGET = target
     return target
@@ -1275,6 +1297,40 @@ def _gh_operation(args: list[str]) -> str:
     if args[0] in {"issue", "pr", "repo"} and len(args) > 1:
         return f"gh {args[0]} {args[1]}"
     return f"gh {args[0]}"
+
+
+_SAFE_CLI_FAILURE_HINTS = (
+    (
+        ("resource not accessible by integration",),
+        "GitHub denied access to this repository resource; verify the active credential's "
+        "repository grants",
+    ),
+    (
+        ("bad credentials", "authentication required", "gh auth login"),
+        "GitHub authentication failed; refresh the active gh credential",
+    ),
+    (
+        ("rate limit", "secondary rate limit"),
+        "GitHub rate limiting blocked the operation; retry later",
+    ),
+    (
+        ("could not resolve host", "network is unreachable", "connection timed out"),
+        "the network request failed; verify connectivity and retry",
+    ),
+    (
+        ("repository not found",),
+        "the remote repository was not found or is not visible to the active credential",
+    ),
+)
+
+
+def _safe_cli_failure_hint(stdout: str, stderr: str) -> Optional[str]:
+    """Map known diagnostics to fixed text without returning remote-controlled content."""
+    diagnostic = f"{stdout}\n{stderr}".lower()
+    for markers, hint in _SAFE_CLI_FAILURE_HINTS:
+        if any(marker in diagnostic for marker in markers):
+            return hint
+    return None
 
 
 def _run_gh(
@@ -1306,7 +1362,11 @@ def _run_gh(
         raise OSError(error.errno, "gh CLI operation could not be started") from None
 
     if result.returncode != 0:
-        log.error("%s failed with exit %d", operation, result.returncode)
+        hint = _safe_cli_failure_hint(result.stdout, result.stderr)
+        if hint:
+            log.error("%s failed with exit %d: %s", operation, result.returncode, hint)
+        else:
+            log.error("%s failed with exit %d", operation, result.returncode)
     return result
 
 
@@ -1314,7 +1374,7 @@ def gh(args: list[str], check: bool = True) -> str:
     """Run a gh CLI command and return stdout without exposing raw failure data."""
     try:
         result = _run_gh(args)
-    except (subprocess.TimeoutExpired, OSError):
+    except (subprocess.TimeoutExpired, OSError, SwarmPreflightError):
         if check:
             raise
         return ""
@@ -2021,12 +2081,21 @@ def sync_main_branch(dry_run: bool = False):
         timeout=GH_TIMEOUT_SECONDS,
     )
     if fetch.returncode != 0:
-        log_blocker(
-            "main-sync:fetch",
-            "Failed to fetch origin/main (git fetch exited %d).",
-            fetch.returncode,
-            level=logging.WARNING,
-        )
+        hint = _safe_cli_failure_hint(fetch.stdout, fetch.stderr)
+        if hint:
+            log_blocker(
+                "main-sync:fetch",
+                "Failed to fetch origin/main: %s.",
+                hint,
+                level=logging.WARNING,
+            )
+        else:
+            log_blocker(
+                "main-sync:fetch",
+                "Failed to fetch origin/main (git fetch exited %d).",
+                fetch.returncode,
+                level=logging.WARNING,
+            )
         return
 
     branch = subprocess.run(
@@ -2417,14 +2486,6 @@ def _spawn_ai_process(argv, cwd, stdout_file, stderr_file, stdin_source):
     )
 
 
-def _is_safe_worker_branch(branch_name: str, issue_number: int) -> bool:
-    """Allow only the shell-safe branch shape generated for this Issue's Worker."""
-    return re.fullmatch(
-        rf"worker/{issue_number}-[A-Za-z0-9][A-Za-z0-9._-]{{0,127}}",
-        branch_name,
-    ) is not None
-
-
 def dispatch_worker(
     issue: TaskIssue,
     dry_run: bool = False,
@@ -2442,13 +2503,11 @@ def dispatch_worker(
     short_desc = re.sub(r"[^a-z0-9]+", "-", raw_desc.lower()).strip("-")[:30]
     if not short_desc:
         short_desc = f"task-{issue.number}"
-    branch_name = f"worker/{issue.number}-{worker.ai}-{short_desc}"
-    if not _is_safe_worker_branch(branch_name, issue.number):
-        log.warning(
-            "Issue #%d produced an unsupported Worker branch name; skipping.",
-            issue.number,
-        )
-        return
+    worker_slug = re.sub(r"[^a-z0-9]+", "-", worker.ai.lower()).strip("-")[:30]
+    if not worker_slug:
+        worker_slug = "worker"
+    branch_name = f"worker/{issue.number}-{worker_slug}-{short_desc}"
+    branch_arg = shlex.quote(branch_name)
     worktree_path = WORKTREE_DIR / str(issue.number)
     if not dry_run:
         worktree_path = create_worktree(issue.number, branch_name)
@@ -2459,7 +2518,7 @@ def dispatch_worker(
         f"Implement the task described in the Issue body:\n\n{issue.body}\n\n"
         f"Work inside this directory. When done:\n"
         f"1. Commit your changes with conventional commit messages referencing #{issue.number}.\n"
-        f"2. Push with `git push --set-upstream origin {branch_name}`; always name `origin` "
+        f"2. Push with `git push --set-upstream origin {branch_arg}`; always name `origin` "
         f"and the branch explicitly, and never use a remote-less `git push`.\n"
         f"3. Create a PR titled '[PR] {issue.number} - <summary>' with a "
         f"[Reviewer: ...] tag in the body.\n"
@@ -2746,14 +2805,16 @@ def dispatch_worker_revision(
     # Reuse the PR's actual branch so a title-derived branch cannot diverge.
     branch_name = pr.head_branch
     if not branch_name:
-        log.warning("PR #%d has no head branch, cannot dispatch revision.", pr.number)
-        return
-    if not _is_safe_worker_branch(branch_name, issue.number):
-        log.warning(
-            "PR #%d has an unsafe or unexpected Worker head branch; cannot dispatch revision.",
+        log_blocker(
+            f"revision-missing-head:{pr.number}",
+            "PR #%d has no head branch, cannot dispatch revision.",
             pr.number,
+            level=logging.WARNING,
         )
         return
+    # Git and subprocess calls receive this ref as an argv element. Quote only the shell command
+    # examples in the agent prompt so valid external/codex/claude branch names remain usable.
+    branch_arg = shlex.quote(branch_name)
 
     # We must run inside the same worktree or recreate it. Dry-run only reports
     # the intended path and must not mutate git worktree state.
@@ -2767,11 +2828,11 @@ def dispatch_worker_revision(
         f"You previously created this PR, but additional modifications were requested. "
         f"Here is the feedback/comments:\n\n{feedback_text}\n\n"
         f"Work inside this directory. This worktree may be stale — first fetch and "
-        f"rebase '{branch_name}' onto the latest origin/main yourself before making "
+        f"rebase {branch_arg} onto the latest origin/main yourself before making "
         f"any changes, so your commit isn't built on an outdated base. When done:\n"
         f"1. Fix the code according to the feedback.\n"
         f"2. Commit your changes with conventional commit messages.\n"
-        f"3. Push with `git push --set-upstream origin {branch_name}`; always name `origin` "
+        f"3. Push with `git push --set-upstream origin {branch_arg}`; always name `origin` "
         f"and the branch explicitly, and never use a remote-less `git push`. If the push is "
         f"rejected (e.g. "
         f"non-fast-forward), that is a FAILED push, not a completed one — resolve it "
@@ -3293,6 +3354,11 @@ def run_loop(
         try:
             log.info("--- Polling cycle (active: %d) ---", tracker.active_count)
 
+            # Supervise already-running local children even when the network preflight is
+            # temporarily unavailable. The write gate still runs before sync/dispatch/writes.
+            if not dry_run:
+                tracker.poll_all()
+
             # A successful startup preflight covers only the first cycle. Every later cycle
             # rechecks before Git sync, dispatch, or direct GitHub writes so revoked access stops
             # new lifecycle work without restarting this long-lived process.
@@ -3302,11 +3368,7 @@ def run_loop(
                 else:
                     assert_repo_workflow_writable()
 
-            # 1. Check status of all running AI processes
-            if not dry_run:
-                tracker.poll_all()
-
-            # 2. Keep local main current so new worktrees branch from a fresh
+            # Keep local main current so new worktrees branch from a fresh
             # base. Cheap, but still throttled — no need to hit the network
             # every single interval.
             cycle_count += 1
@@ -3316,7 +3378,7 @@ def run_loop(
                 except Exception as e:
                     log.error("Error syncing main branch: %s", e, exc_info=True)
 
-            # 3. Poll every open item immediately on startup and every interval
+            # Poll every open item immediately on startup and every interval
             process_polling_cycle(dry_run, initial=initial)
             initial = False
 
@@ -3397,8 +3459,10 @@ def main():
 
     if args.dry_run:
         try:
-            _bind_origin_repository()
-        except SwarmPreflightConfigError as error:
+            # Dry-run needs repository identity for read-only gh calls, but it never pushes, so
+            # custom Git SSH transport commands are not part of its safety boundary.
+            _bind_origin_repository(verify_transport=False)
+        except SwarmPreflightError as error:
             _log_preflight_failure(error)
             return 1
         if args.reset:

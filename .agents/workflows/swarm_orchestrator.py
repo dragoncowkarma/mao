@@ -266,11 +266,29 @@ class RepoWorkflowCapability:
 
 
 @dataclass(frozen=True)
+class SshEndpoint:
+    """The effective SSH authority Git will contact after local config resolution."""
+    host: str
+    user: str
+    port: int
+
+
+@dataclass(frozen=True)
+class HttpEndpoint:
+    """The HTTPS authority used by Git and bound to the gh API probe."""
+    scheme: str
+    host: str
+    port: int
+
+
+@dataclass(frozen=True)
 class GitHubRepoTarget:
     """The GitHub repository selected by this checkout's origin remote."""
     host: str
     owner: str
     repo: str
+    ssh_endpoint: Optional[SshEndpoint] = field(default=None, compare=False, repr=False)
+    http_endpoint: Optional[HttpEndpoint] = field(default=None, compare=False, repr=False)
 
     @property
     def name(self) -> str:
@@ -825,6 +843,48 @@ _CAPABILITY_GAP_REASONS = {
         "the classic gh token has neither repo nor applicable public_repo write scope"
     ),
 }
+_CAPABILITY_GAP_REMEDIES = {
+    "gh-not-authenticated": "configure-gh",
+    "repo-not-found": "repository-state",
+    "bad-credentials": "replace-gh-credential",
+    "sso-authorization-required": "authorize-sso",
+    "installation-suspended": "unsuspend-installation",
+    "resource-not-accessible": "grant-write",
+    "legally-unavailable": "repository-state",
+    "archived": "repository-state",
+    "disabled": "repository-state",
+    "issues-disabled": "repository-state",
+    "permissions-unknown": "grant-write",
+    "no-push-permission": "grant-write",
+    "oauth-scope-missing": "grant-write",
+}
+_CAPABILITY_REMEDY_RANK = {
+    "repository-state": 0,
+    "unsuspend-installation": 1,
+    "authorize-sso": 2,
+    "replace-gh-credential": 3,
+    "configure-gh": 4,
+    "grant-write": 5,
+}
+_CAPABILITY_REMEDY_TEXT = {
+    "repository-state": "Fix the repository state or select a different repository, then retry.",
+    "configure-gh": "Run `gh auth login` with a write credential, then retry.",
+    "replace-gh-credential": "Run `gh auth login` with a working write credential, then retry.",
+    "authorize-sso": (
+        "Authorize the active gh credential for the organization's SAML SSO, then retry."
+    ),
+    "unsuspend-installation": "Unsuspend the GitHub App installation, then retry.",
+    "grant-write": (
+        "Grant the active gh CLI credential Issues, Contents and Pull requests write access, "
+        "then retry."
+    ),
+}
+if set(_CAPABILITY_GAP_REASONS) != set(_CAPABILITY_GAP_REMEDIES):
+    raise RuntimeError("Every swarm capability gap must define both a reason and a remedy")
+if set(_CAPABILITY_GAP_REMEDIES.values()) != set(_CAPABILITY_REMEDY_RANK):
+    raise RuntimeError("Every swarm capability remedy must define a priority")
+if set(_CAPABILITY_REMEDY_RANK) != set(_CAPABILITY_REMEDY_TEXT):
+    raise RuntimeError("Every swarm capability remedy must define operator guidance")
 _UNVERIFIED_GRANT_LABELS = {
     "issues-write": "Issues: write",
     "contents-write": "Contents: write",
@@ -832,26 +892,37 @@ _UNVERIFIED_GRANT_LABELS = {
 }
 _PIPELINE_GRANTS = ("issues-write", "contents-write", "pull-requests-write")
 _ACTIVE_GH_REPO_CONTEXT: Optional[str] = None
+_ACTIVE_REPO_TARGET: Optional[GitHubRepoTarget] = None
 
 
 def _bound_gh_environment(repo_context: Optional[str] = None) -> dict[str, str]:
     """Pin gh repository selection while preserving the credential-bearing environment."""
     environment = os.environ.copy()
     selected = repo_context or _ACTIVE_GH_REPO_CONTEXT
-    if selected:
-        environment["GH_REPO"] = selected
-        host, separator, _ = selected.partition("/")
-        if separator:
-            environment["GH_HOST"] = host
+    if not selected:
+        raise SwarmPreflightConfigError(
+            "The GitHub repository context is not bound to this checkout's origin.",
+        )
+    environment["GH_REPO"] = selected
+    host, separator, _ = selected.partition("/")
+    if not separator:
+        raise SwarmPreflightConfigError(
+            "The GitHub repository context is invalid; re-run swarm from a GitHub checkout.",
+        )
+    environment["GH_HOST"] = host
     return environment
 
 
-def _resolve_origin_repository() -> GitHubRepoTarget:
-    """Resolve origin without ever returning or logging its potentially secret-bearing URL."""
+def _read_origin_urls(push: bool, repo_root: Path = REPO_ROOT) -> list[str]:
+    """Read every effective origin URL without exposing its potentially secret-bearing value."""
+    args = ["git", "remote", "get-url", "--all"]
+    if push:
+        args.append("--push")
+    args.append("origin")
     try:
         result = subprocess.run(
-            ["git", "remote", "get-url", "origin"],
-            cwd=REPO_ROOT,
+            args,
+            cwd=repo_root,
             capture_output=True,
             text=True,
             check=False,
@@ -865,42 +936,336 @@ def _resolve_origin_repository() -> GitHubRepoTarget:
             "git could not inspect the selected checkout's origin; retry after fixing the local "
             "Git installation",
         ) from None
-    if result.returncode != 0 or not result.stdout.strip():
+    urls = [line for line in result.stdout.splitlines() if line]
+    if result.returncode != 0 or not urls:
         raise SwarmPreflightConfigError(
             "The selected checkout has no readable origin remote. Configure its GitHub origin, "
             "then retry.",
         )
+    return urls
 
-    remote = result.stdout.strip()
+
+def _assert_standard_git_ssh_context(repo_root: Path = REPO_ROOT) -> None:
+    """Fail closed when Git would not use the system SSH configuration we inspect."""
+    if os.environ.get("GIT_SSH_COMMAND") or os.environ.get("GIT_SSH"):
+        raise SwarmPreflightConfigError(
+            "Swarm cannot verify an SSH origin while GIT_SSH_COMMAND or GIT_SSH overrides Git's "
+            "transport. Unset the override or use an HTTPS origin, then retry.",
+        )
+    try:
+        result = subprocess.run(
+            ["git", "config", "--get", "core.sshCommand"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (FileNotFoundError, OSError):
+        raise SwarmPreflightConfigError(
+            "git could not inspect the SSH transport configuration for this checkout.",
+        ) from None
+    if result.returncode == 0 and result.stdout.strip():
+        raise SwarmPreflightConfigError(
+            "Swarm cannot verify an SSH origin with core.sshCommand configured. Remove the "
+            "override or use an HTTPS origin, then retry.",
+        )
+    if result.returncode not in {0, 1}:
+        raise SwarmPreflightConfigError(
+            "git could not inspect the SSH transport configuration for this checkout.",
+        )
+
+
+def _resolve_ssh_endpoint(
+    host: str,
+    user: Optional[str] = None,
+    port: Optional[int] = None,
+    repo_root: Path = REPO_ROOT,
+) -> SshEndpoint:
+    """Resolve the exact SSH host, user, and port Git will use for this remote."""
+    _assert_standard_git_ssh_context(repo_root)
+    args = ["ssh", "-G"]
+    if user:
+        args.extend(["-l", user])
+    if port is not None:
+        args.extend(["-p", str(port)])
+    args.extend(["--", host])
+    try:
+        result = subprocess.run(
+            args,
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=GH_TIMEOUT_SECONDS,
+        )
+    except FileNotFoundError:
+        raise SwarmPreflightConfigError(
+            "ssh is required to resolve this checkout's SSH origin; install it and retry",
+        ) from None
+    except subprocess.TimeoutExpired:
+        raise SwarmPreflightConfigError(
+            "ssh timed out while resolving the selected checkout's origin host.",
+        ) from None
+    except OSError:
+        raise SwarmPreflightConfigError(
+            "ssh could not resolve the selected checkout's origin host.",
+        ) from None
+
+    if result.returncode != 0:
+        raise SwarmPreflightConfigError(
+            "ssh could not resolve the selected checkout's origin host.",
+        )
+    resolved_values: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition(" ")
+        normalized_key = key.lower()
+        if separator and normalized_key in {"hostname", "user", "port"} and value.strip():
+            resolved_values[normalized_key] = value.strip()
+    try:
+        resolved_port = int(resolved_values["port"])
+        if not 1 <= resolved_port <= 65535:
+            raise ValueError("invalid SSH port")
+        endpoint = SshEndpoint(
+            resolved_values["hostname"].lower(),
+            resolved_values["user"],
+            resolved_port,
+        )
+    except (KeyError, ValueError):
+        raise SwarmPreflightConfigError(
+            "ssh returned an incomplete target for the selected checkout's origin.",
+        ) from None
+
+    # GitHub documents ssh.github.com:443 as the alternate endpoint for the same public
+    # github.com SSH service. No other host/user/port equivalence is assumed.
+    if endpoint == SshEndpoint("ssh.github.com", "git", 443):
+        return SshEndpoint("github.com", "git", 22)
+    return endpoint
+
+
+def _parse_github_remote(
+    remote: str,
+    ssh_host_cache: Optional[
+        dict[tuple[str, str, Optional[int]], SshEndpoint]
+    ] = None,
+    repo_root: Path = REPO_ROOT,
+) -> GitHubRepoTarget:
+    """Parse one remote as data, resolving SSH aliases without logging the input."""
+
     host = ""
     path = ""
+    uses_ssh = False
+    ssh_user: Optional[str] = None
+    ssh_port: Optional[int] = None
+    http_endpoint: Optional[HttpEndpoint] = None
     try:
         if "://" in remote:
             parsed = urlsplit(remote)
+            scheme = parsed.scheme.lower()
+            if scheme not in {"http", "https", "ssh"}:
+                raise ValueError("unsupported remote scheme")
+            if parsed.query or parsed.fragment:
+                raise ValueError("remote query and fragment are unsupported")
             host = parsed.hostname or ""
             path = parsed.path
+            uses_ssh = scheme == "ssh"
+            if uses_ssh:
+                if parsed.password is not None:
+                    raise ValueError("SSH remote passwords are unsupported")
+                ssh_user = parsed.username
+                ssh_port = parsed.port
+            else:
+                effective_port = parsed.port or (443 if scheme == "https" else 80)
+                # gh API host binding defaults to HTTPS. A non-default web authority cannot be
+                # proven equivalent without additional host configuration, so fail closed.
+                if scheme != "https" or effective_port != 443:
+                    raise ValueError("unbound HTTP authority")
+                http_endpoint = HttpEndpoint("https", host.lower(), 443)
         else:
-            match = re.match(r"^(?:[^@/:]+@)?(?P<host>[^:/]+):(?P<path>.+)$", remote)
+            match = re.match(
+                r"^(?:(?P<user>[^@/:]+)@)?(?P<host>[^:/]+):(?P<path>.+)$",
+                remote,
+            )
             if match:
                 host = match.group("host")
                 path = match.group("path")
+                uses_ssh = True
+                ssh_user = match.group("user")
     except (UnicodeError, ValueError):
         raise SwarmPreflightConfigError(
             "The selected checkout's origin is not a supported GitHub repository URL. "
             "Configure a GitHub origin, then retry.",
         ) from None
 
-    parts = path.removesuffix(".git").strip("/").split("/")
+    repository_path = path.strip("/").removesuffix(".git")
+    parts = repository_path.split("/")
     if (
         not host
         or len(parts) != 2
         or not all(re.fullmatch(r"[A-Za-z0-9_.-]+", part) for part in parts)
+        or (
+            uses_ssh
+            and ssh_user is not None
+            and not re.fullmatch(r"[A-Za-z0-9_.-]+", ssh_user)
+        )
     ):
         raise SwarmPreflightConfigError(
             "The selected checkout's origin is not a supported GitHub repository URL. "
             "Configure a GitHub origin, then retry.",
         )
-    return GitHubRepoTarget(host.lower(), parts[0], parts[1])
+    if uses_ssh:
+        cache = ssh_host_cache if ssh_host_cache is not None else {}
+        cache_key = (host.lower(), ssh_user or "", ssh_port)
+        if cache_key not in cache:
+            cache[cache_key] = _resolve_ssh_endpoint(
+                host,
+                user=ssh_user,
+                port=ssh_port,
+                repo_root=repo_root,
+            )
+        ssh_endpoint = cache[cache_key]
+        resolved_host = ssh_endpoint.host
+    else:
+        ssh_endpoint = None
+        resolved_host = host.lower()
+    return GitHubRepoTarget(
+        resolved_host,
+        parts[0],
+        parts[1],
+        ssh_endpoint=ssh_endpoint,
+        http_endpoint=http_endpoint,
+    )
+
+
+def _resolve_origin_repository(repo_root: Path = REPO_ROOT) -> GitHubRepoTarget:
+    """Resolve and cross-check every effective origin fetch and push URL."""
+    ssh_host_cache: dict[tuple[str, str, Optional[int]], SshEndpoint] = {}
+    fetch_targets = [
+        _parse_github_remote(url, ssh_host_cache, repo_root)
+        for url in _read_origin_urls(push=False, repo_root=repo_root)
+    ]
+    push_targets = [
+        _parse_github_remote(url, ssh_host_cache, repo_root)
+        for url in _read_origin_urls(push=True, repo_root=repo_root)
+    ]
+    targets = [*fetch_targets, *push_targets]
+    target = targets[0]
+    identity = (target.host.lower(), target.owner.lower(), target.repo.lower())
+    for candidate in targets[1:]:
+        candidate_identity = (
+            candidate.host.lower(),
+            candidate.owner.lower(),
+            candidate.repo.lower(),
+        )
+        if candidate_identity != identity:
+            raise SwarmPreflightConfigError(
+                "The selected checkout's origin fetch and push URLs do not identify the same "
+                "GitHub repository. Align every origin URL, then retry.",
+            )
+    ssh_endpoints = [
+        candidate.ssh_endpoint
+        for candidate in targets
+        if candidate.ssh_endpoint is not None
+    ]
+    if ssh_endpoints and any(
+        endpoint != ssh_endpoints[0] for endpoint in ssh_endpoints[1:]
+    ):
+        raise SwarmPreflightConfigError(
+            "The selected checkout's origin SSH URLs do not resolve to the same host, user, and "
+            "port. Align every origin URL and SSH Host rule, then retry.",
+        )
+    http_endpoints = [
+        candidate.http_endpoint
+        for candidate in targets
+        if candidate.http_endpoint is not None
+    ]
+    if http_endpoints and any(
+        endpoint != http_endpoints[0] for endpoint in http_endpoints[1:]
+    ):
+        raise SwarmPreflightConfigError(
+            "The selected checkout's origin HTTPS URLs do not use the same authority. Align "
+            "every origin URL, then retry.",
+        )
+    return GitHubRepoTarget(
+        target.host,
+        target.owner,
+        target.repo,
+        ssh_endpoint=ssh_endpoints[0] if ssh_endpoints else None,
+        http_endpoint=http_endpoints[0] if http_endpoints else None,
+    )
+
+
+def _read_git_config_values(key: str, repo_root: Path) -> tuple[str, ...]:
+    """Read one effective Git config key without exposing its value in failures."""
+    try:
+        result = subprocess.run(
+            ["git", "config", "--get-all", key],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (FileNotFoundError, OSError):
+        raise SwarmPreflightConfigError(
+            "git could not inspect the task worktree's push target configuration.",
+        ) from None
+    if result.returncode == 1:
+        return ()
+    values = tuple(result.stdout.splitlines())
+    if result.returncode != 0 or not values:
+        raise SwarmPreflightConfigError(
+            "git could not inspect the task worktree's push target configuration.",
+        )
+    return values
+
+
+def _assert_worktree_push_target(worktree_path: Path, branch_name: str) -> None:
+    """Revalidate branch-scoped origin and bare-push selectors before agent dispatch."""
+    target = _resolve_origin_repository(worktree_path)
+    if not _ACTIVE_REPO_TARGET:
+        raise SwarmPreflightConfigError(
+            "The GitHub repository context is not bound to this checkout's origin.",
+        )
+    expected = [
+        _ACTIVE_REPO_TARGET.host,
+        _ACTIVE_REPO_TARGET.owner,
+        _ACTIVE_REPO_TARGET.repo,
+    ]
+    actual = [target.host, target.owner, target.repo]
+    if (
+        [part.lower() for part in actual] != [part.lower() for part in expected]
+        or target.ssh_endpoint != _ACTIVE_REPO_TARGET.ssh_endpoint
+        or target.http_endpoint != _ACTIVE_REPO_TARGET.http_endpoint
+    ):
+        raise SwarmPreflightConfigError(
+            "The task worktree's effective origin or transport endpoint differs from the target "
+            "bound at startup. Align branch-scoped Git configuration, then retry.",
+        )
+
+    selector_keys = (
+        "remote.pushDefault",
+        f"branch.{branch_name}.pushRemote",
+        f"branch.{branch_name}.remote",
+    )
+    if any(
+        value != "origin"
+        for key in selector_keys
+        for value in _read_git_config_values(key, worktree_path)
+    ):
+        raise SwarmPreflightConfigError(
+            "The task worktree selects a push remote other than origin. Remove the conflicting "
+            "push-remote override or point it to origin, then retry.",
+        )
+
+
+def _bind_origin_repository() -> GitHubRepoTarget:
+    """Bind local gh context without performing a network permission probe."""
+    global _ACTIVE_GH_REPO_CONTEXT, _ACTIVE_REPO_TARGET
+    _ACTIVE_GH_REPO_CONTEXT = None
+    _ACTIVE_REPO_TARGET = None
+    target = _resolve_origin_repository()
+    _ACTIVE_GH_REPO_CONTEXT = target.gh_context
+    _ACTIVE_REPO_TARGET = target
+    return target
 
 
 def _gh_operation(args: list[str]) -> str:
@@ -1043,33 +1408,38 @@ def _classify_gh_api_failure(
             status = int(matches[-1])
 
     diagnostic = raw_diagnostic.lower()
-    if headers.get("x-ratelimit-remaining") == "0":
-        raise SwarmPreflightTransientError(
-            f"{repository}: GitHub rate limit is exhausted; retry after it resets",
-        )
-    if "retry-after" in headers or "rate limit" in diagnostic:
-        raise SwarmPreflightTransientError(
-            f"{repository}: GitHub rate-limited the preflight; retry later",
-        )
-
-    if result.returncode == 4 or re.search(
-        r"not logged in|authentication required|gh auth login|no oauth token",
-        diagnostic,
-    ):
-        return _failure_capability(repository, "gh-not-authenticated")
     if status == 404:
         return _failure_capability(repository, "repo-not-found")
-    if status == 401 or "bad credentials" in diagnostic:
+    if status == 401:
         return _failure_capability(repository, "bad-credentials")
     if status == 451:
         return _failure_capability(repository, "legally-unavailable")
     if status in {403, 429}:
+        if headers.get("x-ratelimit-remaining") == "0":
+            raise SwarmPreflightTransientError(
+                f"{repository}: GitHub rate limit is exhausted; retry after it resets",
+            )
+        if "retry-after" in headers or "rate limit" in diagnostic:
+            raise SwarmPreflightTransientError(
+                f"{repository}: GitHub rate-limited the preflight; retry later",
+            )
         if "x-github-sso" in headers:
             return _failure_capability(repository, "sso-authorization-required")
         if "installation has been suspended" in diagnostic:
             return _failure_capability(repository, "installation-suspended")
         if "resource not accessible by" in diagnostic:
             return _failure_capability(repository, "resource-not-accessible")
+    if status is None and "bad credentials" in diagnostic:
+        return _failure_capability(repository, "bad-credentials")
+    if status is None and (result.returncode == 4 or re.search(
+        r"not logged in|authentication required|gh auth login|no oauth token",
+        diagnostic,
+    )):
+        return _failure_capability(repository, "gh-not-authenticated")
+    if status is None and "rate limit" in diagnostic:
+        raise SwarmPreflightTransientError(
+            f"{repository}: GitHub rate-limited the preflight; retry later",
+        )
 
     raise SwarmPreflightTransientError(
         f"{repository}: GitHub write preflight was inconclusive (gh exit {result.returncode}); "
@@ -1079,8 +1449,9 @@ def _classify_gh_api_failure(
 
 def check_repo_workflow_capability() -> RepoWorkflowCapability:
     """Probe the active gh credential with one non-mutating repository GET."""
-    global _ACTIVE_GH_REPO_CONTEXT
+    global _ACTIVE_GH_REPO_CONTEXT, _ACTIVE_REPO_TARGET
     _ACTIVE_GH_REPO_CONTEXT = None
+    _ACTIVE_REPO_TARGET = None
     target = _resolve_origin_repository()
     try:
         result = _run_gh([
@@ -1113,6 +1484,8 @@ def check_repo_workflow_capability() -> RepoWorkflowCapability:
         raise SwarmPreflightTransientError(
             f"{target.name}: GitHub returned an unreadable preflight response; retry later",
         ) from error
+    # `gh api` currently exits non-zero for non-2xx responses, so this is defensive against a
+    # future CLI behavior change rather than an expected path today.
     if status < 200 or status >= 300:
         raise SwarmPreflightTransientError(
             f"{target.name}: GitHub returned unexpected HTTP {status}; retry later",
@@ -1130,12 +1503,15 @@ def check_repo_workflow_capability() -> RepoWorkflowCapability:
             f"The selected checkout origin is {target.name}, but gh resolved {repository}. "
             "Clear the conflicting gh repository context, then retry.",
         )
-    _ACTIVE_GH_REPO_CONTEXT = target.gh_context
-    return _evaluate_repo_workflow_capability(
+    capability = _evaluate_repo_workflow_capability(
         repository,
         snapshot,
         headers.get("x-oauth-scopes"),
     )
+    if capability.ok:
+        _ACTIVE_GH_REPO_CONTEXT = target.gh_context
+        _ACTIVE_REPO_TARGET = target
+    return capability
 
 
 def describe_repo_workflow_capability(capability: RepoWorkflowCapability) -> str:
@@ -1143,20 +1519,11 @@ def describe_repo_workflow_capability(capability: RepoWorkflowCapability) -> str
         return f"{capability.repository} has no known blocker for mao swarm"
 
     reasons = "; ".join(_CAPABILITY_GAP_REASONS[gap] for gap in capability.gaps)
-    gaps = set(capability.gaps)
-    if gaps & {"archived", "disabled", "issues-disabled", "repo-not-found", "legally-unavailable"}:
-        remedy = "Fix the repository state or select a different repository, then retry."
-    elif "installation-suspended" in gaps:
-        remedy = "Unsuspend the GitHub App installation, then retry."
-    elif "sso-authorization-required" in gaps:
-        remedy = "Authorize the active gh credential for the organization's SAML SSO, then retry."
-    elif gaps & {"gh-not-authenticated", "bad-credentials"}:
-        remedy = "Run `gh auth login` with a working write credential, then retry."
-    else:
-        remedy = (
-            "Grant the active gh CLI credential Issues, Contents and Pull requests write access, "
-            "then retry."
-        )
+    remedy_kind = min(
+        (_CAPABILITY_GAP_REMEDIES[gap] for gap in capability.gaps),
+        key=lambda kind: _CAPABILITY_REMEDY_RANK[kind],
+    )
+    remedy = _CAPABILITY_REMEDY_TEXT[remedy_kind]
     return (
         f"{capability.repository} cannot run mao swarm with the active gh CLI credential: "
         f"{reasons}. {remedy}"
@@ -1187,6 +1554,16 @@ def assert_repo_workflow_writable() -> RepoWorkflowCapability:
     if caveat:
         log.warning("%s", caveat)
     return capability
+
+
+def _log_preflight_failure(error: SwarmPreflightError):
+    """Log typed preflight failures without exposing raw remote or CLI diagnostics."""
+    if isinstance(error, SwarmCapabilityError):
+        log.error("Swarm write preflight failed: %s", error)
+    elif isinstance(error, SwarmPreflightConfigError):
+        log.error("Swarm write preflight configuration error: %s", error)
+    else:
+        log.error("Swarm write preflight unavailable (transient): %s", error)
 
 
 _CURRENT_GH_USER: Optional[str] = None
@@ -1466,6 +1843,7 @@ def create_worktree(issue_number: int, branch_name: str) -> Path:
             and path_entry
             and path_entry.get("branch") == expected_branch
         ):
+            _assert_worktree_push_target(worktree_path, branch_name)
             log.info("Reusing worktree: %s", worktree_path)
             return worktree_path
 
@@ -1498,6 +1876,7 @@ def create_worktree(issue_number: int, branch_name: str) -> Path:
         ["git", "worktree", "add", str(worktree_path), branch_name],
         cwd=REPO_ROOT, check=True,
     )
+    _assert_worktree_push_target(worktree_path, branch_name)
     log.info("Created worktree: %s on branch %s", worktree_path, branch_name)
     return worktree_path
 
@@ -2038,6 +2417,14 @@ def _spawn_ai_process(argv, cwd, stdout_file, stderr_file, stdin_source):
     )
 
 
+def _is_safe_worker_branch(branch_name: str, issue_number: int) -> bool:
+    """Allow only the shell-safe branch shape generated for this Issue's Worker."""
+    return re.fullmatch(
+        rf"worker/{issue_number}-[A-Za-z0-9][A-Za-z0-9._-]{{0,127}}",
+        branch_name,
+    ) is not None
+
+
 def dispatch_worker(
     issue: TaskIssue,
     dry_run: bool = False,
@@ -2056,6 +2443,12 @@ def dispatch_worker(
     if not short_desc:
         short_desc = f"task-{issue.number}"
     branch_name = f"worker/{issue.number}-{worker.ai}-{short_desc}"
+    if not _is_safe_worker_branch(branch_name, issue.number):
+        log.warning(
+            "Issue #%d produced an unsupported Worker branch name; skipping.",
+            issue.number,
+        )
+        return
     worktree_path = WORKTREE_DIR / str(issue.number)
     if not dry_run:
         worktree_path = create_worktree(issue.number, branch_name)
@@ -2066,7 +2459,8 @@ def dispatch_worker(
         f"Implement the task described in the Issue body:\n\n{issue.body}\n\n"
         f"Work inside this directory. When done:\n"
         f"1. Commit your changes with conventional commit messages referencing #{issue.number}.\n"
-        f"2. Push the branch '{branch_name}'.\n"
+        f"2. Push with `git push --set-upstream origin {branch_name}`; always name `origin` "
+        f"and the branch explicitly, and never use a remote-less `git push`.\n"
         f"3. Create a PR titled '[PR] {issue.number} - <summary>' with a "
         f"[Reviewer: ...] tag in the body.\n"
         f"4. The Reviewer AI MUST be different from Worker AI '{worker.ai}'.\n"
@@ -2354,6 +2748,12 @@ def dispatch_worker_revision(
     if not branch_name:
         log.warning("PR #%d has no head branch, cannot dispatch revision.", pr.number)
         return
+    if not _is_safe_worker_branch(branch_name, issue.number):
+        log.warning(
+            "PR #%d has an unsafe or unexpected Worker head branch; cannot dispatch revision.",
+            pr.number,
+        )
+        return
 
     # We must run inside the same worktree or recreate it. Dry-run only reports
     # the intended path and must not mutate git worktree state.
@@ -2371,7 +2771,9 @@ def dispatch_worker_revision(
         f"any changes, so your commit isn't built on an outdated base. When done:\n"
         f"1. Fix the code according to the feedback.\n"
         f"2. Commit your changes with conventional commit messages.\n"
-        f"3. Push the branch '{branch_name}'. If the push is rejected (e.g. "
+        f"3. Push with `git push --set-upstream origin {branch_name}`; always name `origin` "
+        f"and the branch explicitly, and never use a remote-less `git push`. If the push is "
+        f"rejected (e.g. "
         f"non-fast-forward), that is a FAILED push, not a completed one — resolve it "
         f"(rebase/force-push your own branch as needed) and push again before "
         f"proceeding.\n"
@@ -2861,7 +3263,11 @@ def process_polling_cycle(dry_run: bool = False, initial: bool = False):
     cleanup_merged_prs(dry_run)
 
 
-def run_loop(interval: int, dry_run: bool = False):
+def run_loop(
+    interval: int,
+    dry_run: bool = False,
+    preflight_completed: bool = False,
+):
     """Main polling loop with process status monitoring."""
     log.info("=" * 60)
     log.info("Swarm Orchestrator started")
@@ -2887,6 +3293,15 @@ def run_loop(interval: int, dry_run: bool = False):
         try:
             log.info("--- Polling cycle (active: %d) ---", tracker.active_count)
 
+            # A successful startup preflight covers only the first cycle. Every later cycle
+            # rechecks before Git sync, dispatch, or direct GitHub writes so revoked access stops
+            # new lifecycle work without restarting this long-lived process.
+            if not dry_run:
+                if preflight_completed:
+                    preflight_completed = False
+                else:
+                    assert_repo_workflow_writable()
+
             # 1. Check status of all running AI processes
             if not dry_run:
                 tracker.poll_all()
@@ -2910,6 +3325,8 @@ def run_loop(interval: int, dry_run: bool = False):
             if not dry_run:
                 tracker.kill_all()
             break
+        except SwarmPreflightError as error:
+            _log_preflight_failure(error)
         except Exception as e:
             log.error("Error in polling cycle: %s", e, exc_info=True)
 
@@ -2979,28 +3396,33 @@ def main():
         return 0
 
     if args.dry_run:
+        try:
+            _bind_origin_repository()
+        except SwarmPreflightConfigError as error:
+            _log_preflight_failure(error)
+            return 1
         if args.reset:
             log.info("[DRY RUN] Would reset process history")
     else:
-        try:
-            assert_repo_workflow_writable()
-        except SwarmCapabilityError as error:
-            log.error("Swarm write preflight failed: %s", error)
-            return 1
-        except SwarmPreflightConfigError as error:
-            log.error("Swarm write preflight configuration error: %s", error)
-            return 1
-        except SwarmPreflightTransientError as error:
-            log.error("Swarm write preflight unavailable (transient): %s", error)
-            return 1
-        enable_runtime_writes()
+        # `--reset` explicitly authorizes this local history mutation and must remain useful while
+        # GitHub is offline or access is being repaired. It never touches a worktree or GitHub.
         if args.reset:
             reset_process_history()
+        try:
+            assert_repo_workflow_writable()
+        except SwarmPreflightError as error:
+            _log_preflight_failure(error)
+            return 1
+        enable_runtime_writes()
         cleanup_old_task_logs()
 
     if args.once:
         return run_once(args.dry_run)
-    run_loop(args.interval, args.dry_run)
+    run_loop(
+        args.interval,
+        args.dry_run,
+        preflight_completed=not args.dry_run,
+    )
     return 0
 
 

@@ -14,10 +14,11 @@ SCRIPT_PATH = Path(__file__).with_name("swarm_orchestrator.py")
 
 def gh_api_response(body: dict, status: int = 200, headers: dict | None = None) -> str:
     reason = "OK" if status == 200 else "Error"
-    lines = [f"HTTP/2.0 {status} {reason}"]
-    for name, value in (headers or {}).items():
-        lines.append(f"{name}: {value}")
-    return "\n".join(lines) + "\n\n" + json.dumps(body)
+    # gh 2.92 emits a LF status line followed by CRLF headers and terminator.
+    header_lines = "".join(
+        f"{name}: {value}\r\n" for name, value in (headers or {}).items()
+    )
+    return f"HTTP/2.0 {status} {reason}\n{header_lines}\r\n{json.dumps(body)}"
 
 
 class WorktreeSafetyTest(unittest.TestCase):
@@ -65,12 +66,23 @@ class WorktreeSafetyTest(unittest.TestCase):
         cls.import_changed_excludes = exclude_path.read_text() != exclude_before
         cls.swarm.enable_runtime_writes()
 
+    def setUp(self):
+        target = self.swarm.GitHubRepoTarget(
+            "github.com",
+            "acme",
+            "widgets",
+            http_endpoint=self.swarm.HttpEndpoint("https", "github.com", 443),
+        )
+        self.swarm._ACTIVE_GH_REPO_CONTEXT = target.gh_context
+        self.swarm._ACTIVE_REPO_TARGET = target
+
     @classmethod
     def tearDownClass(cls):
         cls.temp_dir.cleanup()
 
     def tearDown(self):
         self.swarm._ACTIVE_GH_REPO_CONTEXT = None
+        self.swarm._ACTIVE_REPO_TARGET = None
         for entry in self.swarm.list_git_worktrees():
             path = Path(entry["worktree"])
             if path != self.repo:
@@ -87,8 +99,15 @@ class WorktreeSafetyTest(unittest.TestCase):
             )
 
     def test_reuses_only_the_expected_registered_worktree(self):
-        created = self.swarm.create_worktree(1, "worker/1-test")
-        self.assertEqual(created, self.swarm.create_worktree(1, "worker/1-test"))
+        with patch.object(
+            self.swarm,
+            "_assert_worktree_push_target",
+            wraps=self.swarm._assert_worktree_push_target,
+        ) as assert_push_target:
+            created = self.swarm.create_worktree(1, "worker/1-test")
+            self.assertEqual(created, self.swarm.create_worktree(1, "worker/1-test"))
+
+        self.assertEqual(assert_push_target.call_count, 2)
 
     def test_runtime_artifacts_are_locally_excluded(self):
         status = subprocess.run(
@@ -112,9 +131,76 @@ class WorktreeSafetyTest(unittest.TestCase):
             worker=self.swarm.RoleAssignment("codex", "5.6", "high"),
         )
 
-        self.swarm.dispatch_worker(issue, dry_run=True)
+        with patch.object(
+            self.swarm,
+            "build_ai_argv",
+            return_value=([], False),
+        ) as build_ai_argv:
+            self.swarm.dispatch_worker(issue, dry_run=True)
 
         self.assertFalse(self.swarm.PROMPT_DIR.exists())
+        prompt = build_ai_argv.call_args.kwargs["prompt_text"]
+        self.assertIn("git push --set-upstream origin worker/99-codex-task-dry-run", prompt)
+        self.assertIn("never use a remote-less `git push`", prompt)
+
+    def test_worker_revision_prompt_pins_origin_push(self):
+        issue = self.swarm.TaskIssue(
+            number=99,
+            title="[Task] dry run",
+            body="No writes",
+            worker=self.swarm.RoleAssignment("codex", "5.6", "high"),
+        )
+        pr = self.swarm.TaskPR(
+            number=101,
+            title="[PR] dry run",
+            body="No writes",
+            head_branch="worker/99-codex-dry-run",
+        )
+        with patch.object(
+            self.swarm,
+            "build_ai_argv",
+            return_value=([], False),
+        ) as build_ai_argv:
+            self.swarm.dispatch_worker_revision(
+                pr,
+                issue,
+                "Please revise",
+                dry_run=True,
+            )
+
+        prompt = build_ai_argv.call_args.kwargs["prompt_text"]
+        self.assertIn("git push --set-upstream origin worker/99-codex-dry-run", prompt)
+        self.assertIn("never use a remote-less `git push`", prompt)
+
+    def test_worker_revision_rejects_shell_metacharacter_branch(self):
+        sentinel = "touch-pwned"
+        issue = self.swarm.TaskIssue(
+            number=99,
+            title="[Task] unsafe branch",
+            body="No writes",
+            worker=self.swarm.RoleAssignment("codex", "5.6", "high"),
+        )
+        pr = self.swarm.TaskPR(
+            number=101,
+            title="[PR] unsafe branch",
+            body="No writes",
+            head_branch=f"worker/99-safe;$({sentinel})",
+        )
+        with (
+            patch.object(self.swarm, "create_worktree") as create_worktree,
+            patch.object(self.swarm, "build_ai_argv") as build_ai_argv,
+            patch.object(self.swarm.log, "warning") as warning,
+        ):
+            self.swarm.dispatch_worker_revision(
+                pr,
+                issue,
+                "Please revise",
+                dry_run=False,
+            )
+
+        create_worktree.assert_not_called()
+        build_ai_argv.assert_not_called()
+        self.assertNotIn(sentinel, str(warning.call_args))
 
     def test_dry_run_skips_git_sync(self):
         with patch.object(self.swarm.subprocess, "run") as run:
@@ -131,6 +217,27 @@ class WorktreeSafetyTest(unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt):
                 self.swarm.run_loop(interval=30, dry_run=True)
         poll.assert_called_once_with(True, initial=True)
+
+    def test_real_loop_rechecks_preflight_before_each_later_cycle(self):
+        with (
+            patch.object(self.swarm.signal, "signal"),
+            patch.object(self.swarm, "assert_repo_workflow_writable") as preflight,
+            patch.object(self.swarm.tracker, "poll_all"),
+            patch.object(self.swarm, "sync_main_branch"),
+            patch.object(
+                self.swarm,
+                "process_polling_cycle",
+                side_effect=[None, KeyboardInterrupt],
+            ),
+            patch.object(self.swarm.time, "sleep"),
+        ):
+            self.swarm.run_loop(
+                interval=30,
+                dry_run=False,
+                preflight_completed=True,
+            )
+
+        preflight.assert_called_once_with()
 
     def test_once_subprocess_failure_returns_nonzero_without_traceback(self):
         with (
@@ -211,6 +318,11 @@ class WorktreeSafetyTest(unittest.TestCase):
                 "argv",
                 ["swarm_orchestrator.py", "--dry-run", "--once"],
             ),
+            patch.object(
+                self.swarm,
+                "_resolve_origin_repository",
+                return_value=self.swarm.GitHubRepoTarget("github.com", "acme", "widgets"),
+            ) as resolve_origin,
             patch.object(self.swarm, "assert_repo_workflow_writable") as preflight,
             patch.object(self.swarm, "enable_runtime_writes") as enable_runtime_writes,
             patch.object(self.swarm, "run_once", return_value=0) as run_once,
@@ -221,6 +333,11 @@ class WorktreeSafetyTest(unittest.TestCase):
         preflight.assert_not_called()
         enable_runtime_writes.assert_not_called()
         run_once.assert_called_once_with(True)
+        resolve_origin.assert_called_once_with()
+        self.assertEqual(
+            self.swarm._ACTIVE_GH_REPO_CONTEXT,
+            "github.com/acme/widgets",
+        )
 
     def test_real_dry_run_cycle_performs_reads_without_mutating(self):
         calls = []
@@ -333,6 +450,36 @@ class WorktreeSafetyTest(unittest.TestCase):
         cleanup_old_task_logs.assert_called_once_with()
         run_once.assert_called_once_with(False)
 
+    def test_explicit_reset_runs_before_a_failed_preflight(self):
+        capability = self.swarm.RepoWorkflowCapability(
+            "acme/widgets",
+            False,
+            ("no-push-permission",),
+            (),
+        )
+        with (
+            patch.object(
+                self.swarm.sys,
+                "argv",
+                ["swarm_orchestrator.py", "--once", "--reset"],
+            ),
+            patch.object(self.swarm, "reset_process_history") as reset_process_history,
+            patch.object(
+                self.swarm,
+                "assert_repo_workflow_writable",
+                side_effect=self.swarm.SwarmCapabilityError(capability),
+            ),
+            patch.object(self.swarm, "enable_runtime_writes") as enable_runtime_writes,
+            patch.object(self.swarm, "run_once") as run_once,
+            patch.object(self.swarm.log, "error"),
+        ):
+            result = self.swarm.main()
+
+        self.assertEqual(result, 1)
+        reset_process_history.assert_called_once_with()
+        enable_runtime_writes.assert_not_called()
+        run_once.assert_not_called()
+
     def test_preflight_uses_one_read_only_gh_api_probe(self):
         response = gh_api_response(
             {
@@ -360,6 +507,7 @@ class WorktreeSafetyTest(unittest.TestCase):
         self.assertEqual(capability.repository, "acme/widgets")
         self.assertEqual(capability.gaps, ("no-push-permission",))
         self.assertEqual(capability.unverified, ())
+        self.assertIsNone(self.swarm._ACTIVE_GH_REPO_CONTEXT)
 
     def test_preflight_pins_repo_context_to_origin(self):
         response = gh_api_response(
@@ -389,6 +537,324 @@ class WorktreeSafetyTest(unittest.TestCase):
             self.swarm._ACTIVE_GH_REPO_CONTEXT,
             "github.com/acme/widgets",
         )
+
+    def test_origin_resolution_accepts_trailing_slash_after_dot_git(self):
+        target = self.swarm._parse_github_remote(
+            "https://github.com/acme/widgets.git/",
+        )
+
+        self.assertEqual(target, self.swarm.GitHubRepoTarget("github.com", "acme", "widgets"))
+        self.assertEqual(
+            target.http_endpoint,
+            self.swarm.HttpEndpoint("https", "github.com", 443),
+        )
+
+    def test_origin_resolution_accepts_explicit_default_https_port(self):
+        target = self.swarm._parse_github_remote(
+            "https://github.com:443/acme/widgets.git",
+        )
+
+        self.assertEqual(target.host, "github.com")
+        self.assertEqual(
+            target.http_endpoint,
+            self.swarm.HttpEndpoint("https", "github.com", 443),
+        )
+
+    def test_origin_resolution_rejects_unbound_http_authority(self):
+        sentinel = "credential-bearing-query"
+        remotes = (
+            "http://github.example/acme/widgets.git",
+            "https://github.example:8443/acme/widgets.git",
+            f"https://github.example/acme/widgets.git?{sentinel}",
+        )
+        for remote in remotes:
+            with self.subTest(remote=remote):
+                with self.assertRaises(self.swarm.SwarmPreflightConfigError) as raised:
+                    self.swarm._parse_github_remote(remote)
+                self.assertNotIn(sentinel, str(raised.exception))
+
+    def test_origin_resolution_uses_every_fetch_and_push_url(self):
+        fetch = subprocess.CompletedProcess(
+            ["git", "remote", "get-url", "--all", "origin"],
+            0,
+            "https://github.com/acme/widgets.git\n",
+            "",
+        )
+        push = subprocess.CompletedProcess(
+            ["git", "remote", "get-url", "--all", "--push", "origin"],
+            0,
+            "git@github.com:acme/widgets.git\n",
+            "",
+        )
+        core_config_absent = subprocess.CompletedProcess(
+            ["git", "config", "--get", "core.sshCommand"],
+            1,
+            "",
+            "",
+        )
+        ssh_config = subprocess.CompletedProcess(
+            ["ssh", "-G", "--", "github.com"],
+            0,
+            "user git\nhostname github.com\nport 22\n",
+            "",
+        )
+        with patch.object(
+            self.swarm.subprocess,
+            "run",
+            side_effect=[fetch, push, core_config_absent, ssh_config],
+        ) as run:
+            target = self.swarm._resolve_origin_repository()
+
+        self.assertEqual(target, self.swarm.GitHubRepoTarget("github.com", "acme", "widgets"))
+        self.assertEqual(
+            run.call_args_list[0].args[0],
+            ["git", "remote", "get-url", "--all", "origin"],
+        )
+        self.assertEqual(
+            run.call_args_list[1].args[0],
+            ["git", "remote", "get-url", "--all", "--push", "origin"],
+        )
+
+    def test_origin_resolution_resolves_ssh_alias_and_github_ssh_host(self):
+        alias_result = subprocess.CompletedProcess(
+            ["ssh", "-G", "--", "github.com-work"],
+            0,
+            "user git\nhostname github.com\nport 22\n",
+            "",
+        )
+        ssh_github_result = subprocess.CompletedProcess(
+            ["ssh", "-G", "--", "ssh.github.com"],
+            0,
+            "user git\nhostname ssh.github.com\nport 443\n",
+            "",
+        )
+        with (
+            patch.object(self.swarm, "_assert_standard_git_ssh_context"),
+            patch.object(
+                self.swarm.subprocess,
+                "run",
+                side_effect=[alias_result, ssh_github_result],
+            ) as run,
+        ):
+            alias = self.swarm._parse_github_remote(
+                "git@github.com-work:acme/widgets.git",
+            )
+            ssh_over_443 = self.swarm._parse_github_remote(
+                "ssh://git@ssh.github.com:443/acme/widgets.git",
+            )
+
+        expected = self.swarm.GitHubRepoTarget("github.com", "acme", "widgets")
+        self.assertEqual(alias, expected)
+        self.assertEqual(ssh_over_443, expected)
+        self.assertEqual(
+            alias.ssh_endpoint,
+            self.swarm.SshEndpoint("github.com", "git", 22),
+        )
+        self.assertEqual(alias.ssh_endpoint, ssh_over_443.ssh_endpoint)
+        self.assertEqual(
+            run.call_args_list[0].args[0],
+            ["ssh", "-G", "-l", "git", "--", "github.com-work"],
+        )
+        self.assertEqual(
+            run.call_args_list[1].args[0],
+            ["ssh", "-G", "-l", "git", "-p", "443", "--", "ssh.github.com"],
+        )
+
+    def test_ssh_alias_cache_distinguishes_user_and_port(self):
+        git_result = subprocess.CompletedProcess(
+            ["ssh", "-G"],
+            0,
+            "user git\nhostname github.com\nport 22\n",
+            "",
+        )
+        deploy_result = subprocess.CompletedProcess(
+            ["ssh", "-G"],
+            0,
+            "user deploy\nhostname github.com\nport 443\n",
+            "",
+        )
+        cache = {}
+        with (
+            patch.object(self.swarm, "_assert_standard_git_ssh_context"),
+            patch.object(
+                self.swarm.subprocess,
+                "run",
+                side_effect=[git_result, deploy_result],
+            ) as run,
+        ):
+            self.swarm._parse_github_remote(
+                "ssh://git@github.com-work:22/acme/widgets.git",
+                cache,
+            )
+            self.swarm._parse_github_remote(
+                "ssh://deploy@github.com-work:443/acme/widgets.git",
+                cache,
+            )
+
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(len(cache), 2)
+
+    def test_origin_resolution_rejects_different_effective_ssh_ports(self):
+        fetch_endpoint = subprocess.CompletedProcess(
+            ["ssh", "-G"],
+            0,
+            "user git\nhostname github.example\nport 22\n",
+            "",
+        )
+        push_endpoint = subprocess.CompletedProcess(
+            ["ssh", "-G"],
+            0,
+            "user git\nhostname github.example\nport 2222\n",
+            "",
+        )
+        with (
+            patch.object(
+                self.swarm,
+                "_read_origin_urls",
+                side_effect=[
+                    ["ssh://git@github.example:22/acme/widgets.git"],
+                    ["ssh://git@github.example:2222/acme/widgets.git"],
+                ],
+            ),
+            patch.object(self.swarm, "_assert_standard_git_ssh_context"),
+            patch.object(
+                self.swarm.subprocess,
+                "run",
+                side_effect=[fetch_endpoint, push_endpoint],
+            ),
+        ):
+            with self.assertRaises(self.swarm.SwarmPreflightConfigError) as raised:
+                self.swarm._resolve_origin_repository()
+
+        self.assertIn("host, user, and port", str(raised.exception))
+
+    def test_origin_resolution_rejects_custom_git_ssh_environment(self):
+        sentinel = "credential-bearing-config"
+        with patch.dict(
+            os.environ,
+            {"GIT_SSH_COMMAND": f"ssh -F {sentinel}"},
+            clear=False,
+        ):
+            with self.assertRaises(self.swarm.SwarmPreflightConfigError) as raised:
+                self.swarm._parse_github_remote(
+                    "git@github.com-work:acme/widgets.git",
+                )
+
+        self.assertIn("GIT_SSH_COMMAND or GIT_SSH", str(raised.exception))
+        self.assertNotIn(sentinel, str(raised.exception))
+
+    def test_origin_resolution_rejects_core_ssh_command(self):
+        sentinel = "credential-bearing-config"
+        configured = subprocess.CompletedProcess(
+            ["git", "config", "--get", "core.sshCommand"],
+            0,
+            f"ssh -F {sentinel}\n",
+            "",
+        )
+        with patch.object(self.swarm.subprocess, "run", return_value=configured):
+            with self.assertRaises(self.swarm.SwarmPreflightConfigError) as raised:
+                self.swarm._parse_github_remote(
+                    "git@github.com-work:acme/widgets.git",
+                )
+
+        self.assertIn("core.sshCommand", str(raised.exception))
+        self.assertNotIn(sentinel, str(raised.exception))
+
+    def test_worktree_push_target_rejects_non_origin_default_without_leak(self):
+        sentinel = "credential-bearing-remote"
+        with (
+            patch.object(
+                self.swarm,
+                "_resolve_origin_repository",
+                return_value=self.swarm.GitHubRepoTarget(
+                    "github.com",
+                    "acme",
+                    "widgets",
+                    http_endpoint=self.swarm.HttpEndpoint("https", "github.com", 443),
+                ),
+            ),
+            patch.object(
+                self.swarm,
+                "_read_git_config_values",
+                side_effect=[(sentinel,), (), ("origin",)],
+            ),
+        ):
+            with self.assertRaises(self.swarm.SwarmPreflightConfigError) as raised:
+                self.swarm._assert_worktree_push_target(
+                    self.repo,
+                    "worker/1-test",
+                )
+
+        self.assertIn("other than origin", str(raised.exception))
+        self.assertNotIn(sentinel, str(raised.exception))
+
+    def test_worktree_push_target_rejects_branch_scoped_origin_drift(self):
+        with (
+            patch.object(
+                self.swarm,
+                "_resolve_origin_repository",
+                return_value=self.swarm.GitHubRepoTarget(
+                    "github.com",
+                    "other",
+                    "writable",
+                ),
+            ),
+            patch.object(self.swarm, "_read_git_config_values") as read_config,
+        ):
+            with self.assertRaises(self.swarm.SwarmPreflightConfigError) as raised:
+                self.swarm._assert_worktree_push_target(
+                    self.repo,
+                    "worker/1-test",
+                )
+
+        self.assertIn("differs", str(raised.exception))
+        self.assertNotIn("other/writable", str(raised.exception))
+        read_config.assert_not_called()
+
+    def test_worktree_push_target_rejects_ssh_endpoint_drift(self):
+        self.swarm._ACTIVE_REPO_TARGET = self.swarm.GitHubRepoTarget(
+            "github.example",
+            "acme",
+            "widgets",
+            ssh_endpoint=self.swarm.SshEndpoint("github.example", "git", 22),
+        )
+        worktree_target = self.swarm.GitHubRepoTarget(
+            "github.example",
+            "acme",
+            "widgets",
+            ssh_endpoint=self.swarm.SshEndpoint("github.example", "git", 2222),
+        )
+        with (
+            patch.object(
+                self.swarm,
+                "_resolve_origin_repository",
+                return_value=worktree_target,
+            ),
+            patch.object(self.swarm, "_read_git_config_values") as read_config,
+        ):
+            with self.assertRaises(self.swarm.SwarmPreflightConfigError) as raised:
+                self.swarm._assert_worktree_push_target(
+                    self.repo,
+                    "worker/1-test",
+                )
+
+        self.assertIn("transport endpoint", str(raised.exception))
+        read_config.assert_not_called()
+
+    def test_origin_resolution_rejects_divergent_push_repository(self):
+        with patch.object(
+            self.swarm,
+            "_read_origin_urls",
+            side_effect=[
+                ["https://github.com/acme/widgets.git"],
+                ["https://github.com/other/writable.git"],
+            ],
+        ):
+            with self.assertRaises(self.swarm.SwarmPreflightConfigError) as raised:
+                self.swarm._resolve_origin_repository()
+
+        self.assertIn("fetch and push URLs", str(raised.exception))
+        self.assertNotIn("other/writable", str(raised.exception))
 
     def test_origin_resolution_reports_missing_git_as_configuration_error(self):
         with patch.object(
@@ -488,6 +954,14 @@ class WorktreeSafetyTest(unittest.TestCase):
         self.assertEqual(invocation["env"]["GH_REPO"], "github.com/acme/widgets")
         self.assertEqual(invocation["env"]["GH_HOST"], "github.com")
 
+    def test_gh_environment_fails_closed_before_origin_binding(self):
+        self.swarm._ACTIVE_GH_REPO_CONTEXT = None
+
+        with self.assertRaises(self.swarm.SwarmPreflightConfigError) as raised:
+            self.swarm._bound_gh_environment()
+
+        self.assertIn("not bound", str(raised.exception))
+
     def test_dispatched_agent_inherits_preflight_repo_context(self):
         issue = self.swarm.TaskIssue(
             number=99,
@@ -546,6 +1020,31 @@ class WorktreeSafetyTest(unittest.TestCase):
             ),
         )
         self.assertEqual(capability.unverified, ())
+
+    def test_every_capability_gap_has_an_explicit_reason_and_remedy(self):
+        reason_gaps = set(self.swarm._CAPABILITY_GAP_REASONS)
+        remedy_gaps = set(self.swarm._CAPABILITY_GAP_REMEDIES)
+        remedy_kinds = set(self.swarm._CAPABILITY_GAP_REMEDIES.values())
+
+        self.assertEqual(reason_gaps, remedy_gaps)
+        self.assertEqual(remedy_kinds, set(self.swarm._CAPABILITY_REMEDY_RANK))
+        self.assertEqual(
+            set(self.swarm._CAPABILITY_REMEDY_RANK),
+            set(self.swarm._CAPABILITY_REMEDY_TEXT),
+        )
+
+    def test_gh_include_parser_handles_mixed_line_endings(self):
+        raw = gh_api_response(
+            {"full_name": "acme/widgets"},
+            headers={"X-OAuth-Scopes": "repo"},
+        )
+
+        status, headers, body = self.swarm._parse_gh_api_response(raw)
+
+        self.assertIn("\nX-OAuth-Scopes: repo\r\n\r\n", raw)
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["x-oauth-scopes"], "repo")
+        self.assertEqual(body["full_name"], "acme/widgets")
 
     def test_preflight_reports_unauthenticated_gh_with_actionable_remedy(self):
         result = subprocess.CompletedProcess(
@@ -652,6 +1151,31 @@ class WorktreeSafetyTest(unittest.TestCase):
         self.assertIn("rate limit", str(raised.exception))
         self.assertNotIn("missing permission", str(raised.exception))
 
+    def test_preflight_prefers_sso_status_over_generic_auth_hint(self):
+        response = gh_api_response(
+            {"message": "authentication required; run gh auth login"},
+            status=403,
+            headers={"X-GitHub-SSO": "required"},
+        )
+        result = subprocess.CompletedProcess(["gh", "api"], 1, response, "")
+        with patch.object(self.swarm, "_run_gh", return_value=result):
+            capability = self.swarm.check_repo_workflow_capability()
+
+        self.assertEqual(capability.gaps, ("sso-authorization-required",))
+        self.assertNotIn("gh auth login", self.swarm.describe_repo_workflow_capability(capability))
+
+    def test_preflight_keeps_unknown_forbidden_auth_hint_transient(self):
+        response = gh_api_response(
+            {"message": "authentication required; run gh auth login"},
+            status=403,
+        )
+        result = subprocess.CompletedProcess(["gh", "api"], 1, response, "")
+        with patch.object(self.swarm, "_run_gh", return_value=result):
+            with self.assertRaises(self.swarm.SwarmPreflightTransientError) as raised:
+                self.swarm.check_repo_workflow_capability()
+
+        self.assertIn("inconclusive", str(raised.exception))
+
     def test_preflight_leaves_unknown_forbidden_response_transient(self):
         response = gh_api_response(
             {"message": "Forbidden for an indeterminate reason"},
@@ -689,6 +1213,7 @@ class WorktreeSafetyTest(unittest.TestCase):
     def test_gh_failure_does_not_expose_raw_command_or_output(self):
         sentinel = "TOP-SECRET-SENTINEL"
         credential_url = "https://x-access-token:credential-secret@github.com/acme/widgets.git"
+        self.swarm._ACTIVE_GH_REPO_CONTEXT = "github.com/acme/widgets"
         raw_result = subprocess.CompletedProcess(
             ["gh", "api", sentinel],
             1,

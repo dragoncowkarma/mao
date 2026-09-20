@@ -170,20 +170,34 @@ task worktrees under `<repo>/.worktrees`, persists process history under
 review, merge, and close issues. `--dry-run` and `--status` do not modify the target
 checkout, its Git metadata, or GitHub; `--dry-run` performs GitHub reads only.
 `--once` still performs real dispatch and GitHub/Git operations. `--reset` clears only
-the persisted dispatch history, not Git branches or worktrees. On the first real run it
+the persisted dispatch history, not Git branches or worktrees, and that explicit local clear runs
+even if the following GitHub preflight fails. On the first real run it
 adds only these runtime paths to the checkout's local `.git/info/exclude`; it never edits
 or commits the target repository's shared `.gitignore`.
 
-Before any real-run runtime files, Git sync, worktree creation, AI dispatch, or direct GitHub write,
-Swarm sends one read-only `GET /repos/{owner}/{repo}` through the active `gh` CLI credential. This is
+Before any real-run Git sync, worktree creation, AI dispatch, or direct GitHub write, Swarm sends one
+read-only `GET /repos/{owner}/{repo}` through the active `gh` CLI credential. The first check runs at
+startup and long-running mode repeats it before each later polling cycle. This is
 the credential used by the orchestrator's `gh` commands and inherited by dispatched agents; MAO's
 stored `githubToken` is deliberately ignored because it is a different credential. The target comes
-from the selected checkout's `origin`; Swarm overrides any inherited `GH_REPO` and `GH_HOST` with
-that identity for its own `gh` calls and every dispatched agent, preventing a successful check of one
-repository or host from authorizing work against another. A permanent repository or permission gap
+from every effective fetch and push URL of the selected checkout's `origin`; Swarm resolves SSH Host
+aliases and refuses to run when any identity differs. SSH origins also fail closed when
+`core.sshCommand`, `GIT_SSH_COMMAND`, or `GIT_SSH` would make Git use a transport different from the
+system `ssh -G` configuration Swarm inspects. Effective SSH host, user, and port are compared
+together; only GitHub's documented `ssh.github.com:443` endpoint is canonicalized to
+`github.com:22`. HTTP and non-default-port HTTPS origins are rejected because the default `gh` API
+authority cannot prove them; HTTPS origins bind scheme, host, and effective port 443. Before a
+Worker is dispatched, Swarm resolves the effective origin and transport endpoints again inside the
+branch worktree and rejects any non-`origin` `remote.pushDefault`, branch
+`pushRemote`, or branch `remote`. Worker prompts require `git push --set-upstream origin <branch>`
+rather than a bare push, and revision dispatch accepts only Swarm's shell-safe
+`worker/<issue>-<slug>` head-branch format. It overrides inherited `GH_REPO` and `GH_HOST` with that
+identity for its own `gh` calls and every dispatched agent, preventing a successful check of one
+repository or host from authorizing work or a push against another. A permanent repository or permission gap
 exits non-zero with an actionable error, while rate limits, timeouts, 5xx responses, and unclassified
 403s are reported as transient rather than mislabeled as missing permission. `--status` remains
-offline and `--dry-run` remains read-only, so neither requires this write preflight.
+offline. `--dry-run` resolves and binds the local origin so its reads cannot drift to an inherited
+`GH_REPO`, but it remains read-only and skips the network write-capability probe.
 
 A passing Swarm preflight is not proof of every eventual write. When GitHub cannot expose the active
 credential's individual Issues, Contents, and Pull requests grants without a write probe, the CLI

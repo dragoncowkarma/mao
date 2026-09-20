@@ -1612,7 +1612,13 @@ def assert_repo_workflow_writable() -> RepoWorkflowCapability:
     )
     caveat = describe_unverified_grants(capability)
     if caveat:
-        log.warning("%s", caveat)
+        grants_key = ",".join(capability.unverified)
+        log_blocker(
+            f"preflight-unverified:{capability.repository.lower()}:{grants_key}",
+            "%s",
+            caveat,
+            level=logging.WARNING,
+        )
     return capability
 
 

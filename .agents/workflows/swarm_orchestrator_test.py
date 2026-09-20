@@ -1374,12 +1374,43 @@ class WorktreeSafetyTest(unittest.TestCase):
         result = subprocess.CompletedProcess(["gh", "api"], 0, response, "")
         with (
             patch.object(self.swarm, "_run_gh", return_value=result),
-            patch.object(self.swarm.log, "warning") as warning,
+            patch.object(self.swarm, "log_blocker") as log_blocker,
         ):
             capability = self.swarm.assert_repo_workflow_writable()
 
         self.assertEqual(capability.unverified, self.swarm._PIPELINE_GRANTS)
-        rendered = repr(warning.mock_calls)
+        caveat = self.swarm.describe_unverified_grants(capability)
+        log_blocker.assert_called_once_with(
+            "preflight-unverified:acme/widgets:issues-write,contents-write,pull-requests-write",
+            "%s",
+            caveat,
+            level=self.swarm.logging.WARNING,
+        )
+
+    def test_repeated_unverified_grants_warning_is_deduplicated(self):
+        capability = self.swarm.RepoWorkflowCapability(
+            "acme/widgets",
+            True,
+            (),
+            self.swarm._PIPELINE_GRANTS,
+        )
+        with (
+            patch.object(
+                self.swarm,
+                "check_repo_workflow_capability",
+                return_value=capability,
+            ),
+            patch.object(self.swarm, "_REPORTED_BLOCKERS", set()),
+            patch.object(self.swarm.log, "log") as log_at_level,
+            patch.object(self.swarm.log, "debug") as log_debug,
+        ):
+            self.swarm.assert_repo_workflow_writable()
+            self.swarm.assert_repo_workflow_writable()
+
+        self.assertEqual(log_at_level.call_count, 1)
+        self.assertEqual(log_at_level.call_args.args[0], self.swarm.logging.WARNING)
+        self.assertEqual(log_debug.call_count, 1)
+        rendered = repr([log_at_level.mock_calls, log_debug.mock_calls])
         self.assertIn("Issues: write", rendered)
         self.assertIn("unverified", rendered)
 

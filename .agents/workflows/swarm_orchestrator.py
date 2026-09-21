@@ -253,6 +253,7 @@ class TaskPR:
     body: str
     head_branch: str
     head_sha: str = ""
+    is_cross_repository: bool = False
     issue_number: Optional[int] = None
     reviewer: Optional[RoleAssignment] = None
 
@@ -323,7 +324,7 @@ class SwarmPreflightConfigError(SwarmPreflightError):
 @dataclass
 class TrackedProcess:
     """A dispatched AI subprocess with full lifecycle metadata."""
-    pid: int
+    pid: Optional[int]
     role: str           # "worker", "reviewer", "maintainer"
     ai_name: str
     model: str
@@ -340,6 +341,94 @@ class TrackedProcess:
     failure_reason: Optional[str] = None
     retry_after: Optional[str] = None
     defer_scope: Optional[str] = None
+
+
+def _process_group_exists(process_group_id: int) -> bool:
+    """Return whether a POSIX process group still has at least one member."""
+    try:
+        os.killpg(process_group_id, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _wait_for_process_group_exit(process_group_id: int, deadline: float) -> bool:
+    """Wait boundedly for every member of a POSIX process group to disappear."""
+    while time.monotonic() < deadline:
+        if not _process_group_exists(process_group_id):
+            return True
+        time.sleep(0.05)
+    return not _process_group_exists(process_group_id)
+
+
+def _assert_dispatch_platform() -> None:
+    """Fail before mutation when descendant-safe process ownership is unavailable."""
+    if os.name != "posix":
+        raise SwarmPreflightConfigError(
+            "Autonomous Swarm dispatch requires POSIX process-group isolation on this platform.",
+        )
+
+
+def terminate_process_group(proc: subprocess.Popen, timeout: int = 5) -> bool:
+    """Terminate a dispatched agent tree, reap its leader, and report success."""
+    if os.name == "nt":
+        try:
+            result = subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=timeout,
+            )
+            if result.returncode != 0:
+                log.error("Process tree for PID %d could not be terminated.", proc.pid)
+                return False
+            proc.wait(timeout=timeout)
+            return proc.poll() is not None
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+            log.error("Process tree for PID %d could not be terminated.", proc.pid)
+            return False
+
+    if os.name != "posix":
+        log.error("Process-tree termination is unsupported on this platform.")
+        return False
+
+    deadline = time.monotonic() + timeout
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        proc.poll()
+        return True
+    except PermissionError:
+        log.error("Process group for PID %d could not be signalled.", proc.pid)
+        return False
+
+    try:
+        proc.wait(timeout=max(0, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        pass
+    if _wait_for_process_group_exit(proc.pid, deadline):
+        return True
+
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        proc.poll()
+        return True
+    except PermissionError:
+        log.error("Process group for PID %d could not be killed.", proc.pid)
+        return False
+
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        pass
+    stopped = _wait_for_process_group_exit(proc.pid, time.monotonic() + timeout)
+    if not stopped:
+        log.error("Process group for PID %d did not exit after SIGKILL.", proc.pid)
+    return stopped
 
 
 # ---------------------------------------------------------------------------
@@ -409,11 +498,63 @@ class ProcessTracker:
         if len(self._history) > MAX_HISTORY_RECORDS:
             self._history = self._history[-MAX_HISTORY_RECORDS:]
         all_records = self._history + [tp for _, tp in self._active.values()]
-        with open(PROCESS_REGISTRY_FILE, "w") as f:
-            json.dump({
-                "last_updated": datetime.now(timezone.utc).isoformat(),
-                "history": [vars(r) for r in all_records],
-            }, f, indent=2, ensure_ascii=False)
+        payload = {
+            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "history": [vars(r) for r in all_records],
+        }
+        temporary_path: Optional[Path] = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=PROCESS_REGISTRY_FILE.parent,
+                prefix=f".{PROCESS_REGISTRY_FILE.name}.",
+                delete=False,
+            ) as stream:
+                temporary_path = Path(stream.name)
+                json.dump(payload, stream, indent=2, ensure_ascii=False)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary_path, PROCESS_REGISTRY_FILE)
+        except Exception:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+            raise
+
+    def record_failed_attempt(
+        self,
+        role: str,
+        ai_name: str,
+        model: str,
+        reasoning: str,
+        task_ref: str,
+        branch: str,
+        command: str,
+        cwd: str,
+        log_file: str,
+        failure_reason: str,
+    ) -> TrackedProcess:
+        """Persist a failed dispatch that occurred before a child PID existed."""
+        timestamp = datetime.now(timezone.utc).isoformat()
+        tracked = TrackedProcess(
+            pid=None,
+            role=role,
+            ai_name=ai_name,
+            model=model,
+            reasoning=reasoning,
+            task_ref=task_ref,
+            branch=branch,
+            command=command,
+            cwd=cwd,
+            log_file=log_file,
+            started_at=timestamp,
+            ended_at=timestamp,
+            status=ProcessStatus.FAILED,
+            failure_reason=failure_reason,
+        )
+        self._history.append(tracked)
+        self._save_registry()
+        return tracked
 
     # --- Registration ---
 
@@ -460,6 +601,12 @@ class ProcessTracker:
                 )
             else:
                 # Process finished
+                if not terminate_process_group(proc):
+                    log.error(
+                        "Residual process group for PID %d is still active; retaining supervision.",
+                        pid,
+                    )
+                    continue
                 tracked.exit_code = retcode
                 tracked.ended_at = datetime.now(timezone.utc).isoformat()
                 elapsed = self._elapsed_str(tracked.started_at)
@@ -563,8 +710,10 @@ class ProcessTracker:
         instead of being run again, preserving the one-successful-dispatch
         invariant.
 
-        Provider quota failures pause until their cooldown expires and do not
-        consume the bounded crash retry budget.
+        Provider-wide quota failures pause until their cooldown expires and do
+        not consume the bounded crash retry budget. Event-local timeouts and
+        tool withdrawals do consume it after their cooldown, so one broken
+        lifecycle event cannot be relaunched forever.
         """
         attempts = [
             record for record in self.all_records
@@ -591,6 +740,24 @@ class ProcessTracker:
         if not attempts:
             return True, "new event"
 
+        bounded_failures = [
+            record for record in attempts
+            if record.status in (ProcessStatus.FAILED, ProcessStatus.UNKNOWN)
+            or (
+                record.status == ProcessStatus.DEFERRED
+                and record.defer_scope == "event"
+            )
+        ]
+        completed_attempts = [
+            record for record in attempts
+            if record.status == ProcessStatus.COMPLETED
+        ]
+        if completed_attempts:
+            if completion_confirmed:
+                return False, DISPATCH_COMPLETED
+            return False, DISPATCH_UNCONFIRMED
+        if len(bounded_failures) >= MAX_DISPATCH_ATTEMPTS:
+            return False, f"exhausted {len(bounded_failures)} failed attempts"
         deferred = [
             record for record in attempts
             if record.status == ProcessStatus.DEFERRED
@@ -604,26 +771,11 @@ class ProcessTracker:
                         False,
                         f"{DISPATCH_PROVIDER_COOLDOWN} until {latest.retry_after}",
                     )
-
-        crash_attempts = [
-            record for record in attempts
-            if record.status in (ProcessStatus.FAILED, ProcessStatus.UNKNOWN)
-        ]
-        completed_attempts = [
-            record for record in attempts
-            if record.status == ProcessStatus.COMPLETED
-        ]
-        if completed_attempts:
-            if completion_confirmed:
-                return False, DISPATCH_COMPLETED
-            return False, DISPATCH_UNCONFIRMED
-        if len(crash_attempts) >= MAX_DISPATCH_ATTEMPTS:
-            return False, f"exhausted {len(crash_attempts)} failed attempts"
         if deferred:
             return True, "retry after provider cooldown"
         return (
             True,
-            f"retry {len(crash_attempts) + 1}/{MAX_DISPATCH_ATTEMPTS} after failure",
+            f"retry {len(bounded_failures) + 1}/{MAX_DISPATCH_ATTEMPTS} after failure",
         )
 
     @property
@@ -670,8 +822,9 @@ class ProcessTracker:
                 else:
                     icon = "❌"
                 duration = self._duration_str(tp.started_at, tp.ended_at)
+                pid_label = str(tp.pid) if tp.pid is not None else "-"
                 lines.append(
-                    f"  {icon} PID {tp.pid:>7}  │ {tp.role:<12} │ {tp.ai_name:<14} │ "
+                    f"  {icon} PID {pid_label:>7}  │ {tp.role:<12} │ {tp.ai_name:<14} │ "
                     f"{tp.task_ref:<12} │ exit={tp.exit_code} │ ⏱ {duration}"
                 )
         else:
@@ -694,21 +847,21 @@ class ProcessTracker:
 
     # --- Cleanup ---
 
-    def kill_all(self):
-        """Send SIGTERM to all active processes."""
+    def kill_all(self) -> bool:
+        """Terminate every process group and report whether shutdown is safe."""
+        survivors = {}
         for pid, (proc, tracked) in list(self._active.items()):
             log.warning("🛑 Killing [PID %d] %s %s", pid, tracked.role, tracked.task_ref)
-            try:
-                proc.terminate()
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+            if not terminate_process_group(proc):
+                survivors[pid] = (proc, tracked)
+                continue
             tracked.exit_code = proc.returncode
             tracked.ended_at = datetime.now(timezone.utc).isoformat()
             tracked.status = ProcessStatus.FAILED
             self._history.append(tracked)
-        self._active.clear()
+        self._active = survivors
         self._save_registry()
+        return not survivors
 
     # --- Helpers ---
 
@@ -1016,8 +1169,18 @@ def _resolve_ssh_endpoint(
     for line in result.stdout.splitlines():
         key, separator, value = line.partition(" ")
         normalized_key = key.lower()
+        normalized_value = value.strip()
+        if (
+            separator
+            and normalized_key in {"proxycommand", "proxyjump"}
+            and normalized_value.lower() not in {"", "none"}
+        ):
+            raise SwarmPreflightConfigError(
+                "Swarm cannot verify an SSH origin that uses ProxyCommand or ProxyJump. "
+                "Remove the proxy override or use an HTTPS origin, then retry.",
+            )
         if separator and normalized_key in {"hostname", "user", "port"} and value.strip():
-            resolved_values[normalized_key] = value.strip()
+            resolved_values[normalized_key] = normalized_value
     try:
         resolved_port = int(resolved_values["port"])
         if not 1 <= resolved_port <= 65535:
@@ -1215,10 +1378,10 @@ def _resolve_origin_repository(
 
 
 def _read_git_config_values(key: str, repo_root: Path) -> tuple[str, ...]:
-    """Read one effective Git config key without exposing its value in failures."""
+    """Read the effective repository-owned value for one push selector."""
     try:
         result = subprocess.run(
-            ["git", "config", "--get-all", key],
+            ["git", "config", "--show-scope", "--get", key],
             cwd=repo_root,
             capture_output=True,
             text=True,
@@ -1230,12 +1393,21 @@ def _read_git_config_values(key: str, repo_root: Path) -> tuple[str, ...]:
         ) from None
     if result.returncode == 1:
         return ()
-    values = tuple(result.stdout.splitlines())
-    if result.returncode != 0 or not values:
+    if result.returncode != 0:
         raise SwarmPreflightConfigError(
             "git could not inspect the task worktree's push target configuration.",
         )
-    return values
+    lines = result.stdout.splitlines()
+    if len(lines) != 1:
+        raise SwarmPreflightConfigError(
+            "git could not inspect the task worktree's push target configuration.",
+        )
+    scope, separator, value = lines[0].partition("\t")
+    if not separator:
+        raise SwarmPreflightConfigError(
+            "git could not inspect the task worktree's push target configuration.",
+        )
+    return (value,) if scope in {"local", "worktree"} else ()
 
 
 def _assert_worktree_push_target(worktree_path: Path, branch_name: str) -> None:
@@ -1277,6 +1449,29 @@ def _assert_worktree_push_target(worktree_path: Path, branch_name: str) -> None:
             "The task worktree selects a push remote other than origin. Remove the conflicting "
             "push-remote override or point it to origin, then retry.",
         )
+
+
+def _assert_checkout_push_target(checkout_path: Path) -> str:
+    """Apply the dispatch push boundary and return the checked-out branch."""
+    try:
+        result = subprocess.run(
+            ["git", "symbolic-ref", "--quiet", "--short", "HEAD"],
+            cwd=checkout_path,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (FileNotFoundError, OSError):
+        raise SwarmPreflightConfigError(
+            "git could not inspect the agent checkout before dispatch.",
+        ) from None
+    branch_name = result.stdout.strip()
+    if result.returncode != 0 or not branch_name:
+        raise SwarmPreflightConfigError(
+            "The agent checkout is detached or has no readable branch; refusing dispatch.",
+        )
+    _assert_worktree_push_target(checkout_path, branch_name)
+    return branch_name
 
 
 def _bind_origin_repository(verify_transport: bool = True) -> GitHubRepoTarget:
@@ -1636,14 +1831,18 @@ _CURRENT_GH_USER: Optional[str] = None
 
 
 def get_gh_user() -> str:
-    """Fetch and cache the currently authenticated GitHub user login."""
+    """Fetch and cache a successful authenticated GitHub user lookup."""
     global _CURRENT_GH_USER
-    if _CURRENT_GH_USER is None:
+    if not _CURRENT_GH_USER:
         try:
-            _CURRENT_GH_USER = gh(["api", "user", "-q", ".login"]).strip()
+            login = gh(["api", "user", "-q", ".login"]).strip()
+            if not login:
+                log.error("GitHub returned no authenticated user login.")
+                return ""
+            _CURRENT_GH_USER = login
         except Exception as e:
             log.error("Failed to get current GitHub user login: %s", e)
-            _CURRENT_GH_USER = ""
+            return ""
     return _CURRENT_GH_USER
 
 
@@ -1665,7 +1864,7 @@ def fetch_open_prs() -> list[dict]:
     raw = gh([
         "pr", "list",
         "--state", "open",
-        "--json", "number,title,body,headRefName,headRefOid",
+        "--json", "number,title,body,headRefName,headRefOid,isCrossRepository",
         "--limit", str(OPEN_ITEMS_LIMIT),
     ])
     if not raw:
@@ -1800,10 +1999,74 @@ def determine_pr_action(comments: list[dict]) -> tuple[str, Optional[dict], int]
 def local_branch_exists(branch_name: str) -> bool:
     """Return whether a local branch of this name exists."""
     result = subprocess.run(
-        ["git", "branch", "--list", branch_name],
+        ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch_name}"],
         capture_output=True, text=True, cwd=REPO_ROOT, check=False,
     )
-    return bool(result.stdout.strip())
+    return result.returncode == 0
+
+
+def local_branch_sha(branch_name: str) -> Optional[str]:
+    """Return the exact commit of one local branch, or None when it is absent."""
+    result = subprocess.run(
+        ["git", "rev-parse", "--verify", f"refs/heads/{branch_name}^{{commit}}"],
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+        check=False,
+    )
+    sha = result.stdout.strip().lower()
+    if result.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40,64}", sha):
+        return None
+    return sha
+
+
+def fetch_pr_head(pr_number: int, expected_sha: str) -> str:
+    """Fetch and verify the immutable PR-head snapshot used for a revision."""
+    normalized_expected = (expected_sha or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40,64}", normalized_expected):
+        raise RuntimeError(
+            f"PR #{pr_number} has no valid head commit; refusing revision dispatch."
+        )
+    try:
+        fetched = subprocess.run(
+            [
+                "git",
+                "fetch",
+                "--no-tags",
+                "origin",
+                f"refs/pull/{pr_number}/head",
+            ],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=GH_TIMEOUT_SECONDS,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        raise RuntimeError(
+            f"Could not fetch PR #{pr_number}'s head from origin; refusing revision dispatch."
+        ) from None
+    if fetched.returncode != 0:
+        raise RuntimeError(
+            f"Could not fetch PR #{pr_number}'s head from origin; refusing revision dispatch."
+        )
+    resolved = subprocess.run(
+        ["git", "rev-parse", "--verify", "FETCH_HEAD^{commit}"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    actual_sha = resolved.stdout.strip().lower()
+    if (
+        resolved.returncode != 0
+        or not re.fullmatch(r"[0-9a-f]{40,64}", actual_sha)
+        or actual_sha != normalized_expected
+    ):
+        raise RuntimeError(
+            f"PR #{pr_number}'s head changed while preparing the revision; retry the next cycle."
+        )
+    return actual_sha
 
 
 def list_git_worktrees() -> list[dict[str, str]]:
@@ -1873,7 +2136,12 @@ def directory_is_empty(directory: Path) -> bool:
     return False
 
 
-def create_worktree(issue_number: int, branch_name: str) -> Path:
+def create_worktree(
+    issue_number: int,
+    branch_name: str,
+    start_ref: str = "origin/main",
+    expected_sha: Optional[str] = None,
+) -> Path:
     """Create or safely reuse the one isolated worktree owned by a task."""
     worktree_path = WORKTREE_DIR / str(issue_number)
 
@@ -1909,7 +2177,11 @@ def create_worktree(issue_number: int, branch_name: str) -> Path:
             and path_entry
             and path_entry.get("branch") == expected_branch
         ):
-            _assert_worktree_push_target(worktree_path, branch_name)
+            if expected_sha and local_branch_sha(branch_name) != expected_sha.lower():
+                raise RuntimeError(
+                    f"Local branch '{branch_name}' does not match the fetched PR head; "
+                    "preserving it for inspection."
+                )
             log.info("Reusing worktree: %s", worktree_path)
             return worktree_path
 
@@ -1931,10 +2203,18 @@ def create_worktree(issue_number: int, branch_name: str) -> Path:
 
     WORKTREE_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Create branch from origin/main if it doesn't exist
-    if not local_branch_exists(branch_name):
+    branch_sha = local_branch_sha(branch_name)
+    if expected_sha and branch_sha and branch_sha != expected_sha.lower():
+        raise RuntimeError(
+            f"Local branch '{branch_name}' does not match the fetched PR head; "
+            "preserving it for inspection."
+        )
+
+    # Initial Workers branch from origin/main. Revision callers provide a
+    # separately fetched and verified PR-head commit instead.
+    if branch_sha is None:
         subprocess.run(
-            ["git", "branch", branch_name, "origin/main"],
+            ["git", "branch", "--", branch_name, start_ref],
             cwd=REPO_ROOT, check=True,
         )
 
@@ -1942,7 +2222,6 @@ def create_worktree(issue_number: int, branch_name: str) -> Path:
         ["git", "worktree", "add", str(worktree_path), branch_name],
         cwd=REPO_ROOT, check=True,
     )
-    _assert_worktree_push_target(worktree_path, branch_name)
     log.info("Created worktree: %s on branch %s", worktree_path, branch_name)
     return worktree_path
 
@@ -2181,8 +2460,8 @@ def sync_main_branch(dry_run: bool = False):
 def create_log_files(role: str, task_ref: str, ai_name: str) -> tuple[Path, "IO", "IO"]:
     """Create log files and return (log_path, stdout_file, stderr_file).
 
-    Returns open file objects (not raw fds) so they stay open for the
-    lifetime of the subprocess and are cleaned up by the GC.
+    The caller closes its file objects after spawning; the child retains its
+    duplicated descriptors for the lifetime of the process.
     """
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2190,15 +2469,19 @@ def create_log_files(role: str, task_ref: str, ai_name: str) -> tuple[Path, "IO"
     log_path = LOG_DIR / f"{timestamp}_{role}_{ai_name}_{safe_ref}.log"
 
     log_file = open(log_path, "w", encoding="utf-8")
-    log_file.write(
-        f"--- Swarm AI Process Log ---\n"
-        f"Role:      {role}\n"
-        f"AI:        {ai_name}\n"
-        f"Task:      {task_ref}\n"
-        f"Started:   {datetime.now(timezone.utc).isoformat()}\n"
-        f"---\n\n"
-    )
-    log_file.flush()
+    try:
+        log_file.write(
+            f"--- Swarm AI Process Log ---\n"
+            f"Role:      {role}\n"
+            f"AI:        {ai_name}\n"
+            f"Task:      {task_ref}\n"
+            f"Started:   {datetime.now(timezone.utc).isoformat()}\n"
+            f"---\n\n"
+        )
+        log_file.flush()
+    except Exception:
+        log_file.close()
+        raise
     return log_path, log_file, log_file
 
 
@@ -2480,16 +2763,93 @@ def _format_argv_for_log(argv: list[str]) -> str:
     return " ".join(parts)
 
 
+def _bound_dispatch_environment(branch_name: str) -> dict[str, str]:
+    """Bind GitHub context and pin every implicit Git push selector to origin."""
+    environment = _bound_gh_environment()
+    if environment.get("GIT_CONFIG_PARAMETERS", "").strip():
+        raise SwarmPreflightConfigError(
+            "Swarm cannot safely compose inherited GIT_CONFIG_PARAMETERS with its push target "
+            "boundary. Unset it and retry.",
+        )
+    raw_count = environment.get("GIT_CONFIG_COUNT", "0")
+    try:
+        config_count = int(raw_count)
+    except ValueError:
+        raise SwarmPreflightConfigError(
+            "The inherited Git command configuration is invalid; refusing agent dispatch.",
+        ) from None
+    if config_count < 0 or config_count > 1024:
+        raise SwarmPreflightConfigError(
+            "The inherited Git command configuration is invalid; refusing agent dispatch.",
+        )
+    overrides = (
+        ("remote.pushDefault", "origin"),
+        (f"branch.{branch_name}.pushRemote", "origin"),
+        (f"branch.{branch_name}.remote", "origin"),
+    )
+    for key, value in overrides:
+        environment[f"GIT_CONFIG_KEY_{config_count}"] = key
+        environment[f"GIT_CONFIG_VALUE_{config_count}"] = value
+        config_count += 1
+    environment["GIT_CONFIG_COUNT"] = str(config_count)
+    return environment
+
+
 def _spawn_ai_process(argv, cwd, stdout_file, stderr_file, stdin_source):
     """Launch every agent with the repository and host established by preflight."""
+    branch_name = _assert_checkout_push_target(Path(cwd))
+    _assert_dispatch_platform()
     return subprocess.Popen(
         argv,
         cwd=cwd,
-        env=_bound_gh_environment(),
+        env=_bound_dispatch_environment(branch_name),
         stdout=stdout_file,
         stderr=stderr_file,
         stdin=stdin_source,
+        start_new_session=True,
     )
+
+
+def _record_failed_spawn(
+    role: str,
+    assignment: RoleAssignment,
+    task_ref: str,
+    branch: str,
+    argv: list[str],
+    cwd: Path,
+    log_path: Optional[Path],
+) -> None:
+    """Consume retry budget only after an actual child launch was attempted."""
+    try:
+        tracker.record_failed_attempt(
+            role=role,
+            ai_name=assignment.ai,
+            model=assignment.model,
+            reasoning=assignment.reasoning,
+            task_ref=task_ref,
+            branch=branch,
+            command=_format_argv_for_log(argv),
+            cwd=str(cwd),
+            log_file=str(log_path) if log_path else "",
+            failure_reason="AI process launch failed before registration",
+        )
+    except Exception:
+        log.error("Failed to persist the dispatch failure for %s.", task_ref)
+
+
+def _cleanup_failed_process(proc: subprocess.Popen) -> bool:
+    """Stop a launched child without discarding supervision if its tree survives."""
+    active_entry = tracker._active.pop(proc.pid, None)
+    if terminate_process_group(proc):
+        return True
+    if active_entry is not None:
+        tracker._active[proc.pid] = active_entry
+        try:
+            tracker._save_registry()
+        except Exception:
+            log.error("Failed to persist residual process supervision for PID %d.", proc.pid)
+    log.error("Residual process tree for PID %d remains under supervision.", proc.pid)
+    return False
 
 
 def dispatch_worker(
@@ -2514,68 +2874,82 @@ def dispatch_worker(
         worker_slug = "worker"
     branch_name = f"worker/{issue.number}-{worker_slug}-{short_desc}"
     branch_arg = shlex.quote(branch_name)
-    worktree_path = WORKTREE_DIR / str(issue.number)
-    if not dry_run:
-        worktree_path = create_worktree(issue.number, branch_name)
-
-    prompt = (
-        f"You are the Worker for Issue #{issue.number}: {issue.title}.\n"
-        f"Read AGENTS.md and .agents/rules/ for all project rules.\n"
-        f"Implement the task described in the Issue body:\n\n{issue.body}\n\n"
-        f"Work inside this directory. When done:\n"
-        f"1. Commit your changes with conventional commit messages referencing #{issue.number}.\n"
-        f"2. Push with `git push --set-upstream origin {branch_arg}`; always name `origin` "
-        f"and the branch explicitly, and never use a remote-less `git push`.\n"
-        f"3. Create a PR titled '[PR] {issue.number} - <summary>' with a "
-        f"[Reviewer: ...] tag in the body.\n"
-        f"4. The Reviewer AI MUST be different from Worker AI '{worker.ai}'.\n"
-        f"5. Document your decisions and verification evidence in the PR description.\n\n"
-        f"{EXECUTION_INTEGRITY_NOTICE}"
-    )
-
     task_ref = task_ref or f"issue#{issue.number}:initial"
-    prompt_file = (
-        PROMPT_DIR / "dry-run-worker.md"
-        if dry_run
-        else write_prompt_file(prompt, "worker", task_ref)
-    )
-    argv, use_stdin = build_ai_argv(
-        worker.ai,
-        worker.model,
-        worker.reasoning,
-        prompt_file,
-        str(worktree_path),
-        allow_tool_use=True,
-        prompt_text=prompt if dry_run else None,
-    )
-
-    if dry_run:
-        log.info("[DRY RUN] Would execute: %s", _format_argv_for_log(argv))
-        return
-
-    if not argv:
-        return
-
-    log_path, stdout_file, stderr_file = create_log_files("worker", task_ref, worker.ai)
-    log.info("Dispatching Worker %s for Issue #%d (log: %s)", worker.ai, issue.number, log_path)
-    log.info("  argv: %s", _format_argv_for_log(argv))
-
+    worktree_path = WORKTREE_DIR / str(issue.number)
+    argv: list[str] = []
+    log_path: Optional[Path] = None
+    stdout_file = None
+    stderr_file = None
+    proc = None
+    launch_started = False
     try:
+        if not dry_run:
+            worktree_path = create_worktree(issue.number, branch_name)
+
+        prompt = (
+            f"You are the Worker for Issue #{issue.number}: {issue.title}.\n"
+            f"Read AGENTS.md and .agents/rules/ for all project rules.\n"
+            f"Implement the task described in the Issue body:\n\n{issue.body}\n\n"
+            f"Work inside this directory. When done:\n"
+            f"1. Commit your changes with conventional commit messages referencing "
+            f"#{issue.number}.\n"
+            f"2. Push with `git push --set-upstream origin {branch_arg}`; always name `origin` "
+            f"and the branch explicitly, and never use a remote-less `git push`.\n"
+            f"3. Create a PR titled '[PR] {issue.number} - <summary>' with a "
+            f"[Reviewer: ...] tag in the body.\n"
+            f"4. The Reviewer AI MUST be different from Worker AI '{worker.ai}'.\n"
+            f"5. Document your decisions and verification evidence in the PR description.\n\n"
+            f"{EXECUTION_INTEGRITY_NOTICE}"
+        )
+        prompt_file = (
+            PROMPT_DIR / "dry-run-worker.md"
+            if dry_run
+            else write_prompt_file(prompt, "worker", task_ref)
+        )
+        argv, use_stdin = build_ai_argv(
+            worker.ai,
+            worker.model,
+            worker.reasoning,
+            prompt_file,
+            str(worktree_path),
+            allow_tool_use=True,
+            prompt_text=prompt if dry_run else None,
+        )
+
+        if dry_run:
+            log.info("[DRY RUN] Would execute: %s", _format_argv_for_log(argv))
+            return
+        if not argv:
+            raise RuntimeError(f"Unsupported Worker AI '{worker.ai}'.")
+
+        log_path, stdout_file, stderr_file = create_log_files(
+            "worker", task_ref, worker.ai,
+        )
+        log.info(
+            "Dispatching Worker %s for Issue #%d (log: %s)",
+            worker.ai,
+            issue.number,
+            log_path,
+        )
+        log.info("  argv: %s", _format_argv_for_log(argv))
+
         stdin_source = subprocess.DEVNULL
         pf = None
-        if use_stdin:
-            pf = open(prompt_file, 'r', encoding='utf-8')
-            stdin_source = pf
-
-        proc = _spawn_ai_process(
-            argv,
-            str(worktree_path),
-            stdout_file,
-            stderr_file,
-            stdin_source,
-        )
-        if pf:
-            pf.close()
+        try:
+            if use_stdin:
+                pf = open(prompt_file, "r", encoding="utf-8")
+                stdin_source = pf
+            launch_started = True
+            proc = _spawn_ai_process(
+                argv,
+                str(worktree_path),
+                stdout_file,
+                stderr_file,
+                stdin_source,
+            )
+        finally:
+            if pf:
+                pf.close()
         tracker.register(
             proc=proc,
             role="worker",
@@ -2588,10 +2962,28 @@ def dispatch_worker(
             cwd=str(worktree_path),
             log_file=str(log_path),
         )
-    except FileNotFoundError:
-        log.error("AI CLI '%s' not found in PATH. Is it installed?", argv[0])
-    except Exception as e:
-        log.error("Failed to dispatch Worker: %s", e)
+    except Exception as error:
+        process_stopped = True
+        if proc is not None:
+            process_stopped = _cleanup_failed_process(proc)
+        if (
+            launch_started
+            and process_stopped
+            and not isinstance(error, SwarmPreflightError)
+        ):
+            _record_failed_spawn(
+                "worker", worker, task_ref, branch_name, argv, worktree_path, log_path,
+            )
+        if isinstance(error, FileNotFoundError) and argv:
+            log.error("AI CLI '%s' not found in PATH. Is it installed?", argv[0])
+        else:
+            log.error("Failed to dispatch Worker: %s", error)
+        raise
+    finally:
+        if stdout_file is not None:
+            stdout_file.close()
+        if stderr_file is not None and stderr_file is not stdout_file:
+            stderr_file.close()
 
 
 def dispatch_reviewer(
@@ -2636,47 +3028,60 @@ def dispatch_reviewer(
     )
 
     task_ref = task_ref or f"review#{pr.number}-{pr.head_sha or 'initial'}"
-    prompt_file = (
-        PROMPT_DIR / "dry-run-reviewer.md"
-        if dry_run
-        else write_prompt_file(prompt, "reviewer", task_ref)
-    )
-    argv, use_stdin = build_ai_argv(
-        reviewer.ai,
-        reviewer.model,
-        reviewer.reasoning,
-        prompt_file,
-        str(REPO_ROOT),
-        allow_tool_use=False,
-        prompt_text=prompt if dry_run else None,
-    )
-
-    if dry_run:
-        log.info("[DRY RUN] Would execute reviewer: %s", _format_argv_for_log(argv))
-        return
-
-    if not argv:
-        return
-
-    log_path, stdout_file, stderr_file = create_log_files("reviewer", task_ref, reviewer.ai)
-    log.info("Dispatching Reviewer %s for PR #%d (log: %s)", reviewer.ai, pr.number, log_path)
-
+    argv: list[str] = []
+    log_path: Optional[Path] = None
+    stdout_file = None
+    stderr_file = None
+    proc = None
+    launch_started = False
     try:
+        prompt_file = (
+            PROMPT_DIR / "dry-run-reviewer.md"
+            if dry_run
+            else write_prompt_file(prompt, "reviewer", task_ref)
+        )
+        argv, use_stdin = build_ai_argv(
+            reviewer.ai,
+            reviewer.model,
+            reviewer.reasoning,
+            prompt_file,
+            str(REPO_ROOT),
+            allow_tool_use=False,
+            prompt_text=prompt if dry_run else None,
+        )
+        if dry_run:
+            log.info("[DRY RUN] Would execute reviewer: %s", _format_argv_for_log(argv))
+            return
+        if not argv:
+            raise RuntimeError(f"Unsupported Reviewer AI '{reviewer.ai}'.")
+
+        log_path, stdout_file, stderr_file = create_log_files(
+            "reviewer", task_ref, reviewer.ai,
+        )
+        log.info(
+            "Dispatching Reviewer %s for PR #%d (log: %s)",
+            reviewer.ai,
+            pr.number,
+            log_path,
+        )
+
         stdin_source = subprocess.DEVNULL
         pf = None
-        if use_stdin:
-            pf = open(prompt_file, 'r', encoding='utf-8')
-            stdin_source = pf
-
-        proc = _spawn_ai_process(
-            argv,
-            str(REPO_ROOT),
-            stdout_file,
-            stderr_file,
-            stdin_source,
-        )
-        if pf:
-            pf.close()
+        try:
+            if use_stdin:
+                pf = open(prompt_file, "r", encoding="utf-8")
+                stdin_source = pf
+            launch_started = True
+            proc = _spawn_ai_process(
+                argv,
+                str(REPO_ROOT),
+                stdout_file,
+                stderr_file,
+                stdin_source,
+            )
+        finally:
+            if pf:
+                pf.close()
         tracker.register(
             proc=proc,
             role="reviewer",
@@ -2689,10 +3094,28 @@ def dispatch_reviewer(
             cwd=str(REPO_ROOT),
             log_file=str(log_path),
         )
-    except FileNotFoundError:
-        log.error("AI CLI '%s' not found in PATH. Is it installed?", argv[0])
-    except Exception as e:
-        log.error("Failed to dispatch Reviewer: %s", e)
+    except Exception as error:
+        process_stopped = True
+        if proc is not None:
+            process_stopped = _cleanup_failed_process(proc)
+        if (
+            launch_started
+            and process_stopped
+            and not isinstance(error, SwarmPreflightError)
+        ):
+            _record_failed_spawn(
+                "reviewer", reviewer, task_ref, pr.head_branch, argv, REPO_ROOT, log_path,
+            )
+        if isinstance(error, FileNotFoundError) and argv:
+            log.error("AI CLI '%s' not found in PATH. Is it installed?", argv[0])
+        else:
+            log.error("Failed to dispatch Reviewer: %s", error)
+        raise
+    finally:
+        if stdout_file is not None:
+            stdout_file.close()
+        if stderr_file is not None and stderr_file is not stdout_file:
+            stderr_file.close()
 
 
 def dispatch_maintainer(
@@ -2732,47 +3155,60 @@ def dispatch_maintainer(
     )
 
     task_ref = task_ref or f"maintain#{pr.number}"
-    prompt_file = (
-        PROMPT_DIR / "dry-run-maintainer.md"
-        if dry_run
-        else write_prompt_file(prompt, "maintainer", task_ref)
-    )
-    argv, use_stdin = build_ai_argv(
-        maintainer.ai,
-        maintainer.model,
-        maintainer.reasoning,
-        prompt_file,
-        str(REPO_ROOT),
-        allow_tool_use=False,
-        prompt_text=prompt if dry_run else None,
-    )
-
-    if dry_run:
-        log.info("[DRY RUN] Would execute maintainer: %s", _format_argv_for_log(argv))
-        return
-
-    if not argv:
-        return
-
-    log_path, stdout_file, stderr_file = create_log_files("maintainer", task_ref, maintainer.ai)
-    log.info("Dispatching Maintainer %s for PR #%d (log: %s)", maintainer.ai, pr.number, log_path)
-
+    argv: list[str] = []
+    log_path: Optional[Path] = None
+    stdout_file = None
+    stderr_file = None
+    proc = None
+    launch_started = False
     try:
+        prompt_file = (
+            PROMPT_DIR / "dry-run-maintainer.md"
+            if dry_run
+            else write_prompt_file(prompt, "maintainer", task_ref)
+        )
+        argv, use_stdin = build_ai_argv(
+            maintainer.ai,
+            maintainer.model,
+            maintainer.reasoning,
+            prompt_file,
+            str(REPO_ROOT),
+            allow_tool_use=False,
+            prompt_text=prompt if dry_run else None,
+        )
+        if dry_run:
+            log.info("[DRY RUN] Would execute maintainer: %s", _format_argv_for_log(argv))
+            return
+        if not argv:
+            raise RuntimeError(f"Unsupported Maintainer AI '{maintainer.ai}'.")
+
+        log_path, stdout_file, stderr_file = create_log_files(
+            "maintainer", task_ref, maintainer.ai,
+        )
+        log.info(
+            "Dispatching Maintainer %s for PR #%d (log: %s)",
+            maintainer.ai,
+            pr.number,
+            log_path,
+        )
+
         stdin_source = subprocess.DEVNULL
         pf = None
-        if use_stdin:
-            pf = open(prompt_file, 'r', encoding='utf-8')
-            stdin_source = pf
-
-        proc = _spawn_ai_process(
-            argv,
-            str(REPO_ROOT),
-            stdout_file,
-            stderr_file,
-            stdin_source,
-        )
-        if pf:
-            pf.close()
+        try:
+            if use_stdin:
+                pf = open(prompt_file, "r", encoding="utf-8")
+                stdin_source = pf
+            launch_started = True
+            proc = _spawn_ai_process(
+                argv,
+                str(REPO_ROOT),
+                stdout_file,
+                stderr_file,
+                stdin_source,
+            )
+        finally:
+            if pf:
+                pf.close()
         tracker.register(
             proc=proc,
             role="maintainer",
@@ -2785,10 +3221,28 @@ def dispatch_maintainer(
             cwd=str(REPO_ROOT),
             log_file=str(log_path),
         )
-    except FileNotFoundError:
-        log.error("AI CLI '%s' not found in PATH. Is it installed?", argv[0])
-    except Exception as e:
-        log.error("Failed to dispatch Maintainer: %s", e)
+    except Exception as error:
+        process_stopped = True
+        if proc is not None:
+            process_stopped = _cleanup_failed_process(proc)
+        if (
+            launch_started
+            and process_stopped
+            and not isinstance(error, SwarmPreflightError)
+        ):
+            _record_failed_spawn(
+                "maintainer", maintainer, task_ref, "", argv, REPO_ROOT, log_path,
+            )
+        if isinstance(error, FileNotFoundError) and argv:
+            log.error("AI CLI '%s' not found in PATH. Is it installed?", argv[0])
+        else:
+            log.error("Failed to dispatch Maintainer: %s", error)
+        raise
+    finally:
+        if stdout_file is not None:
+            stdout_file.close()
+        if stderr_file is not None and stderr_file is not stdout_file:
+            stderr_file.close()
 
 
 def dispatch_worker_revision(
@@ -2818,6 +3272,14 @@ def dispatch_worker_revision(
             level=logging.WARNING,
         )
         return
+    if pr.is_cross_repository:
+        log_blocker(
+            f"revision-cross-repository:{pr.number}",
+            "PR #%d comes from a fork; Swarm cannot safely update it through origin.",
+            pr.number,
+            level=logging.WARNING,
+        )
+        return
     # Git and subprocess calls receive this ref as an argv element. Quote only the shell command
     # examples in the agent prompt so valid external/codex/claude branch names remain usable.
     branch_arg = shlex.quote(branch_name)
@@ -2825,75 +3287,95 @@ def dispatch_worker_revision(
     # We must run inside the same worktree or recreate it. Dry-run only reports
     # the intended path and must not mutate git worktree state.
     worktree_path = WORKTREE_DIR / str(issue.number)
-    if not dry_run:
-        worktree_path = create_worktree(issue.number, branch_name)
-
-    prompt = (
-        f"You are the Worker for PR #{pr.number} (Issue #{issue.number}: {issue.title}).\n"
-        f"Read AGENTS.md and .agents/rules/ for all project rules.\n"
-        f"You previously created this PR, but additional modifications were requested. "
-        f"Here is the feedback/comments:\n\n{feedback_text}\n\n"
-        f"Work inside this directory. This worktree may be stale — first fetch and "
-        f"rebase {branch_arg} onto the latest origin/main yourself before making "
-        f"any changes, so your commit isn't built on an outdated base. When done:\n"
-        f"1. Fix the code according to the feedback.\n"
-        f"2. Commit your changes with conventional commit messages.\n"
-        f"3. Push with `git push --set-upstream origin {branch_arg}`; always name `origin` "
-        f"and the branch explicitly, and never use a remote-less `git push`. If the push is "
-        f"rejected (e.g. "
-        f"non-fast-forward), that is a FAILED push, not a completed one — resolve it "
-        f"(rebase/force-push your own branch as needed) and push again before "
-        f"proceeding.\n"
-        f"4. Add a comment to the PR containing EXACTLY the phrase:\n"
-        f"   [Worker] Revision complete.\n"
-        f"   indicating it is ready for another review.\n\n"
-        f"{EXECUTION_INTEGRITY_NOTICE}"
-    )
-
-    if not task_ref:
-        task_ref = f"revise#{pr.number}"
-    prompt_file = (
-        PROMPT_DIR / "dry-run-worker-revise.md"
-        if dry_run
-        else write_prompt_file(prompt, "worker-revise", task_ref)
-    )
-    argv, use_stdin = build_ai_argv(
-        worker.ai,
-        worker.model,
-        worker.reasoning,
-        prompt_file,
-        str(worktree_path),
-        allow_tool_use=True,
-        prompt_text=prompt if dry_run else None,
-    )
-
-    if dry_run:
-        log.info("[DRY RUN] Would execute worker revision: %s", _format_argv_for_log(argv))
-        return
-
-    if not argv:
-        return
-
-    log_path, stdout_file, stderr_file = create_log_files("worker_revise", task_ref, worker.ai)
-    log.info("Dispatching Worker %s for PR #%d Revision (log: %s)", worker.ai, pr.number, log_path)
-    log.info("  argv: %s", _format_argv_for_log(argv))
-
+    task_ref = task_ref or f"revise#{pr.number}"
+    argv: list[str] = []
+    log_path: Optional[Path] = None
+    stdout_file = None
+    stderr_file = None
+    proc = None
+    launch_started = False
     try:
+        if not dry_run:
+            fetched_head = fetch_pr_head(pr.number, pr.head_sha)
+            worktree_path = create_worktree(
+                issue.number,
+                branch_name,
+                start_ref=fetched_head,
+                expected_sha=fetched_head,
+            )
+
+        prompt = (
+            f"You are the Worker for PR #{pr.number} "
+            f"(Issue #{issue.number}: {issue.title}).\n"
+            f"Read AGENTS.md and .agents/rules/ for all project rules.\n"
+            f"You previously created this PR, but additional modifications were requested. "
+            f"Here is the feedback/comments:\n\n{feedback_text}\n\n"
+            f"Work inside this directory. This worktree may be stale — first fetch and "
+            f"rebase {branch_arg} onto the latest origin/main yourself before making "
+            f"any changes, so your commit isn't built on an outdated base. When done:\n"
+            f"1. Fix the code according to the feedback.\n"
+            f"2. Commit your changes with conventional commit messages.\n"
+            f"3. Push with `git push --set-upstream origin {branch_arg}`; always name `origin` "
+            f"and the branch explicitly, and never use a remote-less `git push`. If the push is "
+            f"rejected (e.g. non-fast-forward), that is a FAILED push, not a completed one — "
+            f"resolve it (rebase/force-push your own branch as needed) and push again before "
+            f"proceeding.\n"
+            f"4. Add a comment to the PR containing EXACTLY the phrase:\n"
+            f"   [Worker] Revision complete.\n"
+            f"   indicating it is ready for another review.\n\n"
+            f"{EXECUTION_INTEGRITY_NOTICE}"
+        )
+        prompt_file = (
+            PROMPT_DIR / "dry-run-worker-revise.md"
+            if dry_run
+            else write_prompt_file(prompt, "worker-revise", task_ref)
+        )
+        argv, use_stdin = build_ai_argv(
+            worker.ai,
+            worker.model,
+            worker.reasoning,
+            prompt_file,
+            str(worktree_path),
+            allow_tool_use=True,
+            prompt_text=prompt if dry_run else None,
+        )
+        if dry_run:
+            log.info(
+                "[DRY RUN] Would execute worker revision: %s",
+                _format_argv_for_log(argv),
+            )
+            return
+        if not argv:
+            raise RuntimeError(f"Unsupported Worker AI '{worker.ai}'.")
+
+        log_path, stdout_file, stderr_file = create_log_files(
+            "worker_revise", task_ref, worker.ai,
+        )
+        log.info(
+            "Dispatching Worker %s for PR #%d Revision (log: %s)",
+            worker.ai,
+            pr.number,
+            log_path,
+        )
+        log.info("  argv: %s", _format_argv_for_log(argv))
+
         stdin_source = subprocess.DEVNULL
         pf = None
-        if use_stdin:
-            pf = open(prompt_file, 'r', encoding='utf-8')
-            stdin_source = pf
-
-        proc = _spawn_ai_process(
-            argv,
-            str(worktree_path),
-            stdout_file,
-            stderr_file,
-            stdin_source,
-        )
-        if pf:
-            pf.close()
+        try:
+            if use_stdin:
+                pf = open(prompt_file, "r", encoding="utf-8")
+                stdin_source = pf
+            launch_started = True
+            proc = _spawn_ai_process(
+                argv,
+                str(worktree_path),
+                stdout_file,
+                stderr_file,
+                stdin_source,
+            )
+        finally:
+            if pf:
+                pf.close()
         tracker.register(
             proc=proc,
             role="worker_revise",
@@ -2906,32 +3388,58 @@ def dispatch_worker_revision(
             cwd=str(worktree_path),
             log_file=str(log_path),
         )
-    except FileNotFoundError:
-        log.error("AI CLI '%s' not found in PATH. Is it installed?", argv[0])
-    except Exception as e:
-        log.error("Failed to dispatch Worker Revision: %s", e)
+    except Exception as error:
+        process_stopped = True
+        if proc is not None:
+            process_stopped = _cleanup_failed_process(proc)
+        if (
+            launch_started
+            and process_stopped
+            and not isinstance(error, SwarmPreflightError)
+        ):
+            _record_failed_spawn(
+                "worker_revise",
+                worker,
+                task_ref,
+                branch_name,
+                argv,
+                worktree_path,
+                log_path,
+            )
+        if isinstance(error, FileNotFoundError) and argv:
+            log.error("AI CLI '%s' not found in PATH. Is it installed?", argv[0])
+        else:
+            log.error("Failed to dispatch Worker Revision: %s", error)
+        raise
+    finally:
+        if stdout_file is not None:
+            stdout_file.close()
+        if stderr_file is not None and stderr_file is not stdout_file:
+            stderr_file.close()
 
 
 # ---------------------------------------------------------------------------
 # Main Polling Loop
 # ---------------------------------------------------------------------------
 
-def process_issues(
+def _process_issue_batch(
     dry_run: bool = False,
     open_issues: Optional[list[dict]] = None,
     open_prs: Optional[list[dict]] = None,
+    pr_issue_numbers: Optional[set[int]] = None,
 ):
-    """Poll and dispatch each initial Issue event at most once."""
+    """Process a caller-provided Issue batch without exception isolation."""
     issues = open_issues if open_issues is not None else fetch_open_issues()
     if open_prs is None:
         open_prs = fetch_open_prs()
 
-    pr_issue_numbers = set()
-    for pr in open_prs:
-        pr_title = pr.get("title", "")
-        issue_num = extract_issue_number_from_pr_title(pr_title)
-        if issue_num:
-            pr_issue_numbers.add(issue_num)
+    if pr_issue_numbers is None:
+        pr_issue_numbers = set()
+        for pr in open_prs:
+            pr_title = pr.get("title", "")
+            issue_num = extract_issue_number_from_pr_title(pr_title)
+            if issue_num:
+                pr_issue_numbers.add(issue_num)
 
     for raw in issues:
         num = raw["number"]
@@ -2986,11 +3494,45 @@ def process_issues(
         dispatch_worker(issue, dry_run, task_ref=task_ref)
 
 
-def process_prs(
+def process_issues(
+    dry_run: bool = False,
+    open_issues: Optional[list[dict]] = None,
+    open_prs: Optional[list[dict]] = None,
+) -> int:
+    """Process every Issue independently and return the number that failed."""
+    issues = open_issues if open_issues is not None else fetch_open_issues()
+    prs = open_prs if open_prs is not None else fetch_open_prs()
+    pr_issue_numbers = {
+        issue_number
+        for pr in prs
+        if (issue_number := extract_issue_number_from_pr_title(pr.get("title", "")))
+    }
+    failures = 0
+    for raw in issues:
+        try:
+            _process_issue_batch(
+                dry_run,
+                [raw],
+                prs,
+                pr_issue_numbers=pr_issue_numbers,
+            )
+        except Exception as error:
+            failures += 1
+            log.error(
+                "Failed to process Issue #%s: %s",
+                raw.get("number", "?"),
+                error,
+                exc_info=True,
+            )
+    return failures
+
+
+def _process_pr_batch(
     dry_run: bool = False,
     open_prs: Optional[list[dict]] = None,
+    current_user: Optional[str] = None,
 ):
-    """Advance each PR by one idempotent Worker/Reviewer/Maintainer event."""
+    """Process a caller-provided PR batch without exception isolation."""
     prs = open_prs if open_prs is not None else fetch_open_prs()
 
     for raw in prs:
@@ -3037,7 +3579,7 @@ def process_prs(
             continue
 
         comments = fetch_pr_comments(pr_num)
-        current_user = get_gh_user()
+        current_user = current_user if current_user is not None else get_gh_user()
         if not current_user:
             log.warning(
                 "Cannot determine current GitHub user; skipping comment-signal processing for PR #%d.",
@@ -3059,6 +3601,7 @@ def process_prs(
             body=pr_body,
             head_branch=head_branch,
             head_sha=head_sha,
+            is_cross_repository=raw.get("isCrossRepository") is True,
             issue_number=issue_number,
         )
 
@@ -3241,6 +3784,36 @@ def process_prs(
         )
 
 
+def process_prs(
+    dry_run: bool = False,
+    open_prs: Optional[list[dict]] = None,
+) -> int:
+    """Process every PR independently and return the number that failed."""
+    prs = open_prs if open_prs is not None else fetch_open_prs()
+    if not prs:
+        return 0
+    current_user = get_gh_user()
+    if not current_user:
+        log.error(
+            "Cannot determine the authenticated GitHub user; %d PR item(s) failed closed.",
+            len(prs),
+        )
+        return len(prs)
+    failures = 0
+    for raw in prs:
+        try:
+            _process_pr_batch(dry_run, [raw], current_user=current_user)
+        except Exception as error:
+            failures += 1
+            log.error(
+                "Failed to process PR #%s: %s",
+                raw.get("number", "?"),
+                error,
+                exc_info=True,
+            )
+    return failures
+
+
 def close_issue_if_open(issue_num: int, pr_num: int, dry_run: bool):
     """Close the Issue behind a merged PR if it is still open."""
     issue_raw = gh(["issue", "view", str(issue_num), "--json", "state"], check=False)
@@ -3310,8 +3883,8 @@ def log_open_items(issues: list[dict], prs: list[dict]):
         )
 
 
-def process_polling_cycle(dry_run: bool = False, initial: bool = False):
-    """Fetch a consistent open-work snapshot and advance every eligible item."""
+def process_polling_cycle(dry_run: bool = False, initial: bool = False) -> int:
+    """Fetch one snapshot, advance every item, and return isolated failures."""
     # Fetch both collections before dispatch. If either critical query fails,
     # the cycle fails closed instead of creating a duplicate Worker while its
     # existing PR was merely unavailable.
@@ -3321,20 +3894,21 @@ def process_polling_cycle(dry_run: bool = False, initial: bool = False):
     if initial:
         log_open_items(open_issues, open_prs)
 
-    process_issues(
+    failures = process_issues(
         dry_run,
         open_issues=open_issues,
         open_prs=open_prs,
     )
-    process_prs(dry_run, open_prs)
+    failures += process_prs(dry_run, open_prs)
     cleanup_merged_prs(dry_run)
+    return failures
 
 
 def run_loop(
     interval: int,
     dry_run: bool = False,
     preflight_completed: bool = False,
-):
+) -> int:
     """Main polling loop with process status monitoring."""
     log.info("=" * 60)
     log.info("Swarm Orchestrator started")
@@ -3347,9 +3921,10 @@ def run_loop(
     # Graceful shutdown on SIGTERM/SIGINT
     def handle_signal(signum, frame):
         log.info("Received signal %d, shutting down...", signum)
-        if not dry_run:
-            tracker.kill_all()
-        sys.exit(0)
+        stopped = dry_run or tracker.kill_all()
+        if not stopped:
+            log.error("Shutdown left supervised process trees active; exiting non-zero.")
+        sys.exit(0 if stopped else 1)
 
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
@@ -3390,9 +3965,11 @@ def run_loop(
 
         except KeyboardInterrupt:
             log.info("Shutting down gracefully...")
-            if not dry_run:
-                tracker.kill_all()
-            break
+            stopped = dry_run or tracker.kill_all()
+            if not stopped:
+                log.error("Shutdown left supervised process trees active; exiting non-zero.")
+                return 1
+            return 0
         except SwarmPreflightError as error:
             _log_preflight_failure(error)
         except Exception as e:
@@ -3408,16 +3985,19 @@ def run_once(dry_run: bool = False) -> int:
     try:
         log.info("Running single polling cycle...")
         sync_main_branch(dry_run)
-        process_polling_cycle(dry_run, initial=True)
+        item_failures = process_polling_cycle(dry_run, initial=True)
         if not dry_run:
             tracker.poll_all()
-        cleanup_merged_prs(dry_run)
+        if isinstance(item_failures, int) and item_failures:
+            log.error("Single polling cycle completed with %d item failure(s).", item_failures)
+            return 1
         log.info("Done.")
         return 0
     except KeyboardInterrupt:
         log.info("Single polling cycle interrupted.")
-        if not dry_run:
-            tracker.kill_all()
+        if not dry_run and not tracker.kill_all():
+            log.error("Shutdown left supervised process trees active; exiting non-zero.")
+            return 1
         return 130
     except subprocess.SubprocessError as error:
         # gh() has already logged the actionable command failure or timeout.
@@ -3479,6 +4059,7 @@ def main():
         if args.reset:
             reset_process_history()
         try:
+            _assert_dispatch_platform()
             assert_repo_workflow_writable()
         except SwarmPreflightError as error:
             _log_preflight_failure(error)
@@ -3488,12 +4069,11 @@ def main():
 
     if args.once:
         return run_once(args.dry_run)
-    run_loop(
+    return run_loop(
         args.interval,
         args.dry_run,
         preflight_completed=not args.dry_run,
     )
-    return 0
 
 
 if __name__ == "__main__":

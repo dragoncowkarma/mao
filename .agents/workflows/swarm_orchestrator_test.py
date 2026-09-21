@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import ANY, MagicMock, patch
+from unittest.mock import ANY, MagicMock, call, patch
 
 
 SCRIPT_PATH = Path(__file__).with_name("swarm_orchestrator.py")
@@ -100,16 +100,8 @@ class WorktreeSafetyTest(unittest.TestCase):
             )
 
     def test_reuses_only_the_expected_registered_worktree(self):
-        self._bind_test_target()
-        with patch.object(
-            self.swarm,
-            "_assert_worktree_push_target",
-            wraps=self.swarm._assert_worktree_push_target,
-        ) as assert_push_target:
-            created = self.swarm.create_worktree(1, "worker/1-test")
-            self.assertEqual(created, self.swarm.create_worktree(1, "worker/1-test"))
-
-        self.assertEqual(assert_push_target.call_count, 2)
+        created = self.swarm.create_worktree(1, "worker/1-test")
+        self.assertEqual(created, self.swarm.create_worktree(1, "worker/1-test"))
 
     def test_runtime_artifacts_are_locally_excluded(self):
         status = subprocess.run(
@@ -349,6 +341,14 @@ class WorktreeSafetyTest(unittest.TestCase):
         self.assertEqual(result, 130)
         kill_all.assert_called_once_with()
 
+    def test_once_interrupt_is_nonzero_when_a_process_tree_survives(self):
+        with (
+            patch.object(self.swarm, "sync_main_branch", side_effect=KeyboardInterrupt),
+            patch.object(self.swarm.tracker, "kill_all", return_value=False),
+            patch.object(self.swarm.log, "error"),
+        ):
+            self.assertEqual(self.swarm.run_once(dry_run=False), 1)
+
     def test_status_logs_the_resolved_repository_root(self):
         with (
             patch.object(self.swarm.sys, "argv", ["swarm_orchestrator.py", "--status"]),
@@ -391,6 +391,20 @@ class WorktreeSafetyTest(unittest.TestCase):
             self.swarm._ACTIVE_GH_REPO_CONTEXT,
             "github.com/acme/widgets",
         )
+
+    def test_real_run_fails_before_network_on_unsupported_process_platform(self):
+        with (
+            patch.object(self.swarm.sys, "argv", ["swarm_orchestrator.py", "--once"]),
+            patch.object(self.swarm.os, "name", "nt"),
+            patch.object(self.swarm, "assert_repo_workflow_writable") as preflight,
+            patch.object(self.swarm, "enable_runtime_writes") as runtime_writes,
+            patch.object(self.swarm.log, "error"),
+        ):
+            result = self.swarm.main()
+
+        self.assertEqual(result, 1)
+        preflight.assert_not_called()
+        runtime_writes.assert_not_called()
 
     def test_dry_run_allows_custom_ssh_transport_while_binding_origin(self):
         ssh_config = subprocess.CompletedProcess(
@@ -900,7 +914,11 @@ class WorktreeSafetyTest(unittest.TestCase):
             f"ssh -F {sentinel}\n",
             "",
         )
-        with patch.object(self.swarm.subprocess, "run", return_value=configured):
+        with patch.object(
+            self.swarm.subprocess,
+            "run",
+            return_value=configured,
+        ) as run:
             with self.assertRaises(self.swarm.SwarmPreflightConfigError) as raised:
                 self.swarm._parse_github_remote(
                     "git@github.com-work:acme/widgets.git",
@@ -908,6 +926,10 @@ class WorktreeSafetyTest(unittest.TestCase):
 
         self.assertIn("core.sshCommand", str(raised.exception))
         self.assertNotIn(sentinel, str(raised.exception))
+        self.assertEqual(
+            run.call_args.args[0],
+            ["git", "config", "--get", "core.sshCommand"],
+        )
 
     def test_ssh_resolution_timeout_is_transient(self):
         with (
@@ -1157,6 +1179,11 @@ class WorktreeSafetyTest(unittest.TestCase):
                 self.swarm,
                 "create_log_files",
                 return_value=(self.repo / "worker.log", stdout_file, stderr_file),
+            ),
+            patch.object(
+                self.swarm,
+                "_assert_checkout_push_target",
+                return_value="main",
             ),
             patch.object(self.swarm.subprocess, "Popen", return_value=MagicMock()) as popen,
             patch.object(self.swarm.tracker, "register"),
@@ -1495,6 +1522,850 @@ class WorktreeSafetyTest(unittest.TestCase):
         self.swarm.cleanup_worktree(4, "worker/4-test")
 
         self.assertFalse(self.swarm.local_branch_exists("worker/4-test"))
+
+    def test_revision_worktree_starts_from_verified_pr_head(self):
+        self._bind_test_target()
+        head = subprocess.run(
+            ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        tree = subprocess.run(
+            ["git", "-C", str(self.repo), "rev-parse", "HEAD^{tree}"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        pr_head = subprocess.run(
+            ["git", "-C", str(self.repo), "commit-tree", tree, "-p", head],
+            input="remote PR head\n",
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+        worktree = self.swarm.create_worktree(
+            2,
+            "worker/2-test",
+            start_ref=pr_head,
+            expected_sha=pr_head,
+        )
+        checked_out = subprocess.run(
+            ["git", "-C", str(worktree), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+        self.assertEqual(checked_out, pr_head)
+        self.assertNotEqual(checked_out, head)
+
+    def test_worker_revision_fetches_and_uses_exact_pr_head(self):
+        expected_sha = "a" * 40
+        issue = self.swarm.TaskIssue(
+            number=99,
+            title="[Task] exact head",
+            body="No writes",
+            worker=self.swarm.RoleAssignment("codex", "5.6", "high"),
+        )
+        pr = self.swarm.TaskPR(
+            number=101,
+            title="[PR] exact head",
+            body="",
+            head_branch="codex/manual-head",
+            head_sha=expected_sha,
+        )
+        output = MagicMock()
+        process = MagicMock(pid=1234)
+        with (
+            patch.object(self.swarm, "fetch_pr_head", return_value=expected_sha) as fetch,
+            patch.object(self.swarm, "create_worktree", return_value=self.repo) as create,
+            patch.object(
+                self.swarm,
+                "write_prompt_file",
+                return_value=self.repo / "prompt.md",
+            ),
+            patch.object(
+                self.swarm,
+                "build_ai_argv",
+                return_value=(["codex", "exec"], False),
+            ),
+            patch.object(
+                self.swarm,
+                "create_log_files",
+                return_value=(self.repo / "worker.log", output, output),
+            ),
+            patch.object(self.swarm, "_spawn_ai_process", return_value=process),
+            patch.object(self.swarm.tracker, "register"),
+        ):
+            self.swarm.dispatch_worker_revision(pr, issue, "Please revise")
+
+        fetch.assert_called_once_with(101, expected_sha)
+        create.assert_called_once_with(
+            99,
+            "codex/manual-head",
+            start_ref=expected_sha,
+            expected_sha=expected_sha,
+        )
+
+    def test_worker_revision_refuses_fork_before_fetch_or_dispatch(self):
+        issue = self.swarm.TaskIssue(
+            number=99,
+            title="[Task] fork",
+            body="",
+            worker=self.swarm.RoleAssignment("codex", "5.6", "high"),
+        )
+        pr = self.swarm.TaskPR(
+            number=101,
+            title="[PR] fork",
+            body="",
+            head_branch="contributor/change",
+            head_sha="a" * 40,
+            is_cross_repository=True,
+        )
+        with (
+            patch.object(self.swarm, "fetch_pr_head") as fetch,
+            patch.object(self.swarm, "create_worktree") as create,
+            patch.object(self.swarm, "_spawn_ai_process") as spawn,
+            patch.object(self.swarm.log, "warning"),
+        ):
+            self.swarm.dispatch_worker_revision(pr, issue, "Please revise")
+
+        fetch.assert_not_called()
+        create.assert_not_called()
+        spawn.assert_not_called()
+
+    def test_revision_preserves_mismatched_existing_local_branch(self):
+        branch_name = "worker/98-stale-revision"
+        current_head = subprocess.run(
+            ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "-C", str(self.repo), "branch", branch_name, current_head],
+            check=True,
+        )
+        expected_head = "b" * 40
+
+        with self.assertRaisesRegex(RuntimeError, "preserving it for inspection"):
+            self.swarm.create_worktree(
+                98,
+                branch_name,
+                start_ref=expected_head,
+                expected_sha=expected_head,
+            )
+
+        preserved = subprocess.run(
+            ["git", "-C", str(self.repo), "rev-parse", branch_name],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        self.assertEqual(preserved, current_head)
+        self.assertFalse((self.swarm.WORKTREE_DIR / "98").exists())
+
+    def test_fetch_pr_head_rejects_a_changed_sha(self):
+        expected_sha = "a" * 40
+        changed_sha = "b" * 40
+        fetched = subprocess.CompletedProcess(["git", "fetch"], 0, "", "")
+        resolved = subprocess.CompletedProcess(
+            ["git", "rev-parse"], 0, f"{changed_sha}\n", "",
+        )
+        with patch.object(
+            self.swarm.subprocess,
+            "run",
+            side_effect=[fetched, resolved],
+        ) as run:
+            with self.assertRaisesRegex(RuntimeError, "head changed"):
+                self.swarm.fetch_pr_head(101, expected_sha)
+
+        self.assertIn("refs/pull/101/head", run.call_args_list[0].args[0])
+
+    def test_push_selector_reader_uses_only_effective_repository_scope(self):
+        result = subprocess.CompletedProcess(
+            ["git", "config"],
+            0,
+            "worktree\torigin\n",
+            "",
+        )
+        with patch.object(self.swarm.subprocess, "run", return_value=result) as run:
+            values = self.swarm._read_git_config_values(
+                "remote.pushDefault",
+                self.repo,
+            )
+
+        self.assertEqual(values, ("origin",))
+        self.assertEqual(
+            run.call_args.args[0],
+            [
+                "git",
+                "config",
+                "--show-scope",
+                "--get",
+                "remote.pushDefault",
+            ],
+        )
+
+        global_result = subprocess.CompletedProcess(
+            ["git", "config"],
+            0,
+            "global\tupstream\n",
+            "",
+        )
+        with patch.object(self.swarm.subprocess, "run", return_value=global_result):
+            self.assertEqual(
+                self.swarm._read_git_config_values("remote.pushDefault", self.repo),
+                (),
+            )
+
+    def test_ssh_resolution_rejects_proxy_commands_without_leaking_them(self):
+        sentinel = "credential-bearing-proxy"
+        for setting in ("proxycommand", "proxyjump"):
+            with self.subTest(setting=setting):
+                resolved = subprocess.CompletedProcess(
+                    ["ssh", "-G"],
+                    0,
+                    "user git\nhostname github.com\nport 22\n"
+                    f"{setting} {sentinel}\n",
+                    "",
+                )
+                with (
+                    patch.object(self.swarm, "_assert_standard_git_ssh_context"),
+                    patch.object(self.swarm.subprocess, "run", return_value=resolved),
+                ):
+                    with self.assertRaises(
+                        self.swarm.SwarmPreflightConfigError,
+                    ) as raised:
+                        self.swarm._resolve_ssh_endpoint("github.com")
+
+                self.assertIn("ProxyCommand or ProxyJump", str(raised.exception))
+                self.assertNotIn(sentinel, str(raised.exception))
+
+    def test_ssh_lookalike_host_is_not_canonicalized_to_github(self):
+        resolved = subprocess.CompletedProcess(
+            ["ssh", "-G"],
+            0,
+            "user git\nhostname evil-github.com\nport 443\nproxycommand none\n",
+            "",
+        )
+        with (
+            patch.object(self.swarm, "_assert_standard_git_ssh_context"),
+            patch.object(self.swarm.subprocess, "run", return_value=resolved),
+        ):
+            endpoint = self.swarm._resolve_ssh_endpoint("evil-github.com")
+
+        self.assertEqual(
+            endpoint,
+            self.swarm.SshEndpoint("evil-github.com", "git", 443),
+        )
+
+    def test_origin_resolution_consumes_every_push_url(self):
+        fetch = subprocess.CompletedProcess(
+            ["git", "remote"],
+            0,
+            "https://github.com/acme/widgets.git\n",
+            "",
+        )
+        push = subprocess.CompletedProcess(
+            ["git", "remote"],
+            0,
+            "https://github.com/acme/widgets.git\n"
+            "https://github.com/other/writable.git\n",
+            "",
+        )
+        with patch.object(
+            self.swarm.subprocess,
+            "run",
+            side_effect=[fetch, push],
+        ):
+            with self.assertRaises(self.swarm.SwarmPreflightConfigError) as raised:
+                self.swarm._resolve_origin_repository()
+
+        self.assertIn("fetch and push URLs", str(raised.exception))
+        self.assertNotIn("other/writable", str(raised.exception))
+
+    def test_spawn_overrides_conflicting_inherited_github_context(self):
+        self.swarm._ACTIVE_GH_REPO_CONTEXT = "github.com/acme/widgets"
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "GH_REPO": "other/writable",
+                    "GH_HOST": "evil.example",
+                    "GIT_CONFIG_COUNT": "1",
+                    "GIT_CONFIG_KEY_0": "remote.pushDefault",
+                    "GIT_CONFIG_VALUE_0": "attacker",
+                },
+                clear=False,
+            ),
+            patch.object(
+                self.swarm,
+                "_assert_checkout_push_target",
+                return_value="main",
+            ),
+            patch.object(self.swarm.subprocess, "Popen", return_value=MagicMock()) as popen,
+        ):
+            self.swarm._spawn_ai_process(
+                ["codex", "exec"],
+                str(self.repo),
+                MagicMock(),
+                MagicMock(),
+                subprocess.DEVNULL,
+            )
+
+        environment = popen.call_args.kwargs["env"]
+        self.assertEqual(environment["GH_REPO"], "github.com/acme/widgets")
+        self.assertEqual(environment["GH_HOST"], "github.com")
+        self.assertEqual(environment["GIT_CONFIG_COUNT"], "4")
+        self.assertEqual(environment["GIT_CONFIG_KEY_1"], "remote.pushDefault")
+        self.assertEqual(environment["GIT_CONFIG_VALUE_1"], "origin")
+        self.assertEqual(environment["GIT_CONFIG_KEY_2"], "branch.main.pushRemote")
+        self.assertEqual(environment["GIT_CONFIG_VALUE_2"], "origin")
+        self.assertEqual(environment["GIT_CONFIG_KEY_3"], "branch.main.remote")
+        self.assertEqual(environment["GIT_CONFIG_VALUE_3"], "origin")
+        if os.name == "posix":
+            self.assertTrue(popen.call_args.kwargs["start_new_session"])
+
+    def test_spawn_rejects_legacy_git_config_parameters(self):
+        self.swarm._ACTIVE_GH_REPO_CONTEXT = "github.com/acme/widgets"
+        with (
+            patch.dict(
+                os.environ,
+                {"GIT_CONFIG_PARAMETERS": "'remote.pushDefault=attacker'"},
+                clear=False,
+            ),
+            patch.object(
+                self.swarm,
+                "_assert_checkout_push_target",
+                return_value="main",
+            ),
+            patch.object(self.swarm.subprocess, "Popen") as popen,
+        ):
+            with self.assertRaises(self.swarm.SwarmPreflightConfigError) as raised:
+                self.swarm._spawn_ai_process(
+                    ["codex", "exec"],
+                    str(self.repo),
+                    MagicMock(),
+                    MagicMock(),
+                    subprocess.DEVNULL,
+                )
+
+        self.assertIn("GIT_CONFIG_PARAMETERS", str(raised.exception))
+        popen.assert_not_called()
+
+    def test_issue_failure_does_not_skip_later_items(self):
+        issues = [
+            {
+                "number": number,
+                "title": f"[Task] issue {number}",
+                "body": "[Worker: codex | Model: 5.6 | Reasoning: high]",
+            }
+            for number in (1, 2)
+        ]
+        with (
+            patch.object(
+                self.swarm.tracker,
+                "should_dispatch",
+                return_value=(True, "new event"),
+            ),
+            patch.object(
+                self.swarm,
+                "dispatch_worker",
+                side_effect=[OSError("disk full"), None],
+            ) as dispatch,
+            patch.object(self.swarm.log, "error"),
+        ):
+            failures = self.swarm.process_issues(
+                open_issues=issues,
+                open_prs=[],
+            )
+
+        self.assertEqual(failures, 1)
+        self.assertEqual(dispatch.call_count, 2)
+
+    def test_prompt_setup_failure_does_not_spawn_or_consume_retry_budget(self):
+        issues = [
+            {
+                "number": number,
+                "title": f"[Task] issue {number}",
+                "body": "[Worker: codex | Model: 5.6 | Reasoning: high]",
+            }
+            for number in (1, 2)
+        ]
+        stdout_file = MagicMock()
+        stderr_file = MagicMock()
+        process = MagicMock(pid=1234)
+        with (
+            patch.object(
+                self.swarm.tracker,
+                "should_dispatch",
+                return_value=(True, "new event"),
+            ),
+            patch.object(self.swarm, "create_worktree", return_value=self.repo),
+            patch.object(
+                self.swarm,
+                "write_prompt_file",
+                side_effect=[OSError("disk full"), self.repo / "prompt.md"],
+            ),
+            patch.object(
+                self.swarm,
+                "build_ai_argv",
+                return_value=(["codex", "exec"], False),
+            ),
+            patch.object(
+                self.swarm,
+                "create_log_files",
+                return_value=(self.repo / "worker.log", stdout_file, stderr_file),
+            ),
+            patch.object(self.swarm, "_spawn_ai_process", return_value=process) as spawn,
+            patch.object(self.swarm.tracker, "register"),
+            patch.object(self.swarm.tracker, "record_failed_attempt") as failed_attempt,
+            patch.object(self.swarm.log, "error"),
+        ):
+            failures = self.swarm.process_issues(
+                open_issues=issues,
+                open_prs=[],
+            )
+
+        self.assertEqual(failures, 1)
+        spawn.assert_called_once()
+        failed_attempt.assert_not_called()
+        stdout_file.close.assert_called_once()
+        stderr_file.close.assert_called_once()
+
+    def test_log_header_failure_closes_the_open_file(self):
+        output = MagicMock()
+        output.write.side_effect = OSError("disk full")
+        with patch("builtins.open", return_value=output):
+            with self.assertRaises(OSError):
+                self.swarm.create_log_files("worker", "issue#1:initial", "codex")
+
+        output.close.assert_called_once()
+
+    def test_pr_failure_does_not_skip_later_items(self):
+        prs = [
+            {
+                "number": number,
+                "title": f"[PR] {number} - change",
+                "body": "[Reviewer: claude | Model: opus 5 | Reasoning: high]",
+                "headRefName": f"worker/{number}-change",
+                "headRefOid": str(number) * 40,
+                "isCrossRepository": False,
+            }
+            for number in (1, 2)
+        ]
+        issue = {
+            "title": "[Task] change",
+            "body": "[Worker: codex | Model: 5.6 | Reasoning: high]",
+        }
+        with (
+            patch.object(self.swarm, "get_gh_user", return_value="alice"),
+            patch.object(self.swarm, "fetch_issue", return_value=issue),
+            patch.object(self.swarm, "fetch_pr_comments", return_value=[]),
+            patch.object(
+                self.swarm.tracker,
+                "should_dispatch",
+                return_value=(True, "new event"),
+            ),
+            patch.object(
+                self.swarm,
+                "dispatch_reviewer",
+                side_effect=[OSError("disk full"), None],
+            ) as dispatch,
+            patch.object(self.swarm.log, "error"),
+        ):
+            failures = self.swarm.process_prs(open_prs=prs)
+
+        self.assertEqual(failures, 1)
+        self.assertEqual(dispatch.call_count, 2)
+
+    def test_pr_user_lookup_failure_fails_once_closed(self):
+        prs = [{"number": 7, "title": "[PR] 7 - change"}]
+        with (
+            patch.object(self.swarm, "get_gh_user", return_value=""),
+            patch.object(self.swarm, "_process_pr_batch") as process,
+            patch.object(self.swarm.log, "error"),
+        ):
+            failures = self.swarm.process_prs(open_prs=prs)
+
+        self.assertEqual(failures, 1)
+        process.assert_not_called()
+
+    def test_polling_cycle_runs_every_phase_and_reports_item_failures(self):
+        with (
+            patch.object(self.swarm, "fetch_open_issues", return_value=[]),
+            patch.object(self.swarm, "fetch_open_prs", return_value=[]),
+            patch.object(self.swarm, "process_issues", return_value=1) as issues,
+            patch.object(self.swarm, "process_prs", return_value=2) as prs,
+            patch.object(self.swarm, "cleanup_merged_prs") as cleanup,
+        ):
+            failures = self.swarm.process_polling_cycle()
+
+        self.assertEqual(failures, 3)
+        issues.assert_called_once()
+        prs.assert_called_once()
+        cleanup.assert_called_once()
+
+    def test_once_returns_nonzero_after_an_isolated_item_failure(self):
+        with (
+            patch.object(self.swarm, "sync_main_branch"),
+            patch.object(self.swarm, "process_polling_cycle", return_value=1),
+            patch.object(self.swarm, "cleanup_merged_prs") as cleanup,
+            patch.object(self.swarm.log, "error"),
+        ):
+            self.assertEqual(self.swarm.run_once(dry_run=True), 1)
+        cleanup.assert_not_called()
+
+    def test_get_gh_user_retries_failures_and_empty_results(self):
+        for first_result in (RuntimeError("transient"), ""):
+            with self.subTest(first_result=type(first_result).__name__):
+                self.swarm._CURRENT_GH_USER = None
+                effects = [first_result, "alice"]
+                with (
+                    patch.object(self.swarm, "gh", side_effect=effects) as gh,
+                    patch.object(self.swarm.log, "error"),
+                ):
+                    self.assertEqual(self.swarm.get_gh_user(), "")
+                    self.assertEqual(self.swarm.get_gh_user(), "alice")
+                self.assertEqual(gh.call_count, 2)
+
+    def test_failed_process_launches_consume_the_retry_budget(self):
+        attempt_tracker = self.swarm.ProcessTracker.__new__(self.swarm.ProcessTracker)
+        attempt_tracker._active = {}
+        attempt_tracker._history = []
+        issue = self.swarm.TaskIssue(
+            number=99,
+            title="[Task] spawn failure",
+            body="",
+            worker=self.swarm.RoleAssignment("codex", "5.6", "high"),
+        )
+
+        def log_files(*_args):
+            output = MagicMock()
+            return self.repo / "worker.log", output, output
+
+        with (
+            patch.object(self.swarm, "tracker", attempt_tracker),
+            patch.object(attempt_tracker, "_save_registry"),
+            patch.object(self.swarm, "create_worktree", return_value=self.repo),
+            patch.object(
+                self.swarm,
+                "write_prompt_file",
+                return_value=self.repo / "prompt.md",
+            ),
+            patch.object(
+                self.swarm,
+                "build_ai_argv",
+                return_value=(["missing-ai"], False),
+            ),
+            patch.object(self.swarm, "create_log_files", side_effect=log_files),
+            patch.object(self.swarm, "_spawn_ai_process", side_effect=FileNotFoundError),
+            patch.object(self.swarm.log, "error"),
+        ):
+            for _ in range(self.swarm.MAX_DISPATCH_ATTEMPTS):
+                with self.assertRaises(FileNotFoundError):
+                    self.swarm.dispatch_worker(issue, task_ref="issue#99:initial")
+
+        allowed, reason = attempt_tracker.should_dispatch(
+            "issue#99:initial",
+            "worker",
+            completion_confirmed=False,
+            ai_name="codex",
+        )
+        self.assertFalse(allowed)
+        self.assertIn("exhausted", reason)
+        self.assertTrue(all(record.pid is None for record in attempt_tracker._history))
+
+    def test_residual_registered_process_is_not_counted_as_a_second_failure(self):
+        attempt_tracker = self.swarm.ProcessTracker.__new__(self.swarm.ProcessTracker)
+        attempt_tracker._active = {}
+        attempt_tracker._history = []
+        issue = self.swarm.TaskIssue(
+            number=99,
+            title="[Task] registry failure",
+            body="",
+            worker=self.swarm.RoleAssignment("codex", "5.6", "high"),
+        )
+        output = MagicMock()
+        process = MagicMock(pid=4321)
+        with (
+            patch.object(self.swarm, "tracker", attempt_tracker),
+            patch.object(
+                attempt_tracker,
+                "_save_registry",
+                side_effect=OSError("registry unavailable"),
+            ),
+            patch.object(self.swarm, "create_worktree", return_value=self.repo),
+            patch.object(
+                self.swarm,
+                "write_prompt_file",
+                return_value=self.repo / "prompt.md",
+            ),
+            patch.object(
+                self.swarm,
+                "build_ai_argv",
+                return_value=(["codex", "exec"], False),
+            ),
+            patch.object(
+                self.swarm,
+                "create_log_files",
+                return_value=(self.repo / "worker.log", output, output),
+            ),
+            patch.object(self.swarm, "_spawn_ai_process", return_value=process),
+            patch.object(self.swarm, "terminate_process_group", return_value=False),
+            patch.object(attempt_tracker, "record_failed_attempt") as failed_attempt,
+            patch.object(self.swarm.log, "error"),
+        ):
+            with self.assertRaises(OSError):
+                self.swarm.dispatch_worker(issue, task_ref="issue#99:initial")
+
+        self.assertIn(4321, attempt_tracker._active)
+        self.assertEqual(attempt_tracker._history, [])
+        failed_attempt.assert_not_called()
+
+    def test_event_deferrals_are_bounded_but_provider_cooldowns_are_not(self):
+        future = (
+            self.swarm.datetime.now(self.swarm.timezone.utc)
+            + self.swarm.timedelta(hours=1)
+        ).isoformat()
+        now = self.swarm.datetime.now(self.swarm.timezone.utc).isoformat()
+
+        def deferred_record(scope: str):
+            return self.swarm.TrackedProcess(
+                pid=123,
+                role="worker",
+                ai_name="codex",
+                model="5.6",
+                reasoning="high",
+                task_ref="issue#9:initial",
+                branch="worker/9-test",
+                command="codex exec",
+                cwd=str(self.repo),
+                log_file="",
+                started_at=now,
+                ended_at=now,
+                status=self.swarm.ProcessStatus.DEFERRED,
+                retry_after=future,
+                defer_scope=scope,
+            )
+
+        event_tracker = self.swarm.ProcessTracker.__new__(self.swarm.ProcessTracker)
+        event_tracker._active = {}
+        event_tracker._history = [
+            deferred_record("event")
+            for _ in range(self.swarm.MAX_DISPATCH_ATTEMPTS)
+        ]
+        allowed, reason = event_tracker.should_dispatch(
+            "issue#9:initial", "worker", ai_name="codex",
+        )
+        self.assertFalse(allowed)
+        self.assertIn("exhausted", reason)
+
+        provider_tracker = self.swarm.ProcessTracker.__new__(self.swarm.ProcessTracker)
+        provider_tracker._active = {}
+        provider_tracker._history = [
+            deferred_record("provider")
+            for _ in range(self.swarm.MAX_DISPATCH_ATTEMPTS + 2)
+        ]
+        allowed, reason = provider_tracker.should_dispatch(
+            "issue#9:initial", "worker", ai_name="codex",
+        )
+        self.assertFalse(allowed)
+        self.assertIn(self.swarm.DISPATCH_PROVIDER_COOLDOWN, reason)
+        self.assertNotIn("exhausted", reason)
+
+    def test_registry_write_is_atomic_when_serialization_fails(self):
+        registry = self.repo / ".agents" / "atomic-registry.json"
+        registry.parent.mkdir(parents=True, exist_ok=True)
+        original = '{"history": [{"preserve": true}]}\n'
+        registry.write_text(original)
+        attempt_tracker = self.swarm.ProcessTracker.__new__(self.swarm.ProcessTracker)
+        attempt_tracker._active = {}
+        attempt_tracker._history = []
+
+        def partial_dump(_payload, stream, **_kwargs):
+            stream.write("{")
+            raise OSError("simulated partial write")
+
+        with (
+            patch.object(self.swarm, "PROCESS_REGISTRY_FILE", registry),
+            patch.object(self.swarm.json, "dump", side_effect=partial_dump),
+        ):
+            with self.assertRaises(OSError):
+                attempt_tracker._save_registry()
+
+        self.assertEqual(registry.read_text(), original)
+        self.assertEqual(list(registry.parent.glob(f".{registry.name}.*")), [])
+        registry.unlink()
+
+    def test_non_worker_dispatch_validates_push_target_before_process_spawn(self):
+        reviewer = self.swarm.RoleAssignment("codex", "5.6", "high")
+        maintainer = self.swarm.RoleAssignment("claude", "opus 5", "high")
+        pr = self.swarm.TaskPR(
+            number=101,
+            title="[PR] guarded",
+            body="",
+            head_branch="worker/99-test",
+            head_sha="a" * 40,
+            reviewer=reviewer,
+        )
+        issue = self.swarm.TaskIssue(number=99, title="[Task] guarded", body="")
+        output = MagicMock()
+
+        calls = (
+            (self.swarm.dispatch_reviewer, (pr, maintainer)),
+            (self.swarm.dispatch_maintainer, (pr, issue, maintainer)),
+        )
+        for dispatch, args in calls:
+            with self.subTest(dispatch=dispatch.__name__):
+                with (
+                    patch.object(
+                        self.swarm,
+                        "_assert_checkout_push_target",
+                        side_effect=self.swarm.SwarmPreflightConfigError("blocked"),
+                    ) as guard,
+                    patch.object(
+                        self.swarm,
+                        "write_prompt_file",
+                        return_value=self.repo / "prompt.md",
+                    ),
+                    patch.object(
+                        self.swarm,
+                        "build_ai_argv",
+                        return_value=(["agent"], False),
+                    ),
+                    patch.object(
+                        self.swarm,
+                        "create_log_files",
+                        return_value=(self.repo / "agent.log", output, output),
+                    ),
+                    patch.object(self.swarm.subprocess, "Popen") as popen,
+                    patch.object(self.swarm.log, "error"),
+                ):
+                    with self.assertRaises(self.swarm.SwarmPreflightConfigError):
+                        dispatch(*args)
+                guard.assert_called_once_with(self.swarm.REPO_ROOT)
+                popen.assert_not_called()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX process-group semantics")
+    def test_process_group_termination_escalates_and_reaps(self):
+        process = MagicMock(pid=4321)
+        process.wait.side_effect = [
+            subprocess.TimeoutExpired(["agent"], 5),
+            None,
+        ]
+        with (
+            patch.object(self.swarm.os, "killpg") as killpg,
+            patch.object(
+                self.swarm,
+                "_wait_for_process_group_exit",
+                side_effect=[False, True],
+            ),
+        ):
+            stopped = self.swarm.terminate_process_group(process)
+
+        if os.name == "posix":
+            self.assertTrue(stopped)
+            self.assertEqual(
+                killpg.call_args_list,
+                [
+                    call(4321, self.swarm.signal.SIGTERM),
+                    call(4321, self.swarm.signal.SIGKILL),
+                ],
+            )
+        self.assertEqual(process.wait.call_count, 2)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX process-group semantics")
+    def test_process_group_escalates_when_leader_exits_before_descendants(self):
+        process = MagicMock(pid=4321)
+        process.wait.return_value = 0
+        with (
+            patch.object(self.swarm.os, "killpg") as killpg,
+            patch.object(
+                self.swarm,
+                "_wait_for_process_group_exit",
+                side_effect=[False, True],
+            ),
+        ):
+            self.assertTrue(self.swarm.terminate_process_group(process))
+
+        self.assertEqual(
+            killpg.call_args_list,
+            [
+                call(4321, self.swarm.signal.SIGTERM),
+                call(4321, self.swarm.signal.SIGKILL),
+            ],
+        )
+        self.assertEqual(process.wait.call_count, 2)
+
+    def test_poll_keeps_supervising_a_residual_process_group(self):
+        attempt_tracker = self.swarm.ProcessTracker.__new__(self.swarm.ProcessTracker)
+        process = MagicMock(pid=4321)
+        process.poll.return_value = 0
+        now = self.swarm.datetime.now(self.swarm.timezone.utc).isoformat()
+        tracked = self.swarm.TrackedProcess(
+            pid=4321,
+            role="worker",
+            ai_name="codex",
+            model="5.6",
+            reasoning="high",
+            task_ref="issue#1:initial",
+            branch="worker/1-test",
+            command="codex exec",
+            cwd=str(self.repo),
+            log_file="",
+            started_at=now,
+        )
+        attempt_tracker._active = {4321: (process, tracked)}
+        attempt_tracker._history = []
+        with (
+            patch.object(self.swarm, "terminate_process_group", return_value=False),
+            patch.object(attempt_tracker, "_save_registry") as save,
+            patch.object(self.swarm.log, "error"),
+        ):
+            attempt_tracker.poll_all()
+
+        self.assertIn(4321, attempt_tracker._active)
+        self.assertEqual(attempt_tracker._history, [])
+        save.assert_not_called()
+
+    def test_windows_process_tree_uses_taskkill(self):
+        process = MagicMock(pid=4321)
+        process.poll.return_value = 1
+        with (
+            patch.object(self.swarm.os, "name", "nt"),
+            patch.object(
+                self.swarm.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess(["taskkill"], 0),
+            ) as run,
+        ):
+            self.assertTrue(self.swarm.terminate_process_group(process))
+
+        self.assertEqual(
+            run.call_args.args[0],
+            ["taskkill", "/PID", "4321", "/T", "/F"],
+        )
+        process.wait.assert_called_once_with(timeout=5)
+
+    def test_windows_taskkill_failure_keeps_process_tree_supervised(self):
+        process = MagicMock(pid=4321)
+        process.poll.return_value = 1
+        with (
+            patch.object(self.swarm.os, "name", "nt"),
+            patch.object(
+                self.swarm.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess(["taskkill"], 1),
+            ),
+            patch.object(self.swarm.log, "error"),
+        ):
+            self.assertFalse(self.swarm.terminate_process_group(process))
+
+        process.wait.assert_not_called()
 
 
 if __name__ == "__main__":

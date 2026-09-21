@@ -184,16 +184,26 @@ from every effective fetch and push URL of the selected checkout's `origin`; Swa
 aliases and refuses to run when any identity differs. On real runs, SSH origins also fail closed
 when `core.sshCommand`, `GIT_SSH_COMMAND`, or `GIT_SSH` would make Git use a transport different from
 the system `ssh -G` configuration Swarm inspects; read-only `--dry-run` skips that transport proof.
-Effective SSH host, user, and port are compared
-together; only GitHub's documented `ssh.github.com:443` endpoint is canonicalized to
+Effective SSH host, user, and port are compared together, and an effective `ProxyCommand` or
+`ProxyJump` is rejected because it can redirect the connection outside that proof. Only GitHub's
+documented `ssh.github.com:443` endpoint is canonicalized to
 `github.com:22`. HTTP and non-default-port HTTPS origins are rejected because the default `gh` API
-authority cannot prove them; HTTPS origins bind scheme, host, and effective port 443. Before a
-Worker is dispatched, Swarm resolves the effective origin and transport endpoints again inside the
-branch worktree and rejects any non-`origin` `remote.pushDefault`, branch
-`pushRemote`, or branch `remote`. Worker prompts require `git push --set-upstream origin <branch>`
-rather than a bare push. Revision dispatch reuses any non-empty GitHub head ref; direct Git/process
-calls pass it as an argv element without a shell, while prompt command examples quote it with
-`shlex.quote`. This is not a prompt-content sandbox: eligible `[Task]` Issue titles/bodies have no
+authority cannot prove them; HTTPS origins bind scheme, host, and effective port 443. Every role
+revalidates the effective origin and transport endpoints immediately before dispatch — Workers in
+their task worktree, Reviewers and Maintainers in the repository checkout. The effective
+repository-local or worktree-local `remote.pushDefault`, branch `pushRemote`, and branch `remote`
+values must name `origin`; shadowed and global selectors do not cause false rejection. Every
+dispatched child also receives highest-precedence command-scope overrides pinning all three
+implicit push selectors to `origin`, so inherited or global configuration cannot redirect a bare
+push; legacy `GIT_CONFIG_PARAMETERS` is rejected because Git applies it after those overrides.
+Effective `core.sshCommand` remains all-scope and fail-closed because it changes even an
+explicit push's transport. Revision dispatch accepts a
+same-repository, non-empty GitHub head ref only after fetching `refs/pull/<number>/head` and proving
+its commit equals the listed `headRefOid`. A missing local branch is created from that verified
+commit, never `origin/main`; a mismatched local branch is preserved and blocks dispatch, and fork
+PRs are refused because this `origin` cannot update them. Direct Git/process calls pass the ref as
+an argv element without a shell, while prompt command examples quote it with `shlex.quote`. This is
+not a prompt-content sandbox: eligible `[Task]` Issue titles/bodies have no
 author-association gate before becoming instructions for tool-enabled Workers. Revision feedback
 is limited to the active gh user or an `OWNER`/`COLLABORATOR`/`MEMBER`, then is passed through as
 instructions too. Run autonomous Swarm only when those task-authoring surfaces are trusted or
@@ -204,6 +214,15 @@ exits non-zero with an actionable error, while rate limits, timeouts, 5xx respon
 403s are reported as transient rather than mislabeled as missing permission. `--status` remains
 offline. `--dry-run` resolves and binds the local origin so its reads cannot drift to an inherited
 `GH_REPO`, but it remains read-only and skips the network write-capability probe.
+
+Polling isolates each Issue and PR: a broken worktree, prompt/log write, or other per-item failure
+does not skip later items or merged-task cleanup. An authenticated-user lookup failure fails its PR
+batch closed, and `--once` exits non-zero if any item failed. Child launch failures consume the
+bounded retry budget; provider-wide quota cooldowns stay exempt, while repeated event-local
+timeouts do not retry forever. The process registry is replaced atomically. Each agent requires an
+isolated POSIX process group, so unsupported platforms fail before the write preflight or runtime
+file creation. Normal leader exit as well as shutdown removes residual descendants; a tree that
+cannot be stopped remains recorded and forces a non-zero shutdown.
 
 A passing Swarm preflight is not proof of every eventual write. When GitHub cannot expose the active
 credential's individual Issues, Contents, and Pull requests grants without a write probe, the CLI

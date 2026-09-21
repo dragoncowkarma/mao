@@ -373,19 +373,29 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   capability probe and, because it cannot push, the custom-SSH-transport proof. Real runs reject
   custom `core.sshCommand`, `GIT_SSH_COMMAND`, and `GIT_SSH` overrides for SSH origins because the
   system `ssh -G` result would not prove their actual target. Effective
-  SSH host, user, and port are resolved and compared together (only GitHub's documented
+  SSH host, user, and port are resolved and compared together; an effective `ProxyCommand` or
+  `ProxyJump` is also rejected because those can redirect the transport beyond that endpoint proof
+  (only GitHub's documented
   `ssh.github.com:443` endpoint is equated with `github.com:22`). HTTP origins and non-default HTTPS
   ports are rejected because the default `gh` API authority would not prove that target; HTTPS
-  origins bind scheme, host, and effective port 443. Before each Worker dispatch, the task
-  worktree revalidates those bound endpoints and branch-scoped origin URLs, and rejects a
-  non-`origin` `remote.pushDefault`,
-  `branch.<name>.pushRemote`, or `branch.<name>.remote`; Worker prompts likewise require an explicit
-  `git push ... origin <branch>` rather than a remote-less push. Revision dispatch reuses any
-  non-empty GitHub head ref, including manual `codex/` or `claude/` branches. Direct Git/process
-  calls pass that ref as an argv element without a shell; command examples in the human-readable
-  prompt quote it with `shlex.quote`. That quoting is command-example hygiene, not a prompt-content
-  trust boundary. Eligible `[Task]` Issue titles/bodies have no author-association gate before
-  becoming instructions for tool-enabled Workers. Revision feedback is limited to the active gh
+  origins bind scheme, host, and effective port 443. Every role revalidates those bound endpoints
+  immediately before dispatch — Workers in their task worktree, Reviewers and Maintainers in the
+  repository checkout. The effective repository-local or worktree-local `remote.pushDefault`,
+  `branch.<name>.pushRemote`, and `branch.<name>.remote` values must name `origin`; shadowed values
+  and an operator's global selectors do not cause a false rejection. Every child environment then
+  adds highest-precedence command-scope values pinning all three implicit push selectors to
+  `origin`, so inherited or global selectors cannot redirect a bare push either; legacy
+  `GIT_CONFIG_PARAMETERS` is rejected because Git applies it after those values. Effective
+  `core.sshCommand` remains all-scope and fail-closed because it changes even an explicit push's
+  transport. Revision dispatch accepts a same-repository,
+  non-empty GitHub head ref, fetches `refs/pull/<number>/head`, and requires the fetched commit to
+  equal the listed `headRefOid` before it creates a missing local branch from that commit. It never
+  falls back to `origin/main`, never resets a mismatched local branch, and refuses fork PRs it cannot
+  update through `origin`. Direct Git/process calls pass the ref as an argv element without a shell;
+  command examples in the human-readable prompt quote it with `shlex.quote`. That quoting is
+  command-example hygiene, not a prompt-content trust boundary. Eligible `[Task]` Issue
+  titles/bodies have no author-association gate before becoming instructions for tool-enabled
+  Workers. Revision feedback is limited to the active gh
   user or an `OWNER`/`COLLABORATOR`/`MEMBER`, then passed through as instructions too. Run
   autonomous Swarm only where those task-authoring surfaces are trusted or moderated; it does not
   sandbox hostile prompt content. A
@@ -394,6 +404,13 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   Git transport is a separate boundary too —
   `git push` may use SSH or another credential helper, so the `gh` preflight never claims to prove
   that credential. The store's `githubToken` is intentionally not consulted for Swarm.
+  One malformed task is isolated from later Issues, PRs, and merged-task cleanup; a failed
+  authenticated-user lookup also fails the affected PR batch closed, and `--once` exits non-zero
+  when any item failed. Registry updates use same-directory atomic replacement. Dispatched agents
+  require isolated POSIX process groups; unsupported platforms fail before the write preflight or
+  runtime-file creation. Shutdown and normal leader exit terminate residual descendants. A failed
+  termination remains recorded and forces a non-zero shutdown instead of silently leaving an
+  untracked background `git push` or `gh` write alive.
 - The pipeline creates real issues, branches, PRs, reviews, and merges. Test only
   against throwaway repos (see SKILL.md).
 - `github:refreshRepo` is **not a pure read**: it calls `autoTrigger.pollNow()`

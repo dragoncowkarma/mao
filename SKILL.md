@@ -195,13 +195,17 @@ repository-local or worktree-local `remote.pushDefault`, branch `pushRemote`, an
 values must name `origin`; shadowed and global selectors do not cause false rejection. Every
 dispatched child also receives highest-precedence command-scope overrides pinning all three
 implicit push selectors to `origin`, so inherited or global configuration cannot redirect a bare
-push; legacy `GIT_CONFIG_PARAMETERS` is rejected because Git applies it after those overrides.
+push; legacy `GIT_CONFIG_PARAMETERS` is rejected at real-run startup and again before spawn because
+Git applies it after those overrides. A detached repository root remains valid for Reviewer and
+Maintainer dispatch: origin, transport, and `remote.pushDefault` are still checked and pinned, while
+branch-scoped selectors are omitted. Worker task worktrees must stay attached to their branch.
 Effective `core.sshCommand` remains all-scope and fail-closed because it changes even an
 explicit push's transport. Revision dispatch accepts a
 same-repository, non-empty GitHub head ref only after fetching `refs/pull/<number>/head` and proving
 its commit equals the listed `headRefOid`. A missing local branch is created from that verified
-commit, never `origin/main`; a mismatched local branch is preserved and blocks dispatch, and fork
-PRs are refused because this `origin` cannot update them. Direct Git/process calls pass the ref as
+commit, never `origin/main`; a clean local ancestor is fast-forwarded to the verified head, while
+dirty or divergent local state is preserved with an actionable blocker. Fork PRs are refused because
+this `origin` cannot update them. Direct Git/process calls pass the ref as
 an argv element without a shell, while prompt command examples quote it with `shlex.quote`. This is
 not a prompt-content sandbox: eligible `[Task]` Issue titles/bodies have no
 author-association gate before becoming instructions for tool-enabled Workers. Revision feedback
@@ -217,12 +221,15 @@ offline. `--dry-run` resolves and binds the local origin so its reads cannot dri
 
 Polling isolates each Issue and PR: a broken worktree, prompt/log write, or other per-item failure
 does not skip later items or merged-task cleanup. An authenticated-user lookup failure fails its PR
-batch closed, and `--once` exits non-zero if any item failed. Child launch failures consume the
-bounded retry budget; provider-wide quota cooldowns stay exempt, while repeated event-local
+batch closed, and `--once` exits non-zero if any item failed. Every selected real dispatch failure
+before successful registration consumes the bounded retry budget; provider-wide quota cooldowns
+stay exempt, while repeated event-local
 timeouts do not retry forever. The process registry is replaced atomically. Each agent requires an
 isolated POSIX process group, so unsupported platforms fail before the write preflight or runtime
-file creation. Normal leader exit as well as shutdown removes residual descendants; a tree that
-cannot be stopped remains recorded and forces a non-zero shutdown.
+file creation. Normal leader exit as well as shutdown removes residual descendants within a shared
+bounded cleanup deadline. A tree that cannot be stopped is persisted as `stuck`, is not repeatedly
+signalled by numeric PGID, and blocks that lifecycle event until an operator removes it; shutdown
+also remains non-zero.
 
 A passing Swarm preflight is not proof of every eventual write. When GitHub cannot expose the active
 credential's individual Issues, Contents, and Pull requests grants without a write probe, the CLI

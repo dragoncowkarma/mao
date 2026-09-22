@@ -161,6 +161,12 @@ There is no codegen — these couplings are maintained by hand and only `npm run
 - **New store field** → both `MaoStoreSchema` and `MAO_STORE_DEFAULTS` in
   `core/store.ts` (tsc enforces the pair). `electron/store.ts` and `FileStore` pick
   the field up automatically.
+- **Repository capability policy** → `core/repo-capabilities.ts` and the intentionally
+  duplicated policy tables/verdict logic in `.agents/workflows/swarm_orchestrator.py` must be
+  audited together. Gap ids and reasons, remedy kinds/ranking, public-vs-private scope rules,
+  three-state `permissions.push`, and the unverified pipeline grants must stay aligned, with
+  regressions in both TypeScript and Python suites. Credential acquisition and command-failure
+  classification deliberately differ because Swarm checks the active `gh` credential.
 - **New pipeline stage** → `STAGE_ORDER` + `buildPromptForStage` + `applyGithubAction`
   in `core/workflow-engine.ts`, **plus** the `STAGE_LABELS` record that is
   copy-pasted in both `src/components/KanbanBoard.tsx` and
@@ -385,13 +391,18 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   and an operator's global selectors do not cause a false rejection. Every child environment then
   adds highest-precedence command-scope values pinning all three implicit push selectors to
   `origin`, so inherited or global selectors cannot redirect a bare push either; legacy
-  `GIT_CONFIG_PARAMETERS` is rejected because Git applies it after those values. Effective
+  `GIT_CONFIG_PARAMETERS` is rejected once at real-run startup (with a `git -c`/hook diagnostic)
+  and again at the spawn boundary because Git applies it after those values. A detached
+  repository root is valid for Reviewer/Maintainer dispatch: origin, transport, and
+  `remote.pushDefault` are still checked and pinned, while nonexistent branch-scoped selectors
+  are omitted. Task worktrees must remain attached to their expected branch. Effective
   `core.sshCommand` remains all-scope and fail-closed because it changes even an explicit push's
   transport. Revision dispatch accepts a same-repository,
   non-empty GitHub head ref, fetches `refs/pull/<number>/head`, and requires the fetched commit to
   equal the listed `headRefOid` before it creates a missing local branch from that commit. It never
-  falls back to `origin/main`, never resets a mismatched local branch, and refuses fork PRs it cannot
-  update through `origin`. Direct Git/process calls pass the ref as an argv element without a shell;
+  falls back to `origin/main`: a clean local ancestor is fast-forwarded to that verified head, while
+  dirty or divergent state is preserved with an actionable blocker. Fork PRs it cannot update
+  through `origin` are refused. Direct Git/process calls pass the ref as an argv element without a shell;
   command examples in the human-readable prompt quote it with `shlex.quote`. That quoting is
   command-example hygiene, not a prompt-content trust boundary. Eligible `[Task]` Issue
   titles/bodies have no author-association gate before becoming instructions for tool-enabled
@@ -406,11 +417,15 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   that credential. The store's `githubToken` is intentionally not consulted for Swarm.
   One malformed task is isolated from later Issues, PRs, and merged-task cleanup; a failed
   authenticated-user lookup also fails the affected PR batch closed, and `--once` exits non-zero
-  when any item failed. Registry updates use same-directory atomic replacement. Dispatched agents
+  when any item failed. Every selected real dispatch failure before successful registration consumes
+  the same bounded per-event retry budget as a child crash; provider-wide cooldowns remain exempt.
+  Registry updates use same-directory atomic replacement. Dispatched agents
   require isolated POSIX process groups; unsupported platforms fail before the write preflight or
-  runtime-file creation. Shutdown and normal leader exit terminate residual descendants. A failed
-  termination remains recorded and forces a non-zero shutdown instead of silently leaving an
-  untracked background `git push` or `gh` write alive.
+  runtime-file creation. Shutdown and normal leader exit terminate residual descendants within one
+  shared supervision deadline. A failed termination becomes a persisted `stuck` state, is never
+  automatically re-signalled by numeric PGID, and blocks only that lifecycle event until an operator
+  terminates the residual tree; shutdown stays non-zero instead of silently leaving an untracked
+  background `git push` or `gh` write alive.
 - The pipeline creates real issues, branches, PRs, reviews, and merges. Test only
   against throwaway repos (see SKILL.md).
 - `github:refreshRepo` is **not a pure read**: it calls `autoTrigger.pollNow()`

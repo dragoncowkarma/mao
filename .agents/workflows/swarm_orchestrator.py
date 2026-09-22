@@ -74,6 +74,11 @@ MAIN_SYNC_EVERY_CYCLES = 5
 # retried so a transient AI CLI failure cannot deadlock the swarm forever.
 MAX_DISPATCH_ATTEMPTS = 3
 
+# Process-tree shutdown is bounded across one supervision pass, not once per
+# child. A finished leader may leave descendants behind, but harvesting several
+# such leaders must not stall the polling thread for N * timeout seconds.
+PROCESS_GROUP_STOP_TIMEOUT_SECONDS = 5
+
 # Provider quota/tool/timeout failures are availability pauses, not crashed
 # task attempts. Keep them out of the bounded crash budget and retry after the
 # provider's advertised reset, or after a conservative fallback cooldown.
@@ -100,6 +105,7 @@ ANTIGRAVITY_PRINT_TIMEOUT = "45m"
 
 # Stable reasons returned by ProcessTracker.should_dispatch().
 DISPATCH_RUNNING = "already running"
+DISPATCH_RESIDUAL = "residual process tree requires operator cleanup"
 DISPATCH_COMPLETED = "already completed"
 DISPATCH_UNCONFIRMED = "completed without confirmed lifecycle transition"
 DISPATCH_PROVIDER_COOLDOWN = "provider cooldown"
@@ -207,7 +213,10 @@ def log_blocker(key: str, message: str, *args, level: int = logging.ERROR):
 
 def log_dispatch_blocker(key: str, subject: str, reason: str):
     """Report terminal or deferred dispatch state without poll-cycle spam."""
-    if reason.startswith("exhausted") or reason == DISPATCH_UNCONFIRMED:
+    if (
+        reason.startswith("exhausted")
+        or reason in {DISPATCH_UNCONFIRMED, DISPATCH_RESIDUAL}
+    ):
         log_blocker(key, "%s dispatch blocked: %s.", subject, reason)
     elif reason.startswith(DISPATCH_PROVIDER_COOLDOWN):
         log_blocker(
@@ -225,6 +234,7 @@ def log_dispatch_blocker(key: str, subject: str, reason: str):
 
 class ProcessStatus(str, Enum):
     RUNNING = "running"
+    STUCK = "stuck"
     COMPLETED = "completed"
     FAILED = "failed"
     DEFERRED = "deferred"
@@ -371,31 +381,21 @@ def _assert_dispatch_platform() -> None:
         )
 
 
-def terminate_process_group(proc: subprocess.Popen, timeout: int = 5) -> bool:
+def terminate_process_group(proc: subprocess.Popen, timeout: float = 5) -> bool:
     """Terminate a dispatched agent tree, reap its leader, and report success."""
-    if os.name == "nt":
-        try:
-            result = subprocess.run(
-                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=timeout,
-            )
-            if result.returncode != 0:
-                log.error("Process tree for PID %d could not be terminated.", proc.pid)
-                return False
-            proc.wait(timeout=timeout)
-            return proc.poll() is not None
-        except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
-            log.error("Process tree for PID %d could not be terminated.", proc.pid)
-            return False
-
     if os.name != "posix":
         log.error("Process-tree termination is unsupported on this platform.")
         return False
 
-    deadline = time.monotonic() + timeout
+    # poll() may already have reaped a leader. Avoid signalling a process-group
+    # number that no longer exists and could subsequently be reused.
+    if not _process_group_exists(proc.pid):
+        proc.poll()
+        return True
+
+    started_at = time.monotonic()
+    deadline = started_at + max(0, timeout)
+    term_deadline = started_at + max(0, timeout) / 2
     try:
         os.killpg(proc.pid, signal.SIGTERM)
     except ProcessLookupError:
@@ -406,10 +406,11 @@ def terminate_process_group(proc: subprocess.Popen, timeout: int = 5) -> bool:
         return False
 
     try:
-        proc.wait(timeout=max(0, deadline - time.monotonic()))
+        proc.wait(timeout=max(0, term_deadline - time.monotonic()))
     except subprocess.TimeoutExpired:
         pass
-    if _wait_for_process_group_exit(proc.pid, deadline):
+    if _wait_for_process_group_exit(proc.pid, term_deadline):
+        proc.poll()
         return True
 
     try:
@@ -422,12 +423,14 @@ def terminate_process_group(proc: subprocess.Popen, timeout: int = 5) -> bool:
         return False
 
     try:
-        proc.wait(timeout=timeout)
+        proc.wait(timeout=max(0, deadline - time.monotonic()))
     except subprocess.TimeoutExpired:
         pass
-    stopped = _wait_for_process_group_exit(proc.pid, time.monotonic() + timeout)
+    stopped = _wait_for_process_group_exit(proc.pid, deadline)
     if not stopped:
         log.error("Process group for PID %d did not exit after SIGKILL.", proc.pid)
+    else:
+        proc.poll()
     return stopped
 
 
@@ -481,9 +484,28 @@ class ProcessTracker:
         retryable.
         """
         for record in self._history:
-            if record.status != ProcessStatus.RUNNING:
+            if record.status not in (ProcessStatus.RUNNING, ProcessStatus.STUCK):
                 continue
-            if self.check_pid_alive(record.pid, record.command):
+            leader_alive = bool(
+                record.pid is not None
+                and self.check_pid_alive(record.pid, record.command)
+            )
+            group_alive = bool(
+                record.pid is not None
+                and os.name == "posix"
+                and _process_group_exists(record.pid)
+            )
+            if leader_alive:
+                continue
+            if group_alive:
+                record.status = ProcessStatus.STUCK
+                record.failure_reason = DISPATCH_RESIDUAL
+                log.warning(
+                    "Residual process group %d for %s still exists; terminate it outside MAO "
+                    "and restart Swarm before retrying this event.",
+                    record.pid,
+                    record.task_ref,
+                )
                 continue
             record.status = ProcessStatus.UNKNOWN
             record.ended_at = record.ended_at or datetime.now(timezone.utc).isoformat()
@@ -586,8 +608,10 @@ class ProcessTracker:
     # --- Polling ---
 
     def poll_all(self):
-        """Check status of all active processes via poll(). Non-blocking."""
+        """Poll children and perform one globally bounded residual-tree cleanup pass."""
         finished_pids = []
+        registry_changed = False
+        cleanup_deadline = time.monotonic() + PROCESS_GROUP_STOP_TIMEOUT_SECONDS
 
         for pid, (proc, tracked) in self._active.items():
             retcode = proc.poll()
@@ -601,12 +625,35 @@ class ProcessTracker:
                 )
             else:
                 # Process finished
-                if not terminate_process_group(proc):
-                    log.error(
-                        "Residual process group for PID %d is still active; retaining supervision.",
-                        pid,
-                    )
-                    continue
+                if tracked.status == ProcessStatus.STUCK:
+                    # The original process group was already signalled once. Never keep sending
+                    # signals to a numeric PGID after a failed teardown because it may later be
+                    # reused by an unrelated process group. An operator can terminate the residual
+                    # tree; the next poll then observes its absence and completes the record.
+                    if _process_group_exists(pid):
+                        log_blocker(
+                            f"residual-process-group:{pid}",
+                            "Residual process group %d for %s still exists; terminate it outside "
+                            "MAO, then let Swarm poll again.",
+                            pid,
+                            tracked.task_ref,
+                        )
+                        continue
+                else:
+                    remaining = max(0, cleanup_deadline - time.monotonic())
+                    if not terminate_process_group(proc, timeout=remaining):
+                        tracked.status = ProcessStatus.STUCK
+                        tracked.exit_code = retcode
+                        tracked.failure_reason = DISPATCH_RESIDUAL
+                        registry_changed = True
+                        log_blocker(
+                            f"residual-process-group:{pid}",
+                            "Residual process group %d for %s could not be stopped; terminate it "
+                            "outside MAO, then let Swarm poll again.",
+                            pid,
+                            tracked.task_ref,
+                        )
+                        continue
                 tracked.exit_code = retcode
                 tracked.ended_at = datetime.now(timezone.utc).isoformat()
                 elapsed = self._elapsed_str(tracked.started_at)
@@ -645,13 +692,14 @@ class ProcessTracker:
                     )
 
                 finished_pids.append(pid)
+                registry_changed = True
 
         # Move finished processes to history
         for pid in finished_pids:
             _, tracked = self._active.pop(pid)
             self._history.append(tracked)
 
-        if finished_pids:
+        if registry_changed:
             self._save_registry()
 
     def check_pid_alive(self, pid: int, command: Optional[str] = None) -> bool:
@@ -721,6 +769,8 @@ class ProcessTracker:
         ]
         if any(record.status == ProcessStatus.RUNNING for record in attempts):
             return False, DISPATCH_RUNNING
+        if any(record.status == ProcessStatus.STUCK for record in attempts):
+            return False, DISPATCH_RESIDUAL
         provider_cooldowns = []
         if ai_name:
             for record in self.all_records:
@@ -803,9 +853,10 @@ class ProcessTracker:
         if active:
             for tp in active:
                 elapsed = self._elapsed_str(tp.started_at)
+                status = tp.status.value if isinstance(tp.status, ProcessStatus) else tp.status
                 lines.append(
                     f"  PID {tp.pid:>7}  │ {tp.role:<12} │ {tp.ai_name:<14} │ "
-                    f"{tp.task_ref:<12} │ ⏱ {elapsed}"
+                    f"{tp.task_ref:<12} │ {status:<8} │ ⏱ {elapsed}"
                 )
         else:
             lines.append("  (none)")
@@ -850,9 +901,23 @@ class ProcessTracker:
     def kill_all(self) -> bool:
         """Terminate every process group and report whether shutdown is safe."""
         survivors = {}
+        cleanup_deadline = time.monotonic() + PROCESS_GROUP_STOP_TIMEOUT_SECONDS
         for pid, (proc, tracked) in list(self._active.items()):
             log.warning("🛑 Killing [PID %d] %s %s", pid, tracked.role, tracked.task_ref)
-            if not terminate_process_group(proc):
+            if tracked.status == ProcessStatus.STUCK:
+                if _process_group_exists(pid):
+                    survivors[pid] = (proc, tracked)
+                    continue
+                if tracked.exit_code is None:
+                    tracked.exit_code = proc.returncode
+                tracked.ended_at = datetime.now(timezone.utc).isoformat()
+                tracked.status = ProcessStatus.FAILED
+                self._history.append(tracked)
+                continue
+            remaining = max(0, cleanup_deadline - time.monotonic())
+            if not terminate_process_group(proc, timeout=remaining):
+                tracked.status = ProcessStatus.STUCK
+                tracked.failure_reason = DISPATCH_RESIDUAL
                 survivors[pid] = (proc, tracked)
                 continue
             tracked.exit_code = proc.returncode
@@ -1410,7 +1475,10 @@ def _read_git_config_values(key: str, repo_root: Path) -> tuple[str, ...]:
     return (value,) if scope in {"local", "worktree"} else ()
 
 
-def _assert_worktree_push_target(worktree_path: Path, branch_name: str) -> None:
+def _assert_worktree_push_target(
+    worktree_path: Path,
+    branch_name: Optional[str],
+) -> None:
     """Revalidate branch-scoped origin and bare-push selectors before agent dispatch."""
     # Deliberately re-resolve instead of caching: includeIf/onbranch and SSH config can change
     # between polling cycles, and stale endpoint data would weaken the dispatch boundary.
@@ -1435,11 +1503,14 @@ def _assert_worktree_push_target(worktree_path: Path, branch_name: str) -> None:
             "bound at startup. Align branch-scoped Git configuration, then retry.",
         )
 
-    selector_keys = (
-        "remote.pushDefault",
-        f"branch.{branch_name}.pushRemote",
-        f"branch.{branch_name}.remote",
-    )
+    selector_keys = ["remote.pushDefault"]
+    if branch_name:
+        selector_keys.extend(
+            [
+                f"branch.{branch_name}.pushRemote",
+                f"branch.{branch_name}.remote",
+            ]
+        )
     if any(
         value != "origin"
         for key in selector_keys
@@ -1451,7 +1522,7 @@ def _assert_worktree_push_target(worktree_path: Path, branch_name: str) -> None:
         )
 
 
-def _assert_checkout_push_target(checkout_path: Path) -> str:
+def _assert_checkout_push_target(checkout_path: Path) -> Optional[str]:
     """Apply the dispatch push boundary and return the checked-out branch."""
     try:
         result = subprocess.run(
@@ -1465,10 +1536,15 @@ def _assert_checkout_push_target(checkout_path: Path) -> str:
         raise SwarmPreflightConfigError(
             "git could not inspect the agent checkout before dispatch.",
         ) from None
-    branch_name = result.stdout.strip()
-    if result.returncode != 0 or not branch_name:
+    branch_name = result.stdout.strip() or None
+    if result.returncode == 1 and checkout_path.resolve() == REPO_ROOT.resolve():
+        # Reviewer and Maintainer agents run in REPO_ROOT and may legitimately use a
+        # detached checkout. They still get origin/transport validation plus a pinned
+        # remote.pushDefault; branch-scoped selectors simply do not exist in this state.
+        branch_name = None
+    elif result.returncode != 0 or branch_name is None:
         raise SwarmPreflightConfigError(
-            "The agent checkout is detached or has no readable branch; refusing dispatch.",
+            "The task worktree is detached or has no readable branch; refusing dispatch.",
         )
     _assert_worktree_push_target(checkout_path, branch_name)
     return branch_name
@@ -2020,6 +2096,81 @@ def local_branch_sha(branch_name: str) -> Optional[str]:
     return sha
 
 
+def _fast_forward_local_branch(
+    branch_name: str,
+    expected_sha: str,
+    checkout_path: Optional[Path] = None,
+) -> None:
+    """Advance a clean local PR branch only when the verified head is its descendant."""
+    current_sha = local_branch_sha(branch_name)
+    normalized_expected = expected_sha.lower()
+    if current_sha == normalized_expected:
+        return
+    if current_sha is None:
+        raise RuntimeError(
+            f"Local branch '{branch_name}' could not be inspected; preserving it for inspection."
+        )
+
+    ancestor = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", current_sha, normalized_expected],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if ancestor.returncode != 0:
+        raise RuntimeError(
+            f"Local branch '{branch_name}' diverges from the fetched PR head; preserving it "
+            "for inspection. Reconcile or move the local branch manually, then retry."
+        )
+
+    if checkout_path is not None:
+        status = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=checkout_path,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if status.returncode != 0:
+            raise RuntimeError(
+                f"Local branch '{branch_name}' could not be inspected; preserving it for inspection."
+            )
+        if status.stdout:
+            raise RuntimeError(
+                f"Local branch '{branch_name}' trails the fetched PR head but its worktree has "
+                "uncommitted changes; preserving it for inspection. Commit, move, or otherwise "
+                "reconcile those changes, then retry."
+            )
+        advanced = subprocess.run(
+            ["git", "merge", "--ff-only", normalized_expected],
+            cwd=checkout_path,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    else:
+        advanced = subprocess.run(
+            [
+                "git",
+                "update-ref",
+                f"refs/heads/{branch_name}",
+                normalized_expected,
+                current_sha,
+            ],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    if advanced.returncode != 0 or local_branch_sha(branch_name) != normalized_expected:
+        raise RuntimeError(
+            f"Local branch '{branch_name}' changed while fast-forwarding to the fetched PR "
+            "head; preserving its current state for inspection."
+        )
+    log.info("Fast-forwarded local branch %s to the verified PR head.", branch_name)
+
+
 def fetch_pr_head(pr_number: int, expected_sha: str) -> str:
     """Fetch and verify the immutable PR-head snapshot used for a revision."""
     normalized_expected = (expected_sha or "").strip().lower()
@@ -2177,10 +2328,11 @@ def create_worktree(
             and path_entry
             and path_entry.get("branch") == expected_branch
         ):
-            if expected_sha and local_branch_sha(branch_name) != expected_sha.lower():
-                raise RuntimeError(
-                    f"Local branch '{branch_name}' does not match the fetched PR head; "
-                    "preserving it for inspection."
+            if expected_sha:
+                _fast_forward_local_branch(
+                    branch_name,
+                    expected_sha,
+                    checkout_path=worktree_path,
                 )
             log.info("Reusing worktree: %s", worktree_path)
             return worktree_path
@@ -2205,10 +2357,8 @@ def create_worktree(
 
     branch_sha = local_branch_sha(branch_name)
     if expected_sha and branch_sha and branch_sha != expected_sha.lower():
-        raise RuntimeError(
-            f"Local branch '{branch_name}' does not match the fetched PR head; "
-            "preserving it for inspection."
-        )
+        _fast_forward_local_branch(branch_name, expected_sha)
+        branch_sha = local_branch_sha(branch_name)
 
     # Initial Workers branch from origin/main. Revision callers provide a
     # separately fetched and verified PR-head commit instead.
@@ -2763,14 +2913,21 @@ def _format_argv_for_log(argv: list[str]) -> str:
     return " ".join(parts)
 
 
-def _bound_dispatch_environment(branch_name: str) -> dict[str, str]:
+def _assert_dispatch_environment() -> None:
+    """Reject inherited Git command parameters before any real-run network or writes."""
+    if os.environ.get("GIT_CONFIG_PARAMETERS", "").strip():
+        raise SwarmPreflightConfigError(
+            "Swarm cannot safely compose inherited GIT_CONFIG_PARAMETERS with its push target "
+            "boundary. This commonly comes from launching through `git -c` or a Git hook; "
+            "start Swarm outside that wrapper or unset the variable, then retry.",
+        )
+
+
+def _bound_dispatch_environment(branch_name: Optional[str]) -> dict[str, str]:
     """Bind GitHub context and pin every implicit Git push selector to origin."""
     environment = _bound_gh_environment()
     if environment.get("GIT_CONFIG_PARAMETERS", "").strip():
-        raise SwarmPreflightConfigError(
-            "Swarm cannot safely compose inherited GIT_CONFIG_PARAMETERS with its push target "
-            "boundary. Unset it and retry.",
-        )
+        _assert_dispatch_environment()
     raw_count = environment.get("GIT_CONFIG_COUNT", "0")
     try:
         config_count = int(raw_count)
@@ -2782,11 +2939,14 @@ def _bound_dispatch_environment(branch_name: str) -> dict[str, str]:
         raise SwarmPreflightConfigError(
             "The inherited Git command configuration is invalid; refusing agent dispatch.",
         )
-    overrides = (
-        ("remote.pushDefault", "origin"),
-        (f"branch.{branch_name}.pushRemote", "origin"),
-        (f"branch.{branch_name}.remote", "origin"),
-    )
+    overrides = [("remote.pushDefault", "origin")]
+    if branch_name:
+        overrides.extend(
+            [
+                (f"branch.{branch_name}.pushRemote", "origin"),
+                (f"branch.{branch_name}.remote", "origin"),
+            ]
+        )
     for key, value in overrides:
         environment[f"GIT_CONFIG_KEY_{config_count}"] = key
         environment[f"GIT_CONFIG_VALUE_{config_count}"] = value
@@ -2810,7 +2970,7 @@ def _spawn_ai_process(argv, cwd, stdout_file, stderr_file, stdin_source):
     )
 
 
-def _record_failed_spawn(
+def _record_failed_dispatch(
     role: str,
     assignment: RoleAssignment,
     task_ref: str,
@@ -2819,7 +2979,7 @@ def _record_failed_spawn(
     cwd: Path,
     log_path: Optional[Path],
 ) -> None:
-    """Consume retry budget only after an actual child launch was attempted."""
+    """Consume retry budget when a selected real dispatch fails before registration."""
     try:
         tracker.record_failed_attempt(
             role=role,
@@ -2831,7 +2991,7 @@ def _record_failed_spawn(
             command=_format_argv_for_log(argv),
             cwd=str(cwd),
             log_file=str(log_path) if log_path else "",
-            failure_reason="AI process launch failed before registration",
+            failure_reason="Selected dispatch failed before successful registration",
         )
     except Exception:
         log.error("Failed to persist the dispatch failure for %s.", task_ref)
@@ -2843,6 +3003,10 @@ def _cleanup_failed_process(proc: subprocess.Popen) -> bool:
     if terminate_process_group(proc):
         return True
     if active_entry is not None:
+        _, tracked = active_entry
+        tracked.status = ProcessStatus.STUCK
+        tracked.failure_reason = DISPATCH_RESIDUAL
+        tracked.exit_code = proc.returncode
         tracker._active[proc.pid] = active_entry
         try:
             tracker._save_registry()
@@ -2881,7 +3045,7 @@ def dispatch_worker(
     stdout_file = None
     stderr_file = None
     proc = None
-    launch_started = False
+    dispatch_selected = not dry_run
     try:
         if not dry_run:
             worktree_path = create_worktree(issue.number, branch_name)
@@ -2939,7 +3103,6 @@ def dispatch_worker(
             if use_stdin:
                 pf = open(prompt_file, "r", encoding="utf-8")
                 stdin_source = pf
-            launch_started = True
             proc = _spawn_ai_process(
                 argv,
                 str(worktree_path),
@@ -2967,11 +3130,10 @@ def dispatch_worker(
         if proc is not None:
             process_stopped = _cleanup_failed_process(proc)
         if (
-            launch_started
+            dispatch_selected
             and process_stopped
-            and not isinstance(error, SwarmPreflightError)
         ):
-            _record_failed_spawn(
+            _record_failed_dispatch(
                 "worker", worker, task_ref, branch_name, argv, worktree_path, log_path,
             )
         if isinstance(error, FileNotFoundError) and argv:
@@ -3033,7 +3195,7 @@ def dispatch_reviewer(
     stdout_file = None
     stderr_file = None
     proc = None
-    launch_started = False
+    dispatch_selected = not dry_run
     try:
         prompt_file = (
             PROMPT_DIR / "dry-run-reviewer.md"
@@ -3071,7 +3233,6 @@ def dispatch_reviewer(
             if use_stdin:
                 pf = open(prompt_file, "r", encoding="utf-8")
                 stdin_source = pf
-            launch_started = True
             proc = _spawn_ai_process(
                 argv,
                 str(REPO_ROOT),
@@ -3099,11 +3260,10 @@ def dispatch_reviewer(
         if proc is not None:
             process_stopped = _cleanup_failed_process(proc)
         if (
-            launch_started
+            dispatch_selected
             and process_stopped
-            and not isinstance(error, SwarmPreflightError)
         ):
-            _record_failed_spawn(
+            _record_failed_dispatch(
                 "reviewer", reviewer, task_ref, pr.head_branch, argv, REPO_ROOT, log_path,
             )
         if isinstance(error, FileNotFoundError) and argv:
@@ -3160,7 +3320,7 @@ def dispatch_maintainer(
     stdout_file = None
     stderr_file = None
     proc = None
-    launch_started = False
+    dispatch_selected = not dry_run
     try:
         prompt_file = (
             PROMPT_DIR / "dry-run-maintainer.md"
@@ -3198,7 +3358,6 @@ def dispatch_maintainer(
             if use_stdin:
                 pf = open(prompt_file, "r", encoding="utf-8")
                 stdin_source = pf
-            launch_started = True
             proc = _spawn_ai_process(
                 argv,
                 str(REPO_ROOT),
@@ -3226,11 +3385,10 @@ def dispatch_maintainer(
         if proc is not None:
             process_stopped = _cleanup_failed_process(proc)
         if (
-            launch_started
+            dispatch_selected
             and process_stopped
-            and not isinstance(error, SwarmPreflightError)
         ):
-            _record_failed_spawn(
+            _record_failed_dispatch(
                 "maintainer", maintainer, task_ref, "", argv, REPO_ROOT, log_path,
             )
         if isinstance(error, FileNotFoundError) and argv:
@@ -3293,7 +3451,7 @@ def dispatch_worker_revision(
     stdout_file = None
     stderr_file = None
     proc = None
-    launch_started = False
+    dispatch_selected = not dry_run
     try:
         if not dry_run:
             fetched_head = fetch_pr_head(pr.number, pr.head_sha)
@@ -3365,7 +3523,6 @@ def dispatch_worker_revision(
             if use_stdin:
                 pf = open(prompt_file, "r", encoding="utf-8")
                 stdin_source = pf
-            launch_started = True
             proc = _spawn_ai_process(
                 argv,
                 str(worktree_path),
@@ -3393,11 +3550,10 @@ def dispatch_worker_revision(
         if proc is not None:
             process_stopped = _cleanup_failed_process(proc)
         if (
-            launch_started
+            dispatch_selected
             and process_stopped
-            and not isinstance(error, SwarmPreflightError)
         ):
-            _record_failed_spawn(
+            _record_failed_dispatch(
                 "worker_revise",
                 worker,
                 task_ref,
@@ -3884,7 +4040,7 @@ def log_open_items(issues: list[dict], prs: list[dict]):
 
 
 def process_polling_cycle(dry_run: bool = False, initial: bool = False) -> int:
-    """Fetch one snapshot, advance every item, and return isolated failures."""
+    """Fetch one snapshot, advance every open item, and return isolated failures."""
     # Fetch both collections before dispatch. If either critical query fails,
     # the cycle fails closed instead of creating a duplicate Worker while its
     # existing PR was merely unavailable.
@@ -3900,7 +4056,6 @@ def process_polling_cycle(dry_run: bool = False, initial: bool = False) -> int:
         open_prs=open_prs,
     )
     failures += process_prs(dry_run, open_prs)
-    cleanup_merged_prs(dry_run)
     return failures
 
 
@@ -3918,13 +4073,18 @@ def run_loop(
     log.info("Log directory: %s", LOG_DIR)
     log.info("=" * 60)
 
-    # Graceful shutdown on SIGTERM/SIGINT
+    # Signal handlers must not perform blocking process-tree cleanup. The first
+    # signal unwinds into the normal shutdown path; later signals are ignored
+    # while that bounded cleanup is already in progress.
+    shutdown_requested = False
+
     def handle_signal(signum, frame):
+        nonlocal shutdown_requested
+        if shutdown_requested:
+            return
+        shutdown_requested = True
         log.info("Received signal %d, shutting down...", signum)
-        stopped = dry_run or tracker.kill_all()
-        if not stopped:
-            log.error("Shutdown left supervised process trees active; exiting non-zero.")
-        sys.exit(0 if stopped else 1)
+        raise KeyboardInterrupt
 
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
@@ -3933,50 +4093,55 @@ def run_loop(
     cycle_count = 0
     while True:
         try:
-            log.info("--- Polling cycle (active: %d) ---", tracker.active_count)
+            try:
+                log.info("--- Polling cycle (active: %d) ---", tracker.active_count)
 
-            # Supervise already-running local children even when the network preflight is
-            # temporarily unavailable. The write gate still runs before sync/dispatch/writes.
-            if not dry_run:
-                tracker.poll_all()
+                # Supervise already-running local children even when the network preflight is
+                # temporarily unavailable. The write gate still runs before sync/dispatch/writes.
+                if not dry_run:
+                    tracker.poll_all()
 
-            # A successful startup preflight covers only the first cycle. Every later cycle
-            # rechecks before Git sync, dispatch, or direct GitHub writes so revoked access stops
-            # new lifecycle work without restarting this long-lived process.
-            if not dry_run:
-                if preflight_completed:
-                    preflight_completed = False
-                else:
-                    assert_repo_workflow_writable()
+                # A successful startup preflight covers only the first cycle. Every later cycle
+                # rechecks before Git sync, dispatch, or direct GitHub writes so revoked access
+                # stops new lifecycle work without restarting this long-lived process.
+                if not dry_run:
+                    if preflight_completed:
+                        preflight_completed = False
+                    else:
+                        assert_repo_workflow_writable()
 
-            # Keep local main current so new worktrees branch from a fresh
-            # base. Cheap, but still throttled — no need to hit the network
-            # every single interval.
-            cycle_count += 1
-            if cycle_count == 1 or cycle_count % MAIN_SYNC_EVERY_CYCLES == 0:
-                try:
-                    sync_main_branch(dry_run)
-                except Exception as e:
-                    log.error("Error syncing main branch: %s", e, exc_info=True)
+                # Keep local main current so new worktrees branch from a fresh
+                # base. Cheap, but still throttled — no need to hit the network
+                # every single interval.
+                cycle_count += 1
+                if cycle_count == 1 or cycle_count % MAIN_SYNC_EVERY_CYCLES == 0:
+                    try:
+                        sync_main_branch(dry_run)
+                    except Exception as e:
+                        log.error("Error syncing main branch: %s", e, exc_info=True)
 
-            # Poll every open item immediately on startup and every interval
-            process_polling_cycle(dry_run, initial=initial)
-            initial = False
+                # Poll every open item immediately on startup and every interval
+                process_polling_cycle(dry_run, initial=initial)
+                cleanup_merged_prs(dry_run)
+                initial = False
+            except SwarmPreflightError as error:
+                _log_preflight_failure(error)
+            except Exception as e:
+                log.error("Error in polling cycle: %s", e, exc_info=True)
 
+            log.info("Sleeping %ds...", interval)
+            time.sleep(interval)
         except KeyboardInterrupt:
             log.info("Shutting down gracefully...")
-            stopped = dry_run or tracker.kill_all()
+            try:
+                stopped = dry_run or tracker.kill_all()
+            except Exception as error:
+                log.error("Shutdown cleanup failed: %s", error, exc_info=True)
+                return 1
             if not stopped:
                 log.error("Shutdown left supervised process trees active; exiting non-zero.")
                 return 1
             return 0
-        except SwarmPreflightError as error:
-            _log_preflight_failure(error)
-        except Exception as e:
-            log.error("Error in polling cycle: %s", e, exc_info=True)
-
-        log.info("Sleeping %ds...", interval)
-        time.sleep(interval)
 
 
 def run_once(dry_run: bool = False) -> int:
@@ -3986,18 +4151,29 @@ def run_once(dry_run: bool = False) -> int:
         log.info("Running single polling cycle...")
         sync_main_branch(dry_run)
         item_failures = process_polling_cycle(dry_run, initial=True)
-        if not dry_run:
-            tracker.poll_all()
-        if isinstance(item_failures, int) and item_failures:
+        try:
+            if not dry_run:
+                tracker.poll_all()
+        finally:
+            # A registry persistence error while harvesting a just-finished Maintainer must not
+            # skip the one cleanup pass that can close its merged Issue in one-shot mode.
+            cleanup_merged_prs(dry_run)
+        if item_failures:
             log.error("Single polling cycle completed with %d item failure(s).", item_failures)
             return 1
         log.info("Done.")
         return 0
     except KeyboardInterrupt:
         log.info("Single polling cycle interrupted.")
-        if not dry_run and not tracker.kill_all():
-            log.error("Shutdown left supervised process trees active; exiting non-zero.")
-            return 1
+        if not dry_run:
+            try:
+                stopped = tracker.kill_all()
+            except Exception as error:
+                log.error("Shutdown cleanup failed: %s", error, exc_info=True)
+                return 1
+            if not stopped:
+                log.error("Shutdown left supervised process trees active; exiting non-zero.")
+                return 1
         return 130
     except subprocess.SubprocessError as error:
         # gh() has already logged the actionable command failure or timeout.
@@ -4060,6 +4236,7 @@ def main():
             reset_process_history()
         try:
             _assert_dispatch_platform()
+            _assert_dispatch_environment()
             assert_repo_workflow_writable()
         except SwarmPreflightError as error:
             _log_preflight_failure(error)

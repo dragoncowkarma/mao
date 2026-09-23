@@ -400,9 +400,10 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   transport. Revision dispatch accepts a same-repository,
   non-empty GitHub head ref, fetches `refs/pull/<number>/head`, and requires the fetched commit to
   equal the listed `headRefOid` before it creates a missing local branch from that commit. It never
-  falls back to `origin/main`: a clean local ancestor is fast-forwarded to that verified head, while
-  dirty or divergent state is preserved with an actionable blocker. Fork PRs it cannot update
-  through `origin` are refused. Direct Git/process calls pass the ref as an argv element without a shell;
+  falls back to `origin/main`: a tracked-clean local ancestor is fast-forwarded to that verified
+  head while non-conflicting untracked files are preserved; tracked changes, conflicting untracked
+  or ignored files, or divergent history are preserved with an actionable blocker. Fork PRs it
+  cannot update through `origin` are refused. Direct Git/process calls pass the ref as an argv element without a shell;
   command examples in the human-readable prompt quote it with `shlex.quote`. That quoting is
   command-example hygiene, not a prompt-content trust boundary. Eligible `[Task]` Issue
   titles/bodies have no author-association gate before becoming instructions for tool-enabled
@@ -417,12 +418,18 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   that credential. The store's `githubToken` is intentionally not consulted for Swarm.
   One malformed task is isolated from later Issues, PRs, and merged-task cleanup; a failed
   authenticated-user lookup also fails the affected PR batch closed, and `--once` exits non-zero
-  when any item failed. Every selected real dispatch failure before successful registration consumes
-  the same bounded per-event retry budget as a child crash; provider-wide cooldowns remain exempt.
+  when any item failed. Every selected non-preflight setup or launch failure before successful
+  registration consumes the same bounded per-event retry budget as a child crash. Typed preflight
+  and local-configuration blockers stay retryable after the operator fixes them, and provider-wide
+  cooldowns remain exempt.
   Registry updates use same-directory atomic replacement. Dispatched agents
   require isolated POSIX process groups; unsupported platforms fail before the write preflight or
-  runtime-file creation. Shutdown and normal leader exit terminate residual descendants within one
-  shared supervision deadline. A failed termination becomes a persisted `stuck` state, is never
+  runtime-file creation. Shutdown and normal leader exit signal all eligible process groups in a
+  batch, then terminate residual descendants within one shared supervision deadline and one shared
+  forced-exit grace. Polling and `--once` share the same signal controller. A shutdown signal
+  arriving during the narrow spawn-to-in-memory-adoption ownership transfer defers its exception
+  until the child is supervised; registry persistence happens outside that deferral window. A
+  failed termination becomes a persisted `stuck` state, is never
   automatically re-signalled by numeric PGID, and blocks only that lifecycle event until an operator
   terminates the residual tree; shutdown stays non-zero instead of silently leaving an untracked
   background `git push` or `gh` write alive.

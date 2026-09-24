@@ -211,6 +211,12 @@ _DISPATCH_REGISTRATION_DEPTH = 0
 _SHUTDOWN_SIGNAL_PENDING = False
 
 
+def _raise_if_shutdown_pending() -> None:
+    """Surface a deferred shutdown once the ownership-transfer window closes."""
+    if _SHUTDOWN_SIGNAL_PENDING and _DISPATCH_REGISTRATION_DEPTH == 0:
+        raise KeyboardInterrupt
+
+
 @contextmanager
 def _defer_shutdown_during_process_registration():
     """Defer the shutdown exception until a new child is supervised."""
@@ -220,8 +226,10 @@ def _defer_shutdown_during_process_registration():
         yield
     finally:
         _DISPATCH_REGISTRATION_DEPTH -= 1
-    if _SHUTDOWN_SIGNAL_PENDING and _DISPATCH_REGISTRATION_DEPTH == 0:
-        raise KeyboardInterrupt
+        # Keep this check inside finally: if spawn/adoption itself raises after
+        # a signal was deferred, shutdown must supersede that failure instead
+        # of leaving the pending flag set and swallowing every later signal.
+        _raise_if_shutdown_pending()
 
 
 @contextmanager
@@ -277,6 +285,23 @@ def log_dispatch_blocker(key: str, subject: str, reason: str):
             reason,
             level=logging.WARNING,
         )
+
+
+def log_item_config_blocker(
+    item_kind: str,
+    item_number: object,
+    lifecycle_version: str,
+    error: "SwarmPreflightConfigError",
+) -> None:
+    """Report an operator-repairable item blocker once per lifecycle and cause."""
+    log_blocker(
+        f"item-config:{item_kind}:{item_number}:{lifecycle_version}:{error}",
+        "%s #%s dispatch blocked by an operator-repairable configuration condition; "
+        "automatic retry remains enabled after repair: %s",
+        item_kind,
+        item_number,
+        error,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3169,6 +3194,9 @@ def _cleanup_failed_process(
         )
         active_entry = (proc, tracked)
         tracker._active[proc.pid] = active_entry
+        # Persist temporary RUNNING ownership before the bounded termination call.
+        # If this leader is killed during cleanup, the next run can still reconcile
+        # the process tree. Exactly one later save records removal or STUCK state.
         try:
             tracker._save_registry()
         except Exception:
@@ -3342,6 +3370,8 @@ def dispatch_worker(
             )
         if not isinstance(error, Exception):
             raise
+        if isinstance(error, SwarmPreflightConfigError):
+            raise
         if isinstance(error, FileNotFoundError) and argv:
             log.error("AI CLI '%s' not found in PATH. Is it installed?", argv[0])
         else:
@@ -3487,6 +3517,8 @@ def dispatch_reviewer(
             )
         if not isinstance(error, Exception):
             raise
+        if isinstance(error, SwarmPreflightConfigError):
+            raise
         if isinstance(error, FileNotFoundError) and argv:
             log.error("AI CLI '%s' not found in PATH. Is it installed?", argv[0])
         else:
@@ -3626,6 +3658,8 @@ def dispatch_maintainer(
                 "maintainer", maintainer, task_ref, "", argv, REPO_ROOT, log_path,
             )
         if not isinstance(error, Exception):
+            raise
+        if isinstance(error, SwarmPreflightConfigError):
             raise
         if isinstance(error, FileNotFoundError) and argv:
             log.error("AI CLI '%s' not found in PATH. Is it installed?", argv[0])
@@ -3813,6 +3847,8 @@ def dispatch_worker_revision(
             )
         if not isinstance(error, Exception):
             raise
+        if isinstance(error, SwarmPreflightConfigError):
+            raise
         if isinstance(error, FileNotFoundError) and argv:
             log.error("AI CLI '%s' not found in PATH. Is it installed?", argv[0])
         else:
@@ -3922,6 +3958,14 @@ def process_issues(
                 [raw],
                 prs,
                 pr_issue_numbers=pr_issue_numbers,
+            )
+        except SwarmPreflightConfigError as error:
+            failures += 1
+            log_item_config_blocker(
+                "Issue",
+                raw.get("number", "?"),
+                "initial",
+                error,
             )
         except Exception as error:
             failures += 1
@@ -4210,6 +4254,14 @@ def process_prs(
     for raw in prs:
         try:
             _process_pr_batch(dry_run, [raw], current_user=current_user)
+        except SwarmPreflightConfigError as error:
+            failures += 1
+            log_item_config_blocker(
+                "PR",
+                raw.get("number", "?"),
+                raw.get("headRefOid", "") or "initial",
+                error,
+            )
         except Exception as error:
             failures += 1
             log.error(
@@ -4374,8 +4426,7 @@ def _run_loop_impl(
             except Exception as e:
                 log.error("Error in polling cycle: %s", e, exc_info=True)
 
-            if _SHUTDOWN_SIGNAL_PENDING:
-                raise KeyboardInterrupt
+            _raise_if_shutdown_pending()
             log.info("Sleeping %ds...", interval)
             time.sleep(interval)
         except KeyboardInterrupt:
@@ -4404,6 +4455,7 @@ def _run_once_impl(dry_run: bool = False) -> int:
         log.info("Running single polling cycle...")
         sync_main_branch(dry_run)
         item_failures = process_polling_cycle(dry_run, initial=True)
+        _raise_if_shutdown_pending()
         try:
             if not dry_run:
                 tracker.poll_all()
@@ -4411,6 +4463,7 @@ def _run_once_impl(dry_run: bool = False) -> int:
             # A registry persistence error while harvesting a just-finished Maintainer must not
             # skip the one cleanup pass that can close its merged Issue in one-shot mode.
             cleanup_merged_prs(dry_run)
+        _raise_if_shutdown_pending()
         if item_failures:
             log.error("Single polling cycle completed with %d item failure(s).", item_failures)
             return 1

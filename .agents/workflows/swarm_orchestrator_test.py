@@ -432,6 +432,133 @@ class WorktreeSafetyTest(unittest.TestCase):
         self.assertEqual(attempt_tracker._active, {})
         kill_all.assert_called_once_with()
 
+    def test_once_signal_during_failed_spawn_is_not_lost(self):
+        handlers = {}
+        attempt_tracker = self.swarm.ProcessTracker.__new__(self.swarm.ProcessTracker)
+        attempt_tracker._active = {}
+        attempt_tracker._history = []
+        issue = self.swarm.TaskIssue(
+            number=99,
+            title="[Task] interrupted failed spawn",
+            body="",
+            worker=self.swarm.RoleAssignment("codex", "5.6", "high"),
+        )
+        output = MagicMock()
+        events = []
+
+        def install_handler(signum, handler):
+            handlers[signum] = handler
+
+        def fail_after_signal(*_args, **_kwargs):
+            handlers[self.swarm.signal.SIGTERM](self.swarm.signal.SIGTERM, None)
+            raise FileNotFoundError("codex not found")
+
+        def dispatch_cycle(*_args, **_kwargs):
+            events.append("dispatch")
+            self.swarm.dispatch_worker(issue, task_ref="issue#99:initial")
+            events.append("continued")
+
+        with (
+            patch.object(self.swarm, "tracker", attempt_tracker),
+            patch.object(attempt_tracker, "kill_all", return_value=True) as kill_all,
+            patch.object(self.swarm.signal, "signal", side_effect=install_handler),
+            patch.object(self.swarm, "sync_main_branch"),
+            patch.object(self.swarm, "process_polling_cycle", side_effect=dispatch_cycle),
+            patch.object(self.swarm, "create_worktree", return_value=self.repo),
+            patch.object(
+                self.swarm,
+                "write_prompt_file",
+                return_value=self.repo / "prompt.md",
+            ),
+            patch.object(
+                self.swarm,
+                "build_ai_argv",
+                return_value=(["codex", "exec"], False),
+            ),
+            patch.object(
+                self.swarm,
+                "create_log_files",
+                return_value=(self.repo / "worker.log", output, output),
+            ),
+            patch.object(self.swarm, "_spawn_ai_process", side_effect=fail_after_signal),
+            patch.object(self.swarm, "_record_failed_dispatch") as record_failure,
+        ):
+            result = self.swarm.run_once(dry_run=False)
+
+        self.assertEqual(result, 130)
+        self.assertEqual(events, ["dispatch"])
+        record_failure.assert_not_called()
+        kill_all.assert_called_once_with()
+        self.assertFalse(self.swarm._SHUTDOWN_SIGNAL_PENDING)
+        self.assertEqual(self.swarm._DISPATCH_REGISTRATION_DEPTH, 0)
+
+    def test_loop_signal_during_failed_spawn_stops_the_current_cycle(self):
+        handlers = {}
+        attempt_tracker = self.swarm.ProcessTracker.__new__(self.swarm.ProcessTracker)
+        attempt_tracker._active = {}
+        attempt_tracker._history = []
+        issue = self.swarm.TaskIssue(
+            number=99,
+            title="[Task] interrupted loop spawn",
+            body="",
+            worker=self.swarm.RoleAssignment("codex", "5.6", "high"),
+        )
+        output = MagicMock()
+        events = []
+
+        def install_handler(signum, handler):
+            handlers[signum] = handler
+
+        def fail_after_signal(*_args, **_kwargs):
+            handlers[self.swarm.signal.SIGTERM](self.swarm.signal.SIGTERM, None)
+            raise FileNotFoundError("codex not found")
+
+        def dispatch_cycle(*_args, **_kwargs):
+            events.append("dispatch")
+            self.swarm.dispatch_worker(issue, task_ref="issue#99:initial")
+            events.append("continued")
+
+        with (
+            patch.object(self.swarm, "tracker", attempt_tracker),
+            patch.object(attempt_tracker, "poll_all"),
+            patch.object(attempt_tracker, "kill_all", return_value=True) as kill_all,
+            patch.object(self.swarm.signal, "signal", side_effect=install_handler),
+            patch.object(self.swarm, "sync_main_branch"),
+            patch.object(self.swarm, "process_polling_cycle", side_effect=dispatch_cycle),
+            patch.object(self.swarm, "cleanup_merged_prs") as cleanup,
+            patch.object(self.swarm, "create_worktree", return_value=self.repo),
+            patch.object(
+                self.swarm,
+                "write_prompt_file",
+                return_value=self.repo / "prompt.md",
+            ),
+            patch.object(
+                self.swarm,
+                "build_ai_argv",
+                return_value=(["codex", "exec"], False),
+            ),
+            patch.object(
+                self.swarm,
+                "create_log_files",
+                return_value=(self.repo / "worker.log", output, output),
+            ),
+            patch.object(self.swarm, "_spawn_ai_process", side_effect=fail_after_signal),
+            patch.object(self.swarm, "_record_failed_dispatch") as record_failure,
+        ):
+            result = self.swarm.run_loop(
+                interval=30,
+                dry_run=False,
+                preflight_completed=True,
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(events, ["dispatch"])
+        cleanup.assert_not_called()
+        record_failure.assert_not_called()
+        kill_all.assert_called_once_with()
+        self.assertFalse(self.swarm._SHUTDOWN_SIGNAL_PENDING)
+        self.assertEqual(self.swarm._DISPATCH_REGISTRATION_DEPTH, 0)
+
     def test_registration_persistence_runs_outside_signal_deferral(self):
         attempt_tracker = self.swarm.ProcessTracker.__new__(self.swarm.ProcessTracker)
         attempt_tracker._active = {}
@@ -2406,6 +2533,44 @@ class WorktreeSafetyTest(unittest.TestCase):
         self.assertEqual(failures, 1)
         self.assertEqual(dispatch.call_count, 2)
 
+    def test_issue_config_blocker_logs_once_per_cause_without_traceback(self):
+        issue = {
+            "number": 99,
+            "title": "[Task] repair checkout",
+            "body": "[Worker: codex | Model: 5.6 | Reasoning: high]",
+        }
+        errors = [
+            self.swarm.SwarmPreflightConfigError("repair checkout"),
+            self.swarm.SwarmPreflightConfigError("repair checkout"),
+            self.swarm.SwarmPreflightConfigError("repair push target"),
+        ]
+        with (
+            patch.object(self.swarm, "_REPORTED_BLOCKERS", set()),
+            patch.object(
+                self.swarm.tracker,
+                "should_dispatch",
+                return_value=(True, "new event"),
+            ),
+            patch.object(self.swarm, "dispatch_worker", side_effect=errors) as dispatch,
+            patch.object(self.swarm.log, "log") as log_first,
+            patch.object(self.swarm.log, "debug") as log_repeat,
+            patch.object(self.swarm.log, "error") as log_traceback,
+        ):
+            failures = [
+                self.swarm.process_issues(open_issues=[issue], open_prs=[])
+                for _ in errors
+            ]
+
+        self.assertEqual(failures, [1, 1, 1])
+        self.assertEqual(dispatch.call_count, 3)
+        self.assertEqual(log_first.call_count, 2)
+        self.assertEqual(log_repeat.call_count, 1)
+        self.assertTrue(
+            all(call.args[0] == self.swarm.logging.ERROR for call in log_first.mock_calls)
+        )
+        self.assertIn("automatic retry remains enabled", repr(log_first.mock_calls))
+        log_traceback.assert_not_called()
+
     def test_prompt_setup_failure_consumes_retry_budget_without_skipping_later_items(self):
         issues = [
             {
@@ -2588,7 +2753,7 @@ class WorktreeSafetyTest(unittest.TestCase):
                 "write_prompt_file",
                 side_effect=self.swarm.SwarmPreflightConfigError("fix local Git config"),
             ),
-            patch.object(self.swarm.log, "error"),
+            patch.object(self.swarm.log, "error") as log_error,
         ):
             for dispatch, args, task_ref, role, assignment in cases:
                 with self.subTest(dispatch=dispatch.__name__):
@@ -2605,6 +2770,7 @@ class WorktreeSafetyTest(unittest.TestCase):
                     self.assertEqual(reason, "new event")
 
         self.assertEqual(attempt_tracker._history, [])
+        log_error.assert_not_called()
 
     def test_invalid_revision_head_never_consumes_dispatch_retry_budget(self):
         attempt_tracker = self.swarm.ProcessTracker.__new__(self.swarm.ProcessTracker)
@@ -2752,6 +2918,35 @@ class WorktreeSafetyTest(unittest.TestCase):
 
         self.assertEqual(failures, 1)
         self.assertEqual(dispatch.call_count, 2)
+
+    def test_pr_config_blocker_logs_once_without_traceback(self):
+        pr = {
+            "number": 101,
+            "title": "[PR] 99 - repair checkout",
+            "headRefOid": "a" * 40,
+        }
+        error = self.swarm.SwarmPreflightConfigError("repair checkout")
+        with (
+            patch.object(self.swarm, "_REPORTED_BLOCKERS", set()),
+            patch.object(self.swarm, "get_gh_user", return_value="alice"),
+            patch.object(
+                self.swarm,
+                "_process_pr_batch",
+                side_effect=[error, error],
+            ) as process,
+            patch.object(self.swarm.log, "log") as log_first,
+            patch.object(self.swarm.log, "debug") as log_repeat,
+            patch.object(self.swarm.log, "error") as log_traceback,
+        ):
+            first = self.swarm.process_prs(open_prs=[pr])
+            second = self.swarm.process_prs(open_prs=[pr])
+
+        self.assertEqual((first, second), (1, 1))
+        self.assertEqual(process.call_count, 2)
+        log_first.assert_called_once()
+        log_repeat.assert_called_once()
+        self.assertIn("automatic retry remains enabled", repr(log_first.mock_calls))
+        log_traceback.assert_not_called()
 
     def test_pr_user_lookup_failure_fails_once_closed(self):
         prs = [{"number": 7, "title": "[PR] 7 - change"}]
@@ -2952,10 +3147,23 @@ class WorktreeSafetyTest(unittest.TestCase):
         attempt_tracker._history = []
         process = MagicMock(pid=4321, returncode=1)
         assignment = self.swarm.RoleAssignment("codex", "5.6", "high")
+        registry_snapshots = []
+
+        def capture_registry_snapshot():
+            registry_snapshots.append(
+                {
+                    pid: tracked.status
+                    for pid, (_, tracked) in attempt_tracker._active.items()
+                }
+            )
 
         with (
             patch.object(self.swarm, "tracker", attempt_tracker),
-            patch.object(attempt_tracker, "_save_registry") as save,
+            patch.object(
+                attempt_tracker,
+                "_save_registry",
+                side_effect=capture_registry_snapshot,
+            ) as save,
             patch.object(self.swarm, "terminate_process_group", return_value=False),
             patch.object(self.swarm.log, "error") as log_error,
         ):
@@ -2976,7 +3184,14 @@ class WorktreeSafetyTest(unittest.TestCase):
         self.assertEqual(tracked.status, self.swarm.ProcessStatus.STUCK)
         self.assertEqual(tracked.failure_reason, self.swarm.DISPATCH_RESIDUAL)
         self.assertEqual(tracked.task_ref, "issue#99:initial")
-        self.assertGreaterEqual(save.call_count, 2)
+        self.assertEqual(save.call_count, 2)
+        self.assertEqual(
+            registry_snapshots,
+            [
+                {4321: self.swarm.ProcessStatus.RUNNING},
+                {4321: self.swarm.ProcessStatus.STUCK},
+            ],
+        )
         self.assertIn("under supervision", repr(log_error.mock_calls))
 
     def test_event_deferrals_are_bounded_but_provider_cooldowns_are_not(self):

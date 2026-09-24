@@ -224,15 +224,19 @@ Polling isolates each Issue and PR: a broken worktree, prompt/log write, or othe
 does not skip later items or merged-task cleanup. An authenticated-user lookup failure fails its PR
 batch closed, and `--once` exits non-zero if any item failed. Every selected non-preflight setup or
 launch failure before successful registration consumes the bounded retry budget. Typed preflight
-and local-configuration blockers remain retryable after repair; provider-wide quota cooldowns stay
-exempt, while repeated event-local
+and local-configuration blockers remain retryable after repair; the latter log once per lifecycle
+and cause at error level and then at debug level instead of repeating a traceback every cycle.
+Provider-wide quota cooldowns stay exempt, while repeated event-local
 timeouts do not retry forever. The process registry is replaced atomically. Each agent requires an
 isolated POSIX process group, so unsupported platforms fail before the write preflight or runtime
 file creation. Normal leader exit as well as shutdown signals eligible groups in a batch and removes
 residual descendants within a shared bounded cleanup deadline plus one shared forced-exit grace.
 Polling and `--once` use the same signal controller. A shutdown signal during spawn-to-in-memory-
-adoption ownership transfer defers its exception until the child is supervised, while registry
-persistence remains outside that deferral window. A tree that cannot be stopped is persisted as
+adoption ownership transfer defers its exception until the child is supervised even if spawn or
+adoption raises, and both modes stop before later lifecycle work. Registry persistence remains
+outside that deferral window. When a failed dispatch exposes an unregistered child, its temporary
+running ownership is persisted before bounded termination for hard-crash recovery, followed by one
+final removal-or-stuck save, for at most two atomic writes. A tree that cannot be stopped is persisted as
 `stuck`, is not repeatedly signalled by numeric PGID, and blocks that lifecycle event until an
 operator removes it; shutdown also remains non-zero.
 

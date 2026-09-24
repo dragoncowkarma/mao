@@ -421,14 +421,20 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   when any item failed. Every selected non-preflight setup or launch failure before successful
   registration consumes the same bounded per-event retry budget as a child crash. Typed preflight
   and local-configuration blockers stay retryable after the operator fixes them, and provider-wide
-  cooldowns remain exempt.
-  Registry updates use same-directory atomic replacement. Dispatched agents
+  cooldowns remain exempt. Repeated local-configuration blockers are logged at error level only
+  once per lifecycle and cause, then at debug level, so an operator-repairable state does not emit
+  a traceback on every polling cycle.
+  Registry updates use same-directory atomic replacement. A child discovered only while unwinding
+  a failed dispatch is first persisted as running before bounded termination, so a hard leader crash
+  remains recoverable, and then persisted once more as removed or stuck; this fallback performs at
+  most two atomic writes. Dispatched agents
   require isolated POSIX process groups; unsupported platforms fail before the write preflight or
   runtime-file creation. Shutdown and normal leader exit signal all eligible process groups in a
   batch, then terminate residual descendants within one shared supervision deadline and one shared
   forced-exit grace. Polling and `--once` share the same signal controller. A shutdown signal
   arriving during the narrow spawn-to-in-memory-adoption ownership transfer defers its exception
-  until the child is supervised; registry persistence happens outside that deferral window. A
+  until the child is supervised, even when spawn or adoption raises; both modes stop before any
+  later lifecycle work. Registry persistence happens outside that deferral window. A
   failed termination becomes a persisted `stuck` state, is never
   automatically re-signalled by numeric PGID, and blocks only that lifecycle event until an operator
   terminates the residual tree; shutdown stays non-zero instead of silently leaving an untracked

@@ -419,11 +419,12 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   One malformed task is isolated from later Issues, PRs, and merged-task cleanup; a failed
   authenticated-user lookup also fails the affected PR batch closed, and `--once` exits non-zero
   when any item failed. Every selected non-preflight setup or launch failure before successful
-  registration consumes the same bounded per-event retry budget as a child crash. Typed preflight
-  and local-configuration blockers stay retryable after the operator fixes them, and provider-wide
-  cooldowns remain exempt. Repeated local-configuration blockers are logged at error level only
-  once per lifecycle and cause, then at debug level, so an operator-repairable state does not emit
-  a traceback on every polling cycle.
+  registration consumes the same bounded per-event retry budget as a child crash. Per-item typed
+  preflight blockers, whether configuration or transient, stay retryable, and provider-wide
+  cooldowns remain exempt. Their dedup keys contain the item lifecycle and exception class, never
+  the full error message: the first occurrence logs at error level and uninterrupted repeats log at
+  debug without a traceback. A successful dispatch clears that item's preflight keys so the same
+  class recurring after recovery is reported at error level again.
   Registry updates use same-directory atomic replacement. A child discovered only while unwinding
   a failed dispatch is first persisted as running before bounded termination, so a hard leader crash
   remains recoverable, and then persisted once more as removed or stuck; this fallback performs at

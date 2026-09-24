@@ -223,9 +223,11 @@ offline. `--dry-run` resolves and binds the local origin so its reads cannot dri
 Polling isolates each Issue and PR: a broken worktree, prompt/log write, or other per-item failure
 does not skip later items or merged-task cleanup. An authenticated-user lookup failure fails its PR
 batch closed, and `--once` exits non-zero if any item failed. Every selected non-preflight setup or
-launch failure before successful registration consumes the bounded retry budget. Typed preflight
-and local-configuration blockers remain retryable after repair; the latter log once per lifecycle
-and cause at error level and then at debug level instead of repeating a traceback every cycle.
+launch failure before successful registration consumes the bounded retry budget. Per-item typed
+preflight blockers, whether configuration or transient, remain retryable. Their bounded dedup key
+uses the item lifecycle and exception class rather than the full error text; the first occurrence
+logs at error level, uninterrupted repeats log at debug without a traceback, and a successful
+dispatch clears the key so a later recurrence is reported at error level again.
 Provider-wide quota cooldowns stay exempt, while repeated event-local
 timeouts do not retry forever. The process registry is replaced atomically. Each agent requires an
 isolated POSIX process group, so unsupported platforms fail before the write preflight or runtime

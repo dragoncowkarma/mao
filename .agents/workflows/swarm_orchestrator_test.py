@@ -2533,7 +2533,52 @@ class WorktreeSafetyTest(unittest.TestCase):
         self.assertEqual(failures, 1)
         self.assertEqual(dispatch.call_count, 2)
 
-    def test_issue_config_blocker_logs_once_per_cause_without_traceback(self):
+    def test_issue_preflight_blocker_uses_bounded_type_key_without_traceback(self):
+        issue = {
+            "number": 99,
+            "title": "[Task] repair checkout",
+            "body": "[Worker: codex | Model: 5.6 | Reasoning: high]",
+        }
+        reported = set()
+        errors = [
+            self.swarm.SwarmPreflightConfigError("repair /tmp/checkout-1"),
+            self.swarm.SwarmPreflightConfigError("repair /tmp/checkout-2"),
+            self.swarm.SwarmPreflightConfigError("repair /tmp/checkout-3"),
+        ]
+        with (
+            patch.object(self.swarm, "_REPORTED_BLOCKERS", reported),
+            patch.object(
+                self.swarm.tracker,
+                "should_dispatch",
+                return_value=(True, "new event"),
+            ),
+            patch.object(self.swarm, "dispatch_worker", side_effect=errors) as dispatch,
+            patch.object(self.swarm.log, "log") as log_first,
+            patch.object(self.swarm.log, "debug") as log_repeat,
+            patch.object(self.swarm.log, "error") as log_traceback,
+        ):
+            failures = [
+                self.swarm.process_issues(open_issues=[issue], open_prs=[])
+                for _ in errors
+            ]
+
+        self.assertEqual(failures, [1, 1, 1])
+        self.assertEqual(dispatch.call_count, 3)
+        log_first.assert_called_once()
+        self.assertEqual(log_repeat.call_count, 2)
+        self.assertEqual(log_first.call_args.args[0], self.swarm.logging.ERROR)
+        self.assertEqual(
+            reported,
+            {
+                "item-preflight:Issue:99:initial:"
+                "SwarmPreflightConfigError",
+            },
+        )
+        self.assertNotIn("checkout-", repr(reported))
+        self.assertIn("automatic retry remains enabled", repr(log_first.mock_calls))
+        log_traceback.assert_not_called()
+
+    def test_issue_preflight_blocker_relogs_after_successful_dispatch(self):
         issue = {
             "number": 99,
             "title": "[Task] repair checkout",
@@ -2541,8 +2586,8 @@ class WorktreeSafetyTest(unittest.TestCase):
         }
         errors = [
             self.swarm.SwarmPreflightConfigError("repair checkout"),
+            None,
             self.swarm.SwarmPreflightConfigError("repair checkout"),
-            self.swarm.SwarmPreflightConfigError("repair push target"),
         ]
         with (
             patch.object(self.swarm, "_REPORTED_BLOCKERS", set()),
@@ -2561,14 +2606,10 @@ class WorktreeSafetyTest(unittest.TestCase):
                 for _ in errors
             ]
 
-        self.assertEqual(failures, [1, 1, 1])
+        self.assertEqual(failures, [1, 0, 1])
         self.assertEqual(dispatch.call_count, 3)
         self.assertEqual(log_first.call_count, 2)
-        self.assertEqual(log_repeat.call_count, 1)
-        self.assertTrue(
-            all(call.args[0] == self.swarm.logging.ERROR for call in log_first.mock_calls)
-        )
-        self.assertIn("automatic retry remains enabled", repr(log_first.mock_calls))
+        log_repeat.assert_not_called()
         log_traceback.assert_not_called()
 
     def test_prompt_setup_failure_consumes_retry_budget_without_skipping_later_items(self):
@@ -2794,7 +2835,7 @@ class WorktreeSafetyTest(unittest.TestCase):
         with (
             patch.object(self.swarm, "tracker", attempt_tracker),
             patch.object(attempt_tracker, "_save_registry"),
-            patch.object(self.swarm.log, "error"),
+            patch.object(self.swarm.log, "error") as log_error,
         ):
             for _ in range(self.swarm.MAX_DISPATCH_ATTEMPTS):
                 with self.assertRaises(self.swarm.SwarmPreflightTransientError):
@@ -2814,6 +2855,7 @@ class WorktreeSafetyTest(unittest.TestCase):
         self.assertTrue(allowed)
         self.assertEqual(reason, "new event")
         self.assertEqual(attempt_tracker._history, [])
+        log_error.assert_not_called()
 
     def test_preserved_revision_worktree_never_consumes_dispatch_retry_budget(self):
         attempt_tracker = self.swarm.ProcessTracker.__new__(self.swarm.ProcessTracker)
@@ -2919,13 +2961,15 @@ class WorktreeSafetyTest(unittest.TestCase):
         self.assertEqual(failures, 1)
         self.assertEqual(dispatch.call_count, 2)
 
-    def test_pr_config_blocker_logs_once_without_traceback(self):
+    def test_pr_transient_blocker_logs_once_without_traceback(self):
         pr = {
             "number": 101,
             "title": "[PR] 99 - repair checkout",
             "headRefOid": "a" * 40,
         }
-        error = self.swarm.SwarmPreflightConfigError("repair checkout")
+        error = self.swarm.SwarmPreflightTransientError(
+            "PR #101's head changed; retry the next cycle",
+        )
         with (
             patch.object(self.swarm, "_REPORTED_BLOCKERS", set()),
             patch.object(self.swarm, "get_gh_user", return_value="alice"),

@@ -287,17 +287,47 @@ def log_dispatch_blocker(key: str, subject: str, reason: str):
         )
 
 
-def log_item_config_blocker(
+def _item_preflight_blocker_prefix(
     item_kind: str,
     item_number: object,
     lifecycle_version: str,
-    error: "SwarmPreflightConfigError",
+) -> str:
+    """Return the bounded, message-independent namespace for one item lifecycle."""
+    return f"item-preflight:{item_kind}:{item_number}:{lifecycle_version}:"
+
+
+def clear_item_preflight_blockers(
+    item_kind: str,
+    item_number: object,
+    lifecycle_version: str,
 ) -> None:
-    """Report an operator-repairable item blocker once per lifecycle and cause."""
+    """Let a repaired item report the same preflight class if it later recurs."""
+    prefix = _item_preflight_blocker_prefix(
+        item_kind,
+        item_number,
+        lifecycle_version,
+    )
+    _REPORTED_BLOCKERS.difference_update(
+        key for key in tuple(_REPORTED_BLOCKERS) if key.startswith(prefix)
+    )
+
+
+def log_item_preflight_blocker(
+    item_kind: str,
+    item_number: object,
+    lifecycle_version: str,
+    error: "SwarmPreflightError",
+) -> None:
+    """Report one typed preflight blocker per uninterrupted blocked lifecycle."""
     log_blocker(
-        f"item-config:{item_kind}:{item_number}:{lifecycle_version}:{error}",
-        "%s #%s dispatch blocked by an operator-repairable configuration condition; "
-        "automatic retry remains enabled after repair: %s",
+        _item_preflight_blocker_prefix(
+            item_kind,
+            item_number,
+            lifecycle_version,
+        )
+        + type(error).__name__,
+        "%s #%s dispatch blocked by a retryable preflight condition; automatic retry "
+        "remains enabled: %s",
         item_kind,
         item_number,
         error,
@@ -3370,7 +3400,7 @@ def dispatch_worker(
             )
         if not isinstance(error, Exception):
             raise
-        if isinstance(error, SwarmPreflightConfigError):
+        if isinstance(error, SwarmPreflightError):
             raise
         if isinstance(error, FileNotFoundError) and argv:
             log.error("AI CLI '%s' not found in PATH. Is it installed?", argv[0])
@@ -3517,7 +3547,7 @@ def dispatch_reviewer(
             )
         if not isinstance(error, Exception):
             raise
-        if isinstance(error, SwarmPreflightConfigError):
+        if isinstance(error, SwarmPreflightError):
             raise
         if isinstance(error, FileNotFoundError) and argv:
             log.error("AI CLI '%s' not found in PATH. Is it installed?", argv[0])
@@ -3659,7 +3689,7 @@ def dispatch_maintainer(
             )
         if not isinstance(error, Exception):
             raise
-        if isinstance(error, SwarmPreflightConfigError):
+        if isinstance(error, SwarmPreflightError):
             raise
         if isinstance(error, FileNotFoundError) and argv:
             log.error("AI CLI '%s' not found in PATH. Is it installed?", argv[0])
@@ -3847,7 +3877,7 @@ def dispatch_worker_revision(
             )
         if not isinstance(error, Exception):
             raise
-        if isinstance(error, SwarmPreflightConfigError):
+        if isinstance(error, SwarmPreflightError):
             raise
         if isinstance(error, FileNotFoundError) and argv:
             log.error("AI CLI '%s' not found in PATH. Is it installed?", argv[0])
@@ -3935,6 +3965,7 @@ def _process_issue_batch(
             num, reason, issue.title,
         )
         dispatch_worker(issue, dry_run, task_ref=task_ref)
+        clear_item_preflight_blockers("Issue", num, "initial")
 
 
 def process_issues(
@@ -3952,6 +3983,8 @@ def process_issues(
     }
     failures = 0
     for raw in issues:
+        item_number = raw.get("number", "?")
+        lifecycle_version = "initial"
         try:
             _process_issue_batch(
                 dry_run,
@@ -3959,12 +3992,12 @@ def process_issues(
                 prs,
                 pr_issue_numbers=pr_issue_numbers,
             )
-        except SwarmPreflightConfigError as error:
+        except SwarmPreflightError as error:
             failures += 1
-            log_item_config_blocker(
+            log_item_preflight_blocker(
                 "Issue",
-                raw.get("number", "?"),
-                "initial",
+                item_number,
+                lifecycle_version,
                 error,
             )
         except Exception as error:
@@ -4121,6 +4154,7 @@ def _process_pr_batch(
                 dry_run,
                 task_ref=task_ref,
             )
+            clear_item_preflight_blockers("PR", pr_num, head_sha or "initial")
             continue
 
         valid, why = validate_distinct_roles(worker, reviewer)
@@ -4193,6 +4227,7 @@ def _process_pr_batch(
                 task_ref=task_ref,
                 trigger=review_trigger,
             )
+            clear_item_preflight_blockers("PR", pr_num, head_sha or "initial")
             continue
 
         task_ref = f"revise#{pr_num}-{signal_id}"
@@ -4233,6 +4268,7 @@ def _process_pr_batch(
             dry_run,
             task_ref=task_ref,
         )
+        clear_item_preflight_blockers("PR", pr_num, head_sha or "initial")
 
 
 def process_prs(
@@ -4252,14 +4288,16 @@ def process_prs(
         return len(prs)
     failures = 0
     for raw in prs:
+        item_number = raw.get("number", "?")
+        lifecycle_version = raw.get("headRefOid", "") or "initial"
         try:
             _process_pr_batch(dry_run, [raw], current_user=current_user)
-        except SwarmPreflightConfigError as error:
+        except SwarmPreflightError as error:
             failures += 1
-            log_item_config_blocker(
+            log_item_preflight_blocker(
                 "PR",
-                raw.get("number", "?"),
-                raw.get("headRefOid", "") or "initial",
+                item_number,
+                lifecycle_version,
                 error,
             )
         except Exception as error:

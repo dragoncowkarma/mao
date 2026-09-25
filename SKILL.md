@@ -225,9 +225,10 @@ does not skip later items or merged-task cleanup. An authenticated-user lookup f
 batch closed, and `--once` exits non-zero if any item failed. Every selected non-preflight setup or
 launch failure before successful registration consumes the bounded retry budget. Per-item typed
 preflight blockers, whether configuration or transient, remain retryable. Their bounded dedup key
-uses the item lifecycle and exception class rather than the full error text; the first occurrence
-logs at error level, uninterrupted repeats log at debug without a traceback, and a successful
-dispatch clears the key so a later recurrence is reported at error level again.
+uses the item lifecycle, exception class, and finite cause code (normally its source site) rather
+than the full error text; the first occurrence of each cause logs at error level, uninterrupted
+repeats log at debug without a traceback, and any clean item processing pass clears the keys so a
+later recurrence is reported at error level again even when the item no longer needs dispatch.
 Provider-wide quota cooldowns stay exempt, while repeated event-local
 timeouts do not retry forever. The process registry is replaced atomically. Each agent requires an
 isolated POSIX process group, so unsupported platforms fail before the write preflight or runtime

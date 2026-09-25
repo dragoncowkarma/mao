@@ -14,6 +14,7 @@ Requires: Python 3, authenticated gh CLI, git, and at least one AI CLI installed
 """
 
 import argparse
+import inspect
 import json
 import logging
 import logging.handlers
@@ -301,7 +302,7 @@ def clear_item_preflight_blockers(
     item_number: object,
     lifecycle_version: str,
 ) -> None:
-    """Let a repaired item report the same preflight class if it later recurs."""
+    """Let a cleanly processed item report a preflight cause if it later recurs."""
     prefix = _item_preflight_blocker_prefix(
         item_kind,
         item_number,
@@ -325,7 +326,7 @@ def log_item_preflight_blocker(
             item_number,
             lifecycle_version,
         )
-        + type(error).__name__,
+        + f"{type(error).__name__}:{error.reason_code}",
         "%s #%s dispatch blocked by a retryable preflight condition; automatic retry "
         "remains enabled: %s",
         item_kind,
@@ -418,7 +419,28 @@ class GitHubRepoTarget:
 
 
 class SwarmPreflightError(RuntimeError):
-    """Base class for safe, operator-facing write-preflight failures."""
+    """Base preflight failure with a finite reason identifier."""
+
+    def __init__(self, message: str, *, reason_code: Optional[str] = None):
+        super().__init__(message)
+        if reason_code is not None:
+            self.reason_code = reason_code
+            return
+
+        # Blocker state is process-local, so a constructor call site's function and
+        # line form a stable identifier for this running version without retaining
+        # variable paths, repository names, or other message details in the key.
+        frame = inspect.currentframe()
+        caller = frame.f_back if frame is not None else None
+        try:
+            self.reason_code = (
+                f"{caller.f_code.co_name}:{caller.f_lineno}"
+                if caller is not None
+                else type(self).__name__
+            )
+        finally:
+            del caller
+            del frame
 
 
 class SwarmCapabilityError(SwarmPreflightError):
@@ -426,7 +448,10 @@ class SwarmCapabilityError(SwarmPreflightError):
 
     def __init__(self, capability: RepoWorkflowCapability):
         self.capability = capability
-        super().__init__(describe_repo_workflow_capability(capability))
+        super().__init__(
+            describe_repo_workflow_capability(capability),
+            reason_code=f"capability:{','.join(capability.gaps)}",
+        )
 
 
 class SwarmPreflightTransientError(SwarmPreflightError):
@@ -3965,7 +3990,6 @@ def _process_issue_batch(
             num, reason, issue.title,
         )
         dispatch_worker(issue, dry_run, task_ref=task_ref)
-        clear_item_preflight_blockers("Issue", num, "initial")
 
 
 def process_issues(
@@ -3991,6 +4015,11 @@ def process_issues(
                 [raw],
                 prs,
                 pr_issue_numbers=pr_issue_numbers,
+            )
+            clear_item_preflight_blockers(
+                "Issue",
+                item_number,
+                lifecycle_version,
             )
         except SwarmPreflightError as error:
             failures += 1
@@ -4154,7 +4183,6 @@ def _process_pr_batch(
                 dry_run,
                 task_ref=task_ref,
             )
-            clear_item_preflight_blockers("PR", pr_num, head_sha or "initial")
             continue
 
         valid, why = validate_distinct_roles(worker, reviewer)
@@ -4227,7 +4255,6 @@ def _process_pr_batch(
                 task_ref=task_ref,
                 trigger=review_trigger,
             )
-            clear_item_preflight_blockers("PR", pr_num, head_sha or "initial")
             continue
 
         task_ref = f"revise#{pr_num}-{signal_id}"
@@ -4268,7 +4295,6 @@ def _process_pr_batch(
             dry_run,
             task_ref=task_ref,
         )
-        clear_item_preflight_blockers("PR", pr_num, head_sha or "initial")
 
 
 def process_prs(
@@ -4292,6 +4318,11 @@ def process_prs(
         lifecycle_version = raw.get("headRefOid", "") or "initial"
         try:
             _process_pr_batch(dry_run, [raw], current_user=current_user)
+            clear_item_preflight_blockers(
+                "PR",
+                item_number,
+                lifecycle_version,
+            )
         except SwarmPreflightError as error:
             failures += 1
             log_item_preflight_blocker(

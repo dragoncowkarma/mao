@@ -2533,17 +2533,21 @@ class WorktreeSafetyTest(unittest.TestCase):
         self.assertEqual(failures, 1)
         self.assertEqual(dispatch.call_count, 2)
 
-    def test_issue_preflight_blocker_uses_bounded_type_key_without_traceback(self):
+    def test_issue_preflight_blocker_uses_bounded_reason_key_without_traceback(self):
         issue = {
             "number": 99,
             "title": "[Task] repair checkout",
             "body": "[Worker: codex | Model: 5.6 | Reasoning: high]",
         }
+
+        def config_error(path):
+            return self.swarm.SwarmPreflightConfigError(f"repair {path}")
+
         reported = set()
         errors = [
-            self.swarm.SwarmPreflightConfigError("repair /tmp/checkout-1"),
-            self.swarm.SwarmPreflightConfigError("repair /tmp/checkout-2"),
-            self.swarm.SwarmPreflightConfigError("repair /tmp/checkout-3"),
+            config_error("/tmp/checkout-1"),
+            config_error("/tmp/checkout-2"),
+            config_error("/tmp/checkout-3"),
         ]
         with (
             patch.object(self.swarm, "_REPORTED_BLOCKERS", reported),
@@ -2571,26 +2575,30 @@ class WorktreeSafetyTest(unittest.TestCase):
             reported,
             {
                 "item-preflight:Issue:99:initial:"
-                "SwarmPreflightConfigError",
+                f"SwarmPreflightConfigError:{errors[0].reason_code}",
             },
         )
         self.assertNotIn("checkout-", repr(reported))
         self.assertIn("automatic retry remains enabled", repr(log_first.mock_calls))
         log_traceback.assert_not_called()
 
-    def test_issue_preflight_blocker_relogs_after_successful_dispatch(self):
+    def test_issue_preflight_blocker_distinguishes_source_reasons(self):
         issue = {
             "number": 99,
             "title": "[Task] repair checkout",
             "body": "[Worker: codex | Model: 5.6 | Reasoning: high]",
         }
-        errors = [
-            self.swarm.SwarmPreflightConfigError("repair checkout"),
-            None,
-            self.swarm.SwarmPreflightConfigError("repair checkout"),
-        ]
+
+        def symlink_error():
+            return self.swarm.SwarmPreflightConfigError("refusing symlink")
+
+        def branch_error():
+            return self.swarm.SwarmPreflightConfigError("branch already checked out")
+
+        errors = [symlink_error(), symlink_error(), branch_error()]
+        reported = set()
         with (
-            patch.object(self.swarm, "_REPORTED_BLOCKERS", set()),
+            patch.object(self.swarm, "_REPORTED_BLOCKERS", reported),
             patch.object(
                 self.swarm.tracker,
                 "should_dispatch",
@@ -2606,8 +2614,52 @@ class WorktreeSafetyTest(unittest.TestCase):
                 for _ in errors
             ]
 
-        self.assertEqual(failures, [1, 0, 1])
+        self.assertNotEqual(errors[0].reason_code, errors[2].reason_code)
+        self.assertEqual(failures, [1, 1, 1])
         self.assertEqual(dispatch.call_count, 3)
+        self.assertEqual(log_first.call_count, 2)
+        log_repeat.assert_called_once()
+        self.assertEqual(len(reported), 2)
+        log_traceback.assert_not_called()
+
+    def test_issue_preflight_blocker_relogs_after_clean_nondispatch_cycle(self):
+        issue = {
+            "number": 99,
+            "title": "[Task] repair checkout",
+            "body": "[Worker: codex | Model: 5.6 | Reasoning: high]",
+        }
+
+        def config_error():
+            return self.swarm.SwarmPreflightConfigError("repair checkout")
+
+        errors = [
+            config_error(),
+            config_error(),
+        ]
+        reported = set()
+        with (
+            patch.object(self.swarm, "_REPORTED_BLOCKERS", reported),
+            patch.object(
+                self.swarm.tracker,
+                "should_dispatch",
+                return_value=(True, "new event"),
+            ),
+            patch.object(self.swarm, "dispatch_worker", side_effect=errors) as dispatch,
+            patch.object(self.swarm.log, "log") as log_first,
+            patch.object(self.swarm.log, "debug") as log_repeat,
+            patch.object(self.swarm.log, "error") as log_traceback,
+        ):
+            first = self.swarm.process_issues(open_issues=[issue], open_prs=[])
+            self.assertEqual(len(reported), 1)
+            clean = self.swarm.process_issues(
+                open_issues=[issue],
+                open_prs=[{"title": "[PR] 99 - repair checkout"}],
+            )
+            self.assertEqual(reported, set())
+            recurring = self.swarm.process_issues(open_issues=[issue], open_prs=[])
+
+        self.assertEqual((first, clean, recurring), (1, 0, 1))
+        self.assertEqual(dispatch.call_count, 2)
         self.assertEqual(log_first.call_count, 2)
         log_repeat.assert_not_called()
         log_traceback.assert_not_called()

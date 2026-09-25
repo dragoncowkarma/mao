@@ -421,10 +421,11 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   when any item failed. Every selected non-preflight setup or launch failure before successful
   registration consumes the same bounded per-event retry budget as a child crash. Per-item typed
   preflight blockers, whether configuration or transient, stay retryable, and provider-wide
-  cooldowns remain exempt. Their dedup keys contain the item lifecycle and exception class, never
-  the full error message: the first occurrence logs at error level and uninterrupted repeats log at
-  debug without a traceback. A successful dispatch clears that item's preflight keys so the same
-  class recurring after recovery is reported at error level again.
+  cooldowns remain exempt. Their dedup keys contain the item lifecycle, exception class, and a
+  finite cause code (normally its source site), never the full error message: the first occurrence
+  of each cause logs at error level and uninterrupted repeats log at debug without a traceback. Any
+  clean item processing pass clears its preflight keys, including when the item no longer needs
+  dispatch, so a later recurrence is reported at error level again.
   Registry updates use same-directory atomic replacement. A child discovered only while unwinding
   a failed dispatch is first persisted as running before bounded termination, so a hard leader crash
   remains recoverable, and then persisted once more as removed or stuck; this fallback performs at

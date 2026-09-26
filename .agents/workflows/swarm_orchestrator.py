@@ -115,10 +115,16 @@ DISPATCH_COMPLETED = "already completed"
 DISPATCH_UNCONFIRMED = "completed without confirmed lifecycle transition"
 DISPATCH_PROVIDER_COOLDOWN = "provider cooldown"
 
-# Recent diagnostic history budget. Records that still carry dispatch authority
-# (completed/running/stuck events, retry counts, and provider cooldowns) survive
-# compaction even when that makes the registry exceed this soft limit.
+# Hard cap for recent diagnostic records. Dispatch authority is persisted
+# separately as one current lifecycle state per Issue/PR, so retaining it never
+# turns this history budget back into an unbounded registry.
 MAX_HISTORY_RECORDS = 500
+
+# One current lifecycle event can exist for every Issue and PR returned by the
+# bounded GitHub scans. The extra diagnostic-sized margin accommodates supervised
+# processes whose item closed while the child was still running.
+MAX_LIFECYCLE_STATES = OPEN_ITEMS_LIMIT * 2 + MAX_HISTORY_RECORDS
+MAX_PROVIDER_COOLDOWNS = MAX_LIFECYCLE_STATES
 
 # Metadata tag patterns
 WORKER_PATTERN = re.compile(
@@ -486,6 +492,14 @@ class TrackedProcess:
     defer_scope: Optional[str] = None
 
 
+@dataclass
+class LifecycleState:
+    """Minimal dispatch authority for the current event of one Issue or PR."""
+    record: TrackedProcess
+    failure_count: int = 0
+    last_observed_at: str = ""
+
+
 def _process_group_exists(process_group_id: int) -> bool:
     """Return whether a POSIX process group still has at least one member."""
     try:
@@ -605,12 +619,15 @@ class ProcessTracker:
     def __init__(self):
         self._active: dict[int, tuple[subprocess.Popen, TrackedProcess]] = {}
         self._history: list[TrackedProcess] = []
+        self._lifecycle_states: dict[str, LifecycleState] = {}
+        self._provider_cooldowns: dict[str, str] = {}
         self._load_registry()
 
     # --- Persistence ---
 
     def _load_registry(self):
         """Load previous process history from disk (for --status across runs)."""
+        data = None
         if PROCESS_REGISTRY_FILE.exists():
             try:
                 with open(PROCESS_REGISTRY_FILE) as f:
@@ -643,8 +660,27 @@ class ProcessTracker:
                                 len(entries),
                                 len(entries) - skipped,
                             )
-        self._reconcile_orphans()
         self._reclassify_deferred_failures()
+
+        loaded_lifecycle_states = False
+        if isinstance(data, dict) and "lifecycle_states" in data:
+            loaded_lifecycle_states = self._load_lifecycle_states(
+                data.get("lifecycle_states"),
+            )
+        if not loaded_lifecycle_states:
+            self._rebuild_lifecycle_states_from_history()
+
+        if isinstance(data, dict):
+            cooldowns = data.get("provider_cooldowns", {})
+            if isinstance(cooldowns, dict):
+                for ai_name, retry_after in cooldowns.items():
+                    if isinstance(ai_name, str) and isinstance(retry_after, str):
+                        self._remember_provider_cooldown(ai_name, retry_after)
+
+        self._reconcile_orphans()
+        self._compact_history()
+        self._compact_lifecycle_states()
+        self._compact_provider_cooldowns()
 
     def _reclassify_deferred_failures(self):
         """Upgrade historical transient failures so a restart can recover them."""
@@ -660,6 +696,132 @@ class ProcessTracker:
             record.retry_after = retry_after
             record.defer_scope = self._defer_scope(output_tail)
 
+    @staticmethod
+    def _lifecycle_item_key(task_ref: str) -> str:
+        """Map versioned event refs onto the one Issue/PR whose state they advance."""
+        match = re.match(r"^(issue|review|maintain|revise)#(\d+)", task_ref)
+        if not match:
+            return f"event:{task_ref}"
+        item_kind = "issue" if match.group(1) == "issue" else "pr"
+        return f"{item_kind}#{match.group(2)}"
+
+    @staticmethod
+    def _record_timestamp(record: TrackedProcess) -> str:
+        return record.ended_at or record.started_at
+
+    def _ensure_lifecycle_storage(self) -> None:
+        """Support focused tests that construct a tracker without __init__()."""
+        if not hasattr(self, "_lifecycle_states"):
+            self._lifecycle_states = {}
+            self._provider_cooldowns = {}
+            self._rebuild_lifecycle_states_from_history()
+        elif not hasattr(self, "_provider_cooldowns"):
+            self._provider_cooldowns = {}
+
+    def _load_lifecycle_states(self, entries) -> bool:
+        """Load the bounded authoritative state added after the legacy history format."""
+        if not isinstance(entries, list):
+            log.warning("Process registry lifecycle state is invalid; rebuilding from history.")
+            return False
+
+        skipped = 0
+        loaded = 0
+        for entry in entries:
+            try:
+                if not isinstance(entry, dict):
+                    raise TypeError
+                record = TrackedProcess(**entry["record"])
+                failure_count = entry.get("failure_count", 0)
+                last_observed_at = entry.get("last_observed_at")
+                if not isinstance(failure_count, int) or failure_count < 0:
+                    raise TypeError
+                if not isinstance(last_observed_at, str) or not last_observed_at:
+                    last_observed_at = self._record_timestamp(record)
+            except (KeyError, TypeError):
+                skipped += 1
+                continue
+
+            state = LifecycleState(record, failure_count, last_observed_at)
+            item_key = self._lifecycle_item_key(record.task_ref)
+            existing = self._lifecycle_states.get(item_key)
+            if existing is None or existing.last_observed_at <= last_observed_at:
+                self._lifecycle_states[item_key] = state
+            loaded += 1
+
+        if skipped:
+            log.warning(
+                "Skipped %d malformed lifecycle state record(s) out of %d.",
+                skipped,
+                len(entries),
+            )
+        return not entries or loaded > 0
+
+    def _rebuild_lifecycle_states_from_history(self) -> None:
+        """Migrate legacy history into one current authoritative event per item."""
+        self._lifecycle_states = {}
+        self._provider_cooldowns = {}
+        for record in self._history:
+            self._store_lifecycle_record(
+                record,
+                count_failure=self._is_bounded_failure(record),
+            )
+
+    def _store_lifecycle_record(
+        self,
+        record: TrackedProcess,
+        *,
+        count_failure: bool,
+    ) -> None:
+        """Replace a superseded item event while retaining its bounded retry count."""
+        self._ensure_lifecycle_storage()
+        item_key = self._lifecycle_item_key(record.task_ref)
+        previous = self._lifecycle_states.get(item_key)
+        same_event = bool(
+            previous
+            and previous.record.task_ref == record.task_ref
+            and previous.record.role == record.role
+        )
+        failure_count = previous.failure_count if same_event else 0
+        if count_failure:
+            failure_count += 1
+        self._lifecycle_states[item_key] = LifecycleState(
+            record=record,
+            failure_count=failure_count,
+            last_observed_at=self._record_timestamp(record),
+        )
+        if record.status == ProcessStatus.DEFERRED and record.defer_scope == "provider":
+            if record.retry_after:
+                self._remember_provider_cooldown(record.ai_name, record.retry_after)
+
+    def _discard_lifecycle_record(self, record: TrackedProcess) -> None:
+        """Drop temporary ownership after a child was stopped before registration."""
+        self._ensure_lifecycle_storage()
+        item_key = self._lifecycle_item_key(record.task_ref)
+        current = self._lifecycle_states.get(item_key)
+        if (
+            current
+            and current.record.task_ref == record.task_ref
+            and current.record.role == record.role
+            and current.record.status == ProcessStatus.RUNNING
+        ):
+            del self._lifecycle_states[item_key]
+
+    def _remember_provider_cooldown(self, ai_name: str, retry_after: str) -> None:
+        try:
+            parsed = datetime.fromisoformat(retry_after)
+        except (TypeError, ValueError):
+            return
+        if parsed.tzinfo is None:
+            return
+        current = self._provider_cooldowns.get(ai_name)
+        if current:
+            try:
+                if datetime.fromisoformat(current) >= parsed:
+                    return
+            except (TypeError, ValueError):
+                pass
+        self._provider_cooldowns[ai_name] = retry_after
+
     def _reconcile_orphans(self) -> bool:
         """Demote records left RUNNING by a crashed orchestrator.
 
@@ -669,8 +831,12 @@ class ProcessTracker:
         retryable.
         """
         changed = False
-        for record in self._history:
+        self._ensure_lifecycle_storage()
+        for state in self._lifecycle_states.values():
+            record = state.record
             if record.status not in (ProcessStatus.RUNNING, ProcessStatus.STUCK):
+                continue
+            if record.pid in self._active:
                 continue
             leader_alive = bool(
                 record.pid is not None
@@ -687,6 +853,7 @@ class ProcessTracker:
                 if record.status != ProcessStatus.STUCK:
                     record.status = ProcessStatus.STUCK
                     record.failure_reason = DISPATCH_RESIDUAL
+                    state.last_observed_at = datetime.now(timezone.utc).isoformat()
                     changed = True
                     log.warning(
                         "Residual process group %s for %s still exists; terminate it outside MAO "
@@ -697,6 +864,8 @@ class ProcessTracker:
                 continue
             record.status = ProcessStatus.UNKNOWN
             record.ended_at = record.ended_at or datetime.now(timezone.utc).isoformat()
+            state.failure_count += 1
+            state.last_observed_at = record.ended_at
             changed = True
             log.warning(
                 "Orphaned %s record for %s [PID %s] marked UNKNOWN; event is retryable.",
@@ -715,69 +884,75 @@ class ProcessTracker:
         )
 
     def _compact_history(self) -> None:
-        """Bound diagnostics without discarding state used by should_dispatch()."""
-        if len(self._history) <= MAX_HISTORY_RECORDS:
+        """Apply the hard diagnostic cap; dispatch authority lives elsewhere."""
+        if len(self._history) > MAX_HISTORY_RECORDS:
+            self._history = self._history[-MAX_HISTORY_RECORDS:]
+
+    def _compact_lifecycle_states(self) -> None:
+        """Keep the authoritative item-state table within its explicit hard cap."""
+        self._ensure_lifecycle_storage()
+        if len(self._lifecycle_states) <= MAX_LIFECYCLE_STATES:
             return
-
-        protected: set[int] = set()
-        event_records: dict[tuple[str, str], list[int]] = {}
-        latest_provider_cooldown: dict[str, int] = {}
-        for index, record in enumerate(self._history):
-            event_records.setdefault((record.task_ref, record.role), []).append(index)
-            if (
-                record.status == ProcessStatus.DEFERRED
-                and record.defer_scope == "provider"
-            ):
-                latest_provider_cooldown[record.ai_name] = index
-
-        protected.update(latest_provider_cooldown.values())
-        for indices in event_records.values():
-            completed = [
-                index
-                for index in indices
-                if self._history[index].status == ProcessStatus.COMPLETED
-            ]
-            if completed:
-                protected.add(completed[-1])
-
-            for status in (ProcessStatus.RUNNING, ProcessStatus.STUCK):
-                matching = [
-                    index
-                    for index in indices
-                    if self._history[index].status == status
-                ]
-                protected.update(matching)
-
-            if not completed:
-                bounded_failures = [
-                    index
-                    for index in indices
-                    if self._is_bounded_failure(self._history[index])
-                ]
-                protected.update(bounded_failures[-MAX_DISPATCH_ATTEMPTS:])
-
-        diagnostic_budget = max(0, MAX_HISTORY_RECORDS - len(protected))
-        unprotected = [
-            index for index in range(len(self._history)) if index not in protected
-        ]
-        recent_diagnostics = (
-            unprotected[-diagnostic_budget:] if diagnostic_budget else []
+        ordered = sorted(
+            self._lifecycle_states.items(),
+            key=lambda item: item[1].last_observed_at,
         )
-        retained = protected.union(recent_diagnostics)
-        self._history = [
-            record
-            for index, record in enumerate(self._history)
-            if index in retained
+        live = [
+            item
+            for item in ordered
+            if item[1].record.status in (ProcessStatus.RUNNING, ProcessStatus.STUCK)
         ]
+        terminal = [
+            item
+            for item in ordered
+            if item[1].record.status not in (ProcessStatus.RUNNING, ProcessStatus.STUCK)
+        ]
+        if len(live) >= MAX_LIFECYCLE_STATES:
+            retained = live[-MAX_LIFECYCLE_STATES:]
+        else:
+            terminal_budget = MAX_LIFECYCLE_STATES - len(live)
+            retained = live + terminal[-terminal_budget:]
+        self._lifecycle_states = dict(retained)
+
+    def _compact_provider_cooldowns(self) -> None:
+        self._ensure_lifecycle_storage()
+        now = datetime.now(timezone.utc)
+        active = []
+        for ai_name, retry_after in self._provider_cooldowns.items():
+            try:
+                parsed = datetime.fromisoformat(retry_after)
+                is_active = parsed.tzinfo is not None and parsed > now
+            except (TypeError, ValueError):
+                continue
+            if is_active:
+                active.append((parsed, ai_name, retry_after))
+        active.sort()
+        self._provider_cooldowns = {
+            ai_name: retry_after
+            for _, ai_name, retry_after in active[-MAX_PROVIDER_COOLDOWNS:]
+        }
 
     def _save_registry(self):
         """Persist process registry to disk."""
         PROCESS_REGISTRY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_lifecycle_storage()
+        for _, tracked in self._active.values():
+            self._store_lifecycle_record(tracked, count_failure=False)
         self._compact_history()
-        all_records = self._history + [tp for _, tp in self._active.values()]
+        self._compact_lifecycle_states()
+        self._compact_provider_cooldowns()
         payload = {
             "last_updated": datetime.now(timezone.utc).isoformat(),
-            "history": [vars(r) for r in all_records],
+            "history": [vars(record) for record in self._history],
+            "lifecycle_states": [
+                {
+                    "record": vars(state.record),
+                    "failure_count": state.failure_count,
+                    "last_observed_at": state.last_observed_at,
+                }
+                for state in self._lifecycle_states.values()
+            ],
+            "provider_cooldowns": self._provider_cooldowns,
         }
         temporary_path: Optional[Path] = None
         try:
@@ -830,6 +1005,7 @@ class ProcessTracker:
             failure_reason=failure_reason,
         )
         self._history.append(tracked)
+        self._store_lifecycle_record(tracked, count_failure=True)
         self._save_registry()
         return tracked
 
@@ -853,6 +1029,7 @@ class ProcessTracker:
             started_at=datetime.now(timezone.utc).isoformat(),
         )
         self._active[proc.pid] = (proc, tracked)
+        self._store_lifecycle_record(tracked, count_failure=False)
         log.info(
             "📌 Registered %s [PID %d] — %s (%s, %s)",
             role, proc.pid, task_ref, ai_name, model,
@@ -941,6 +1118,7 @@ class ProcessTracker:
                         tracked.status = ProcessStatus.STUCK
                         tracked.exit_code = retcode
                         tracked.failure_reason = DISPATCH_RESIDUAL
+                        self._store_lifecycle_record(tracked, count_failure=False)
                         registry_changed = True
                         log_blocker(
                             f"residual-process-group:{pid}",
@@ -987,6 +1165,10 @@ class ProcessTracker:
                         tracked.failure_reason or "(empty)",
                     )
 
+                self._store_lifecycle_record(
+                    tracked,
+                    count_failure=self._is_bounded_failure(tracked),
+                )
                 finished_pids.append(pid)
                 registry_changed = True
 
@@ -1059,6 +1241,99 @@ class ProcessTracker:
         tool withdrawals do consume it after their cooldown, so one broken
         lifecycle event cannot be relaunched forever.
         """
+        if hasattr(self, "_lifecycle_states"):
+            return self._should_dispatch_from_lifecycle_state(
+                task_ref,
+                role,
+                completion_confirmed=completion_confirmed,
+                ai_name=ai_name,
+            )
+        return self._should_dispatch_from_legacy_history(
+            task_ref,
+            role,
+            completion_confirmed=completion_confirmed,
+            ai_name=ai_name,
+        )
+
+    def _should_dispatch_from_lifecycle_state(
+        self,
+        task_ref: str,
+        role: str,
+        *,
+        completion_confirmed: bool,
+        ai_name: Optional[str],
+    ) -> tuple[bool, str]:
+        """Consult the bounded current-event table instead of diagnostic history."""
+        self._ensure_lifecycle_storage()
+        state = self._lifecycle_states.get(self._lifecycle_item_key(task_ref))
+        same_event = bool(
+            state
+            and state.record.task_ref == task_ref
+            and state.record.role == role
+        )
+
+        if state and state.record.status == ProcessStatus.RUNNING:
+            return False, DISPATCH_RUNNING
+        if state and state.record.status == ProcessStatus.STUCK:
+            return False, DISPATCH_RESIDUAL
+        if same_event and state:
+            if state.record.status == ProcessStatus.COMPLETED:
+                if completion_confirmed:
+                    return False, DISPATCH_COMPLETED
+                return False, DISPATCH_UNCONFIRMED
+            if state.failure_count >= MAX_DISPATCH_ATTEMPTS:
+                return False, f"exhausted {state.failure_count} failed attempts"
+
+        if ai_name:
+            retry_after = self._provider_cooldowns.get(ai_name)
+            if retry_after:
+                try:
+                    retry_at = datetime.fromisoformat(retry_after)
+                    is_active = (
+                        retry_at.tzinfo is not None
+                        and datetime.now(timezone.utc) < retry_at
+                    )
+                except (TypeError, ValueError):
+                    retry_at = None
+                    is_active = False
+                if retry_at and is_active:
+                    return False, f"{DISPATCH_PROVIDER_COOLDOWN} until {retry_after}"
+
+        if not same_event or state is None:
+            return True, "new event"
+
+        if state.record.status == ProcessStatus.DEFERRED:
+            if state.record.retry_after:
+                try:
+                    retry_at = datetime.fromisoformat(state.record.retry_after)
+                    is_active = (
+                        retry_at.tzinfo is not None
+                        and datetime.now(timezone.utc) < retry_at
+                    )
+                except (TypeError, ValueError):
+                    retry_at = None
+                    is_active = False
+                if retry_at and is_active:
+                    return (
+                        False,
+                        f"{DISPATCH_PROVIDER_COOLDOWN} until {state.record.retry_after}",
+                    )
+            return True, "retry after provider cooldown"
+
+        return (
+            True,
+            f"retry {state.failure_count + 1}/{MAX_DISPATCH_ATTEMPTS} after failure",
+        )
+
+    def _should_dispatch_from_legacy_history(
+        self,
+        task_ref: str,
+        role: str,
+        *,
+        completion_confirmed: bool,
+        ai_name: Optional[str],
+    ) -> tuple[bool, str]:
+        """Compatibility path for focused tests and pre-split in-memory trackers."""
         attempts = [
             record for record in self.all_records
             if record.task_ref == task_ref and record.role == role
@@ -1119,6 +1394,35 @@ class ProcessTracker:
             True,
             f"retry {len(bounded_failures) + 1}/{MAX_DISPATCH_ATTEMPTS} after failure",
         )
+
+    def reconcile_open_items(
+        self,
+        open_issues: list[dict],
+        open_prs: list[dict],
+    ) -> None:
+        """Prune terminal authority once a successful snapshot shows an item closed."""
+        self._ensure_lifecycle_storage()
+        open_item_keys = {
+            f"issue#{item['number']}"
+            for item in open_issues
+            if isinstance(item.get("number"), int)
+        }
+        open_item_keys.update(
+            f"pr#{item['number']}"
+            for item in open_prs
+            if isinstance(item.get("number"), int)
+        )
+        stale_keys = [
+            item_key
+            for item_key, state in self._lifecycle_states.items()
+            if item_key not in open_item_keys
+            and state.record.status not in (ProcessStatus.RUNNING, ProcessStatus.STUCK)
+        ]
+        if not stale_keys:
+            return
+        for item_key in stale_keys:
+            del self._lifecycle_states[item_key]
+        self._save_registry()
 
     @property
     def active_count(self) -> int:
@@ -1217,16 +1521,19 @@ class ProcessTracker:
                 tracked.ended_at = datetime.now(timezone.utc).isoformat()
                 tracked.status = ProcessStatus.FAILED
                 self._history.append(tracked)
+                self._store_lifecycle_record(tracked, count_failure=True)
                 continue
             if not cleanup_results[pid]:
                 tracked.status = ProcessStatus.STUCK
                 tracked.failure_reason = DISPATCH_RESIDUAL
+                self._store_lifecycle_record(tracked, count_failure=False)
                 survivors[pid] = (proc, tracked)
                 continue
             tracked.exit_code = proc.returncode
             tracked.ended_at = datetime.now(timezone.utc).isoformat()
             tracked.status = ProcessStatus.FAILED
             self._history.append(tracked)
+            self._store_lifecycle_record(tracked, count_failure=True)
         self._active = survivors
         self._save_registry()
         return not survivors
@@ -1327,6 +1634,8 @@ def reset_process_history():
     """Start a fresh run with no persisted dispatch failures or active state."""
     tracker._active.clear()
     tracker._history.clear()
+    tracker._lifecycle_states.clear()
+    tracker._provider_cooldowns.clear()
     if PROCESS_REGISTRY_FILE.exists():
         PROCESS_REGISTRY_FILE.unlink()
 
@@ -3391,6 +3700,7 @@ def _cleanup_failed_process(
 
     if stopped:
         tracker._active.pop(proc.pid, None)
+        tracker._discard_lifecycle_record(active_entry[1])
         try:
             tracker._save_registry()
         except Exception:
@@ -4599,6 +4909,9 @@ def process_polling_cycle(dry_run: bool = False, initial: bool = False) -> int:
     # existing PR was merely unavailable.
     open_issues = fetch_open_issues()
     open_prs = fetch_open_prs()
+
+    if not dry_run:
+        tracker.reconcile_open_items(open_issues, open_prs)
 
     if initial:
         log_open_items(open_issues, open_prs)

@@ -234,9 +234,11 @@ Provider-wide quota cooldowns stay exempt, while repeated event-local
 timeouts do not retry forever. The process registry is replaced atomically. A malformed root or
 history container is recoverable as empty history, malformed entries are skipped individually, and
 each real poll reconciles inherited `running`/`stuck` records after their process tree exits. History
-compaction treats 500 records as a diagnostic budget: the latest completed state per event, bounded
-retry evidence, live/stuck ownership, and provider-cooldown state remain authoritative even when that
-requires a larger registry. Each agent requires an
+has a hard 500-record diagnostic cap. Dispatch authority is stored separately in a bounded table
+with one current event per Issue or PR, so each new PR head/comment replaces the prior terminal
+event; a successful open-item snapshot prunes closed terminal items but preserves live/stuck
+ownership. Provider cooldowns use their own bounded map, and legacy history is collapsed into this
+schema on load. Each agent requires an
 isolated POSIX process group, so unsupported platforms fail before the write preflight or runtime
 file creation. Normal leader exit as well as shutdown signals eligible groups in a batch and removes
 residual descendants within a shared bounded cleanup deadline plus one shared forced-exit grace.

@@ -3381,6 +3381,10 @@ class WorktreeSafetyTest(unittest.TestCase):
         with (
             patch.object(self.swarm, "fetch_open_issues", return_value=[]),
             patch.object(self.swarm, "fetch_open_prs", return_value=[]),
+            patch.object(
+                self.swarm.tracker,
+                "reconcile_open_items",
+            ) as reconcile_open_items,
             patch.object(self.swarm, "process_issues", return_value=1) as issues,
             patch.object(self.swarm, "process_prs", return_value=2) as prs,
             patch.object(self.swarm, "cleanup_merged_prs") as cleanup,
@@ -3388,9 +3392,26 @@ class WorktreeSafetyTest(unittest.TestCase):
             failures = self.swarm.process_polling_cycle()
 
         self.assertEqual(failures, 3)
+        reconcile_open_items.assert_called_once_with([], [])
         issues.assert_called_once()
         prs.assert_called_once()
         cleanup.assert_not_called()
+
+    def test_dry_run_polling_cycle_does_not_prune_registry_state(self):
+        with (
+            patch.object(self.swarm, "fetch_open_issues", return_value=[]),
+            patch.object(self.swarm, "fetch_open_prs", return_value=[]),
+            patch.object(
+                self.swarm.tracker,
+                "reconcile_open_items",
+            ) as reconcile_open_items,
+            patch.object(self.swarm, "process_issues", return_value=0),
+            patch.object(self.swarm, "process_prs", return_value=0),
+        ):
+            failures = self.swarm.process_polling_cycle(dry_run=True)
+
+        self.assertEqual(failures, 0)
+        reconcile_open_items.assert_not_called()
 
     def test_once_polls_children_before_post_cycle_merged_cleanup(self):
         events = []
@@ -3776,10 +3797,14 @@ class WorktreeSafetyTest(unittest.TestCase):
         self.assertFalse(allowed)
         self.assertTrue(reason.startswith("exhausted"))
 
-    def test_history_compaction_preserves_completed_and_exhausted_events(self):
+    def test_hard_history_cap_keeps_dispatch_authority_in_lifecycle_state(self):
         past = (
             self.swarm.datetime.now(self.swarm.timezone.utc)
             - self.swarm.timedelta(hours=1)
+        ).isoformat()
+        future = (
+            self.swarm.datetime.now(self.swarm.timezone.utc)
+            + self.swarm.timedelta(hours=1)
         ).isoformat()
         completed = self._tracked_process(
             "review#1-head",
@@ -3793,6 +3818,12 @@ class WorktreeSafetyTest(unittest.TestCase):
             )
             for _ in range(self.swarm.MAX_DISPATCH_ATTEMPTS)
         ]
+        cooldown = self._tracked_process(
+            "issue#99:initial",
+            self.swarm.ProcessStatus.DEFERRED,
+            retry_after=future,
+            defer_scope="provider",
+        )
         noise = [
             self._tracked_process(
                 f"issue#noise-{index}:initial",
@@ -3804,13 +3835,15 @@ class WorktreeSafetyTest(unittest.TestCase):
         ]
         attempt_tracker = self.swarm.ProcessTracker.__new__(self.swarm.ProcessTracker)
         attempt_tracker._active = {}
-        attempt_tracker._history = [completed, *exhausted, *noise]
+        attempt_tracker._history = [completed, *exhausted, cooldown, *noise]
 
+        attempt_tracker._ensure_lifecycle_storage()
         attempt_tracker._compact_history()
 
         self.assertEqual(len(attempt_tracker._history), self.swarm.MAX_HISTORY_RECORDS)
-        self.assertIn(completed, attempt_tracker._history)
-        self.assertTrue(all(record in attempt_tracker._history for record in exhausted))
+        self.assertNotIn(completed, attempt_tracker._history)
+        self.assertTrue(all(record not in attempt_tracker._history for record in exhausted))
+        self.assertNotIn(cooldown, attempt_tracker._history)
         self.assertEqual(
             attempt_tracker.should_dispatch("review#1-head", "reviewer"),
             (False, self.swarm.DISPATCH_COMPLETED),
@@ -3821,6 +3854,88 @@ class WorktreeSafetyTest(unittest.TestCase):
         )
         self.assertFalse(allowed)
         self.assertTrue(reason.startswith("exhausted"))
+        allowed, reason = attempt_tracker.should_dispatch(
+            "issue#999:initial",
+            "worker",
+            ai_name="codex",
+        )
+        self.assertFalse(allowed)
+        self.assertIn(self.swarm.DISPATCH_PROVIDER_COOLDOWN, reason)
+
+    def test_legacy_completed_heads_collapse_to_one_state_per_pr(self):
+        registry = self.repo / ".agents" / "bounded-lifecycle-registry.json"
+        registry.parent.mkdir(parents=True, exist_ok=True)
+        history = []
+        for pr_number in range(1, 61):
+            for commit_index in range(40):
+                history.append(
+                    self._tracked_process(
+                        f"review#{pr_number}-head-{commit_index:02d}",
+                        self.swarm.ProcessStatus.COMPLETED,
+                        role="reviewer",
+                    )
+                )
+        registry.write_text(json.dumps({"history": [vars(record) for record in history]}))
+
+        try:
+            with patch.object(self.swarm, "PROCESS_REGISTRY_FILE", registry):
+                loaded = self.swarm.ProcessTracker()
+                loaded._save_registry()
+
+            self.assertEqual(len(loaded._history), self.swarm.MAX_HISTORY_RECORDS)
+            self.assertEqual(len(loaded._lifecycle_states), 60)
+            for pr_number in range(1, 61):
+                current = loaded._lifecycle_states[f"pr#{pr_number}"]
+                self.assertEqual(
+                    current.record.task_ref,
+                    f"review#{pr_number}-head-39",
+                )
+                self.assertEqual(
+                    loaded.should_dispatch(current.record.task_ref, "reviewer"),
+                    (False, self.swarm.DISPATCH_COMPLETED),
+                )
+
+            payload = json.loads(registry.read_text())
+            self.assertEqual(len(payload["history"]), self.swarm.MAX_HISTORY_RECORDS)
+            self.assertEqual(len(payload["lifecycle_states"]), 60)
+        finally:
+            registry.unlink(missing_ok=True)
+
+    def test_closed_terminal_states_are_pruned_but_live_ownership_is_kept(self):
+        attempt_tracker = self.swarm.ProcessTracker.__new__(self.swarm.ProcessTracker)
+        attempt_tracker._active = {}
+        attempt_tracker._history = []
+        attempt_tracker._lifecycle_states = {}
+        attempt_tracker._provider_cooldowns = {}
+        records = [
+            self._tracked_process("issue#1:initial", self.swarm.ProcessStatus.COMPLETED),
+            self._tracked_process(
+                "review#2-head",
+                self.swarm.ProcessStatus.FAILED,
+                role="reviewer",
+            ),
+            self._tracked_process("issue#3:initial", self.swarm.ProcessStatus.RUNNING),
+            self._tracked_process(
+                "review#4-head",
+                self.swarm.ProcessStatus.STUCK,
+                role="reviewer",
+            ),
+            self._tracked_process("issue#5:initial", self.swarm.ProcessStatus.COMPLETED),
+        ]
+        for record in records:
+            attempt_tracker._store_lifecycle_record(
+                record,
+                count_failure=attempt_tracker._is_bounded_failure(record),
+            )
+
+        with patch.object(attempt_tracker, "_save_registry") as save:
+            attempt_tracker.reconcile_open_items([{"number": 5}], [])
+
+        self.assertEqual(
+            set(attempt_tracker._lifecycle_states),
+            {"issue#3", "pr#4", "issue#5"},
+        )
+        save.assert_called_once_with()
 
     def test_registry_load_skips_only_malformed_records(self):
         registry = self.repo / ".agents" / "malformed-entry-registry.json"

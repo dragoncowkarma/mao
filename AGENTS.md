@@ -428,9 +428,12 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   incomplete observation and provider-cooldown deferrals retain them, since neither is a clean pass.
   Registry updates use same-directory atomic replacement. Invalid registry roots/history containers
   recover as empty, malformed entries are skipped individually, and every real poll reconciles
-  inherited `running`/`stuck` records once their process tree exits. The 500-record history limit is
-  a soft diagnostic budget: completed-event, bounded-retry, live/stuck, and provider-cooldown state
-  needed for dispatch safety survives compaction. A child discovered while unwinding after adoption
+  inherited `running`/`stuck` records once their process tree exits. Recent diagnostic history has a
+  hard 500-record cap; dispatch authority lives in a separate bounded table with one current event
+  per Issue or PR, so a new PR head/comment replaces the previous terminal event instead of growing
+  the registry. A successful open-item snapshot prunes closed terminal items while retaining live or
+  stuck ownership, and provider cooldowns are stored in their own bounded map. Legacy registries are
+  collapsed into this schema on load. A child discovered while unwinding after adoption
   but before registration persistence is first saved as running before bounded termination, so a
   hard leader crash remains recoverable, and then persisted once more as removed or stuck; this
   fallback performs at most two atomic writes. Dispatched agents

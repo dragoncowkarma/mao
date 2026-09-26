@@ -14,21 +14,25 @@ Requires: Python 3, authenticated gh CLI, git, and at least one AI CLI installed
 """
 
 import argparse
+import inspect
 import json
 import logging
 import logging.handlers
 import os
 import re
+import shlex
 import signal
 import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -72,6 +76,14 @@ MAIN_SYNC_EVERY_CYCLES = 5
 # retried so a transient AI CLI failure cannot deadlock the swarm forever.
 MAX_DISPATCH_ATTEMPTS = 3
 
+# Process-tree shutdown is bounded across one supervision pass, not once per
+# child. A finished leader may leave descendants behind, but harvesting several
+# such leaders must not stall the polling thread for N * timeout seconds. One
+# shared post-SIGKILL grace prevents an exhausted graceful budget from turning
+# healthy groups into false residuals without adding per-child delay.
+PROCESS_GROUP_STOP_TIMEOUT_SECONDS = 5
+PROCESS_GROUP_KILL_GRACE_SECONDS = 0.25
+
 # Provider quota/tool/timeout failures are availability pauses, not crashed
 # task attempts. Keep them out of the bounded crash budget and retry after the
 # provider's advertised reset, or after a conservative fallback cooldown.
@@ -98,12 +110,21 @@ ANTIGRAVITY_PRINT_TIMEOUT = "45m"
 
 # Stable reasons returned by ProcessTracker.should_dispatch().
 DISPATCH_RUNNING = "already running"
+DISPATCH_RESIDUAL = "residual process tree requires operator cleanup"
 DISPATCH_COMPLETED = "already completed"
 DISPATCH_UNCONFIRMED = "completed without confirmed lifecycle transition"
 DISPATCH_PROVIDER_COOLDOWN = "provider cooldown"
 
-# Upper bound on persisted history so the registry cannot grow without limit.
+# Hard cap for recent diagnostic records. Dispatch authority is persisted
+# separately as one current lifecycle state per Issue/PR, so retaining it never
+# turns this history budget back into an unbounded registry.
 MAX_HISTORY_RECORDS = 500
+
+# One current lifecycle event can exist for every Issue and PR returned by the
+# bounded GitHub scans. The extra diagnostic-sized margin accommodates supervised
+# processes whose item closed while the child was still running.
+MAX_LIFECYCLE_STATES = OPEN_ITEMS_LIMIT * 2 + MAX_HISTORY_RECORDS
+MAX_PROVIDER_COOLDOWNS = MAX_LIFECYCLE_STATES
 
 # Metadata tag patterns
 WORKER_PATTERN = re.compile(
@@ -191,6 +212,61 @@ def enable_runtime_writes():
 # signal is always reported again.
 _REPORTED_BLOCKERS: set[str] = set()
 
+# A POSIX signal can arrive after Popen has created a child but before that child
+# is adopted in memory. The shared shutdown handler defers its KeyboardInterrupt
+# while this narrow ownership-transfer section is active, then the dispatcher
+# raises it as soon as the process is supervised and can be cleaned up safely.
+_DISPATCH_REGISTRATION_DEPTH = 0
+_SHUTDOWN_SIGNAL_PENDING = False
+
+
+def _raise_if_shutdown_pending() -> None:
+    """Surface a deferred shutdown once the ownership-transfer window closes."""
+    if _SHUTDOWN_SIGNAL_PENDING and _DISPATCH_REGISTRATION_DEPTH == 0:
+        raise KeyboardInterrupt
+
+
+@contextmanager
+def _defer_shutdown_during_process_registration():
+    """Defer the shutdown exception until a new child is supervised."""
+    global _DISPATCH_REGISTRATION_DEPTH
+    _DISPATCH_REGISTRATION_DEPTH += 1
+    try:
+        yield
+    finally:
+        _DISPATCH_REGISTRATION_DEPTH -= 1
+        # Keep this check inside finally: if spawn/adoption itself raises after
+        # a signal was deferred, shutdown must supersede that failure instead
+        # of leaving the pending flag set and swallowing every later signal.
+        _raise_if_shutdown_pending()
+
+
+@contextmanager
+def _shutdown_signal_controller():
+    """Route SIGINT/SIGTERM through one cleanup path for loop and one-shot runs."""
+    global _SHUTDOWN_SIGNAL_PENDING
+    _SHUTDOWN_SIGNAL_PENDING = False
+    previous_handlers = {}
+
+    def handle_signal(signum, _frame):
+        global _SHUTDOWN_SIGNAL_PENDING
+        if _SHUTDOWN_SIGNAL_PENDING:
+            return
+        _SHUTDOWN_SIGNAL_PENDING = True
+        log.info("Received signal %d, shutting down...", signum)
+        if _DISPATCH_REGISTRATION_DEPTH == 0:
+            raise KeyboardInterrupt
+
+    try:
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            previous_handlers[signum] = signal.getsignal(signum)
+            signal.signal(signum, handle_signal)
+        yield
+    finally:
+        for signum, previous_handler in previous_handlers.items():
+            signal.signal(signum, previous_handler)
+        _SHUTDOWN_SIGNAL_PENDING = False
+
 
 def log_blocker(key: str, message: str, *args, level: int = logging.ERROR):
     """Report a lifecycle blocker once at `level`, then at DEBUG while it persists."""
@@ -205,7 +281,10 @@ def log_blocker(key: str, message: str, *args, level: int = logging.ERROR):
 
 def log_dispatch_blocker(key: str, subject: str, reason: str):
     """Report terminal or deferred dispatch state without poll-cycle spam."""
-    if reason.startswith("exhausted") or reason == DISPATCH_UNCONFIRMED:
+    if (
+        reason.startswith("exhausted")
+        or reason in {DISPATCH_UNCONFIRMED, DISPATCH_RESIDUAL}
+    ):
         log_blocker(key, "%s dispatch blocked: %s.", subject, reason)
     elif reason.startswith(DISPATCH_PROVIDER_COOLDOWN):
         log_blocker(
@@ -217,12 +296,60 @@ def log_dispatch_blocker(key: str, subject: str, reason: str):
         )
 
 
+def _item_preflight_blocker_prefix(
+    item_kind: str,
+    item_number: object,
+    lifecycle_version: str,
+) -> str:
+    """Return the bounded, message-independent namespace for one item lifecycle."""
+    return f"item-preflight:{item_kind}:{item_number}:{lifecycle_version}:"
+
+
+def clear_item_preflight_blockers(
+    item_kind: str,
+    item_number: object,
+    lifecycle_version: str,
+) -> None:
+    """Let a cleanly processed item report a preflight cause if it later recurs."""
+    prefix = _item_preflight_blocker_prefix(
+        item_kind,
+        item_number,
+        lifecycle_version,
+    )
+    _REPORTED_BLOCKERS.difference_update(
+        key for key in tuple(_REPORTED_BLOCKERS) if key.startswith(prefix)
+    )
+
+
+def log_item_preflight_blocker(
+    item_kind: str,
+    item_number: object,
+    lifecycle_version: str,
+    error: "SwarmPreflightError",
+) -> None:
+    """Report one typed preflight blocker per uninterrupted blocked lifecycle."""
+    log_blocker(
+        _item_preflight_blocker_prefix(
+            item_kind,
+            item_number,
+            lifecycle_version,
+        )
+        + f"{type(error).__name__}:{error.reason_code}",
+        "%s #%s dispatch blocked by a retryable preflight condition; automatic retry "
+        "remains enabled: %s",
+        item_kind,
+        item_number,
+        error,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Data Classes
 # ---------------------------------------------------------------------------
 
 class ProcessStatus(str, Enum):
     RUNNING = "running"
+    STUCK = "stuck"
     COMPLETED = "completed"
     FAILED = "failed"
     DEFERRED = "deferred"
@@ -251,14 +378,102 @@ class TaskPR:
     body: str
     head_branch: str
     head_sha: str = ""
+    is_cross_repository: bool = False
     issue_number: Optional[int] = None
     reviewer: Optional[RoleAssignment] = None
+
+
+@dataclass(frozen=True)
+class RepoWorkflowCapability:
+    """Read-only verdict for the active gh CLI credential in this repository."""
+    repository: str
+    ok: bool
+    gaps: tuple[str, ...]
+    unverified: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class SshEndpoint:
+    """The effective SSH authority Git will contact after local config resolution."""
+    host: str
+    user: str
+    port: int
+
+
+@dataclass(frozen=True)
+class HttpEndpoint:
+    """The HTTPS authority used by Git and bound to the gh API probe."""
+    scheme: str
+    host: str
+    port: int
+
+
+@dataclass(frozen=True)
+class GitHubRepoTarget:
+    """The GitHub repository selected by this checkout's origin remote."""
+    host: str
+    owner: str
+    repo: str
+    ssh_endpoint: Optional[SshEndpoint] = field(default=None, compare=False, repr=False)
+    http_endpoint: Optional[HttpEndpoint] = field(default=None, compare=False, repr=False)
+
+    @property
+    def name(self) -> str:
+        return f"{self.owner}/{self.repo}"
+
+    @property
+    def gh_context(self) -> str:
+        return f"{self.host}/{self.name}"
+
+
+class SwarmPreflightError(RuntimeError):
+    """Base preflight failure with a finite reason identifier."""
+
+    def __init__(self, message: str, *, reason_code: Optional[str] = None):
+        super().__init__(message)
+        if reason_code is not None:
+            self.reason_code = reason_code
+            return
+
+        # Blocker state is process-local, so a constructor call site's function and
+        # line form a stable identifier for this running version without retaining
+        # variable paths, repository names, or other message details in the key.
+        frame = inspect.currentframe()
+        caller = frame.f_back if frame is not None else None
+        try:
+            self.reason_code = (
+                f"{caller.f_code.co_name}:{caller.f_lineno}"
+                if caller is not None
+                else type(self).__name__
+            )
+        finally:
+            del caller
+            del frame
+
+
+class SwarmCapabilityError(SwarmPreflightError):
+    """A permanent repository or credential blocker."""
+
+    def __init__(self, capability: RepoWorkflowCapability):
+        self.capability = capability
+        super().__init__(
+            describe_repo_workflow_capability(capability),
+            reason_code=f"capability:{','.join(capability.gaps)}",
+        )
+
+
+class SwarmPreflightTransientError(SwarmPreflightError):
+    """A transient or indeterminate lookup failure, never a permission verdict."""
+
+
+class SwarmPreflightConfigError(SwarmPreflightError):
+    """A local prerequisite failure, such as a missing gh executable."""
 
 
 @dataclass
 class TrackedProcess:
     """A dispatched AI subprocess with full lifecycle metadata."""
-    pid: int
+    pid: Optional[int]
     role: str           # "worker", "reviewer", "maintainer"
     ai_name: str
     model: str
@@ -277,6 +492,123 @@ class TrackedProcess:
     defer_scope: Optional[str] = None
 
 
+@dataclass
+class LifecycleState:
+    """Minimal dispatch authority for the current event of one Issue or PR."""
+    record: TrackedProcess
+    failure_count: int = 0
+    last_observed_at: str = ""
+
+
+def _process_group_exists(process_group_id: int) -> bool:
+    """Return whether a POSIX process group still has at least one member."""
+    try:
+        os.killpg(process_group_id, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _wait_for_process_groups_exit(
+    processes: dict[int, subprocess.Popen],
+    deadline: float,
+) -> dict[int, subprocess.Popen]:
+    """Return groups still alive after one shared, bounded observation window."""
+    remaining = dict(processes)
+    while True:
+        alive = {}
+        for process_group_id, proc in remaining.items():
+            # Reap a finished direct child before testing its process group. A
+            # zombie leader otherwise keeps its PID/PGID visible and can be
+            # misclassified as a residual tree.
+            proc.poll()
+            if _process_group_exists(process_group_id):
+                alive[process_group_id] = proc
+        remaining = alive
+        now = time.monotonic()
+        if not remaining or now >= deadline:
+            return remaining
+        time.sleep(min(0.05, deadline - now))
+
+
+def _assert_dispatch_platform() -> None:
+    """Fail before mutation when descendant-safe process ownership is unavailable."""
+    if os.name != "posix":
+        raise SwarmPreflightConfigError(
+            "Autonomous Swarm dispatch requires POSIX process-group isolation on this platform.",
+        )
+
+
+def terminate_process_groups(
+    processes: list[subprocess.Popen],
+    timeout: float = PROCESS_GROUP_STOP_TIMEOUT_SECONDS,
+) -> dict[int, bool]:
+    """Terminate agent trees in parallel within one shared supervision budget."""
+    process_map = {proc.pid: proc for proc in processes}
+    if not process_map:
+        return {}
+    if os.name != "posix":
+        log.error("Process-tree termination is unsupported on this platform.")
+        return {process_group_id: False for process_group_id in process_map}
+
+    started_at = time.monotonic()
+    timeout = max(0, timeout)
+    term_deadline = started_at + timeout / 2
+    configured_deadline = started_at + timeout
+    term_candidates = {}
+
+    # Signal every group before waiting for any one group, so a stubborn tree
+    # cannot consume the observation window of a healthy peer.
+    for process_group_id, proc in process_map.items():
+        proc.poll()
+        if not _process_group_exists(process_group_id):
+            continue
+        term_candidates[process_group_id] = proc
+        try:
+            os.killpg(process_group_id, signal.SIGTERM)
+        except ProcessLookupError:
+            term_candidates.pop(process_group_id, None)
+            proc.poll()
+        except PermissionError:
+            # Keep observing. The group may still disappear on its own, and the
+            # final existence check is more accurate than the signal race.
+            log.debug("Process group for PID %d could not be signalled.", process_group_id)
+
+    kill_candidates = _wait_for_process_groups_exit(term_candidates, term_deadline)
+    for process_group_id, proc in list(kill_candidates.items()):
+        try:
+            os.killpg(process_group_id, signal.SIGKILL)
+        except ProcessLookupError:
+            kill_candidates.pop(process_group_id, None)
+            proc.poll()
+        except PermissionError:
+            # A concurrent owner may still remove the group. Report an error
+            # only if the final shared observation finds a survivor.
+            log.debug("Process group for PID %d could not be killed.", process_group_id)
+
+    final_deadline = max(
+        configured_deadline,
+        time.monotonic() + PROCESS_GROUP_KILL_GRACE_SECONDS,
+    )
+    survivors = _wait_for_process_groups_exit(kill_candidates, final_deadline)
+    results = {}
+    for process_group_id, proc in process_map.items():
+        stopped = process_group_id not in survivors
+        results[process_group_id] = stopped
+        if stopped:
+            proc.poll()
+        else:
+            log.error("Process group for PID %d did not exit after SIGKILL.", process_group_id)
+    return results
+
+
+def terminate_process_group(proc: subprocess.Popen, timeout: float = 5) -> bool:
+    """Terminate one dispatched agent tree through the shared batch primitive."""
+    return terminate_process_groups([proc], timeout=timeout)[proc.pid]
+
+
 # ---------------------------------------------------------------------------
 # Process Tracker — PID registry with poll()-based status checks
 # ---------------------------------------------------------------------------
@@ -287,22 +619,68 @@ class ProcessTracker:
     def __init__(self):
         self._active: dict[int, tuple[subprocess.Popen, TrackedProcess]] = {}
         self._history: list[TrackedProcess] = []
+        self._lifecycle_states: dict[str, LifecycleState] = {}
+        self._provider_cooldowns: dict[str, str] = {}
         self._load_registry()
 
     # --- Persistence ---
 
     def _load_registry(self):
         """Load previous process history from disk (for --status across runs)."""
+        data = None
         if PROCESS_REGISTRY_FILE.exists():
             try:
                 with open(PROCESS_REGISTRY_FILE) as f:
                     data = json.load(f)
-                for entry in data.get("history", []):
-                    self._history.append(TrackedProcess(**entry))
-            except (json.JSONDecodeError, TypeError):
-                log.warning("Corrupted process registry, starting fresh.")
-        self._reconcile_orphans()
+            except json.JSONDecodeError:
+                log.warning("Process registry JSON is invalid; loaded no history records.")
+            else:
+                if not isinstance(data, dict):
+                    log.warning(
+                        "Process registry root is invalid; loaded no history records.",
+                    )
+                else:
+                    entries = data.get("history", [])
+                    if not isinstance(entries, list):
+                        log.warning(
+                            "Process registry history is invalid; loaded no history records.",
+                        )
+                    else:
+                        skipped = 0
+                        for entry in entries:
+                            try:
+                                self._history.append(TrackedProcess(**entry))
+                            except TypeError:
+                                skipped += 1
+                        if skipped:
+                            log.warning(
+                                "Skipped %d malformed process registry record(s) out of %d; "
+                                "loaded %d valid record(s).",
+                                skipped,
+                                len(entries),
+                                len(entries) - skipped,
+                            )
         self._reclassify_deferred_failures()
+
+        loaded_lifecycle_states = False
+        if isinstance(data, dict) and "lifecycle_states" in data:
+            loaded_lifecycle_states = self._load_lifecycle_states(
+                data.get("lifecycle_states"),
+            )
+        if not loaded_lifecycle_states:
+            self._rebuild_lifecycle_states_from_history()
+
+        if isinstance(data, dict):
+            cooldowns = data.get("provider_cooldowns", {})
+            if isinstance(cooldowns, dict):
+                for ai_name, retry_after in cooldowns.items():
+                    if isinstance(ai_name, str) and isinstance(retry_after, str):
+                        self._remember_provider_cooldown(ai_name, retry_after)
+
+        self._reconcile_orphans()
+        self._compact_history()
+        self._compact_lifecycle_states()
+        self._compact_provider_cooldowns()
 
     def _reclassify_deferred_failures(self):
         """Upgrade historical transient failures so a restart can recover them."""
@@ -318,7 +696,133 @@ class ProcessTracker:
             record.retry_after = retry_after
             record.defer_scope = self._defer_scope(output_tail)
 
-    def _reconcile_orphans(self):
+    @staticmethod
+    def _lifecycle_item_key(task_ref: str) -> str:
+        """Map versioned event refs onto the one Issue/PR whose state they advance."""
+        match = re.match(r"^(issue|review|maintain|revise)#(\d+)", task_ref)
+        if not match:
+            return f"event:{task_ref}"
+        item_kind = "issue" if match.group(1) == "issue" else "pr"
+        return f"{item_kind}#{match.group(2)}"
+
+    @staticmethod
+    def _record_timestamp(record: TrackedProcess) -> str:
+        return record.ended_at or record.started_at
+
+    def _ensure_lifecycle_storage(self) -> None:
+        """Support focused tests that construct a tracker without __init__()."""
+        if not hasattr(self, "_lifecycle_states"):
+            self._lifecycle_states = {}
+            self._provider_cooldowns = {}
+            self._rebuild_lifecycle_states_from_history()
+        elif not hasattr(self, "_provider_cooldowns"):
+            self._provider_cooldowns = {}
+
+    def _load_lifecycle_states(self, entries) -> bool:
+        """Load the bounded authoritative state added after the legacy history format."""
+        if not isinstance(entries, list):
+            log.warning("Process registry lifecycle state is invalid; rebuilding from history.")
+            return False
+
+        skipped = 0
+        loaded = 0
+        for entry in entries:
+            try:
+                if not isinstance(entry, dict):
+                    raise TypeError
+                record = TrackedProcess(**entry["record"])
+                failure_count = entry.get("failure_count", 0)
+                last_observed_at = entry.get("last_observed_at")
+                if not isinstance(failure_count, int) or failure_count < 0:
+                    raise TypeError
+                if not isinstance(last_observed_at, str) or not last_observed_at:
+                    last_observed_at = self._record_timestamp(record)
+            except (KeyError, TypeError):
+                skipped += 1
+                continue
+
+            state = LifecycleState(record, failure_count, last_observed_at)
+            item_key = self._lifecycle_item_key(record.task_ref)
+            existing = self._lifecycle_states.get(item_key)
+            if existing is None or existing.last_observed_at <= last_observed_at:
+                self._lifecycle_states[item_key] = state
+            loaded += 1
+
+        if skipped:
+            log.warning(
+                "Skipped %d malformed lifecycle state record(s) out of %d.",
+                skipped,
+                len(entries),
+            )
+        return not entries or loaded > 0
+
+    def _rebuild_lifecycle_states_from_history(self) -> None:
+        """Migrate legacy history into one current authoritative event per item."""
+        self._lifecycle_states = {}
+        self._provider_cooldowns = {}
+        for record in self._history:
+            self._store_lifecycle_record(
+                record,
+                count_failure=self._is_bounded_failure(record),
+            )
+
+    def _store_lifecycle_record(
+        self,
+        record: TrackedProcess,
+        *,
+        count_failure: bool,
+    ) -> None:
+        """Replace a superseded item event while retaining its bounded retry count."""
+        self._ensure_lifecycle_storage()
+        item_key = self._lifecycle_item_key(record.task_ref)
+        previous = self._lifecycle_states.get(item_key)
+        same_event = bool(
+            previous
+            and previous.record.task_ref == record.task_ref
+            and previous.record.role == record.role
+        )
+        failure_count = previous.failure_count if same_event else 0
+        if count_failure:
+            failure_count += 1
+        self._lifecycle_states[item_key] = LifecycleState(
+            record=record,
+            failure_count=failure_count,
+            last_observed_at=self._record_timestamp(record),
+        )
+        if record.status == ProcessStatus.DEFERRED and record.defer_scope == "provider":
+            if record.retry_after:
+                self._remember_provider_cooldown(record.ai_name, record.retry_after)
+
+    def _discard_lifecycle_record(self, record: TrackedProcess) -> None:
+        """Drop temporary ownership after a child was stopped before registration."""
+        self._ensure_lifecycle_storage()
+        item_key = self._lifecycle_item_key(record.task_ref)
+        current = self._lifecycle_states.get(item_key)
+        if (
+            current
+            and current.record.task_ref == record.task_ref
+            and current.record.role == record.role
+            and current.record.status == ProcessStatus.RUNNING
+        ):
+            del self._lifecycle_states[item_key]
+
+    def _remember_provider_cooldown(self, ai_name: str, retry_after: str) -> None:
+        try:
+            parsed = datetime.fromisoformat(retry_after)
+        except (TypeError, ValueError):
+            return
+        if parsed.tzinfo is None:
+            return
+        current = self._provider_cooldowns.get(ai_name)
+        if current:
+            try:
+                if datetime.fromisoformat(current) >= parsed:
+                    return
+            except (TypeError, ValueError):
+                pass
+        self._provider_cooldowns[ai_name] = retry_after
+
+    def _reconcile_orphans(self) -> bool:
         """Demote records left RUNNING by a crashed orchestrator.
 
         A previous run that died without `kill_all()` leaves records claiming to
@@ -326,36 +830,191 @@ class ProcessTracker:
         forever, so any record whose PID is gone becomes UNKNOWN and therefore
         retryable.
         """
-        for record in self._history:
-            if record.status != ProcessStatus.RUNNING:
+        changed = False
+        self._ensure_lifecycle_storage()
+        for state in self._lifecycle_states.values():
+            record = state.record
+            if record.status not in (ProcessStatus.RUNNING, ProcessStatus.STUCK):
                 continue
-            if self.check_pid_alive(record.pid, record.command):
+            if record.pid in self._active:
+                continue
+            leader_alive = bool(
+                record.pid is not None
+                and self.check_pid_alive(record.pid, record.command)
+            )
+            group_alive = bool(
+                record.pid is not None
+                and os.name == "posix"
+                and _process_group_exists(record.pid)
+            )
+            if leader_alive:
+                continue
+            if group_alive:
+                if record.status != ProcessStatus.STUCK:
+                    record.status = ProcessStatus.STUCK
+                    record.failure_reason = DISPATCH_RESIDUAL
+                    state.last_observed_at = datetime.now(timezone.utc).isoformat()
+                    changed = True
+                    log.warning(
+                        "Residual process group %s for %s still exists; terminate it outside MAO "
+                        "before retrying this event.",
+                        record.pid,
+                        record.task_ref,
+                    )
                 continue
             record.status = ProcessStatus.UNKNOWN
             record.ended_at = record.ended_at or datetime.now(timezone.utc).isoformat()
+            state.failure_count += 1
+            state.last_observed_at = record.ended_at
+            changed = True
             log.warning(
-                "Orphaned %s record for %s [PID %d] marked UNKNOWN; event is retryable.",
+                "Orphaned %s record for %s [PID %s] marked UNKNOWN; event is retryable.",
                 record.role, record.task_ref, record.pid,
             )
+        return changed
+
+    @staticmethod
+    def _is_bounded_failure(record: TrackedProcess) -> bool:
+        return (
+            record.status in (ProcessStatus.FAILED, ProcessStatus.UNKNOWN)
+            or (
+                record.status == ProcessStatus.DEFERRED
+                and record.defer_scope == "event"
+            )
+        )
+
+    def _compact_history(self) -> None:
+        """Apply the hard diagnostic cap; dispatch authority lives elsewhere."""
+        if len(self._history) > MAX_HISTORY_RECORDS:
+            self._history = self._history[-MAX_HISTORY_RECORDS:]
+
+    def _compact_lifecycle_states(self) -> None:
+        """Keep the authoritative item-state table within its explicit hard cap."""
+        self._ensure_lifecycle_storage()
+        if len(self._lifecycle_states) <= MAX_LIFECYCLE_STATES:
+            return
+        ordered = sorted(
+            self._lifecycle_states.items(),
+            key=lambda item: item[1].last_observed_at,
+        )
+        live = [
+            item
+            for item in ordered
+            if item[1].record.status in (ProcessStatus.RUNNING, ProcessStatus.STUCK)
+        ]
+        terminal = [
+            item
+            for item in ordered
+            if item[1].record.status not in (ProcessStatus.RUNNING, ProcessStatus.STUCK)
+        ]
+        if len(live) >= MAX_LIFECYCLE_STATES:
+            retained = live[-MAX_LIFECYCLE_STATES:]
+        else:
+            terminal_budget = MAX_LIFECYCLE_STATES - len(live)
+            retained = live + terminal[-terminal_budget:]
+        self._lifecycle_states = dict(retained)
+
+    def _compact_provider_cooldowns(self) -> None:
+        self._ensure_lifecycle_storage()
+        now = datetime.now(timezone.utc)
+        active = []
+        for ai_name, retry_after in self._provider_cooldowns.items():
+            try:
+                parsed = datetime.fromisoformat(retry_after)
+                is_active = parsed.tzinfo is not None and parsed > now
+            except (TypeError, ValueError):
+                continue
+            if is_active:
+                active.append((parsed, ai_name, retry_after))
+        active.sort()
+        self._provider_cooldowns = {
+            ai_name: retry_after
+            for _, ai_name, retry_after in active[-MAX_PROVIDER_COOLDOWNS:]
+        }
 
     def _save_registry(self):
         """Persist process registry to disk."""
         PROCESS_REGISTRY_FILE.parent.mkdir(parents=True, exist_ok=True)
-        if len(self._history) > MAX_HISTORY_RECORDS:
-            self._history = self._history[-MAX_HISTORY_RECORDS:]
-        all_records = self._history + [tp for _, tp in self._active.values()]
-        with open(PROCESS_REGISTRY_FILE, "w") as f:
-            json.dump({
-                "last_updated": datetime.now(timezone.utc).isoformat(),
-                "history": [vars(r) for r in all_records],
-            }, f, indent=2, ensure_ascii=False)
+        self._ensure_lifecycle_storage()
+        for _, tracked in self._active.values():
+            self._store_lifecycle_record(tracked, count_failure=False)
+        self._compact_history()
+        self._compact_lifecycle_states()
+        self._compact_provider_cooldowns()
+        payload = {
+            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "history": [vars(record) for record in self._history],
+            "lifecycle_states": [
+                {
+                    "record": vars(state.record),
+                    "failure_count": state.failure_count,
+                    "last_observed_at": state.last_observed_at,
+                }
+                for state in self._lifecycle_states.values()
+            ],
+            "provider_cooldowns": self._provider_cooldowns,
+        }
+        temporary_path: Optional[Path] = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=PROCESS_REGISTRY_FILE.parent,
+                prefix=f".{PROCESS_REGISTRY_FILE.name}.",
+                delete=False,
+            ) as stream:
+                temporary_path = Path(stream.name)
+                json.dump(payload, stream, indent=2, ensure_ascii=False)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary_path, PROCESS_REGISTRY_FILE)
+        except BaseException:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+            raise
+
+    def record_failed_attempt(
+        self,
+        role: str,
+        ai_name: str,
+        model: str,
+        reasoning: str,
+        task_ref: str,
+        branch: str,
+        command: str,
+        cwd: str,
+        log_file: str,
+        failure_reason: str,
+    ) -> TrackedProcess:
+        """Persist a failed dispatch that occurred before a child PID existed."""
+        timestamp = datetime.now(timezone.utc).isoformat()
+        tracked = TrackedProcess(
+            pid=None,
+            role=role,
+            ai_name=ai_name,
+            model=model,
+            reasoning=reasoning,
+            task_ref=task_ref,
+            branch=branch,
+            command=command,
+            cwd=cwd,
+            log_file=log_file,
+            started_at=timestamp,
+            ended_at=timestamp,
+            status=ProcessStatus.FAILED,
+            failure_reason=failure_reason,
+        )
+        self._history.append(tracked)
+        self._store_lifecycle_record(tracked, count_failure=True)
+        self._save_registry()
+        return tracked
 
     # --- Registration ---
 
-    def register(self, proc: subprocess.Popen, role: str, ai_name: str,
-                 model: str, reasoning: str, task_ref: str, branch: str,
-                 command: str, cwd: str, log_file: str) -> TrackedProcess:
-        """Register a newly launched subprocess."""
+    def adopt(self, proc: subprocess.Popen, role: str, ai_name: str,
+              model: str, reasoning: str, task_ref: str, branch: str,
+              command: str, cwd: str, log_file: str) -> TrackedProcess:
+        """Take in-memory ownership of a child without blocking on registry I/O."""
         tracked = TrackedProcess(
             pid=proc.pid,
             role=role,
@@ -370,21 +1029,66 @@ class ProcessTracker:
             started_at=datetime.now(timezone.utc).isoformat(),
         )
         self._active[proc.pid] = (proc, tracked)
+        self._store_lifecycle_record(tracked, count_failure=False)
         log.info(
             "📌 Registered %s [PID %d] — %s (%s, %s)",
             role, proc.pid, task_ref, ai_name, model,
         )
+        return tracked
+
+    def persist_registration(self) -> None:
+        """Persist an already-adopted child outside the signal-deferral window."""
         self._save_registry()
+
+    def register(self, proc: subprocess.Popen, role: str, ai_name: str,
+                 model: str, reasoning: str, task_ref: str, branch: str,
+                 command: str, cwd: str, log_file: str) -> TrackedProcess:
+        """Adopt and persist a newly launched subprocess."""
+        tracked = self.adopt(
+            proc=proc,
+            role=role,
+            ai_name=ai_name,
+            model=model,
+            reasoning=reasoning,
+            task_ref=task_ref,
+            branch=branch,
+            command=command,
+            cwd=cwd,
+            log_file=log_file,
+        )
+        self.persist_registration()
         return tracked
 
     # --- Polling ---
 
     def poll_all(self):
-        """Check status of all active processes via poll(). Non-blocking."""
+        """Poll children and clean finished process groups in one bounded batch."""
         finished_pids = []
+        # Historical RUNNING/STUCK records have no Popen handle. Recheck them on
+        # every real polling pass so an inherited process that exits later cannot
+        # block its lifecycle event until the orchestrator itself restarts.
+        registry_changed = self._reconcile_orphans()
+        poll_results = {
+            pid: proc.poll()
+            for pid, (proc, _) in self._active.items()
+        }
+        cleanup_processes = [
+            proc
+            for pid, (proc, tracked) in self._active.items()
+            if poll_results[pid] is not None
+            and tracked.status != ProcessStatus.STUCK
+        ]
+        cleanup_results = (
+            terminate_process_groups(
+                cleanup_processes,
+                timeout=PROCESS_GROUP_STOP_TIMEOUT_SECONDS,
+            )
+            if cleanup_processes
+            else {}
+        )
 
         for pid, (proc, tracked) in self._active.items():
-            retcode = proc.poll()
+            retcode = poll_results[pid]
 
             if retcode is None:
                 # Still running — log a heartbeat
@@ -395,6 +1099,35 @@ class ProcessTracker:
                 )
             else:
                 # Process finished
+                if tracked.status == ProcessStatus.STUCK:
+                    # The original process group was already signalled once. Never keep sending
+                    # signals to a numeric PGID after a failed teardown because it may later be
+                    # reused by an unrelated process group. An operator can terminate the residual
+                    # tree; the next poll then observes its absence and completes the record.
+                    if _process_group_exists(pid):
+                        log_blocker(
+                            f"residual-process-group:{pid}",
+                            "Residual process group %d for %s still exists; terminate it outside "
+                            "MAO, then let Swarm poll again.",
+                            pid,
+                            tracked.task_ref,
+                        )
+                        continue
+                else:
+                    if not cleanup_results[pid]:
+                        tracked.status = ProcessStatus.STUCK
+                        tracked.exit_code = retcode
+                        tracked.failure_reason = DISPATCH_RESIDUAL
+                        self._store_lifecycle_record(tracked, count_failure=False)
+                        registry_changed = True
+                        log_blocker(
+                            f"residual-process-group:{pid}",
+                            "Residual process group %d for %s could not be stopped; terminate it "
+                            "outside MAO, then let Swarm poll again.",
+                            pid,
+                            tracked.task_ref,
+                        )
+                        continue
                 tracked.exit_code = retcode
                 tracked.ended_at = datetime.now(timezone.utc).isoformat()
                 elapsed = self._elapsed_str(tracked.started_at)
@@ -432,14 +1165,19 @@ class ProcessTracker:
                         tracked.failure_reason or "(empty)",
                     )
 
+                self._store_lifecycle_record(
+                    tracked,
+                    count_failure=self._is_bounded_failure(tracked),
+                )
                 finished_pids.append(pid)
+                registry_changed = True
 
         # Move finished processes to history
         for pid in finished_pids:
             _, tracked = self._active.pop(pid)
             self._history.append(tracked)
 
-        if finished_pids:
+        if registry_changed:
             self._save_registry()
 
     def check_pid_alive(self, pid: int, command: Optional[str] = None) -> bool:
@@ -498,15 +1236,127 @@ class ProcessTracker:
         instead of being run again, preserving the one-successful-dispatch
         invariant.
 
-        Provider quota failures pause until their cooldown expires and do not
-        consume the bounded crash retry budget.
+        Provider-wide quota failures pause until their cooldown expires and do
+        not consume the bounded crash retry budget. Event-local timeouts and
+        tool withdrawals do consume it after their cooldown, so one broken
+        lifecycle event cannot be relaunched forever.
         """
+        if hasattr(self, "_lifecycle_states"):
+            return self._should_dispatch_from_lifecycle_state(
+                task_ref,
+                role,
+                completion_confirmed=completion_confirmed,
+                ai_name=ai_name,
+            )
+        return self._should_dispatch_from_legacy_history(
+            task_ref,
+            role,
+            completion_confirmed=completion_confirmed,
+            ai_name=ai_name,
+        )
+
+    def _should_dispatch_from_lifecycle_state(
+        self,
+        task_ref: str,
+        role: str,
+        *,
+        completion_confirmed: bool,
+        ai_name: Optional[str],
+    ) -> tuple[bool, str]:
+        """Consult the bounded current-event table instead of diagnostic history."""
+        self._ensure_lifecycle_storage()
+        state = self._lifecycle_states.get(self._lifecycle_item_key(task_ref))
+        same_event = bool(
+            state
+            and state.record.task_ref == task_ref
+            and state.record.role == role
+        )
+
+        if state and state.record.status == ProcessStatus.RUNNING:
+            return False, DISPATCH_RUNNING
+        if state and state.record.status == ProcessStatus.STUCK:
+            return False, DISPATCH_RESIDUAL
+        if same_event and state:
+            if state.record.status == ProcessStatus.COMPLETED:
+                if completion_confirmed:
+                    return False, DISPATCH_COMPLETED
+                return False, DISPATCH_UNCONFIRMED
+            if state.failure_count >= MAX_DISPATCH_ATTEMPTS:
+                return False, f"exhausted {state.failure_count} failed attempts"
+
+        if ai_name:
+            retry_after = self._provider_cooldowns.get(ai_name)
+            if retry_after:
+                try:
+                    retry_at = datetime.fromisoformat(retry_after)
+                    is_active = (
+                        retry_at.tzinfo is not None
+                        and datetime.now(timezone.utc) < retry_at
+                    )
+                except (TypeError, ValueError):
+                    retry_at = None
+                    is_active = False
+                if retry_at and is_active:
+                    return False, f"{DISPATCH_PROVIDER_COOLDOWN} until {retry_after}"
+
+        if not same_event or state is None:
+            return True, "new event"
+
+        if state.record.status == ProcessStatus.DEFERRED:
+            if state.record.retry_after:
+                try:
+                    retry_at = datetime.fromisoformat(state.record.retry_after)
+                    is_active = (
+                        retry_at.tzinfo is not None
+                        and datetime.now(timezone.utc) < retry_at
+                    )
+                except (TypeError, ValueError):
+                    retry_at = None
+                    is_active = False
+                if retry_at and is_active:
+                    return (
+                        False,
+                        f"{DISPATCH_PROVIDER_COOLDOWN} until {state.record.retry_after}",
+                    )
+            return True, "retry after provider cooldown"
+
+        return (
+            True,
+            f"retry {state.failure_count + 1}/{MAX_DISPATCH_ATTEMPTS} after failure",
+        )
+
+    def _should_dispatch_from_legacy_history(
+        self,
+        task_ref: str,
+        role: str,
+        *,
+        completion_confirmed: bool,
+        ai_name: Optional[str],
+    ) -> tuple[bool, str]:
+        """Compatibility path for focused tests and pre-split in-memory trackers."""
         attempts = [
             record for record in self.all_records
             if record.task_ref == task_ref and record.role == role
         ]
         if any(record.status == ProcessStatus.RUNNING for record in attempts):
             return False, DISPATCH_RUNNING
+        if any(record.status == ProcessStatus.STUCK for record in attempts):
+            return False, DISPATCH_RESIDUAL
+        bounded_failures = [
+            record for record in attempts
+            if self._is_bounded_failure(record)
+        ]
+        completed_attempts = [
+            record for record in attempts
+            if record.status == ProcessStatus.COMPLETED
+        ]
+        if completed_attempts:
+            if completion_confirmed:
+                return False, DISPATCH_COMPLETED
+            return False, DISPATCH_UNCONFIRMED
+        if len(bounded_failures) >= MAX_DISPATCH_ATTEMPTS:
+            return False, f"exhausted {len(bounded_failures)} failed attempts"
+
         provider_cooldowns = []
         if ai_name:
             for record in self.all_records:
@@ -525,7 +1375,6 @@ class ProcessTracker:
             return False, f"{DISPATCH_PROVIDER_COOLDOWN} until {retry_at}"
         if not attempts:
             return True, "new event"
-
         deferred = [
             record for record in attempts
             if record.status == ProcessStatus.DEFERRED
@@ -539,27 +1388,41 @@ class ProcessTracker:
                         False,
                         f"{DISPATCH_PROVIDER_COOLDOWN} until {latest.retry_after}",
                     )
-
-        crash_attempts = [
-            record for record in attempts
-            if record.status in (ProcessStatus.FAILED, ProcessStatus.UNKNOWN)
-        ]
-        completed_attempts = [
-            record for record in attempts
-            if record.status == ProcessStatus.COMPLETED
-        ]
-        if completed_attempts:
-            if completion_confirmed:
-                return False, DISPATCH_COMPLETED
-            return False, DISPATCH_UNCONFIRMED
-        if len(crash_attempts) >= MAX_DISPATCH_ATTEMPTS:
-            return False, f"exhausted {len(crash_attempts)} failed attempts"
         if deferred:
             return True, "retry after provider cooldown"
         return (
             True,
-            f"retry {len(crash_attempts) + 1}/{MAX_DISPATCH_ATTEMPTS} after failure",
+            f"retry {len(bounded_failures) + 1}/{MAX_DISPATCH_ATTEMPTS} after failure",
         )
+
+    def reconcile_open_items(
+        self,
+        open_issues: list[dict],
+        open_prs: list[dict],
+    ) -> None:
+        """Prune terminal authority once a successful snapshot shows an item closed."""
+        self._ensure_lifecycle_storage()
+        open_item_keys = {
+            f"issue#{item['number']}"
+            for item in open_issues
+            if isinstance(item.get("number"), int)
+        }
+        open_item_keys.update(
+            f"pr#{item['number']}"
+            for item in open_prs
+            if isinstance(item.get("number"), int)
+        )
+        stale_keys = [
+            item_key
+            for item_key, state in self._lifecycle_states.items()
+            if item_key not in open_item_keys
+            and state.record.status not in (ProcessStatus.RUNNING, ProcessStatus.STUCK)
+        ]
+        if not stale_keys:
+            return
+        for item_key in stale_keys:
+            del self._lifecycle_states[item_key]
+        self._save_registry()
 
     @property
     def active_count(self) -> int:
@@ -586,9 +1449,10 @@ class ProcessTracker:
         if active:
             for tp in active:
                 elapsed = self._elapsed_str(tp.started_at)
+                status = tp.status.value if isinstance(tp.status, ProcessStatus) else tp.status
                 lines.append(
                     f"  PID {tp.pid:>7}  │ {tp.role:<12} │ {tp.ai_name:<14} │ "
-                    f"{tp.task_ref:<12} │ ⏱ {elapsed}"
+                    f"{tp.task_ref:<12} │ {status:<8} │ ⏱ {elapsed}"
                 )
         else:
             lines.append("  (none)")
@@ -605,8 +1469,9 @@ class ProcessTracker:
                 else:
                     icon = "❌"
                 duration = self._duration_str(tp.started_at, tp.ended_at)
+                pid_label = str(tp.pid) if tp.pid is not None else "-"
                 lines.append(
-                    f"  {icon} PID {tp.pid:>7}  │ {tp.role:<12} │ {tp.ai_name:<14} │ "
+                    f"  {icon} PID {pid_label:>7}  │ {tp.role:<12} │ {tp.ai_name:<14} │ "
                     f"{tp.task_ref:<12} │ exit={tp.exit_code} │ ⏱ {duration}"
                 )
         else:
@@ -629,21 +1494,49 @@ class ProcessTracker:
 
     # --- Cleanup ---
 
-    def kill_all(self):
-        """Send SIGTERM to all active processes."""
+    def kill_all(self) -> bool:
+        """Terminate every process group and report whether shutdown is safe."""
+        survivors = {}
+        cleanup_processes = [
+            proc
+            for proc, tracked in self._active.values()
+            if tracked.status != ProcessStatus.STUCK
+        ]
+        cleanup_results = (
+            terminate_process_groups(
+                cleanup_processes,
+                timeout=PROCESS_GROUP_STOP_TIMEOUT_SECONDS,
+            )
+            if cleanup_processes
+            else {}
+        )
         for pid, (proc, tracked) in list(self._active.items()):
             log.warning("🛑 Killing [PID %d] %s %s", pid, tracked.role, tracked.task_ref)
-            try:
-                proc.terminate()
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+            if tracked.status == ProcessStatus.STUCK:
+                if _process_group_exists(pid):
+                    survivors[pid] = (proc, tracked)
+                    continue
+                if tracked.exit_code is None:
+                    tracked.exit_code = proc.returncode
+                tracked.ended_at = datetime.now(timezone.utc).isoformat()
+                tracked.status = ProcessStatus.FAILED
+                self._history.append(tracked)
+                self._store_lifecycle_record(tracked, count_failure=True)
+                continue
+            if not cleanup_results[pid]:
+                tracked.status = ProcessStatus.STUCK
+                tracked.failure_reason = DISPATCH_RESIDUAL
+                self._store_lifecycle_record(tracked, count_failure=False)
+                survivors[pid] = (proc, tracked)
+                continue
             tracked.exit_code = proc.returncode
             tracked.ended_at = datetime.now(timezone.utc).isoformat()
             tracked.status = ProcessStatus.FAILED
             self._history.append(tracked)
-        self._active.clear()
+            self._store_lifecycle_record(tracked, count_failure=True)
+        self._active = survivors
         self._save_registry()
+        return not survivors
 
     # --- Helpers ---
 
@@ -741,6 +1634,8 @@ def reset_process_history():
     """Start a fresh run with no persisted dispatch failures or active state."""
     tracker._active.clear()
     tracker._history.clear()
+    tracker._lifecycle_states.clear()
+    tracker._provider_cooldowns.clear()
     if PROCESS_REGISTRY_FILE.exists():
         PROCESS_REGISTRY_FILE.unlink()
 
@@ -749,56 +1644,893 @@ def reset_process_history():
 # GitHub CLI Helpers
 # ---------------------------------------------------------------------------
 
-def gh(args: list[str], check: bool = True) -> str:
-    """Run a gh CLI command and return stdout."""
+
+_CAPABILITY_GAP_REASONS = {
+    "gh-not-authenticated": "the gh CLI is not authenticated",
+    "repo-not-found": (
+        "the repository does not exist, or the active gh credential cannot see it "
+        "(GitHub reports both as 404)"
+    ),
+    "bad-credentials": "GitHub rejected the active gh CLI credential",
+    "sso-authorization-required": (
+        "the organization enforces SAML SSO and the active gh credential is not authorized for it"
+    ),
+    "installation-suspended": "the GitHub App installation for this repository is suspended",
+    "resource-not-accessible": (
+        "GitHub reports that the active gh credential was not granted access to this repository"
+    ),
+    "legally-unavailable": "the repository is unavailable for legal reasons",
+    "archived": "the repository is archived, so GitHub rejects every write",
+    "disabled": "the repository is disabled",
+    "issues-disabled": "the Issues feature is disabled, so swarm cannot manage task issues",
+    "permissions-unknown": (
+        "GitHub returned no permissions.push value, so Contents: write cannot be established"
+    ),
+    "no-push-permission": (
+        "the active gh credential has read-only repository access "
+        "(permissions.push is false; Contents: write is missing)"
+    ),
+    "oauth-scope-missing": (
+        "the classic gh token has neither repo nor applicable public_repo write scope"
+    ),
+}
+_CAPABILITY_GAP_REMEDIES = {
+    "gh-not-authenticated": "configure-gh",
+    "repo-not-found": "repository-state",
+    "bad-credentials": "replace-gh-credential",
+    "sso-authorization-required": "authorize-sso",
+    "installation-suspended": "unsuspend-installation",
+    "resource-not-accessible": "grant-write",
+    "legally-unavailable": "repository-state",
+    "archived": "repository-state",
+    "disabled": "repository-state",
+    "issues-disabled": "repository-state",
+    "permissions-unknown": "grant-write",
+    "no-push-permission": "grant-write",
+    "oauth-scope-missing": "grant-write",
+}
+_CAPABILITY_REMEDY_RANK = {
+    "repository-state": 0,
+    "unsuspend-installation": 1,
+    "authorize-sso": 2,
+    "replace-gh-credential": 3,
+    "configure-gh": 4,
+    "grant-write": 5,
+}
+_CAPABILITY_REMEDY_TEXT = {
+    "repository-state": "Fix the repository state or select a different repository, then retry.",
+    "configure-gh": "Run `gh auth login` with a write credential, then retry.",
+    "replace-gh-credential": "Run `gh auth login` with a working write credential, then retry.",
+    "authorize-sso": (
+        "Authorize the active gh credential for the organization's SAML SSO, then retry."
+    ),
+    "unsuspend-installation": "Unsuspend the GitHub App installation, then retry.",
+    "grant-write": (
+        "Grant the active gh CLI credential Issues, Contents and Pull requests write access, "
+        "then retry."
+    ),
+}
+_UNVERIFIED_GRANT_LABELS = {
+    "issues-write": "Issues: write",
+    "contents-write": "Contents: write",
+    "pull-requests-write": "Pull requests: write",
+}
+_PIPELINE_GRANTS = ("issues-write", "contents-write", "pull-requests-write")
+_ACTIVE_GH_REPO_CONTEXT: Optional[str] = None
+_ACTIVE_REPO_TARGET: Optional[GitHubRepoTarget] = None
+
+
+def _bound_gh_environment(repo_context: Optional[str] = None) -> dict[str, str]:
+    """Pin gh repository selection while preserving the credential-bearing environment."""
+    environment = os.environ.copy()
+    selected = repo_context or _ACTIVE_GH_REPO_CONTEXT
+    if not selected:
+        raise SwarmPreflightConfigError(
+            "The GitHub repository context is not bound to this checkout's origin.",
+        )
+    environment["GH_REPO"] = selected
+    host, separator, _ = selected.partition("/")
+    if not separator:
+        raise SwarmPreflightConfigError(
+            "The GitHub repository context is invalid; re-run swarm from a GitHub checkout.",
+        )
+    environment["GH_HOST"] = host
+    return environment
+
+
+def _read_origin_urls(push: bool, repo_root: Path = REPO_ROOT) -> list[str]:
+    """Read every effective origin URL without exposing its potentially secret-bearing value."""
+    args = ["git", "remote", "get-url", "--all"]
+    if push:
+        args.append("--push")
+    args.append("origin")
+    try:
+        result = subprocess.run(
+            args,
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        raise SwarmPreflightConfigError(
+            "git is required for mao swarm; install it and retry",
+        ) from None
+    except OSError:
+        raise SwarmPreflightConfigError(
+            "git could not inspect the selected checkout's origin; retry after fixing the local "
+            "Git installation",
+        ) from None
+    urls = [line for line in result.stdout.splitlines() if line]
+    if result.returncode != 0 or not urls:
+        raise SwarmPreflightConfigError(
+            "The selected checkout has no readable origin remote. Configure its GitHub origin, "
+            "then retry.",
+        )
+    return urls
+
+
+def _assert_standard_git_ssh_context(repo_root: Path = REPO_ROOT) -> None:
+    """Fail closed when Git would not use the system SSH configuration we inspect."""
+    if os.environ.get("GIT_SSH_COMMAND") or os.environ.get("GIT_SSH"):
+        raise SwarmPreflightConfigError(
+            "Swarm cannot verify an SSH origin while GIT_SSH_COMMAND or GIT_SSH overrides Git's "
+            "transport. Unset the override or use an HTTPS origin, then retry.",
+        )
+    try:
+        result = subprocess.run(
+            ["git", "config", "--get", "core.sshCommand"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (FileNotFoundError, OSError):
+        raise SwarmPreflightConfigError(
+            "git could not inspect the SSH transport configuration for this checkout.",
+        ) from None
+    if result.returncode == 0 and result.stdout.strip():
+        raise SwarmPreflightConfigError(
+            "Swarm cannot verify an SSH origin with core.sshCommand configured. Remove the "
+            "override or use an HTTPS origin, then retry.",
+        )
+    if result.returncode not in {0, 1}:
+        raise SwarmPreflightConfigError(
+            "git could not inspect the SSH transport configuration for this checkout.",
+        )
+
+
+def _resolve_ssh_endpoint(
+    host: str,
+    user: Optional[str] = None,
+    port: Optional[int] = None,
+    repo_root: Path = REPO_ROOT,
+    verify_transport: bool = True,
+) -> SshEndpoint:
+    """Resolve the exact SSH host, user, and port Git will use for this remote."""
+    if verify_transport:
+        _assert_standard_git_ssh_context(repo_root)
+    args = ["ssh", "-G"]
+    if user:
+        args.extend(["-l", user])
+    if port is not None:
+        args.extend(["-p", str(port)])
+    args.extend(["--", host])
+    try:
+        result = subprocess.run(
+            args,
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=GH_TIMEOUT_SECONDS,
+        )
+    except FileNotFoundError:
+        raise SwarmPreflightConfigError(
+            "ssh is required to resolve this checkout's SSH origin; install it and retry",
+        ) from None
+    except subprocess.TimeoutExpired:
+        raise SwarmPreflightTransientError(
+            "ssh timed out while resolving the selected checkout's origin host.",
+        ) from None
+    except OSError:
+        raise SwarmPreflightConfigError(
+            "ssh could not resolve the selected checkout's origin host.",
+        ) from None
+
+    if result.returncode != 0:
+        raise SwarmPreflightConfigError(
+            "ssh could not resolve the selected checkout's origin host.",
+        )
+    resolved_values: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition(" ")
+        normalized_key = key.lower()
+        normalized_value = value.strip()
+        if (
+            separator
+            and normalized_key in {"proxycommand", "proxyjump"}
+            and normalized_value.lower() not in {"", "none"}
+        ):
+            raise SwarmPreflightConfigError(
+                "Swarm cannot verify an SSH origin that uses ProxyCommand or ProxyJump. "
+                "Remove the proxy override or use an HTTPS origin, then retry.",
+            )
+        if separator and normalized_key in {"hostname", "user", "port"} and value.strip():
+            resolved_values[normalized_key] = normalized_value
+    try:
+        resolved_port = int(resolved_values["port"])
+        if not 1 <= resolved_port <= 65535:
+            raise ValueError("invalid SSH port")
+        endpoint = SshEndpoint(
+            resolved_values["hostname"].lower(),
+            resolved_values["user"],
+            resolved_port,
+        )
+    except (KeyError, ValueError):
+        raise SwarmPreflightConfigError(
+            "ssh returned an incomplete target for the selected checkout's origin.",
+        ) from None
+
+    # GitHub documents ssh.github.com:443 as the alternate endpoint for the same public
+    # github.com SSH service. No other host/user/port equivalence is assumed.
+    if endpoint == SshEndpoint("ssh.github.com", "git", 443):
+        return SshEndpoint("github.com", "git", 22)
+    return endpoint
+
+
+def _parse_github_remote(
+    remote: str,
+    ssh_host_cache: Optional[
+        dict[tuple[str, str, Optional[int]], SshEndpoint]
+    ] = None,
+    repo_root: Path = REPO_ROOT,
+    verify_transport: bool = True,
+) -> GitHubRepoTarget:
+    """Parse one remote as data, resolving SSH aliases without logging the input."""
+
+    host = ""
+    path = ""
+    uses_ssh = False
+    ssh_user: Optional[str] = None
+    ssh_port: Optional[int] = None
+    http_endpoint: Optional[HttpEndpoint] = None
+    try:
+        if "://" in remote:
+            parsed = urlsplit(remote)
+            scheme = parsed.scheme.lower()
+            if scheme not in {"http", "https", "ssh"}:
+                raise ValueError("unsupported remote scheme")
+            if parsed.query or parsed.fragment:
+                raise ValueError("remote query and fragment are unsupported")
+            host = parsed.hostname or ""
+            path = parsed.path
+            uses_ssh = scheme == "ssh"
+            if uses_ssh:
+                if parsed.password is not None:
+                    raise ValueError("SSH remote passwords are unsupported")
+                ssh_user = parsed.username
+                ssh_port = parsed.port
+            else:
+                effective_port = parsed.port or (443 if scheme == "https" else 80)
+                # gh API host binding defaults to HTTPS. A non-default web authority cannot be
+                # proven equivalent without additional host configuration, so fail closed.
+                if scheme != "https":
+                    raise SwarmPreflightConfigError(
+                        "Swarm cannot bind gh to an HTTP origin. Use an HTTPS origin on port "
+                        "443 or an SSH origin, then retry.",
+                    )
+                if effective_port != 443:
+                    raise SwarmPreflightConfigError(
+                        "Swarm cannot prove that a non-default HTTPS origin authority matches "
+                        "gh. Use HTTPS on port 443 or an SSH origin, then retry.",
+                    )
+                http_endpoint = HttpEndpoint("https", host.lower(), 443)
+        else:
+            match = re.match(
+                r"^(?:(?P<user>[^@/:]+)@)?(?P<host>[^:/]+):(?P<path>.+)$",
+                remote,
+            )
+            if match:
+                host = match.group("host")
+                path = match.group("path")
+                uses_ssh = True
+                ssh_user = match.group("user")
+    except (UnicodeError, ValueError):
+        raise SwarmPreflightConfigError(
+            "The selected checkout's origin is not a supported GitHub repository URL. "
+            "Configure a GitHub origin, then retry.",
+        ) from None
+
+    repository_path = path.strip("/").removesuffix(".git")
+    parts = repository_path.split("/")
+    if (
+        not host
+        or len(parts) != 2
+        or not all(re.fullmatch(r"[A-Za-z0-9_.-]+", part) for part in parts)
+        or (
+            uses_ssh
+            and ssh_user is not None
+            and not re.fullmatch(r"[A-Za-z0-9_.-]+", ssh_user)
+        )
+    ):
+        raise SwarmPreflightConfigError(
+            "The selected checkout's origin is not a supported GitHub repository URL. "
+            "Configure a GitHub origin, then retry.",
+        )
+    if uses_ssh:
+        cache = ssh_host_cache if ssh_host_cache is not None else {}
+        cache_key = (host.lower(), ssh_user or "", ssh_port)
+        if cache_key not in cache:
+            cache[cache_key] = _resolve_ssh_endpoint(
+                host,
+                user=ssh_user,
+                port=ssh_port,
+                repo_root=repo_root,
+                verify_transport=verify_transport,
+            )
+        ssh_endpoint = cache[cache_key]
+        resolved_host = ssh_endpoint.host
+    else:
+        ssh_endpoint = None
+        resolved_host = host.lower()
+    return GitHubRepoTarget(
+        resolved_host,
+        parts[0],
+        parts[1],
+        ssh_endpoint=ssh_endpoint,
+        http_endpoint=http_endpoint,
+    )
+
+
+def _resolve_origin_repository(
+    repo_root: Path = REPO_ROOT,
+    verify_transport: bool = True,
+) -> GitHubRepoTarget:
+    """Resolve and cross-check every effective origin fetch and push URL."""
+    ssh_host_cache: dict[tuple[str, str, Optional[int]], SshEndpoint] = {}
+    fetch_targets = [
+        _parse_github_remote(
+            url,
+            ssh_host_cache,
+            repo_root,
+            verify_transport=verify_transport,
+        )
+        for url in _read_origin_urls(push=False, repo_root=repo_root)
+    ]
+    push_targets = [
+        _parse_github_remote(
+            url,
+            ssh_host_cache,
+            repo_root,
+            verify_transport=verify_transport,
+        )
+        for url in _read_origin_urls(push=True, repo_root=repo_root)
+    ]
+    targets = [*fetch_targets, *push_targets]
+    target = targets[0]
+    identity = (target.host.lower(), target.owner.lower(), target.repo.lower())
+    for candidate in targets[1:]:
+        candidate_identity = (
+            candidate.host.lower(),
+            candidate.owner.lower(),
+            candidate.repo.lower(),
+        )
+        if candidate_identity != identity:
+            raise SwarmPreflightConfigError(
+                "The selected checkout's origin fetch and push URLs do not identify the same "
+                "GitHub repository. Align every origin URL, then retry.",
+            )
+    ssh_endpoints = [
+        candidate.ssh_endpoint
+        for candidate in targets
+        if candidate.ssh_endpoint is not None
+    ]
+    if ssh_endpoints and any(
+        endpoint != ssh_endpoints[0] for endpoint in ssh_endpoints[1:]
+    ):
+        raise SwarmPreflightConfigError(
+            "The selected checkout's origin SSH URLs do not resolve to the same host, user, and "
+            "port. Align every origin URL and SSH Host rule, then retry.",
+        )
+    http_endpoints = [
+        candidate.http_endpoint
+        for candidate in targets
+        if candidate.http_endpoint is not None
+    ]
+    if http_endpoints and any(
+        endpoint != http_endpoints[0] for endpoint in http_endpoints[1:]
+    ):
+        raise SwarmPreflightConfigError(
+            "The selected checkout's origin HTTPS URLs do not use the same authority. Align "
+            "every origin URL, then retry.",
+        )
+    return GitHubRepoTarget(
+        target.host,
+        target.owner,
+        target.repo,
+        ssh_endpoint=ssh_endpoints[0] if ssh_endpoints else None,
+        http_endpoint=http_endpoints[0] if http_endpoints else None,
+    )
+
+
+def _read_git_config_values(key: str, repo_root: Path) -> tuple[str, ...]:
+    """Read the effective repository-owned value for one push selector."""
+    try:
+        result = subprocess.run(
+            ["git", "config", "--show-scope", "--get", key],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (FileNotFoundError, OSError):
+        raise SwarmPreflightConfigError(
+            "git could not inspect the task worktree's push target configuration.",
+        ) from None
+    if result.returncode == 1:
+        return ()
+    if result.returncode != 0:
+        raise SwarmPreflightConfigError(
+            "git could not inspect the task worktree's push target configuration.",
+        )
+    lines = result.stdout.splitlines()
+    if len(lines) != 1:
+        raise SwarmPreflightConfigError(
+            "git could not inspect the task worktree's push target configuration.",
+        )
+    scope, separator, value = lines[0].partition("\t")
+    if not separator:
+        raise SwarmPreflightConfigError(
+            "git could not inspect the task worktree's push target configuration.",
+        )
+    return (value,) if scope in {"local", "worktree"} else ()
+
+
+def _assert_worktree_push_target(
+    worktree_path: Path,
+    branch_name: Optional[str],
+) -> None:
+    """Revalidate branch-scoped origin and bare-push selectors before agent dispatch."""
+    # Deliberately re-resolve instead of caching: includeIf/onbranch and SSH config can change
+    # between polling cycles, and stale endpoint data would weaken the dispatch boundary.
+    target = _resolve_origin_repository(worktree_path)
+    if not _ACTIVE_REPO_TARGET:
+        raise SwarmPreflightConfigError(
+            "The GitHub repository context is not bound to this checkout's origin.",
+        )
+    expected = [
+        _ACTIVE_REPO_TARGET.host,
+        _ACTIVE_REPO_TARGET.owner,
+        _ACTIVE_REPO_TARGET.repo,
+    ]
+    actual = [target.host, target.owner, target.repo]
+    if (
+        [part.lower() for part in actual] != [part.lower() for part in expected]
+        or target.ssh_endpoint != _ACTIVE_REPO_TARGET.ssh_endpoint
+        or target.http_endpoint != _ACTIVE_REPO_TARGET.http_endpoint
+    ):
+        raise SwarmPreflightConfigError(
+            "The task worktree's effective origin or transport endpoint differs from the target "
+            "bound at startup. Align branch-scoped Git configuration, then retry.",
+        )
+
+    selector_keys = ["remote.pushDefault"]
+    if branch_name:
+        selector_keys.extend(
+            [
+                f"branch.{branch_name}.pushRemote",
+                f"branch.{branch_name}.remote",
+            ]
+        )
+    if any(
+        value != "origin"
+        for key in selector_keys
+        for value in _read_git_config_values(key, worktree_path)
+    ):
+        raise SwarmPreflightConfigError(
+            "The task worktree selects a push remote other than origin. Remove the conflicting "
+            "push-remote override or point it to origin, then retry.",
+        )
+
+
+def _assert_checkout_push_target(checkout_path: Path) -> Optional[str]:
+    """Apply the dispatch push boundary and return the checked-out branch."""
+    try:
+        result = subprocess.run(
+            ["git", "symbolic-ref", "--quiet", "--short", "HEAD"],
+            cwd=checkout_path,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (FileNotFoundError, OSError):
+        raise SwarmPreflightConfigError(
+            "git could not inspect the agent checkout before dispatch.",
+        ) from None
+    branch_name = result.stdout.strip() or None
+    if result.returncode == 1 and checkout_path.resolve() == REPO_ROOT.resolve():
+        # Reviewer and Maintainer agents run in REPO_ROOT and may legitimately use a
+        # detached checkout. They still get origin/transport validation plus a pinned
+        # remote.pushDefault; branch-scoped selectors simply do not exist in this state.
+        branch_name = None
+    elif result.returncode != 0 or branch_name is None:
+        raise SwarmPreflightConfigError(
+            "The task worktree is detached or has no readable branch; refusing dispatch.",
+        )
+    _assert_worktree_push_target(checkout_path, branch_name)
+    return branch_name
+
+
+def _bind_origin_repository(verify_transport: bool = True) -> GitHubRepoTarget:
+    """Bind local gh context without performing a network permission probe."""
+    global _ACTIVE_GH_REPO_CONTEXT, _ACTIVE_REPO_TARGET
+    _ACTIVE_GH_REPO_CONTEXT = None
+    _ACTIVE_REPO_TARGET = None
+    target = _resolve_origin_repository(verify_transport=verify_transport)
+    _ACTIVE_GH_REPO_CONTEXT = target.gh_context
+    _ACTIVE_REPO_TARGET = target
+    return target
+
+
+def _gh_operation(args: list[str]) -> str:
+    """Return a fixed, non-sensitive label instead of logging arbitrary argv."""
+    if not args:
+        return "gh"
+    if args[0] in {"issue", "pr", "repo"} and len(args) > 1:
+        return f"gh {args[0]} {args[1]}"
+    return f"gh {args[0]}"
+
+
+_SAFE_CLI_FAILURE_HINTS = (
+    (
+        ("resource not accessible by integration",),
+        "GitHub denied access to this repository resource; verify the active credential's "
+        "repository grants",
+    ),
+    (
+        ("bad credentials", "authentication required", "gh auth login"),
+        "GitHub authentication failed; refresh the active gh credential",
+    ),
+    (
+        ("rate limit", "secondary rate limit"),
+        "GitHub rate limiting blocked the operation; retry later",
+    ),
+    (
+        ("could not resolve host", "network is unreachable", "connection timed out"),
+        "the network request failed; verify connectivity and retry",
+    ),
+    (
+        ("repository not found",),
+        "the remote repository was not found or is not visible to the active credential",
+    ),
+)
+
+
+def _safe_cli_failure_hint(stdout: str, stderr: str) -> Optional[str]:
+    """Map known diagnostics to fixed text without returning remote-controlled content."""
+    diagnostic = f"{stdout}\n{stderr}".lower()
+    for markers, hint in _SAFE_CLI_FAILURE_HINTS:
+        if any(marker in diagnostic for marker in markers):
+            return hint
+    return None
+
+
+def _run_gh(
+    args: list[str],
+    repo_context: Optional[str] = None,
+) -> subprocess.CompletedProcess:
+    """Run gh while keeping raw argv/stdout/stderr out of logs and raised errors."""
     cmd = ["gh"] + args
-    log.debug("Running: %s", " ".join(cmd))
+    operation = _gh_operation(args)
+    log.debug("Running %s", operation)
     try:
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
             cwd=REPO_ROOT,
+            env=_bound_gh_environment(repo_context),
             check=False,
             timeout=GH_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired:
-        log.error(
-            "gh command timed out after %ds: %s", GH_TIMEOUT_SECONDS, " ".join(cmd),
-        )
+        log.error("%s timed out after %ds", operation, GH_TIMEOUT_SECONDS)
+        raise subprocess.TimeoutExpired([operation], GH_TIMEOUT_SECONDS) from None
+    except FileNotFoundError:
+        log.error("gh CLI executable was not found")
+        raise FileNotFoundError("gh CLI executable was not found") from None
+    except OSError as error:
+        log.error("%s could not be started", operation)
+        raise OSError(error.errno, "gh CLI operation could not be started") from None
+
+    if result.returncode != 0:
+        hint = _safe_cli_failure_hint(result.stdout, result.stderr)
+        if hint:
+            log.error("%s failed with exit %d: %s", operation, result.returncode, hint)
+        else:
+            log.error("%s failed with exit %d", operation, result.returncode)
+    return result
+
+
+def gh(args: list[str], check: bool = True) -> str:
+    """Run a gh CLI command and return stdout without exposing raw failure data."""
+    try:
+        result = _run_gh(args)
+    except (subprocess.TimeoutExpired, OSError, SwarmPreflightError):
         if check:
             raise
         return ""
+
     if result.returncode != 0:
-        log.error(
-            "gh command failed (exit %d): %s\nstderr: %s",
-            result.returncode,
-            " ".join(cmd),
-            result.stderr.strip() or "(empty)",
-        )
         if check:
             raise subprocess.CalledProcessError(
                 result.returncode,
-                cmd,
-                output=result.stdout,
-                stderr=result.stderr,
+                [_gh_operation(args)],
+                output="",
+                stderr="",
             )
         return ""
     return result.stdout.strip()
+
+
+def _parse_gh_api_response(raw: str) -> tuple[int, dict[str, str], dict]:
+    """Parse `gh api --include` output without ever logging its raw headers or body."""
+    normalized = raw.replace("\r\n", "\n")
+    header_text, separator, body_text = normalized.partition("\n\n")
+    status_match = re.match(r"HTTP/\S+\s+(\d{3})\b", header_text)
+    if not separator or not status_match:
+        raise ValueError("gh API response did not contain an HTTP envelope")
+
+    headers: dict[str, str] = {}
+    for line in header_text.splitlines()[1:]:
+        name, colon, value = line.partition(":")
+        if colon:
+            headers[name.strip().lower()] = value.strip()
+    body = json.loads(body_text)
+    if not isinstance(body, dict):
+        raise ValueError("gh API response body was not an object")
+    return int(status_match.group(1)), headers, body
+
+
+def _failure_capability(repository: str, gap: str) -> RepoWorkflowCapability:
+    return RepoWorkflowCapability(repository, False, (gap,), ())
+
+
+def _evaluate_repo_workflow_capability(
+    repository: str,
+    snapshot: dict,
+    oauth_scopes: Optional[str],
+) -> RepoWorkflowCapability:
+    permissions = snapshot.get("permissions")
+    push = permissions.get("push") if isinstance(permissions, dict) else None
+    if not isinstance(push, bool):
+        push = None
+
+    gaps: list[str] = []
+    if snapshot.get("archived") is True:
+        gaps.append("archived")
+    if snapshot.get("disabled") is True:
+        gaps.append("disabled")
+    if snapshot.get("has_issues") is False:
+        gaps.append("issues-disabled")
+    if push is None:
+        gaps.append("permissions-unknown")
+    elif not push:
+        gaps.append("no-push-permission")
+
+    scopes = {
+        scope.strip()
+        for scope in (oauth_scopes or "").split(",")
+        if scope.strip()
+    }
+    credential_is_classic = bool(scopes)
+    if credential_is_classic:
+        can_write = "repo" in scopes or (
+            snapshot.get("private") is not True and "public_repo" in scopes
+        )
+        if not can_write:
+            gaps.append("oauth-scope-missing")
+
+    unverified = _PIPELINE_GRANTS if not gaps and not credential_is_classic else ()
+    return RepoWorkflowCapability(repository, not gaps, tuple(gaps), tuple(unverified))
+
+
+def _classify_gh_api_failure(
+    repository: str,
+    result: subprocess.CompletedProcess,
+) -> RepoWorkflowCapability:
+    raw_diagnostic = f"{result.stdout}\n{result.stderr}"
+    status: Optional[int] = None
+    headers: dict[str, str] = {}
+    try:
+        status, headers, _ = _parse_gh_api_response(result.stdout)
+    except (ValueError, json.JSONDecodeError):
+        matches = re.findall(r"(?:HTTP/\S+\s+|HTTP\s+)(\d{3})\b", raw_diagnostic)
+        if matches:
+            status = int(matches[-1])
+
+    diagnostic = raw_diagnostic.lower()
+    if status == 404:
+        return _failure_capability(repository, "repo-not-found")
+    if status == 401:
+        return _failure_capability(repository, "bad-credentials")
+    if status == 451:
+        return _failure_capability(repository, "legally-unavailable")
+    if status in {403, 429}:
+        if headers.get("x-ratelimit-remaining") == "0":
+            raise SwarmPreflightTransientError(
+                f"{repository}: GitHub rate limit is exhausted; retry after it resets",
+            )
+        if "retry-after" in headers or "rate limit" in diagnostic:
+            raise SwarmPreflightTransientError(
+                f"{repository}: GitHub rate-limited the preflight; retry later",
+            )
+        if "x-github-sso" in headers:
+            return _failure_capability(repository, "sso-authorization-required")
+        if "installation has been suspended" in diagnostic:
+            return _failure_capability(repository, "installation-suspended")
+        if "resource not accessible by" in diagnostic:
+            return _failure_capability(repository, "resource-not-accessible")
+    if status is None and "bad credentials" in diagnostic:
+        return _failure_capability(repository, "bad-credentials")
+    if status is None and (result.returncode == 4 or re.search(
+        r"not logged in|authentication required|gh auth login|no oauth token",
+        diagnostic,
+    )):
+        return _failure_capability(repository, "gh-not-authenticated")
+    if status is None and "rate limit" in diagnostic:
+        raise SwarmPreflightTransientError(
+            f"{repository}: GitHub rate-limited the preflight; retry later",
+        )
+
+    raise SwarmPreflightTransientError(
+        f"{repository}: GitHub write preflight was inconclusive (gh exit {result.returncode}); "
+        "retry later. No permanent authorization verdict was inferred",
+    )
+
+
+def check_repo_workflow_capability() -> RepoWorkflowCapability:
+    """Probe the active gh credential with one non-mutating repository GET."""
+    global _ACTIVE_GH_REPO_CONTEXT, _ACTIVE_REPO_TARGET
+    _ACTIVE_GH_REPO_CONTEXT = None
+    _ACTIVE_REPO_TARGET = None
+    target = _resolve_origin_repository()
+    try:
+        result = _run_gh([
+            "api",
+            "--include",
+            "--method", "GET",
+            "repos/{owner}/{repo}",
+            "--jq", "{full_name,archived,disabled,has_issues,private,permissions}",
+        ], repo_context=target.gh_context)
+    except FileNotFoundError as error:
+        raise SwarmPreflightConfigError(
+            "gh CLI is required for mao swarm; install it and run `gh auth login`, then retry",
+        ) from error
+    except subprocess.TimeoutExpired as error:
+        raise SwarmPreflightTransientError(
+            f"{target.name}: GitHub write preflight timed out after "
+            f"{GH_TIMEOUT_SECONDS}s; retry later",
+        ) from error
+    except OSError as error:
+        raise SwarmPreflightTransientError(
+            f"{target.name}: gh CLI could not start the GitHub write preflight; retry later",
+        ) from error
+
+    if result.returncode != 0:
+        return _classify_gh_api_failure(target.name, result)
+
+    try:
+        status, headers, snapshot = _parse_gh_api_response(result.stdout)
+    except (ValueError, json.JSONDecodeError) as error:
+        raise SwarmPreflightTransientError(
+            f"{target.name}: GitHub returned an unreadable preflight response; retry later",
+        ) from error
+    # `gh api` currently exits non-zero for non-2xx responses, so this is defensive against a
+    # future CLI behavior change rather than an expected path today.
+    if status < 200 or status >= 300:
+        raise SwarmPreflightTransientError(
+            f"{target.name}: GitHub returned unexpected HTTP {status}; retry later",
+        )
+
+    repository = snapshot.get("full_name")
+    if not isinstance(repository, str) or not repository.strip():
+        raise SwarmPreflightTransientError(
+            f"{target.name}: GitHub omitted the repository name from the preflight response; "
+            "retry later",
+        )
+    repository = repository.strip()
+    if repository.lower() != target.name.lower():
+        raise SwarmPreflightConfigError(
+            f"The selected checkout origin is {target.name}, but gh resolved {repository}. "
+            "Clear the conflicting gh repository context, then retry.",
+        )
+    capability = _evaluate_repo_workflow_capability(
+        repository,
+        snapshot,
+        headers.get("x-oauth-scopes"),
+    )
+    if capability.ok:
+        _ACTIVE_GH_REPO_CONTEXT = target.gh_context
+        _ACTIVE_REPO_TARGET = target
+    return capability
+
+
+def describe_repo_workflow_capability(capability: RepoWorkflowCapability) -> str:
+    if capability.ok:
+        return f"{capability.repository} has no known blocker for mao swarm"
+
+    reasons = "; ".join(_CAPABILITY_GAP_REASONS[gap] for gap in capability.gaps)
+    remedy_kind = min(
+        (_CAPABILITY_GAP_REMEDIES[gap] for gap in capability.gaps),
+        key=lambda kind: _CAPABILITY_REMEDY_RANK[kind],
+    )
+    remedy = _CAPABILITY_REMEDY_TEXT[remedy_kind]
+    return (
+        f"{capability.repository} cannot run mao swarm with the active gh CLI credential: "
+        f"{reasons}. {remedy}"
+    )
+
+
+def describe_unverified_grants(capability: RepoWorkflowCapability) -> Optional[str]:
+    if not capability.unverified:
+        return None
+    grants = ", ".join(_UNVERIFIED_GRANT_LABELS[grant] for grant in capability.unverified)
+    return (
+        f"{capability.repository}: repository push permission is necessary but not sufficient, and "
+        "GitHub exposes no non-mutating way to confirm this gh credential's individual "
+        f"{grants} grants. They remain unverified, so a write can still fail."
+    )
+
+
+def assert_repo_workflow_writable() -> RepoWorkflowCapability:
+    capability = check_repo_workflow_capability()
+    if not capability.ok:
+        raise SwarmCapabilityError(capability)
+
+    log.info(
+        "Swarm write preflight passed for %s using the active gh CLI credential.",
+        capability.repository,
+    )
+    caveat = describe_unverified_grants(capability)
+    if caveat:
+        grants_key = ",".join(capability.unverified)
+        log_blocker(
+            f"preflight-unverified:{capability.repository.lower()}:{grants_key}",
+            "%s",
+            caveat,
+            level=logging.WARNING,
+        )
+    return capability
+
+
+def _log_preflight_failure(error: SwarmPreflightError):
+    """Log typed preflight failures without exposing raw remote or CLI diagnostics."""
+    if isinstance(error, SwarmCapabilityError):
+        log.error("Swarm write preflight failed: %s", error)
+    elif isinstance(error, SwarmPreflightConfigError):
+        log.error("Swarm write preflight configuration error: %s", error)
+    else:
+        log.error("Swarm write preflight unavailable (transient): %s", error)
 
 
 _CURRENT_GH_USER: Optional[str] = None
 
 
 def get_gh_user() -> str:
-    """Fetch and cache the currently authenticated GitHub user login."""
+    """Fetch and cache a successful authenticated GitHub user lookup."""
     global _CURRENT_GH_USER
-    if _CURRENT_GH_USER is None:
+    if not _CURRENT_GH_USER:
         try:
-            _CURRENT_GH_USER = gh(["api", "user", "-q", ".login"]).strip()
+            login = gh(["api", "user", "-q", ".login"]).strip()
+            if not login:
+                log.error("GitHub returned no authenticated user login.")
+                return ""
+            _CURRENT_GH_USER = login
         except Exception as e:
             log.error("Failed to get current GitHub user login: %s", e)
-            _CURRENT_GH_USER = ""
+            return ""
     return _CURRENT_GH_USER
 
 
@@ -820,7 +2552,7 @@ def fetch_open_prs() -> list[dict]:
     raw = gh([
         "pr", "list",
         "--state", "open",
-        "--json", "number,title,body,headRefName,headRefOid",
+        "--json", "number,title,body,headRefName,headRefOid,isCrossRepository",
         "--limit", str(OPEN_ITEMS_LIMIT),
     ])
     if not raw:
@@ -828,16 +2560,20 @@ def fetch_open_prs() -> list[dict]:
     return json.loads(raw)
 
 
-def fetch_pr_comments(pr_number: int) -> list[dict]:
-    """Fetch comments on a PR."""
+def fetch_pr_comments(pr_number: int) -> Optional[list[dict]]:
+    """Fetch PR comments, distinguishing an empty result from an unreadable one."""
     raw = gh([
         "pr", "view", str(pr_number),
         "--json", "comments",
     ], check=False)
     if not raw:
-        return []
-    data = json.loads(raw)
-    return data.get("comments", [])
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    comments = data.get("comments") if isinstance(data, dict) else None
+    return comments if isinstance(comments, list) else None
 
 
 def fetch_issue(issue_number: int) -> Optional[dict]:
@@ -955,18 +2691,163 @@ def determine_pr_action(comments: list[dict]) -> tuple[str, Optional[dict], int]
 def local_branch_exists(branch_name: str) -> bool:
     """Return whether a local branch of this name exists."""
     result = subprocess.run(
-        ["git", "branch", "--list", branch_name],
+        ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch_name}"],
         capture_output=True, text=True, cwd=REPO_ROOT, check=False,
     )
-    return bool(result.stdout.strip())
+    return result.returncode == 0
+
+
+def local_branch_sha(branch_name: str) -> Optional[str]:
+    """Return the exact commit of one local branch, or None when it is absent."""
+    result = subprocess.run(
+        ["git", "rev-parse", "--verify", f"refs/heads/{branch_name}^{{commit}}"],
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+        check=False,
+    )
+    sha = result.stdout.strip().lower()
+    if result.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40,64}", sha):
+        return None
+    return sha
+
+
+def _fast_forward_local_branch(
+    branch_name: str,
+    expected_sha: str,
+    checkout_path: Optional[Path] = None,
+) -> None:
+    """Advance a tracked-clean local PR branch when the verified head descends from it."""
+    current_sha = local_branch_sha(branch_name)
+    normalized_expected = expected_sha.lower()
+    if current_sha == normalized_expected:
+        return
+    if current_sha is None:
+        raise SwarmPreflightConfigError(
+            f"Local branch '{branch_name}' could not be inspected; preserving it for inspection."
+        )
+
+    ancestor = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", current_sha, normalized_expected],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if ancestor.returncode != 0:
+        raise SwarmPreflightConfigError(
+            f"Local branch '{branch_name}' diverges from the fetched PR head; preserving it "
+            "for inspection. Reconcile or move the local branch manually, then retry."
+        )
+
+    if checkout_path is not None:
+        status = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            cwd=checkout_path,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if status.returncode != 0:
+            raise SwarmPreflightConfigError(
+                f"Local branch '{branch_name}' could not be inspected; preserving it for inspection."
+            )
+        if status.stdout:
+            raise SwarmPreflightConfigError(
+                f"Local branch '{branch_name}' trails the fetched PR head but its worktree has "
+                "tracked changes; preserving it for inspection. Commit, move, or otherwise "
+                "reconcile those changes, then retry."
+            )
+        advanced = subprocess.run(
+            ["git", "merge", "--no-overwrite-ignore", "--ff-only", normalized_expected],
+            cwd=checkout_path,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    else:
+        advanced = subprocess.run(
+            [
+                "git",
+                "update-ref",
+                f"refs/heads/{branch_name}",
+                normalized_expected,
+                current_sha,
+            ],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    if advanced.returncode != 0 or local_branch_sha(branch_name) != normalized_expected:
+        raise SwarmPreflightConfigError(
+            f"Local branch '{branch_name}' could not be fast-forwarded to the fetched PR head "
+            "without overwriting local state, or changed concurrently; preserving its current "
+            "state for inspection."
+        )
+    log.info("Fast-forwarded local branch %s to the verified PR head.", branch_name)
+
+
+def fetch_pr_head(pr_number: int, expected_sha: str) -> str:
+    """Fetch and verify the immutable PR-head snapshot used for a revision."""
+    normalized_expected = (expected_sha or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40,64}", normalized_expected):
+        raise SwarmPreflightTransientError(
+            f"PR #{pr_number} has no valid head commit; refusing revision dispatch."
+        )
+    try:
+        fetched = subprocess.run(
+            [
+                "git",
+                "fetch",
+                "--no-tags",
+                "origin",
+                f"refs/pull/{pr_number}/head",
+            ],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=GH_TIMEOUT_SECONDS,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        raise SwarmPreflightTransientError(
+            f"Could not fetch PR #{pr_number}'s head from origin; refusing revision dispatch."
+        ) from None
+    if fetched.returncode != 0:
+        raise SwarmPreflightTransientError(
+            f"Could not fetch PR #{pr_number}'s head from origin; refusing revision dispatch."
+        )
+    resolved = subprocess.run(
+        ["git", "rev-parse", "--verify", "FETCH_HEAD^{commit}"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    actual_sha = resolved.stdout.strip().lower()
+    if (
+        resolved.returncode != 0
+        or not re.fullmatch(r"[0-9a-f]{40,64}", actual_sha)
+        or actual_sha != normalized_expected
+    ):
+        raise SwarmPreflightTransientError(
+            f"PR #{pr_number}'s head changed while preparing the revision; retry the next cycle."
+        )
+    return actual_sha
 
 
 def list_git_worktrees() -> list[dict[str, str]]:
     """Return Git's authoritative worktree registry in porcelain form."""
-    result = subprocess.run(
-        ["git", "worktree", "list", "--porcelain"],
-        capture_output=True, text=True, cwd=REPO_ROOT, check=True,
-    )
+    try:
+        result = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            capture_output=True, text=True, cwd=REPO_ROOT, check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        raise SwarmPreflightConfigError(
+            "Could not inspect Git worktrees; preserving local checkout state for inspection."
+        ) from None
     entries: list[dict[str, str]] = []
     current: dict[str, str] = {}
     for line in result.stdout.splitlines():
@@ -1028,12 +2909,17 @@ def directory_is_empty(directory: Path) -> bool:
     return False
 
 
-def create_worktree(issue_number: int, branch_name: str) -> Path:
+def create_worktree(
+    issue_number: int,
+    branch_name: str,
+    start_ref: str = "origin/main",
+    expected_sha: Optional[str] = None,
+) -> Path:
     """Create or safely reuse the one isolated worktree owned by a task."""
     worktree_path = WORKTREE_DIR / str(issue_number)
 
     if worktree_path.is_symlink():
-        raise RuntimeError(f"Refusing symlinked worktree path: {worktree_path}")
+        raise SwarmPreflightConfigError(f"Refusing symlinked worktree path: {worktree_path}")
 
     entries = list_git_worktrees()
     path_entry = worktree_entry_for_path(entries, worktree_path)
@@ -1064,13 +2950,19 @@ def create_worktree(issue_number: int, branch_name: str) -> Path:
             and path_entry
             and path_entry.get("branch") == expected_branch
         ):
+            if expected_sha:
+                _fast_forward_local_branch(
+                    branch_name,
+                    expected_sha,
+                    checkout_path=worktree_path,
+                )
             log.info("Reusing worktree: %s", worktree_path)
             return worktree_path
 
         if worktree_path.exists() and directory_is_empty(worktree_path):
             worktree_path.rmdir()
         elif worktree_path.exists():
-            raise RuntimeError(
+            raise SwarmPreflightConfigError(
                 f"Worktree path is not a valid checkout for '{branch_name}'; "
                 f"preserving non-empty directory: {worktree_path}"
             )
@@ -1078,24 +2970,40 @@ def create_worktree(issue_number: int, branch_name: str) -> Path:
     entries = list_git_worktrees()
     branch_entry = worktree_entry_for_branch(entries, branch_name)
     if branch_entry:
-        raise RuntimeError(
+        raise SwarmPreflightConfigError(
             f"Branch '{branch_name}' is already checked out at "
             f"{branch_entry.get('worktree', '(unknown path)')}"
         )
 
     WORKTREE_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Create branch from origin/main if it doesn't exist
-    if not local_branch_exists(branch_name):
+    branch_sha = local_branch_sha(branch_name)
+    if expected_sha and branch_sha and branch_sha != expected_sha.lower():
+        _fast_forward_local_branch(branch_name, expected_sha)
+        branch_sha = local_branch_sha(branch_name)
+
+    # Initial Workers branch from origin/main. Revision callers provide a
+    # separately fetched and verified PR-head commit instead.
+    if branch_sha is None:
+        try:
+            subprocess.run(
+                ["git", "branch", "--", branch_name, start_ref],
+                cwd=REPO_ROOT, check=True,
+            )
+        except (OSError, subprocess.SubprocessError):
+            raise SwarmPreflightConfigError(
+                f"Could not create local branch '{branch_name}'; preserving Git state."
+            ) from None
+
+    try:
         subprocess.run(
-            ["git", "branch", branch_name, "origin/main"],
+            ["git", "worktree", "add", str(worktree_path), branch_name],
             cwd=REPO_ROOT, check=True,
         )
-
-    subprocess.run(
-        ["git", "worktree", "add", str(worktree_path), branch_name],
-        cwd=REPO_ROOT, check=True,
-    )
+    except (OSError, subprocess.SubprocessError):
+        raise SwarmPreflightConfigError(
+            f"Could not create the worktree for '{branch_name}'; preserving Git state."
+        ) from None
     log.info("Created worktree: %s on branch %s", worktree_path, branch_name)
     return worktree_path
 
@@ -1215,9 +3123,11 @@ def cleanup_worktree(issue_number: int, branch_name: str):
         cwd=REPO_ROOT, capture_output=True, text=True, check=False,
     )
     if result.returncode != 0:
-        stderr = result.stderr.strip()
-        if stderr:
-            log.warning("Failed to delete branch '%s': %s", branch_name, stderr)
+        log.warning(
+            "Failed to delete branch '%s' (git branch exited %d).",
+            branch_name,
+            result.returncode,
+        )
 
 
 def sync_main_branch(dry_run: bool = False):
@@ -1238,12 +3148,21 @@ def sync_main_branch(dry_run: bool = False):
         timeout=GH_TIMEOUT_SECONDS,
     )
     if fetch.returncode != 0:
-        log_blocker(
-            "main-sync:fetch",
-            "Failed to fetch origin/main: %s",
-            fetch.stderr.strip() or "(unknown error)",
-            level=logging.WARNING,
-        )
+        hint = _safe_cli_failure_hint(fetch.stdout, fetch.stderr)
+        if hint:
+            log_blocker(
+                "main-sync:fetch",
+                "Failed to fetch origin/main: %s.",
+                hint,
+                level=logging.WARNING,
+            )
+        else:
+            log_blocker(
+                "main-sync:fetch",
+                "Failed to fetch origin/main (git fetch exited %d).",
+                fetch.returncode,
+                level=logging.WARNING,
+            )
         return
 
     branch = subprocess.run(
@@ -1296,8 +3215,8 @@ def sync_main_branch(dry_run: bool = False):
         else:
             log_blocker(
                 "main-sync:ff",
-                "Failed to fast-forward main: %s",
-                merge.stderr.strip(),
+                "Failed to fast-forward main (git merge exited %d).",
+                merge.returncode,
                 level=logging.WARNING,
             )
     elif ahead and not behind:
@@ -1323,8 +3242,8 @@ def sync_main_branch(dry_run: bool = False):
 def create_log_files(role: str, task_ref: str, ai_name: str) -> tuple[Path, "IO", "IO"]:
     """Create log files and return (log_path, stdout_file, stderr_file).
 
-    Returns open file objects (not raw fds) so they stay open for the
-    lifetime of the subprocess and are cleaned up by the GC.
+    The caller closes its file objects after spawning; the child retains its
+    duplicated descriptors for the lifetime of the process.
     """
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1332,15 +3251,19 @@ def create_log_files(role: str, task_ref: str, ai_name: str) -> tuple[Path, "IO"
     log_path = LOG_DIR / f"{timestamp}_{role}_{ai_name}_{safe_ref}.log"
 
     log_file = open(log_path, "w", encoding="utf-8")
-    log_file.write(
-        f"--- Swarm AI Process Log ---\n"
-        f"Role:      {role}\n"
-        f"AI:        {ai_name}\n"
-        f"Task:      {task_ref}\n"
-        f"Started:   {datetime.now(timezone.utc).isoformat()}\n"
-        f"---\n\n"
-    )
-    log_file.flush()
+    try:
+        log_file.write(
+            f"--- Swarm AI Process Log ---\n"
+            f"Role:      {role}\n"
+            f"AI:        {ai_name}\n"
+            f"Task:      {task_ref}\n"
+            f"Started:   {datetime.now(timezone.utc).isoformat()}\n"
+            f"---\n\n"
+        )
+        log_file.flush()
+    except Exception:
+        log_file.close()
+        raise
     return log_path, log_file, log_file
 
 
@@ -1622,6 +3545,180 @@ def _format_argv_for_log(argv: list[str]) -> str:
     return " ".join(parts)
 
 
+def _assert_dispatch_environment() -> None:
+    """Reject inherited Git command parameters before any real-run network or writes."""
+    if os.environ.get("GIT_CONFIG_PARAMETERS", "").strip():
+        raise SwarmPreflightConfigError(
+            "Swarm cannot safely compose inherited GIT_CONFIG_PARAMETERS with its push target "
+            "boundary. This commonly comes from launching through `git -c` or a Git hook; "
+            "start Swarm outside that wrapper or unset the variable, then retry.",
+        )
+
+
+def _bound_dispatch_environment(branch_name: Optional[str]) -> dict[str, str]:
+    """Bind GitHub context and pin every implicit Git push selector to origin."""
+    environment = _bound_gh_environment()
+    raw_count = environment.get("GIT_CONFIG_COUNT", "0")
+    try:
+        config_count = int(raw_count)
+    except ValueError:
+        raise SwarmPreflightConfigError(
+            "The inherited Git command configuration is invalid; refusing agent dispatch.",
+        ) from None
+    if config_count < 0 or config_count > 1024:
+        raise SwarmPreflightConfigError(
+            "The inherited Git command configuration is invalid; refusing agent dispatch.",
+        )
+    overrides = [("remote.pushDefault", "origin")]
+    if branch_name:
+        overrides.extend(
+            [
+                (f"branch.{branch_name}.pushRemote", "origin"),
+                (f"branch.{branch_name}.remote", "origin"),
+            ]
+        )
+    for key, value in overrides:
+        environment[f"GIT_CONFIG_KEY_{config_count}"] = key
+        environment[f"GIT_CONFIG_VALUE_{config_count}"] = value
+        config_count += 1
+    environment["GIT_CONFIG_COUNT"] = str(config_count)
+    return environment
+
+
+def _prepare_ai_process_spawn(cwd: str) -> dict[str, str]:
+    """Validate a checkout before entering the signal-deferral ownership window."""
+    _assert_dispatch_environment()
+    branch_name = _assert_checkout_push_target(Path(cwd))
+    _assert_dispatch_platform()
+    return _bound_dispatch_environment(branch_name)
+
+
+def _spawn_ai_process(
+    argv,
+    cwd,
+    stdout_file,
+    stderr_file,
+    stdin_source,
+    dispatch_environment: Optional[dict[str, str]] = None,
+):
+    """Launch an agent with a prevalidated repository and host environment."""
+    environment = (
+        dispatch_environment
+        if dispatch_environment is not None
+        else _prepare_ai_process_spawn(cwd)
+    )
+    return subprocess.Popen(
+        argv,
+        cwd=cwd,
+        env=environment,
+        stdout=stdout_file,
+        stderr=stderr_file,
+        stdin=stdin_source,
+        start_new_session=True,
+    )
+
+
+def _record_failed_dispatch(
+    role: str,
+    assignment: RoleAssignment,
+    task_ref: str,
+    branch: str,
+    argv: list[str],
+    cwd: Path,
+    log_path: Optional[Path],
+) -> None:
+    """Consume retry budget for a non-preflight dispatch failure before registration."""
+    try:
+        tracker.record_failed_attempt(
+            role=role,
+            ai_name=assignment.ai,
+            model=assignment.model,
+            reasoning=assignment.reasoning,
+            task_ref=task_ref,
+            branch=branch,
+            command=_format_argv_for_log(argv),
+            cwd=str(cwd),
+            log_file=str(log_path) if log_path else "",
+            failure_reason="Selected dispatch failed before successful registration",
+        )
+    except Exception:
+        log.error("Failed to persist the dispatch failure for %s.", task_ref)
+
+
+def _cleanup_failed_process(
+    proc: subprocess.Popen,
+    *,
+    role: str,
+    assignment: RoleAssignment,
+    task_ref: str,
+    branch: str,
+    argv: list[str],
+    cwd: Path,
+    log_path: Optional[Path],
+    registration_persisted: bool = False,
+) -> bool:
+    """Stop a launched child while keeping any residual tree under supervision."""
+    active_entry = tracker._active.get(proc.pid)
+    if active_entry is None:
+        tracked = TrackedProcess(
+            pid=proc.pid,
+            role=role,
+            ai_name=assignment.ai,
+            model=assignment.model,
+            reasoning=assignment.reasoning,
+            task_ref=task_ref,
+            branch=branch,
+            command=_format_argv_for_log(argv),
+            cwd=str(cwd),
+            log_file=str(log_path) if log_path else "",
+            started_at=datetime.now(timezone.utc).isoformat(),
+        )
+        active_entry = (proc, tracked)
+        tracker._active[proc.pid] = active_entry
+
+    if not registration_persisted:
+        # Persist temporary RUNNING ownership before the bounded termination call.
+        # If this leader is killed during cleanup, the next run can still reconcile
+        # the process tree. Exactly one later save records removal or STUCK state.
+        try:
+            tracker._save_registry()
+        except Exception:
+            log.error("Failed to persist process supervision for PID %d.", proc.pid)
+
+    try:
+        stopped = terminate_process_group(proc)
+    except BaseException:
+        _, tracked = active_entry
+        tracked.status = ProcessStatus.STUCK
+        tracked.failure_reason = DISPATCH_RESIDUAL
+        tracked.exit_code = proc.returncode
+        try:
+            tracker._save_registry()
+        except Exception:
+            log.error("Failed to persist residual process supervision for PID %d.", proc.pid)
+        raise
+
+    if stopped:
+        tracker._active.pop(proc.pid, None)
+        tracker._discard_lifecycle_record(active_entry[1])
+        try:
+            tracker._save_registry()
+        except Exception:
+            log.error("Failed to persist completed process cleanup for PID %d.", proc.pid)
+        return True
+
+    _, tracked = active_entry
+    tracked.status = ProcessStatus.STUCK
+    tracked.failure_reason = DISPATCH_RESIDUAL
+    tracked.exit_code = proc.returncode
+    try:
+        tracker._save_registry()
+    except Exception:
+        log.error("Failed to persist residual process supervision for PID %d.", proc.pid)
+    log.error("Residual process tree for PID %d remains under supervision.", proc.pid)
+    return False
+
+
 def dispatch_worker(
     issue: TaskIssue,
     dry_run: bool = False,
@@ -1639,84 +3736,141 @@ def dispatch_worker(
     short_desc = re.sub(r"[^a-z0-9]+", "-", raw_desc.lower()).strip("-")[:30]
     if not short_desc:
         short_desc = f"task-{issue.number}"
-    branch_name = f"worker/{issue.number}-{worker.ai}-{short_desc}"
-    worktree_path = WORKTREE_DIR / str(issue.number)
-    if not dry_run:
-        worktree_path = create_worktree(issue.number, branch_name)
-
-    prompt = (
-        f"You are the Worker for Issue #{issue.number}: {issue.title}.\n"
-        f"Read AGENTS.md and .agents/rules/ for all project rules.\n"
-        f"Implement the task described in the Issue body:\n\n{issue.body}\n\n"
-        f"Work inside this directory. When done:\n"
-        f"1. Commit your changes with conventional commit messages referencing #{issue.number}.\n"
-        f"2. Push the branch '{branch_name}'.\n"
-        f"3. Create a PR titled '[PR] {issue.number} - <summary>' with a "
-        f"[Reviewer: ...] tag in the body.\n"
-        f"4. The Reviewer AI MUST be different from Worker AI '{worker.ai}'.\n"
-        f"5. Document your decisions and verification evidence in the PR description.\n\n"
-        f"{EXECUTION_INTEGRITY_NOTICE}"
-    )
-
+    worker_slug = re.sub(r"[^a-z0-9]+", "-", worker.ai.lower()).strip("-")[:30]
+    if not worker_slug:
+        worker_slug = "worker"
+    branch_name = f"worker/{issue.number}-{worker_slug}-{short_desc}"
+    branch_arg = shlex.quote(branch_name)
     task_ref = task_ref or f"issue#{issue.number}:initial"
-    prompt_file = (
-        PROMPT_DIR / "dry-run-worker.md"
-        if dry_run
-        else write_prompt_file(prompt, "worker", task_ref)
-    )
-    argv, use_stdin = build_ai_argv(
-        worker.ai,
-        worker.model,
-        worker.reasoning,
-        prompt_file,
-        str(worktree_path),
-        allow_tool_use=True,
-        prompt_text=prompt if dry_run else None,
-    )
-
-    if dry_run:
-        log.info("[DRY RUN] Would execute: %s", _format_argv_for_log(argv))
-        return
-
-    if not argv:
-        return
-
-    log_path, stdout_file, stderr_file = create_log_files("worker", task_ref, worker.ai)
-    log.info("Dispatching Worker %s for Issue #%d (log: %s)", worker.ai, issue.number, log_path)
-    log.info("  argv: %s", _format_argv_for_log(argv))
-
+    worktree_path = WORKTREE_DIR / str(issue.number)
+    argv: list[str] = []
+    log_path: Optional[Path] = None
+    stdout_file = None
+    stderr_file = None
+    proc = None
+    registration_persisted = False
+    dispatch_selected = not dry_run
     try:
+        if not dry_run:
+            worktree_path = create_worktree(issue.number, branch_name)
+
+        prompt = (
+            f"You are the Worker for Issue #{issue.number}: {issue.title}.\n"
+            f"Read AGENTS.md and .agents/rules/ for all project rules.\n"
+            f"Implement the task described in the Issue body:\n\n{issue.body}\n\n"
+            f"Work inside this directory. When done:\n"
+            f"1. Commit your changes with conventional commit messages referencing "
+            f"#{issue.number}.\n"
+            f"2. Push with `git push --set-upstream origin {branch_arg}`; always name `origin` "
+            f"and the branch explicitly, and never use a remote-less `git push`.\n"
+            f"3. Create a PR titled '[PR] {issue.number} - <summary>' with a "
+            f"[Reviewer: ...] tag in the body.\n"
+            f"4. The Reviewer AI MUST be different from Worker AI '{worker.ai}'.\n"
+            f"5. Document your decisions and verification evidence in the PR description.\n\n"
+            f"{EXECUTION_INTEGRITY_NOTICE}"
+        )
+        prompt_file = (
+            PROMPT_DIR / "dry-run-worker.md"
+            if dry_run
+            else write_prompt_file(prompt, "worker", task_ref)
+        )
+        argv, use_stdin = build_ai_argv(
+            worker.ai,
+            worker.model,
+            worker.reasoning,
+            prompt_file,
+            str(worktree_path),
+            allow_tool_use=True,
+            prompt_text=prompt if dry_run else None,
+        )
+
+        if dry_run:
+            log.info("[DRY RUN] Would execute: %s", _format_argv_for_log(argv))
+            return
+        if not argv:
+            raise RuntimeError(f"Unsupported Worker AI '{worker.ai}'.")
+
+        log_path, stdout_file, stderr_file = create_log_files(
+            "worker", task_ref, worker.ai,
+        )
+        log.info(
+            "Dispatching Worker %s for Issue #%d (log: %s)",
+            worker.ai,
+            issue.number,
+            log_path,
+        )
+        log.info("  argv: %s", _format_argv_for_log(argv))
+
         stdin_source = subprocess.DEVNULL
         pf = None
-        if use_stdin:
-            pf = open(prompt_file, 'r', encoding='utf-8')
-            stdin_source = pf
-
-        proc = subprocess.Popen(
-            argv,
-            cwd=str(worktree_path),
-            stdout=stdout_file,
-            stderr=stderr_file,
-            stdin=stdin_source,
-        )
-        if pf:
-            pf.close()
-        tracker.register(
-            proc=proc,
-            role="worker",
-            ai_name=worker.ai,
-            model=worker.model,
-            reasoning=worker.reasoning,
-            task_ref=task_ref,
-            branch=branch_name,
-            command=_format_argv_for_log(argv),
-            cwd=str(worktree_path),
-            log_file=str(log_path),
-        )
-    except FileNotFoundError:
-        log.error("AI CLI '%s' not found in PATH. Is it installed?", argv[0])
-    except Exception as e:
-        log.error("Failed to dispatch Worker: %s", e)
+        try:
+            if use_stdin:
+                pf = open(prompt_file, "r", encoding="utf-8")
+                stdin_source = pf
+            dispatch_environment = _prepare_ai_process_spawn(str(worktree_path))
+            with _defer_shutdown_during_process_registration():
+                proc = _spawn_ai_process(
+                    argv,
+                    str(worktree_path),
+                    stdout_file,
+                    stderr_file,
+                    stdin_source,
+                    dispatch_environment,
+                )
+                tracker.adopt(
+                    proc=proc,
+                    role="worker",
+                    ai_name=worker.ai,
+                    model=worker.model,
+                    reasoning=worker.reasoning,
+                    task_ref=task_ref,
+                    branch=branch_name,
+                    command=_format_argv_for_log(argv),
+                    cwd=str(worktree_path),
+                    log_file=str(log_path),
+                )
+            tracker.persist_registration()
+            registration_persisted = True
+        finally:
+            if pf:
+                pf.close()
+    except BaseException as error:
+        process_stopped = True
+        if proc is not None:
+            process_stopped = _cleanup_failed_process(
+                proc,
+                role="worker",
+                assignment=worker,
+                task_ref=task_ref,
+                branch=branch_name,
+                argv=argv,
+                cwd=worktree_path,
+                log_path=log_path,
+                registration_persisted=registration_persisted,
+            )
+        if (
+            isinstance(error, Exception)
+            and dispatch_selected
+            and process_stopped
+            and not isinstance(error, SwarmPreflightError)
+        ):
+            _record_failed_dispatch(
+                "worker", worker, task_ref, branch_name, argv, worktree_path, log_path,
+            )
+        if not isinstance(error, Exception):
+            raise
+        if isinstance(error, SwarmPreflightError):
+            raise
+        if isinstance(error, FileNotFoundError) and argv:
+            log.error("AI CLI '%s' not found in PATH. Is it installed?", argv[0])
+        else:
+            log.error("Failed to dispatch Worker: %s", error)
+        raise
+    finally:
+        if stdout_file is not None:
+            stdout_file.close()
+        if stderr_file is not None and stderr_file is not stdout_file:
+            stderr_file.close()
 
 
 def dispatch_reviewer(
@@ -1761,63 +3915,114 @@ def dispatch_reviewer(
     )
 
     task_ref = task_ref or f"review#{pr.number}-{pr.head_sha or 'initial'}"
-    prompt_file = (
-        PROMPT_DIR / "dry-run-reviewer.md"
-        if dry_run
-        else write_prompt_file(prompt, "reviewer", task_ref)
-    )
-    argv, use_stdin = build_ai_argv(
-        reviewer.ai,
-        reviewer.model,
-        reviewer.reasoning,
-        prompt_file,
-        str(REPO_ROOT),
-        allow_tool_use=False,
-        prompt_text=prompt if dry_run else None,
-    )
-
-    if dry_run:
-        log.info("[DRY RUN] Would execute reviewer: %s", _format_argv_for_log(argv))
-        return
-
-    if not argv:
-        return
-
-    log_path, stdout_file, stderr_file = create_log_files("reviewer", task_ref, reviewer.ai)
-    log.info("Dispatching Reviewer %s for PR #%d (log: %s)", reviewer.ai, pr.number, log_path)
-
+    argv: list[str] = []
+    log_path: Optional[Path] = None
+    stdout_file = None
+    stderr_file = None
+    proc = None
+    registration_persisted = False
+    dispatch_selected = not dry_run
     try:
+        prompt_file = (
+            PROMPT_DIR / "dry-run-reviewer.md"
+            if dry_run
+            else write_prompt_file(prompt, "reviewer", task_ref)
+        )
+        argv, use_stdin = build_ai_argv(
+            reviewer.ai,
+            reviewer.model,
+            reviewer.reasoning,
+            prompt_file,
+            str(REPO_ROOT),
+            allow_tool_use=False,
+            prompt_text=prompt if dry_run else None,
+        )
+        if dry_run:
+            log.info("[DRY RUN] Would execute reviewer: %s", _format_argv_for_log(argv))
+            return
+        if not argv:
+            raise RuntimeError(f"Unsupported Reviewer AI '{reviewer.ai}'.")
+
+        log_path, stdout_file, stderr_file = create_log_files(
+            "reviewer", task_ref, reviewer.ai,
+        )
+        log.info(
+            "Dispatching Reviewer %s for PR #%d (log: %s)",
+            reviewer.ai,
+            pr.number,
+            log_path,
+        )
+
         stdin_source = subprocess.DEVNULL
         pf = None
-        if use_stdin:
-            pf = open(prompt_file, 'r', encoding='utf-8')
-            stdin_source = pf
-
-        proc = subprocess.Popen(
-            argv,
-            cwd=str(REPO_ROOT),
-            stdout=stdout_file,
-            stderr=stderr_file,
-            stdin=stdin_source,
-        )
-        if pf:
-            pf.close()
-        tracker.register(
-            proc=proc,
-            role="reviewer",
-            ai_name=reviewer.ai,
-            model=reviewer.model,
-            reasoning=reviewer.reasoning,
-            task_ref=task_ref,
-            branch=pr.head_branch,
-            command=_format_argv_for_log(argv),
-            cwd=str(REPO_ROOT),
-            log_file=str(log_path),
-        )
-    except FileNotFoundError:
-        log.error("AI CLI '%s' not found in PATH. Is it installed?", argv[0])
-    except Exception as e:
-        log.error("Failed to dispatch Reviewer: %s", e)
+        try:
+            if use_stdin:
+                pf = open(prompt_file, "r", encoding="utf-8")
+                stdin_source = pf
+            dispatch_environment = _prepare_ai_process_spawn(str(REPO_ROOT))
+            with _defer_shutdown_during_process_registration():
+                proc = _spawn_ai_process(
+                    argv,
+                    str(REPO_ROOT),
+                    stdout_file,
+                    stderr_file,
+                    stdin_source,
+                    dispatch_environment,
+                )
+                tracker.adopt(
+                    proc=proc,
+                    role="reviewer",
+                    ai_name=reviewer.ai,
+                    model=reviewer.model,
+                    reasoning=reviewer.reasoning,
+                    task_ref=task_ref,
+                    branch=pr.head_branch,
+                    command=_format_argv_for_log(argv),
+                    cwd=str(REPO_ROOT),
+                    log_file=str(log_path),
+                )
+            tracker.persist_registration()
+            registration_persisted = True
+        finally:
+            if pf:
+                pf.close()
+    except BaseException as error:
+        process_stopped = True
+        if proc is not None:
+            process_stopped = _cleanup_failed_process(
+                proc,
+                role="reviewer",
+                assignment=reviewer,
+                task_ref=task_ref,
+                branch=pr.head_branch,
+                argv=argv,
+                cwd=REPO_ROOT,
+                log_path=log_path,
+                registration_persisted=registration_persisted,
+            )
+        if (
+            isinstance(error, Exception)
+            and dispatch_selected
+            and process_stopped
+            and not isinstance(error, SwarmPreflightError)
+        ):
+            _record_failed_dispatch(
+                "reviewer", reviewer, task_ref, pr.head_branch, argv, REPO_ROOT, log_path,
+            )
+        if not isinstance(error, Exception):
+            raise
+        if isinstance(error, SwarmPreflightError):
+            raise
+        if isinstance(error, FileNotFoundError) and argv:
+            log.error("AI CLI '%s' not found in PATH. Is it installed?", argv[0])
+        else:
+            log.error("Failed to dispatch Reviewer: %s", error)
+        raise
+    finally:
+        if stdout_file is not None:
+            stdout_file.close()
+        if stderr_file is not None and stderr_file is not stdout_file:
+            stderr_file.close()
 
 
 def dispatch_maintainer(
@@ -1857,63 +4062,114 @@ def dispatch_maintainer(
     )
 
     task_ref = task_ref or f"maintain#{pr.number}"
-    prompt_file = (
-        PROMPT_DIR / "dry-run-maintainer.md"
-        if dry_run
-        else write_prompt_file(prompt, "maintainer", task_ref)
-    )
-    argv, use_stdin = build_ai_argv(
-        maintainer.ai,
-        maintainer.model,
-        maintainer.reasoning,
-        prompt_file,
-        str(REPO_ROOT),
-        allow_tool_use=False,
-        prompt_text=prompt if dry_run else None,
-    )
-
-    if dry_run:
-        log.info("[DRY RUN] Would execute maintainer: %s", _format_argv_for_log(argv))
-        return
-
-    if not argv:
-        return
-
-    log_path, stdout_file, stderr_file = create_log_files("maintainer", task_ref, maintainer.ai)
-    log.info("Dispatching Maintainer %s for PR #%d (log: %s)", maintainer.ai, pr.number, log_path)
-
+    argv: list[str] = []
+    log_path: Optional[Path] = None
+    stdout_file = None
+    stderr_file = None
+    proc = None
+    registration_persisted = False
+    dispatch_selected = not dry_run
     try:
+        prompt_file = (
+            PROMPT_DIR / "dry-run-maintainer.md"
+            if dry_run
+            else write_prompt_file(prompt, "maintainer", task_ref)
+        )
+        argv, use_stdin = build_ai_argv(
+            maintainer.ai,
+            maintainer.model,
+            maintainer.reasoning,
+            prompt_file,
+            str(REPO_ROOT),
+            allow_tool_use=False,
+            prompt_text=prompt if dry_run else None,
+        )
+        if dry_run:
+            log.info("[DRY RUN] Would execute maintainer: %s", _format_argv_for_log(argv))
+            return
+        if not argv:
+            raise RuntimeError(f"Unsupported Maintainer AI '{maintainer.ai}'.")
+
+        log_path, stdout_file, stderr_file = create_log_files(
+            "maintainer", task_ref, maintainer.ai,
+        )
+        log.info(
+            "Dispatching Maintainer %s for PR #%d (log: %s)",
+            maintainer.ai,
+            pr.number,
+            log_path,
+        )
+
         stdin_source = subprocess.DEVNULL
         pf = None
-        if use_stdin:
-            pf = open(prompt_file, 'r', encoding='utf-8')
-            stdin_source = pf
-
-        proc = subprocess.Popen(
-            argv,
-            cwd=str(REPO_ROOT),
-            stdout=stdout_file,
-            stderr=stderr_file,
-            stdin=stdin_source,
-        )
-        if pf:
-            pf.close()
-        tracker.register(
-            proc=proc,
-            role="maintainer",
-            ai_name=maintainer.ai,
-            model=maintainer.model,
-            reasoning=maintainer.reasoning,
-            task_ref=task_ref,
-            branch="",
-            command=_format_argv_for_log(argv),
-            cwd=str(REPO_ROOT),
-            log_file=str(log_path),
-        )
-    except FileNotFoundError:
-        log.error("AI CLI '%s' not found in PATH. Is it installed?", argv[0])
-    except Exception as e:
-        log.error("Failed to dispatch Maintainer: %s", e)
+        try:
+            if use_stdin:
+                pf = open(prompt_file, "r", encoding="utf-8")
+                stdin_source = pf
+            dispatch_environment = _prepare_ai_process_spawn(str(REPO_ROOT))
+            with _defer_shutdown_during_process_registration():
+                proc = _spawn_ai_process(
+                    argv,
+                    str(REPO_ROOT),
+                    stdout_file,
+                    stderr_file,
+                    stdin_source,
+                    dispatch_environment,
+                )
+                tracker.adopt(
+                    proc=proc,
+                    role="maintainer",
+                    ai_name=maintainer.ai,
+                    model=maintainer.model,
+                    reasoning=maintainer.reasoning,
+                    task_ref=task_ref,
+                    branch="",
+                    command=_format_argv_for_log(argv),
+                    cwd=str(REPO_ROOT),
+                    log_file=str(log_path),
+                )
+            tracker.persist_registration()
+            registration_persisted = True
+        finally:
+            if pf:
+                pf.close()
+    except BaseException as error:
+        process_stopped = True
+        if proc is not None:
+            process_stopped = _cleanup_failed_process(
+                proc,
+                role="maintainer",
+                assignment=maintainer,
+                task_ref=task_ref,
+                branch="",
+                argv=argv,
+                cwd=REPO_ROOT,
+                log_path=log_path,
+                registration_persisted=registration_persisted,
+            )
+        if (
+            isinstance(error, Exception)
+            and dispatch_selected
+            and process_stopped
+            and not isinstance(error, SwarmPreflightError)
+        ):
+            _record_failed_dispatch(
+                "maintainer", maintainer, task_ref, "", argv, REPO_ROOT, log_path,
+            )
+        if not isinstance(error, Exception):
+            raise
+        if isinstance(error, SwarmPreflightError):
+            raise
+        if isinstance(error, FileNotFoundError) and argv:
+            log.error("AI CLI '%s' not found in PATH. Is it installed?", argv[0])
+        else:
+            log.error("Failed to dispatch Maintainer: %s", error)
+        raise
+    finally:
+        if stdout_file is not None:
+            stdout_file.close()
+        if stderr_file is not None and stderr_file is not stdout_file:
+            stderr_file.close()
 
 
 def dispatch_worker_revision(
@@ -1936,117 +4192,202 @@ def dispatch_worker_revision(
     # Reuse the PR's actual branch so a title-derived branch cannot diverge.
     branch_name = pr.head_branch
     if not branch_name:
-        log.warning("PR #%d has no head branch, cannot dispatch revision.", pr.number)
+        log_blocker(
+            f"revision-missing-head:{pr.number}",
+            "PR #%d has no head branch, cannot dispatch revision.",
+            pr.number,
+            level=logging.WARNING,
+        )
         return
+    if pr.is_cross_repository:
+        log_blocker(
+            f"revision-cross-repository:{pr.number}",
+            "PR #%d comes from a fork; Swarm cannot safely update it through origin.",
+            pr.number,
+            level=logging.WARNING,
+        )
+        return
+    # Git and subprocess calls receive this ref as an argv element. Quote only the shell command
+    # examples in the agent prompt so valid external/codex/claude branch names remain usable.
+    branch_arg = shlex.quote(branch_name)
 
     # We must run inside the same worktree or recreate it. Dry-run only reports
     # the intended path and must not mutate git worktree state.
     worktree_path = WORKTREE_DIR / str(issue.number)
-    if not dry_run:
-        worktree_path = create_worktree(issue.number, branch_name)
-
-    prompt = (
-        f"You are the Worker for PR #{pr.number} (Issue #{issue.number}: {issue.title}).\n"
-        f"Read AGENTS.md and .agents/rules/ for all project rules.\n"
-        f"You previously created this PR, but additional modifications were requested. "
-        f"Here is the feedback/comments:\n\n{feedback_text}\n\n"
-        f"Work inside this directory. This worktree may be stale — first fetch and "
-        f"rebase '{branch_name}' onto the latest origin/main yourself before making "
-        f"any changes, so your commit isn't built on an outdated base. When done:\n"
-        f"1. Fix the code according to the feedback.\n"
-        f"2. Commit your changes with conventional commit messages.\n"
-        f"3. Push the branch '{branch_name}'. If the push is rejected (e.g. "
-        f"non-fast-forward), that is a FAILED push, not a completed one — resolve it "
-        f"(rebase/force-push your own branch as needed) and push again before "
-        f"proceeding.\n"
-        f"4. Add a comment to the PR containing EXACTLY the phrase:\n"
-        f"   [Worker] Revision complete.\n"
-        f"   indicating it is ready for another review.\n\n"
-        f"{EXECUTION_INTEGRITY_NOTICE}"
-    )
-
-    if not task_ref:
-        task_ref = f"revise#{pr.number}"
-    prompt_file = (
-        PROMPT_DIR / "dry-run-worker-revise.md"
-        if dry_run
-        else write_prompt_file(prompt, "worker-revise", task_ref)
-    )
-    argv, use_stdin = build_ai_argv(
-        worker.ai,
-        worker.model,
-        worker.reasoning,
-        prompt_file,
-        str(worktree_path),
-        allow_tool_use=True,
-        prompt_text=prompt if dry_run else None,
-    )
-
-    if dry_run:
-        log.info("[DRY RUN] Would execute worker revision: %s", _format_argv_for_log(argv))
-        return
-
-    if not argv:
-        return
-
-    log_path, stdout_file, stderr_file = create_log_files("worker_revise", task_ref, worker.ai)
-    log.info("Dispatching Worker %s for PR #%d Revision (log: %s)", worker.ai, pr.number, log_path)
-    log.info("  argv: %s", _format_argv_for_log(argv))
-
+    task_ref = task_ref or f"revise#{pr.number}"
+    argv: list[str] = []
+    log_path: Optional[Path] = None
+    stdout_file = None
+    stderr_file = None
+    proc = None
+    registration_persisted = False
+    dispatch_selected = not dry_run
     try:
+        if not dry_run:
+            fetched_head = fetch_pr_head(pr.number, pr.head_sha)
+            worktree_path = create_worktree(
+                issue.number,
+                branch_name,
+                start_ref=fetched_head,
+                expected_sha=fetched_head,
+            )
+
+        prompt = (
+            f"You are the Worker for PR #{pr.number} "
+            f"(Issue #{issue.number}: {issue.title}).\n"
+            f"Read AGENTS.md and .agents/rules/ for all project rules.\n"
+            f"You previously created this PR, but additional modifications were requested. "
+            f"Here is the feedback/comments:\n\n{feedback_text}\n\n"
+            f"Work inside this directory. This worktree may be stale — first fetch and "
+            f"rebase {branch_arg} onto the latest origin/main yourself before making "
+            f"any changes, so your commit isn't built on an outdated base. When done:\n"
+            f"1. Fix the code according to the feedback.\n"
+            f"2. Commit your changes with conventional commit messages.\n"
+            f"3. Push with `git push --set-upstream origin {branch_arg}`; always name `origin` "
+            f"and the branch explicitly, and never use a remote-less `git push`. If the push is "
+            f"rejected (e.g. non-fast-forward), that is a FAILED push, not a completed one — "
+            f"resolve it (rebase/force-push your own branch as needed) and push again before "
+            f"proceeding.\n"
+            f"4. Add a comment to the PR containing EXACTLY the phrase:\n"
+            f"   [Worker] Revision complete.\n"
+            f"   indicating it is ready for another review.\n\n"
+            f"{EXECUTION_INTEGRITY_NOTICE}"
+        )
+        prompt_file = (
+            PROMPT_DIR / "dry-run-worker-revise.md"
+            if dry_run
+            else write_prompt_file(prompt, "worker-revise", task_ref)
+        )
+        argv, use_stdin = build_ai_argv(
+            worker.ai,
+            worker.model,
+            worker.reasoning,
+            prompt_file,
+            str(worktree_path),
+            allow_tool_use=True,
+            prompt_text=prompt if dry_run else None,
+        )
+        if dry_run:
+            log.info(
+                "[DRY RUN] Would execute worker revision: %s",
+                _format_argv_for_log(argv),
+            )
+            return
+        if not argv:
+            raise RuntimeError(f"Unsupported Worker AI '{worker.ai}'.")
+
+        log_path, stdout_file, stderr_file = create_log_files(
+            "worker_revise", task_ref, worker.ai,
+        )
+        log.info(
+            "Dispatching Worker %s for PR #%d Revision (log: %s)",
+            worker.ai,
+            pr.number,
+            log_path,
+        )
+        log.info("  argv: %s", _format_argv_for_log(argv))
+
         stdin_source = subprocess.DEVNULL
         pf = None
-        if use_stdin:
-            pf = open(prompt_file, 'r', encoding='utf-8')
-            stdin_source = pf
-
-        proc = subprocess.Popen(
-            argv,
-            cwd=str(worktree_path),
-            stdout=stdout_file,
-            stderr=stderr_file,
-            stdin=stdin_source,
-        )
-        if pf:
-            pf.close()
-        tracker.register(
-            proc=proc,
-            role="worker_revise",
-            ai_name=worker.ai,
-            model=worker.model,
-            reasoning=worker.reasoning,
-            task_ref=task_ref,
-            branch=branch_name,
-            command=_format_argv_for_log(argv),
-            cwd=str(worktree_path),
-            log_file=str(log_path),
-        )
-    except FileNotFoundError:
-        log.error("AI CLI '%s' not found in PATH. Is it installed?", argv[0])
-    except Exception as e:
-        log.error("Failed to dispatch Worker Revision: %s", e)
+        try:
+            if use_stdin:
+                pf = open(prompt_file, "r", encoding="utf-8")
+                stdin_source = pf
+            dispatch_environment = _prepare_ai_process_spawn(str(worktree_path))
+            with _defer_shutdown_during_process_registration():
+                proc = _spawn_ai_process(
+                    argv,
+                    str(worktree_path),
+                    stdout_file,
+                    stderr_file,
+                    stdin_source,
+                    dispatch_environment,
+                )
+                tracker.adopt(
+                    proc=proc,
+                    role="worker_revise",
+                    ai_name=worker.ai,
+                    model=worker.model,
+                    reasoning=worker.reasoning,
+                    task_ref=task_ref,
+                    branch=branch_name,
+                    command=_format_argv_for_log(argv),
+                    cwd=str(worktree_path),
+                    log_file=str(log_path),
+                )
+            tracker.persist_registration()
+            registration_persisted = True
+        finally:
+            if pf:
+                pf.close()
+    except BaseException as error:
+        process_stopped = True
+        if proc is not None:
+            process_stopped = _cleanup_failed_process(
+                proc,
+                role="worker_revise",
+                assignment=worker,
+                task_ref=task_ref,
+                branch=branch_name,
+                argv=argv,
+                cwd=worktree_path,
+                log_path=log_path,
+                registration_persisted=registration_persisted,
+            )
+        if (
+            isinstance(error, Exception)
+            and dispatch_selected
+            and process_stopped
+            and not isinstance(error, SwarmPreflightError)
+        ):
+            _record_failed_dispatch(
+                "worker_revise",
+                worker,
+                task_ref,
+                branch_name,
+                argv,
+                worktree_path,
+                log_path,
+            )
+        if not isinstance(error, Exception):
+            raise
+        if isinstance(error, SwarmPreflightError):
+            raise
+        if isinstance(error, FileNotFoundError) and argv:
+            log.error("AI CLI '%s' not found in PATH. Is it installed?", argv[0])
+        else:
+            log.error("Failed to dispatch Worker Revision: %s", error)
+        raise
+    finally:
+        if stdout_file is not None:
+            stdout_file.close()
+        if stderr_file is not None and stderr_file is not stdout_file:
+            stderr_file.close()
 
 
 # ---------------------------------------------------------------------------
 # Main Polling Loop
 # ---------------------------------------------------------------------------
 
-def process_issues(
+def _process_issue_batch(
     dry_run: bool = False,
     open_issues: Optional[list[dict]] = None,
     open_prs: Optional[list[dict]] = None,
-):
-    """Poll and dispatch each initial Issue event at most once."""
+    pr_issue_numbers: Optional[set[int]] = None,
+) -> set[object]:
+    """Process a caller-provided Issue batch without exception isolation."""
     issues = open_issues if open_issues is not None else fetch_open_issues()
+    clearable_items: set[object] = set()
     if open_prs is None:
         open_prs = fetch_open_prs()
 
-    pr_issue_numbers = set()
-    for pr in open_prs:
-        pr_title = pr.get("title", "")
-        issue_num = extract_issue_number_from_pr_title(pr_title)
-        if issue_num:
-            pr_issue_numbers.add(issue_num)
+    if pr_issue_numbers is None:
+        pr_issue_numbers = set()
+        for pr in open_prs:
+            pr_title = pr.get("title", "")
+            issue_num = extract_issue_number_from_pr_title(pr_title)
+            if issue_num:
+                pr_issue_numbers.add(issue_num)
 
     for raw in issues:
         num = raw["number"]
@@ -2056,15 +4397,18 @@ def process_issues(
                 "Open Issue #%d is not a [Task] Issue; inspected without dispatch.",
                 num,
             )
+            clearable_items.add(num)
             continue
 
         # 1. If PR already exists, Worker is done (or PR handles the rest)
         if num in pr_issue_numbers:
+            clearable_items.add(num)
             continue
 
         worker = parse_role(WORKER_PATTERN, raw.get("body", ""))
         if not worker:
             log.debug("Issue #%d has no Worker metadata, skipping.", num)
+            clearable_items.add(num)
             continue
 
         # 2. A persistent event key prevents repeat dispatch after completion.
@@ -2084,6 +4428,8 @@ def process_issues(
                 reason,
             )
             log.debug("Skipping Worker for Issue #%d: %s.", num, reason)
+            if not reason.startswith(DISPATCH_PROVIDER_COOLDOWN):
+                clearable_items.add(num)
             continue
 
         # 3. Dispatch Worker
@@ -2099,14 +4445,68 @@ def process_issues(
             num, reason, issue.title,
         )
         dispatch_worker(issue, dry_run, task_ref=task_ref)
+        clearable_items.add(num)
+
+    return clearable_items
 
 
-def process_prs(
+def process_issues(
+    dry_run: bool = False,
+    open_issues: Optional[list[dict]] = None,
+    open_prs: Optional[list[dict]] = None,
+) -> int:
+    """Process every Issue independently and return the number that failed."""
+    issues = open_issues if open_issues is not None else fetch_open_issues()
+    prs = open_prs if open_prs is not None else fetch_open_prs()
+    pr_issue_numbers = {
+        issue_number
+        for pr in prs
+        if (issue_number := extract_issue_number_from_pr_title(pr.get("title", "")))
+    }
+    failures = 0
+    for raw in issues:
+        item_number = raw.get("number", "?")
+        lifecycle_version = "initial"
+        try:
+            clearable_items = _process_issue_batch(
+                dry_run,
+                [raw],
+                prs,
+                pr_issue_numbers=pr_issue_numbers,
+            )
+            if item_number in clearable_items:
+                clear_item_preflight_blockers(
+                    "Issue",
+                    item_number,
+                    lifecycle_version,
+                )
+        except SwarmPreflightError as error:
+            failures += 1
+            log_item_preflight_blocker(
+                "Issue",
+                item_number,
+                lifecycle_version,
+                error,
+            )
+        except Exception as error:
+            failures += 1
+            log.error(
+                "Failed to process Issue #%s: %s",
+                raw.get("number", "?"),
+                error,
+                exc_info=True,
+            )
+    return failures
+
+
+def _process_pr_batch(
     dry_run: bool = False,
     open_prs: Optional[list[dict]] = None,
-):
-    """Advance each PR by one idempotent Worker/Reviewer/Maintainer event."""
+    current_user: Optional[str] = None,
+) -> set[object]:
+    """Process a caller-provided PR batch without exception isolation."""
     prs = open_prs if open_prs is not None else fetch_open_prs()
+    clearable_items: set[object] = set()
 
     for raw in prs:
         pr_num = raw["number"]
@@ -2123,6 +4523,7 @@ def process_prs(
                 "PR #%d has no Issue number in its title; refusing role dispatch.",
                 pr_num,
             )
+            clearable_items.add(pr_num)
             continue
 
         reviewer = parse_role(REVIEWER_PATTERN, pr_body)
@@ -2132,6 +4533,7 @@ def process_prs(
                 "PR #%d has no Reviewer metadata; refusing dispatch.",
                 pr_num,
             )
+            clearable_items.add(pr_num)
             continue
 
         issue_raw = fetch_issue(issue_number)
@@ -2149,10 +4551,18 @@ def process_prs(
                 "Issue #%d has no Worker metadata; refusing dispatch for PR #%d.",
                 issue_number, pr_num,
             )
+            clearable_items.add(pr_num)
             continue
 
         comments = fetch_pr_comments(pr_num)
-        current_user = get_gh_user()
+        if comments is None:
+            log_blocker(
+                f"pr-comments:{pr_num}:{head_sha}",
+                "Could not fetch comments for PR #%d.",
+                pr_num,
+            )
+            continue
+        current_user = current_user if current_user is not None else get_gh_user()
         if not current_user:
             log.warning(
                 "Cannot determine current GitHub user; skipping comment-signal processing for PR #%d.",
@@ -2174,6 +4584,7 @@ def process_prs(
             body=pr_body,
             head_branch=head_branch,
             head_sha=head_sha,
+            is_cross_repository=raw.get("isCrossRepository") is True,
             issue_number=issue_number,
         )
 
@@ -2207,6 +4618,7 @@ def process_prs(
                     pr_num,
                     reviewer.ai,
                 )
+                clearable_items.add(pr_num)
                 continue
             valid, why = validate_distinct_roles(worker, reviewer, maintainer)
             if not valid:
@@ -2214,6 +4626,7 @@ def process_prs(
                     f"roles:{pr_num}:{signal_id}",
                     "PR #%d role assignment rejected: %s.", pr_num, why,
                 )
+                clearable_items.add(pr_num)
                 continue
 
             task_ref = f"maintain#{pr_num}-{signal_id}"
@@ -2230,6 +4643,8 @@ def process_prs(
                     reason,
                 )
                 log.debug("Skipping Maintainer for PR #%d: %s.", pr_num, reason)
+                if not reason.startswith(DISPATCH_PROVIDER_COOLDOWN):
+                    clearable_items.add(pr_num)
                 continue
             log.info(
                 "=== PR #%d approved, dispatching AI3 Maintainer (%s) ===",
@@ -2242,6 +4657,7 @@ def process_prs(
                 dry_run,
                 task_ref=task_ref,
             )
+            clearable_items.add(pr_num)
             continue
 
         valid, why = validate_distinct_roles(worker, reviewer)
@@ -2250,6 +4666,7 @@ def process_prs(
                 f"roles:{pr_num}:{head_sha}",
                 "PR #%d role assignment rejected: %s.", pr_num, why,
             )
+            clearable_items.add(pr_num)
             continue
 
         if action in ("review", "review_after_maintainer_block"):
@@ -2271,6 +4688,7 @@ def process_prs(
                         pr_num,
                         why,
                     )
+                    clearable_items.add(pr_num)
                     continue
                 review_version = f"maintainer-block-{signal_id}"
                 review_trigger = "maintainer_block"
@@ -2302,6 +4720,8 @@ def process_prs(
                         level=logging.WARNING,
                     )
                 log.debug("Skipping Reviewer for PR #%d: %s.", pr_num, reason)
+                if not reason.startswith(DISPATCH_PROVIDER_COOLDOWN):
+                    clearable_items.add(pr_num)
                 continue
             log.info(
                 "=== PR #%d needs review for %s (%s) ===",
@@ -2314,6 +4734,7 @@ def process_prs(
                 task_ref=task_ref,
                 trigger=review_trigger,
             )
+            clearable_items.add(pr_num)
             continue
 
         task_ref = f"revise#{pr_num}-{signal_id}"
@@ -2330,6 +4751,8 @@ def process_prs(
                 reason,
             )
             log.debug("Skipping Worker revision for PR #%d: %s.", pr_num, reason)
+            if not reason.startswith(DISPATCH_PROVIDER_COOLDOWN):
+                clearable_items.add(pr_num)
             continue
         feedback_reviewer = parse_role(
             REVIEWER_PATTERN,
@@ -2342,6 +4765,7 @@ def process_prs(
                 pr_num,
                 reviewer.ai,
             )
+            clearable_items.add(pr_num)
             continue
         log.info(
             "=== PR #%d needs Worker revision for %s (%s) ===",
@@ -2354,6 +4778,59 @@ def process_prs(
             dry_run,
             task_ref=task_ref,
         )
+        clearable_items.add(pr_num)
+
+    return clearable_items
+
+
+def process_prs(
+    dry_run: bool = False,
+    open_prs: Optional[list[dict]] = None,
+) -> int:
+    """Process every PR independently and return the number that failed."""
+    prs = open_prs if open_prs is not None else fetch_open_prs()
+    if not prs:
+        return 0
+    current_user = get_gh_user()
+    if not current_user:
+        log.error(
+            "Cannot determine the authenticated GitHub user; %d PR item(s) failed closed.",
+            len(prs),
+        )
+        return len(prs)
+    failures = 0
+    for raw in prs:
+        item_number = raw.get("number", "?")
+        lifecycle_version = raw.get("headRefOid", "") or "initial"
+        try:
+            clearable_items = _process_pr_batch(
+                dry_run,
+                [raw],
+                current_user=current_user,
+            )
+            if item_number in clearable_items:
+                clear_item_preflight_blockers(
+                    "PR",
+                    item_number,
+                    lifecycle_version,
+                )
+        except SwarmPreflightError as error:
+            failures += 1
+            log_item_preflight_blocker(
+                "PR",
+                item_number,
+                lifecycle_version,
+                error,
+            )
+        except Exception as error:
+            failures += 1
+            log.error(
+                "Failed to process PR #%s: %s",
+                raw.get("number", "?"),
+                error,
+                exc_info=True,
+            )
+    return failures
 
 
 def close_issue_if_open(issue_num: int, pr_num: int, dry_run: bool):
@@ -2425,27 +4902,44 @@ def log_open_items(issues: list[dict], prs: list[dict]):
         )
 
 
-def process_polling_cycle(dry_run: bool = False, initial: bool = False):
-    """Fetch a consistent open-work snapshot and advance every eligible item."""
+def process_polling_cycle(dry_run: bool = False, initial: bool = False) -> int:
+    """Fetch one snapshot, advance every open item, and return isolated failures."""
     # Fetch both collections before dispatch. If either critical query fails,
     # the cycle fails closed instead of creating a duplicate Worker while its
     # existing PR was merely unavailable.
     open_issues = fetch_open_issues()
     open_prs = fetch_open_prs()
 
+    if not dry_run:
+        tracker.reconcile_open_items(open_issues, open_prs)
+
     if initial:
         log_open_items(open_issues, open_prs)
 
-    process_issues(
+    failures = process_issues(
         dry_run,
         open_issues=open_issues,
         open_prs=open_prs,
     )
-    process_prs(dry_run, open_prs)
-    cleanup_merged_prs(dry_run)
+    failures += process_prs(dry_run, open_prs)
+    return failures
 
 
-def run_loop(interval: int, dry_run: bool = False):
+def run_loop(
+    interval: int,
+    dry_run: bool = False,
+    preflight_completed: bool = False,
+) -> int:
+    """Run the polling loop under the shared shutdown-signal controller."""
+    with _shutdown_signal_controller():
+        return _run_loop_impl(interval, dry_run, preflight_completed)
+
+
+def _run_loop_impl(
+    interval: int,
+    dry_run: bool = False,
+    preflight_completed: bool = False,
+) -> int:
     """Main polling loop with process status monitoring."""
     log.info("=" * 60)
     log.info("Swarm Orchestrator started")
@@ -2455,68 +4949,103 @@ def run_loop(interval: int, dry_run: bool = False):
     log.info("Log directory: %s", LOG_DIR)
     log.info("=" * 60)
 
-    # Graceful shutdown on SIGTERM/SIGINT
-    def handle_signal(signum, frame):
-        log.info("Received signal %d, shutting down...", signum)
-        if not dry_run:
-            tracker.kill_all()
-        sys.exit(0)
-
-    signal.signal(signal.SIGTERM, handle_signal)
-    signal.signal(signal.SIGINT, handle_signal)
-
     initial = True
     cycle_count = 0
     while True:
         try:
-            log.info("--- Polling cycle (active: %d) ---", tracker.active_count)
+            try:
+                log.info("--- Polling cycle (active: %d) ---", tracker.active_count)
 
-            # 1. Check status of all running AI processes
-            if not dry_run:
-                tracker.poll_all()
+                # Supervise already-running local children even when the network preflight is
+                # temporarily unavailable. The write gate still runs before sync/dispatch/writes.
+                if not dry_run:
+                    tracker.poll_all()
 
-            # 2. Keep local main current so new worktrees branch from a fresh
-            # base. Cheap, but still throttled — no need to hit the network
-            # every single interval.
-            cycle_count += 1
-            if cycle_count == 1 or cycle_count % MAIN_SYNC_EVERY_CYCLES == 0:
-                try:
-                    sync_main_branch(dry_run)
-                except Exception as e:
-                    log.error("Error syncing main branch: %s", e, exc_info=True)
+                # A successful startup preflight covers only the first cycle. Every later cycle
+                # rechecks before Git sync, dispatch, or direct GitHub writes so revoked access
+                # stops new lifecycle work without restarting this long-lived process.
+                if not dry_run:
+                    if preflight_completed:
+                        preflight_completed = False
+                    else:
+                        assert_repo_workflow_writable()
 
-            # 3. Poll every open item immediately on startup and every interval
-            process_polling_cycle(dry_run, initial=initial)
-            initial = False
+                # Keep local main current so new worktrees branch from a fresh
+                # base. Cheap, but still throttled — no need to hit the network
+                # every single interval.
+                cycle_count += 1
+                if cycle_count == 1 or cycle_count % MAIN_SYNC_EVERY_CYCLES == 0:
+                    try:
+                        sync_main_branch(dry_run)
+                    except Exception as e:
+                        log.error("Error syncing main branch: %s", e, exc_info=True)
 
+                # Poll every open item immediately on startup and every interval
+                process_polling_cycle(dry_run, initial=initial)
+                cleanup_merged_prs(dry_run)
+                initial = False
+            except SwarmPreflightError as error:
+                _log_preflight_failure(error)
+            except Exception as e:
+                log.error("Error in polling cycle: %s", e, exc_info=True)
+
+            _raise_if_shutdown_pending()
+            log.info("Sleeping %ds...", interval)
+            time.sleep(interval)
         except KeyboardInterrupt:
             log.info("Shutting down gracefully...")
-            if not dry_run:
-                tracker.kill_all()
-            break
-        except Exception as e:
-            log.error("Error in polling cycle: %s", e, exc_info=True)
-
-        log.info("Sleeping %ds...", interval)
-        time.sleep(interval)
+            try:
+                stopped = dry_run or tracker.kill_all()
+            except Exception as error:
+                log.error("Shutdown cleanup failed: %s", error, exc_info=True)
+                return 1
+            if not stopped:
+                log.error("Shutdown left supervised process trees active; exiting non-zero.")
+                return 1
+            return 0
 
 
 def run_once(dry_run: bool = False) -> int:
+    """Run one polling cycle under the shared shutdown-signal controller."""
+    with _shutdown_signal_controller():
+        return _run_once_impl(dry_run)
+
+
+def _run_once_impl(dry_run: bool = False) -> int:
     """Run one polling cycle and return a concise process exit status."""
     log.info("Repo root: %s", REPO_ROOT)
     try:
         log.info("Running single polling cycle...")
         sync_main_branch(dry_run)
-        process_polling_cycle(dry_run, initial=True)
-        if not dry_run:
-            tracker.poll_all()
+        item_failures = process_polling_cycle(dry_run, initial=True)
+        _raise_if_shutdown_pending()
+        try:
+            if not dry_run:
+                tracker.poll_all()
+        except Exception:
+            # A registry persistence error while harvesting a just-finished Maintainer must not
+            # skip the one cleanup pass that can close its merged Issue in one-shot mode.
+            cleanup_merged_prs(dry_run)
+            raise
+        _raise_if_shutdown_pending()
         cleanup_merged_prs(dry_run)
+        _raise_if_shutdown_pending()
+        if item_failures:
+            log.error("Single polling cycle completed with %d item failure(s).", item_failures)
+            return 1
         log.info("Done.")
         return 0
     except KeyboardInterrupt:
         log.info("Single polling cycle interrupted.")
         if not dry_run:
-            tracker.kill_all()
+            try:
+                stopped = tracker.kill_all()
+            except Exception as error:
+                log.error("Shutdown cleanup failed: %s", error, exc_info=True)
+                return 1
+            if not stopped:
+                log.error("Shutdown left supervised process trees active; exiting non-zero.")
+                return 1
         return 130
     except subprocess.SubprocessError as error:
         # gh() has already logged the actionable command failure or timeout.
@@ -2563,18 +5092,37 @@ def main():
         return 0
 
     if args.dry_run:
+        try:
+            # Dry-run needs repository identity for read-only gh calls, but it never pushes, so
+            # custom Git SSH transport commands are not part of its safety boundary.
+            _bind_origin_repository(verify_transport=False)
+        except SwarmPreflightError as error:
+            _log_preflight_failure(error)
+            return 1
         if args.reset:
             log.info("[DRY RUN] Would reset process history")
     else:
-        enable_runtime_writes()
+        # `--reset` explicitly authorizes this local history mutation and must remain useful while
+        # GitHub is offline or access is being repaired. It never touches a worktree or GitHub.
         if args.reset:
             reset_process_history()
+        try:
+            _assert_dispatch_platform()
+            _assert_dispatch_environment()
+            assert_repo_workflow_writable()
+        except SwarmPreflightError as error:
+            _log_preflight_failure(error)
+            return 1
+        enable_runtime_writes()
         cleanup_old_task_logs()
 
     if args.once:
         return run_once(args.dry_run)
-    run_loop(args.interval, args.dry_run)
-    return 0
+    return run_loop(
+        args.interval,
+        args.dry_run,
+        preflight_completed=not args.dry_run,
+    )
 
 
 if __name__ == "__main__":

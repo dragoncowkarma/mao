@@ -170,9 +170,94 @@ task worktrees under `<repo>/.worktrees`, persists process history under
 review, merge, and close issues. `--dry-run` and `--status` do not modify the target
 checkout, its Git metadata, or GitHub; `--dry-run` performs GitHub reads only.
 `--once` still performs real dispatch and GitHub/Git operations. `--reset` clears only
-the persisted dispatch history, not Git branches or worktrees. On the first real run it
+the persisted dispatch history, not Git branches or worktrees, and that explicit local clear runs
+even if the following GitHub preflight fails. On the first real run it
 adds only these runtime paths to the checkout's local `.git/info/exclude`; it never edits
 or commits the target repository's shared `.gitignore`.
+
+Before any real-run Git sync, worktree creation, AI dispatch, or direct GitHub write, Swarm sends one
+read-only `GET /repos/{owner}/{repo}` through the active `gh` CLI credential. The first check runs at
+startup and long-running mode repeats it before each later polling cycle. This is
+the credential used by the orchestrator's `gh` commands and inherited by dispatched agents; MAO's
+stored `githubToken` is deliberately ignored because it is a different credential. The target comes
+from every effective fetch and push URL of the selected checkout's `origin`; Swarm resolves SSH Host
+aliases and refuses to run when any identity differs. On real runs, SSH origins also fail closed
+when `core.sshCommand`, `GIT_SSH_COMMAND`, or `GIT_SSH` would make Git use a transport different from
+the system `ssh -G` configuration Swarm inspects; read-only `--dry-run` skips that transport proof.
+Effective SSH host, user, and port are compared together, and an effective `ProxyCommand` or
+`ProxyJump` is rejected because it can redirect the connection outside that proof. Only GitHub's
+documented `ssh.github.com:443` endpoint is canonicalized to
+`github.com:22`. HTTP and non-default-port HTTPS origins are rejected because the default `gh` API
+authority cannot prove them; HTTPS origins bind scheme, host, and effective port 443. Every role
+revalidates the effective origin and transport endpoints immediately before dispatch — Workers in
+their task worktree, Reviewers and Maintainers in the repository checkout. The effective
+repository-local or worktree-local `remote.pushDefault`, branch `pushRemote`, and branch `remote`
+values must name `origin`; shadowed and global selectors do not cause false rejection. Every
+dispatched child also receives highest-precedence command-scope overrides pinning all three
+implicit push selectors to `origin`, so inherited or global configuration cannot redirect a bare
+push; legacy `GIT_CONFIG_PARAMETERS` is rejected at real-run startup and again before spawn because
+Git applies it after those overrides. A detached repository root remains valid for Reviewer and
+Maintainer dispatch: origin, transport, and `remote.pushDefault` are still checked and pinned, while
+branch-scoped selectors are omitted. Worker task worktrees must stay attached to their branch.
+Effective `core.sshCommand` remains all-scope and fail-closed because it changes even an
+explicit push's transport. Revision dispatch accepts a
+same-repository, non-empty GitHub head ref only after fetching `refs/pull/<number>/head` and proving
+its commit equals the listed `headRefOid`. A missing local branch is created from that verified
+commit, never `origin/main`; a tracked-clean local ancestor is fast-forwarded to the verified head
+while non-conflicting untracked files are preserved. Tracked changes, conflicting untracked or
+ignored files, or divergent local state remain in place with an actionable blocker. Fork PRs are
+refused because this `origin` cannot update them. Direct Git/process calls pass the ref as
+an argv element without a shell, while prompt command examples quote it with `shlex.quote`. This is
+not a prompt-content sandbox: eligible `[Task]` Issue titles/bodies have no
+author-association gate before becoming instructions for tool-enabled Workers. Revision feedback
+is limited to the active gh user or an `OWNER`/`COLLABORATOR`/`MEMBER`, then is passed through as
+instructions too. Run autonomous Swarm only when those task-authoring surfaces are trusted or
+moderated. It overrides inherited `GH_REPO` and `GH_HOST` with that
+identity for its own `gh` calls and every dispatched agent, preventing a successful check of one
+repository or host from authorizing work or a push against another. A permanent repository or permission gap
+exits non-zero with an actionable error, while rate limits, timeouts, 5xx responses, and unclassified
+403s are reported as transient rather than mislabeled as missing permission. `--status` remains
+offline. `--dry-run` resolves and binds the local origin so its reads cannot drift to an inherited
+`GH_REPO`, but it remains read-only and skips the network write-capability probe.
+
+Polling isolates each Issue and PR: a broken worktree, prompt/log write, or other per-item failure
+does not skip later items or merged-task cleanup. An authenticated-user lookup failure fails its PR
+batch closed, and `--once` exits non-zero if any item failed. Every selected non-preflight setup or
+launch failure before successful registration consumes the bounded retry budget. Per-item typed
+preflight blockers, whether configuration or transient, remain retryable. Their bounded dedup key
+uses the item lifecycle, exception class, and finite cause code (normally its source site) rather
+than the full error text; the first occurrence of each cause logs at error level, uninterrupted
+repeats log at debug without a traceback. A successful dispatch or a definitive terminal/no-dispatch
+result clears the item's keys so a later recurrence is reported at error level again; incomplete
+observation and provider-cooldown deferrals retain them, because neither establishes a clean pass.
+Provider-wide quota cooldowns stay exempt, while repeated event-local
+timeouts do not retry forever. The process registry is replaced atomically. A malformed root or
+history container is recoverable as empty history, malformed entries are skipped individually, and
+each real poll reconciles inherited `running`/`stuck` records after their process tree exits. History
+has a hard 500-record diagnostic cap. Dispatch authority is stored separately in a bounded table
+with one current event per Issue or PR, so each new PR head/comment replaces the prior terminal
+event; a successful open-item snapshot prunes closed terminal items but preserves live/stuck
+ownership. Provider cooldowns use their own bounded map, and legacy history is collapsed into this
+schema on load. Each agent requires an
+isolated POSIX process group, so unsupported platforms fail before the write preflight or runtime
+file creation. Normal leader exit as well as shutdown signals eligible groups in a batch and removes
+residual descendants within a shared bounded cleanup deadline plus one shared forced-exit grace.
+Polling and `--once` use the same signal controller. A shutdown signal during spawn-to-in-memory-
+adoption ownership transfer defers its exception until the child is supervised even if spawn or
+adoption raises; checkout/environment preflight runs before that narrow window, and both modes stop
+before later lifecycle work (`--once` does not run merged-task cleanup after shutdown). Registry
+persistence remains outside that deferral window. When a failed dispatch exposes an adopted but
+unpersisted child, its temporary running ownership is persisted before bounded termination for
+hard-crash recovery, followed by one
+final removal-or-stuck save, for at most two atomic writes. A tree that cannot be stopped is persisted as
+`stuck`, is not repeatedly signalled by numeric PGID, and blocks that lifecycle event until an
+operator removes it; shutdown also remains non-zero.
+
+A passing Swarm preflight is not proof of every eventual write. When GitHub cannot expose the active
+credential's individual Issues, Contents, and Pull requests grants without a write probe, the CLI
+reports them as unverified. `git push` may also use SSH or a separate Git credential helper instead
+of the `gh` credential; the non-mutating API probe cannot establish that transport credential, so a
+push can still fail even after the GitHub API check passes.
 
 Worktree handling is preservation-first: a branch already checked out elsewhere is a
 hard blocker; a damaged checkout is repaired with `git worktree repair`; and a

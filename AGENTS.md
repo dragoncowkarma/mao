@@ -48,8 +48,8 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
 | `src/electron-api.ts` | The renderer's only door to the preload bridge: `setElectronApi()` binds it (production from `src/main.tsx`, tests from a stub), `electronApi()` reads it |
 | `src/test/` | Renderer test harness — `setup.ts` (jsdom polyfills, unmount + unbind between tests) and `electron-api-stub.ts` (a typed fake bridge, `satisfies ElectronApi`) |
 | `cli/index.ts` | Commander CLI: `config` / `repos` / `github` / `workflow` / `run` / `swarm` |
-| `.agents/workflows/swarm_orchestrator.py` | Autonomous Worker/Reviewer/Maintainer lifecycle, isolated worktrees, process registry, retry/cooldown, and safe merged-task cleanup; copied beside the CLI bundle by `scripts/build-cli.mjs` |
-| `.agents/workflows/swarm_orchestrator_test.py` | Standalone Python worktree-safety regressions, included in `npm run test` |
+| `.agents/workflows/swarm_orchestrator.py` | Autonomous Worker/Reviewer/Maintainer lifecycle, credential-aligned write preflight, origin fetch/push identity binding, isolated worktrees, process registry, retry/cooldown, and safe merged-task cleanup; copied beside the CLI bundle by `scripts/build-cli.mjs` |
+| `.agents/workflows/swarm_orchestrator_test.py` | Standalone Python preflight, credential non-disclosure, dry-run, and worktree-safety regressions, included in `npm run test` |
 | `core/node-environment.test.ts` | Architecture rule 8 as a test: asserts the `core` vitest project still runs with no DOM in scope |
 | `scripts/test-workflow.ts` | Standalone e2e harness against a real (throwaway) repo |
 | `scripts/check-origin.mjs` | Publish-preflight guard: validates every effective `origin` fetch/push URL against an expected host/owner/repo; failure output is fixed-category-only, never remote-derived strings (see SKILL.md) |
@@ -68,7 +68,10 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
    The one scoped exception is Issue #31's CLI-only autonomous Swarm engine:
    `.agents/workflows/swarm_orchestrator.py` owns that long-lived process lifecycle,
    while `cli/index.ts` must remain a thin delegation to `core/swarm-runner.ts` for
-   validation and shell-free launch. Do not duplicate Swarm behavior in the CLI shell.
+   validation and shell-free launch. Its repository write preflight also stays in Python:
+   Swarm writes with the active `gh` CLI credential, not the store's `githubToken`, so routing
+   this check through `GithubService` would validate the wrong credential. Do not duplicate
+   Swarm behavior in the CLI shell.
 3. **`createMaoApp()` (`core/app.ts`) is the only boot path.** Both shells call it;
    it wires token/providers/workspace, subscribes queue persistence to the engine's
    `'change'` event, and restores tasks. Workflow mutations must go through
@@ -158,6 +161,12 @@ There is no codegen — these couplings are maintained by hand and only `npm run
 - **New store field** → both `MaoStoreSchema` and `MAO_STORE_DEFAULTS` in
   `core/store.ts` (tsc enforces the pair). `electron/store.ts` and `FileStore` pick
   the field up automatically.
+- **Repository capability policy** → `core/repo-capabilities.ts` and the intentionally
+  duplicated policy tables/verdict logic in `.agents/workflows/swarm_orchestrator.py` must be
+  audited together. Gap ids and reasons, remedy kinds/ranking, public-vs-private scope rules,
+  three-state `permissions.push`, and the unverified pipeline grants must stay aligned, with
+  regressions in both TypeScript and Python suites. Credential acquisition and command-failure
+  classification deliberately differ because Swarm checks the active `gh` credential.
 - **New pipeline stage** → `STAGE_ORDER` + `buildPromptForStage` + `applyGithubAction`
   in `core/workflow-engine.ts`, **plus** the `STAGE_LABELS` record that is
   copy-pasted in both `src/components/KanbanBoard.tsx` and
@@ -357,6 +366,90 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   deliberately skip it, so a repo whose access was revoked stays manageable. Auto-trigger runs
   the same check before `fetchTasks`, so an unauthorized repo yields zero `enqueueFromIssue` and
   zero `workflow-active` label writes. Never add an exemption list.
+- **Real `mao swarm` runs have their own credential-aligned preflight.** Before Git sync, worktree
+  creation, AI dispatch, or direct `gh` writes, the Python orchestrator performs one non-mutating
+  repository GET with the same active `gh` CLI credential inherited by dispatched agents. It runs at
+  startup and again before each later polling cycle so revoked access stops new lifecycle work. The
+  explicit `--reset` history clear is the only local mutation allowed before the network gate, so it
+  remains usable while access is being repaired. The orchestrator resolves every effective `origin`
+  fetch and push URL (including SSH aliases), rejects identities that disagree, and overrides
+  inherited `GH_REPO` and `GH_HOST` for both its own calls and agent subprocesses. A caller therefore
+  cannot preflight one repository or host and dispatch or push against another. `--status` bypasses
+  target resolution entirely; `--dry-run` binds the locally resolved origin but skips the write
+  capability probe and, because it cannot push, the custom-SSH-transport proof. Real runs reject
+  custom `core.sshCommand`, `GIT_SSH_COMMAND`, and `GIT_SSH` overrides for SSH origins because the
+  system `ssh -G` result would not prove their actual target. Effective
+  SSH host, user, and port are resolved and compared together; an effective `ProxyCommand` or
+  `ProxyJump` is also rejected because those can redirect the transport beyond that endpoint proof
+  (only GitHub's documented
+  `ssh.github.com:443` endpoint is equated with `github.com:22`). HTTP origins and non-default HTTPS
+  ports are rejected because the default `gh` API authority would not prove that target; HTTPS
+  origins bind scheme, host, and effective port 443. Every role revalidates those bound endpoints
+  immediately before dispatch — Workers in their task worktree, Reviewers and Maintainers in the
+  repository checkout. The effective repository-local or worktree-local `remote.pushDefault`,
+  `branch.<name>.pushRemote`, and `branch.<name>.remote` values must name `origin`; shadowed values
+  and an operator's global selectors do not cause a false rejection. Every child environment then
+  adds highest-precedence command-scope values pinning all three implicit push selectors to
+  `origin`, so inherited or global selectors cannot redirect a bare push either; legacy
+  `GIT_CONFIG_PARAMETERS` is rejected once at real-run startup (with a `git -c`/hook diagnostic)
+  and again at the spawn boundary because Git applies it after those values. A detached
+  repository root is valid for Reviewer/Maintainer dispatch: origin, transport, and
+  `remote.pushDefault` are still checked and pinned, while nonexistent branch-scoped selectors
+  are omitted. Task worktrees must remain attached to their expected branch. Effective
+  `core.sshCommand` remains all-scope and fail-closed because it changes even an explicit push's
+  transport. Revision dispatch accepts a same-repository,
+  non-empty GitHub head ref, fetches `refs/pull/<number>/head`, and requires the fetched commit to
+  equal the listed `headRefOid` before it creates a missing local branch from that commit. It never
+  falls back to `origin/main`: a tracked-clean local ancestor is fast-forwarded to that verified
+  head while non-conflicting untracked files are preserved; tracked changes, conflicting untracked
+  or ignored files, or divergent history are preserved with an actionable blocker. Fork PRs it
+  cannot update through `origin` are refused. Direct Git/process calls pass the ref as an argv element without a shell;
+  command examples in the human-readable prompt quote it with `shlex.quote`. That quoting is
+  command-example hygiene, not a prompt-content trust boundary. Eligible `[Task]` Issue
+  titles/bodies have no author-association gate before becoming instructions for tool-enabled
+  Workers. Revision feedback is limited to the active gh
+  user or an `OWNER`/`COLLABORATOR`/`MEMBER`, then passed through as instructions too. Run
+  autonomous Swarm only where those task-authoring surfaces are trusted or moderated; it does not
+  sandbox hostile prompt content. A
+  passing verdict means only that GitHub exposed no known blocker: fine-grained
+  Issues/Contents/Pull-requests grants stay explicitly unverified when the API cannot prove them.
+  Git transport is a separate boundary too —
+  `git push` may use SSH or another credential helper, so the `gh` preflight never claims to prove
+  that credential. The store's `githubToken` is intentionally not consulted for Swarm.
+  One malformed task is isolated from later Issues, PRs, and merged-task cleanup; a failed
+  authenticated-user lookup also fails the affected PR batch closed, and `--once` exits non-zero
+  when any item failed. Every selected non-preflight setup or launch failure before successful
+  registration consumes the same bounded per-event retry budget as a child crash. Per-item typed
+  preflight blockers, whether configuration or transient, stay retryable, and provider-wide
+  cooldowns remain exempt. Their dedup keys contain the item lifecycle, exception class, and a
+  finite cause code (normally its source site), never the full error message: the first occurrence
+  of each cause logs at error level and uninterrupted repeats log at debug without a traceback. A
+  successful dispatch or definitive terminal/no-dispatch result clears the item's preflight keys;
+  incomplete observation and provider-cooldown deferrals retain them, since neither is a clean pass.
+  Registry updates use same-directory atomic replacement. Invalid registry roots/history containers
+  recover as empty, malformed entries are skipped individually, and every real poll reconciles
+  inherited `running`/`stuck` records once their process tree exits. Recent diagnostic history has a
+  hard 500-record cap; dispatch authority lives in a separate bounded table with one current event
+  per Issue or PR, so a new PR head/comment replaces the previous terminal event instead of growing
+  the registry. A successful open-item snapshot prunes closed terminal items while retaining live or
+  stuck ownership, and provider cooldowns are stored in their own bounded map. Legacy registries are
+  collapsed into this schema on load. A child discovered while unwinding after adoption
+  but before registration persistence is first saved as running before bounded termination, so a
+  hard leader crash remains recoverable, and then persisted once more as removed or stuck; this
+  fallback performs at most two atomic writes. Dispatched agents
+  require isolated POSIX process groups; unsupported platforms fail before the write preflight or
+  runtime-file creation. Shutdown and normal leader exit signal all eligible process groups in a
+  batch, then terminate residual descendants within one shared supervision deadline and one shared
+  forced-exit grace. Polling and `--once` share the same signal controller. A shutdown signal
+  arriving during the narrow spawn-to-in-memory-adoption ownership transfer defers its exception
+  until the child is supervised, even when spawn or adoption raises; checkout/environment preflight
+  happens before that window, and both modes stop before any later lifecycle work. In particular,
+  `--once` skips merged-task cleanup after shutdown. Registry persistence happens outside that
+  deferral window. A
+  failed termination becomes a persisted `stuck` state, is never
+  automatically re-signalled by numeric PGID, and blocks only that lifecycle event until an operator
+  terminates the residual tree; shutdown stays non-zero instead of silently leaving an untracked
+  background `git push` or `gh` write alive.
 - The pipeline creates real issues, branches, PRs, reviews, and merges. Test only
   against throwaway repos (see SKILL.md).
 - `github:refreshRepo` is **not a pure read**: it calls `autoTrigger.pollNow()`

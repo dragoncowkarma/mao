@@ -115,7 +115,9 @@ DISPATCH_COMPLETED = "already completed"
 DISPATCH_UNCONFIRMED = "completed without confirmed lifecycle transition"
 DISPATCH_PROVIDER_COOLDOWN = "provider cooldown"
 
-# Upper bound on persisted history so the registry cannot grow without limit.
+# Recent diagnostic history budget. Records that still carry dispatch authority
+# (completed/running/stuck events, retry counts, and provider cooldowns) survive
+# compaction even when that makes the registry exceed this soft limit.
 MAX_HISTORY_RECORDS = 500
 
 # Metadata tag patterns
@@ -613,10 +615,34 @@ class ProcessTracker:
             try:
                 with open(PROCESS_REGISTRY_FILE) as f:
                     data = json.load(f)
-                for entry in data.get("history", []):
-                    self._history.append(TrackedProcess(**entry))
-            except (json.JSONDecodeError, TypeError):
-                log.warning("Corrupted process registry, starting fresh.")
+            except json.JSONDecodeError:
+                log.warning("Process registry JSON is invalid; loaded no history records.")
+            else:
+                if not isinstance(data, dict):
+                    log.warning(
+                        "Process registry root is invalid; loaded no history records.",
+                    )
+                else:
+                    entries = data.get("history", [])
+                    if not isinstance(entries, list):
+                        log.warning(
+                            "Process registry history is invalid; loaded no history records.",
+                        )
+                    else:
+                        skipped = 0
+                        for entry in entries:
+                            try:
+                                self._history.append(TrackedProcess(**entry))
+                            except TypeError:
+                                skipped += 1
+                        if skipped:
+                            log.warning(
+                                "Skipped %d malformed process registry record(s) out of %d; "
+                                "loaded %d valid record(s).",
+                                skipped,
+                                len(entries),
+                                len(entries) - skipped,
+                            )
         self._reconcile_orphans()
         self._reclassify_deferred_failures()
 
@@ -634,7 +660,7 @@ class ProcessTracker:
             record.retry_after = retry_after
             record.defer_scope = self._defer_scope(output_tail)
 
-    def _reconcile_orphans(self):
+    def _reconcile_orphans(self) -> bool:
         """Demote records left RUNNING by a crashed orchestrator.
 
         A previous run that died without `kill_all()` leaves records claiming to
@@ -642,6 +668,7 @@ class ProcessTracker:
         forever, so any record whose PID is gone becomes UNKNOWN and therefore
         retryable.
         """
+        changed = False
         for record in self._history:
             if record.status not in (ProcessStatus.RUNNING, ProcessStatus.STUCK):
                 continue
@@ -657,27 +684,96 @@ class ProcessTracker:
             if leader_alive:
                 continue
             if group_alive:
-                record.status = ProcessStatus.STUCK
-                record.failure_reason = DISPATCH_RESIDUAL
-                log.warning(
-                    "Residual process group %d for %s still exists; terminate it outside MAO "
-                    "and restart Swarm before retrying this event.",
-                    record.pid,
-                    record.task_ref,
-                )
+                if record.status != ProcessStatus.STUCK:
+                    record.status = ProcessStatus.STUCK
+                    record.failure_reason = DISPATCH_RESIDUAL
+                    changed = True
+                    log.warning(
+                        "Residual process group %s for %s still exists; terminate it outside MAO "
+                        "before retrying this event.",
+                        record.pid,
+                        record.task_ref,
+                    )
                 continue
             record.status = ProcessStatus.UNKNOWN
             record.ended_at = record.ended_at or datetime.now(timezone.utc).isoformat()
+            changed = True
             log.warning(
-                "Orphaned %s record for %s [PID %d] marked UNKNOWN; event is retryable.",
+                "Orphaned %s record for %s [PID %s] marked UNKNOWN; event is retryable.",
                 record.role, record.task_ref, record.pid,
             )
+        return changed
+
+    @staticmethod
+    def _is_bounded_failure(record: TrackedProcess) -> bool:
+        return (
+            record.status in (ProcessStatus.FAILED, ProcessStatus.UNKNOWN)
+            or (
+                record.status == ProcessStatus.DEFERRED
+                and record.defer_scope == "event"
+            )
+        )
+
+    def _compact_history(self) -> None:
+        """Bound diagnostics without discarding state used by should_dispatch()."""
+        if len(self._history) <= MAX_HISTORY_RECORDS:
+            return
+
+        protected: set[int] = set()
+        event_records: dict[tuple[str, str], list[int]] = {}
+        latest_provider_cooldown: dict[str, int] = {}
+        for index, record in enumerate(self._history):
+            event_records.setdefault((record.task_ref, record.role), []).append(index)
+            if (
+                record.status == ProcessStatus.DEFERRED
+                and record.defer_scope == "provider"
+            ):
+                latest_provider_cooldown[record.ai_name] = index
+
+        protected.update(latest_provider_cooldown.values())
+        for indices in event_records.values():
+            completed = [
+                index
+                for index in indices
+                if self._history[index].status == ProcessStatus.COMPLETED
+            ]
+            if completed:
+                protected.add(completed[-1])
+
+            for status in (ProcessStatus.RUNNING, ProcessStatus.STUCK):
+                matching = [
+                    index
+                    for index in indices
+                    if self._history[index].status == status
+                ]
+                protected.update(matching)
+
+            if not completed:
+                bounded_failures = [
+                    index
+                    for index in indices
+                    if self._is_bounded_failure(self._history[index])
+                ]
+                protected.update(bounded_failures[-MAX_DISPATCH_ATTEMPTS:])
+
+        diagnostic_budget = max(0, MAX_HISTORY_RECORDS - len(protected))
+        unprotected = [
+            index for index in range(len(self._history)) if index not in protected
+        ]
+        recent_diagnostics = (
+            unprotected[-diagnostic_budget:] if diagnostic_budget else []
+        )
+        retained = protected.union(recent_diagnostics)
+        self._history = [
+            record
+            for index, record in enumerate(self._history)
+            if index in retained
+        ]
 
     def _save_registry(self):
         """Persist process registry to disk."""
         PROCESS_REGISTRY_FILE.parent.mkdir(parents=True, exist_ok=True)
-        if len(self._history) > MAX_HISTORY_RECORDS:
-            self._history = self._history[-MAX_HISTORY_RECORDS:]
+        self._compact_history()
         all_records = self._history + [tp for _, tp in self._active.values()]
         payload = {
             "last_updated": datetime.now(timezone.utc).isoformat(),
@@ -791,7 +887,10 @@ class ProcessTracker:
     def poll_all(self):
         """Poll children and clean finished process groups in one bounded batch."""
         finished_pids = []
-        registry_changed = False
+        # Historical RUNNING/STUCK records have no Popen handle. Recheck them on
+        # every real polling pass so an inherited process that exits later cannot
+        # block its lifecycle event until the orchestrator itself restarts.
+        registry_changed = self._reconcile_orphans()
         poll_results = {
             pid: proc.poll()
             for pid, (proc, _) in self._active.items()
@@ -968,6 +1067,21 @@ class ProcessTracker:
             return False, DISPATCH_RUNNING
         if any(record.status == ProcessStatus.STUCK for record in attempts):
             return False, DISPATCH_RESIDUAL
+        bounded_failures = [
+            record for record in attempts
+            if self._is_bounded_failure(record)
+        ]
+        completed_attempts = [
+            record for record in attempts
+            if record.status == ProcessStatus.COMPLETED
+        ]
+        if completed_attempts:
+            if completion_confirmed:
+                return False, DISPATCH_COMPLETED
+            return False, DISPATCH_UNCONFIRMED
+        if len(bounded_failures) >= MAX_DISPATCH_ATTEMPTS:
+            return False, f"exhausted {len(bounded_failures)} failed attempts"
+
         provider_cooldowns = []
         if ai_name:
             for record in self.all_records:
@@ -986,25 +1100,6 @@ class ProcessTracker:
             return False, f"{DISPATCH_PROVIDER_COOLDOWN} until {retry_at}"
         if not attempts:
             return True, "new event"
-
-        bounded_failures = [
-            record for record in attempts
-            if record.status in (ProcessStatus.FAILED, ProcessStatus.UNKNOWN)
-            or (
-                record.status == ProcessStatus.DEFERRED
-                and record.defer_scope == "event"
-            )
-        ]
-        completed_attempts = [
-            record for record in attempts
-            if record.status == ProcessStatus.COMPLETED
-        ]
-        if completed_attempts:
-            if completion_confirmed:
-                return False, DISPATCH_COMPLETED
-            return False, DISPATCH_UNCONFIRMED
-        if len(bounded_failures) >= MAX_DISPATCH_ATTEMPTS:
-            return False, f"exhausted {len(bounded_failures)} failed attempts"
         deferred = [
             record for record in attempts
             if record.status == ProcessStatus.DEFERRED
@@ -2156,16 +2251,20 @@ def fetch_open_prs() -> list[dict]:
     return json.loads(raw)
 
 
-def fetch_pr_comments(pr_number: int) -> list[dict]:
-    """Fetch comments on a PR."""
+def fetch_pr_comments(pr_number: int) -> Optional[list[dict]]:
+    """Fetch PR comments, distinguishing an empty result from an unreadable one."""
     raw = gh([
         "pr", "view", str(pr_number),
         "--json", "comments",
     ], check=False)
     if not raw:
-        return []
-    data = json.loads(raw)
-    return data.get("comments", [])
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    comments = data.get("comments") if isinstance(data, dict) else None
+    return comments if isinstance(comments, list) else None
 
 
 def fetch_issue(issue_number: int) -> Optional[dict]:
@@ -3177,15 +3276,32 @@ def _bound_dispatch_environment(branch_name: Optional[str]) -> dict[str, str]:
     return environment
 
 
-def _spawn_ai_process(argv, cwd, stdout_file, stderr_file, stdin_source):
-    """Launch every agent with the repository and host established by preflight."""
+def _prepare_ai_process_spawn(cwd: str) -> dict[str, str]:
+    """Validate a checkout before entering the signal-deferral ownership window."""
     _assert_dispatch_environment()
     branch_name = _assert_checkout_push_target(Path(cwd))
     _assert_dispatch_platform()
+    return _bound_dispatch_environment(branch_name)
+
+
+def _spawn_ai_process(
+    argv,
+    cwd,
+    stdout_file,
+    stderr_file,
+    stdin_source,
+    dispatch_environment: Optional[dict[str, str]] = None,
+):
+    """Launch an agent with a prevalidated repository and host environment."""
+    environment = (
+        dispatch_environment
+        if dispatch_environment is not None
+        else _prepare_ai_process_spawn(cwd)
+    )
     return subprocess.Popen(
         argv,
         cwd=cwd,
-        env=_bound_dispatch_environment(branch_name),
+        env=environment,
         stdout=stdout_file,
         stderr=stderr_file,
         stdin=stdin_source,
@@ -3230,6 +3346,7 @@ def _cleanup_failed_process(
     argv: list[str],
     cwd: Path,
     log_path: Optional[Path],
+    registration_persisted: bool = False,
 ) -> bool:
     """Stop a launched child while keeping any residual tree under supervision."""
     active_entry = tracker._active.get(proc.pid)
@@ -3249,6 +3366,8 @@ def _cleanup_failed_process(
         )
         active_entry = (proc, tracked)
         tracker._active[proc.pid] = active_entry
+
+    if not registration_persisted:
         # Persist temporary RUNNING ownership before the bounded termination call.
         # If this leader is killed during cleanup, the next run can still reconcile
         # the process tree. Exactly one later save records removal or STUCK state.
@@ -3319,6 +3438,7 @@ def dispatch_worker(
     stdout_file = None
     stderr_file = None
     proc = None
+    registration_persisted = False
     dispatch_selected = not dry_run
     try:
         if not dry_run:
@@ -3377,6 +3497,7 @@ def dispatch_worker(
             if use_stdin:
                 pf = open(prompt_file, "r", encoding="utf-8")
                 stdin_source = pf
+            dispatch_environment = _prepare_ai_process_spawn(str(worktree_path))
             with _defer_shutdown_during_process_registration():
                 proc = _spawn_ai_process(
                     argv,
@@ -3384,6 +3505,7 @@ def dispatch_worker(
                     stdout_file,
                     stderr_file,
                     stdin_source,
+                    dispatch_environment,
                 )
                 tracker.adopt(
                     proc=proc,
@@ -3398,6 +3520,7 @@ def dispatch_worker(
                     log_file=str(log_path),
                 )
             tracker.persist_registration()
+            registration_persisted = True
         finally:
             if pf:
                 pf.close()
@@ -3413,6 +3536,7 @@ def dispatch_worker(
                 argv=argv,
                 cwd=worktree_path,
                 log_path=log_path,
+                registration_persisted=registration_persisted,
             )
         if (
             isinstance(error, Exception)
@@ -3486,6 +3610,7 @@ def dispatch_reviewer(
     stdout_file = None
     stderr_file = None
     proc = None
+    registration_persisted = False
     dispatch_selected = not dry_run
     try:
         prompt_file = (
@@ -3524,6 +3649,7 @@ def dispatch_reviewer(
             if use_stdin:
                 pf = open(prompt_file, "r", encoding="utf-8")
                 stdin_source = pf
+            dispatch_environment = _prepare_ai_process_spawn(str(REPO_ROOT))
             with _defer_shutdown_during_process_registration():
                 proc = _spawn_ai_process(
                     argv,
@@ -3531,6 +3657,7 @@ def dispatch_reviewer(
                     stdout_file,
                     stderr_file,
                     stdin_source,
+                    dispatch_environment,
                 )
                 tracker.adopt(
                     proc=proc,
@@ -3545,6 +3672,7 @@ def dispatch_reviewer(
                     log_file=str(log_path),
                 )
             tracker.persist_registration()
+            registration_persisted = True
         finally:
             if pf:
                 pf.close()
@@ -3560,6 +3688,7 @@ def dispatch_reviewer(
                 argv=argv,
                 cwd=REPO_ROOT,
                 log_path=log_path,
+                registration_persisted=registration_persisted,
             )
         if (
             isinstance(error, Exception)
@@ -3628,6 +3757,7 @@ def dispatch_maintainer(
     stdout_file = None
     stderr_file = None
     proc = None
+    registration_persisted = False
     dispatch_selected = not dry_run
     try:
         prompt_file = (
@@ -3666,6 +3796,7 @@ def dispatch_maintainer(
             if use_stdin:
                 pf = open(prompt_file, "r", encoding="utf-8")
                 stdin_source = pf
+            dispatch_environment = _prepare_ai_process_spawn(str(REPO_ROOT))
             with _defer_shutdown_during_process_registration():
                 proc = _spawn_ai_process(
                     argv,
@@ -3673,6 +3804,7 @@ def dispatch_maintainer(
                     stdout_file,
                     stderr_file,
                     stdin_source,
+                    dispatch_environment,
                 )
                 tracker.adopt(
                     proc=proc,
@@ -3687,6 +3819,7 @@ def dispatch_maintainer(
                     log_file=str(log_path),
                 )
             tracker.persist_registration()
+            registration_persisted = True
         finally:
             if pf:
                 pf.close()
@@ -3702,6 +3835,7 @@ def dispatch_maintainer(
                 argv=argv,
                 cwd=REPO_ROOT,
                 log_path=log_path,
+                registration_persisted=registration_persisted,
             )
         if (
             isinstance(error, Exception)
@@ -3776,6 +3910,7 @@ def dispatch_worker_revision(
     stdout_file = None
     stderr_file = None
     proc = None
+    registration_persisted = False
     dispatch_selected = not dry_run
     try:
         if not dry_run:
@@ -3848,6 +3983,7 @@ def dispatch_worker_revision(
             if use_stdin:
                 pf = open(prompt_file, "r", encoding="utf-8")
                 stdin_source = pf
+            dispatch_environment = _prepare_ai_process_spawn(str(worktree_path))
             with _defer_shutdown_during_process_registration():
                 proc = _spawn_ai_process(
                     argv,
@@ -3855,6 +3991,7 @@ def dispatch_worker_revision(
                     stdout_file,
                     stderr_file,
                     stdin_source,
+                    dispatch_environment,
                 )
                 tracker.adopt(
                     proc=proc,
@@ -3869,6 +4006,7 @@ def dispatch_worker_revision(
                     log_file=str(log_path),
                 )
             tracker.persist_registration()
+            registration_persisted = True
         finally:
             if pf:
                 pf.close()
@@ -3884,6 +4022,7 @@ def dispatch_worker_revision(
                 argv=argv,
                 cwd=worktree_path,
                 log_path=log_path,
+                registration_persisted=registration_persisted,
             )
         if (
             isinstance(error, Exception)
@@ -3925,9 +4064,10 @@ def _process_issue_batch(
     open_issues: Optional[list[dict]] = None,
     open_prs: Optional[list[dict]] = None,
     pr_issue_numbers: Optional[set[int]] = None,
-):
+) -> set[object]:
     """Process a caller-provided Issue batch without exception isolation."""
     issues = open_issues if open_issues is not None else fetch_open_issues()
+    clearable_items: set[object] = set()
     if open_prs is None:
         open_prs = fetch_open_prs()
 
@@ -3947,15 +4087,18 @@ def _process_issue_batch(
                 "Open Issue #%d is not a [Task] Issue; inspected without dispatch.",
                 num,
             )
+            clearable_items.add(num)
             continue
 
         # 1. If PR already exists, Worker is done (or PR handles the rest)
         if num in pr_issue_numbers:
+            clearable_items.add(num)
             continue
 
         worker = parse_role(WORKER_PATTERN, raw.get("body", ""))
         if not worker:
             log.debug("Issue #%d has no Worker metadata, skipping.", num)
+            clearable_items.add(num)
             continue
 
         # 2. A persistent event key prevents repeat dispatch after completion.
@@ -3975,6 +4118,8 @@ def _process_issue_batch(
                 reason,
             )
             log.debug("Skipping Worker for Issue #%d: %s.", num, reason)
+            if not reason.startswith(DISPATCH_PROVIDER_COOLDOWN):
+                clearable_items.add(num)
             continue
 
         # 3. Dispatch Worker
@@ -3990,6 +4135,9 @@ def _process_issue_batch(
             num, reason, issue.title,
         )
         dispatch_worker(issue, dry_run, task_ref=task_ref)
+        clearable_items.add(num)
+
+    return clearable_items
 
 
 def process_issues(
@@ -4010,17 +4158,18 @@ def process_issues(
         item_number = raw.get("number", "?")
         lifecycle_version = "initial"
         try:
-            _process_issue_batch(
+            clearable_items = _process_issue_batch(
                 dry_run,
                 [raw],
                 prs,
                 pr_issue_numbers=pr_issue_numbers,
             )
-            clear_item_preflight_blockers(
-                "Issue",
-                item_number,
-                lifecycle_version,
-            )
+            if item_number in clearable_items:
+                clear_item_preflight_blockers(
+                    "Issue",
+                    item_number,
+                    lifecycle_version,
+                )
         except SwarmPreflightError as error:
             failures += 1
             log_item_preflight_blocker(
@@ -4044,9 +4193,10 @@ def _process_pr_batch(
     dry_run: bool = False,
     open_prs: Optional[list[dict]] = None,
     current_user: Optional[str] = None,
-):
+) -> set[object]:
     """Process a caller-provided PR batch without exception isolation."""
     prs = open_prs if open_prs is not None else fetch_open_prs()
+    clearable_items: set[object] = set()
 
     for raw in prs:
         pr_num = raw["number"]
@@ -4063,6 +4213,7 @@ def _process_pr_batch(
                 "PR #%d has no Issue number in its title; refusing role dispatch.",
                 pr_num,
             )
+            clearable_items.add(pr_num)
             continue
 
         reviewer = parse_role(REVIEWER_PATTERN, pr_body)
@@ -4072,6 +4223,7 @@ def _process_pr_batch(
                 "PR #%d has no Reviewer metadata; refusing dispatch.",
                 pr_num,
             )
+            clearable_items.add(pr_num)
             continue
 
         issue_raw = fetch_issue(issue_number)
@@ -4089,9 +4241,17 @@ def _process_pr_batch(
                 "Issue #%d has no Worker metadata; refusing dispatch for PR #%d.",
                 issue_number, pr_num,
             )
+            clearable_items.add(pr_num)
             continue
 
         comments = fetch_pr_comments(pr_num)
+        if comments is None:
+            log_blocker(
+                f"pr-comments:{pr_num}:{head_sha}",
+                "Could not fetch comments for PR #%d.",
+                pr_num,
+            )
+            continue
         current_user = current_user if current_user is not None else get_gh_user()
         if not current_user:
             log.warning(
@@ -4148,6 +4308,7 @@ def _process_pr_batch(
                     pr_num,
                     reviewer.ai,
                 )
+                clearable_items.add(pr_num)
                 continue
             valid, why = validate_distinct_roles(worker, reviewer, maintainer)
             if not valid:
@@ -4155,6 +4316,7 @@ def _process_pr_batch(
                     f"roles:{pr_num}:{signal_id}",
                     "PR #%d role assignment rejected: %s.", pr_num, why,
                 )
+                clearable_items.add(pr_num)
                 continue
 
             task_ref = f"maintain#{pr_num}-{signal_id}"
@@ -4171,6 +4333,8 @@ def _process_pr_batch(
                     reason,
                 )
                 log.debug("Skipping Maintainer for PR #%d: %s.", pr_num, reason)
+                if not reason.startswith(DISPATCH_PROVIDER_COOLDOWN):
+                    clearable_items.add(pr_num)
                 continue
             log.info(
                 "=== PR #%d approved, dispatching AI3 Maintainer (%s) ===",
@@ -4183,6 +4347,7 @@ def _process_pr_batch(
                 dry_run,
                 task_ref=task_ref,
             )
+            clearable_items.add(pr_num)
             continue
 
         valid, why = validate_distinct_roles(worker, reviewer)
@@ -4191,6 +4356,7 @@ def _process_pr_batch(
                 f"roles:{pr_num}:{head_sha}",
                 "PR #%d role assignment rejected: %s.", pr_num, why,
             )
+            clearable_items.add(pr_num)
             continue
 
         if action in ("review", "review_after_maintainer_block"):
@@ -4212,6 +4378,7 @@ def _process_pr_batch(
                         pr_num,
                         why,
                     )
+                    clearable_items.add(pr_num)
                     continue
                 review_version = f"maintainer-block-{signal_id}"
                 review_trigger = "maintainer_block"
@@ -4243,6 +4410,8 @@ def _process_pr_batch(
                         level=logging.WARNING,
                     )
                 log.debug("Skipping Reviewer for PR #%d: %s.", pr_num, reason)
+                if not reason.startswith(DISPATCH_PROVIDER_COOLDOWN):
+                    clearable_items.add(pr_num)
                 continue
             log.info(
                 "=== PR #%d needs review for %s (%s) ===",
@@ -4255,6 +4424,7 @@ def _process_pr_batch(
                 task_ref=task_ref,
                 trigger=review_trigger,
             )
+            clearable_items.add(pr_num)
             continue
 
         task_ref = f"revise#{pr_num}-{signal_id}"
@@ -4271,6 +4441,8 @@ def _process_pr_batch(
                 reason,
             )
             log.debug("Skipping Worker revision for PR #%d: %s.", pr_num, reason)
+            if not reason.startswith(DISPATCH_PROVIDER_COOLDOWN):
+                clearable_items.add(pr_num)
             continue
         feedback_reviewer = parse_role(
             REVIEWER_PATTERN,
@@ -4283,6 +4455,7 @@ def _process_pr_batch(
                 pr_num,
                 reviewer.ai,
             )
+            clearable_items.add(pr_num)
             continue
         log.info(
             "=== PR #%d needs Worker revision for %s (%s) ===",
@@ -4295,6 +4468,9 @@ def _process_pr_batch(
             dry_run,
             task_ref=task_ref,
         )
+        clearable_items.add(pr_num)
+
+    return clearable_items
 
 
 def process_prs(
@@ -4317,12 +4493,17 @@ def process_prs(
         item_number = raw.get("number", "?")
         lifecycle_version = raw.get("headRefOid", "") or "initial"
         try:
-            _process_pr_batch(dry_run, [raw], current_user=current_user)
-            clear_item_preflight_blockers(
-                "PR",
-                item_number,
-                lifecycle_version,
+            clearable_items = _process_pr_batch(
+                dry_run,
+                [raw],
+                current_user=current_user,
             )
+            if item_number in clearable_items:
+                clear_item_preflight_blockers(
+                    "PR",
+                    item_number,
+                    lifecycle_version,
+                )
         except SwarmPreflightError as error:
             failures += 1
             log_item_preflight_blocker(
@@ -4528,10 +4709,13 @@ def _run_once_impl(dry_run: bool = False) -> int:
         try:
             if not dry_run:
                 tracker.poll_all()
-        finally:
+        except Exception:
             # A registry persistence error while harvesting a just-finished Maintainer must not
             # skip the one cleanup pass that can close its merged Issue in one-shot mode.
             cleanup_merged_prs(dry_run)
+            raise
+        _raise_if_shutdown_pending()
+        cleanup_merged_prs(dry_run)
         _raise_if_shutdown_pending()
         if item_failures:
             log.error("Single polling cycle completed with %d item failure(s).", item_failures)

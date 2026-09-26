@@ -423,20 +423,26 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   preflight blockers, whether configuration or transient, stay retryable, and provider-wide
   cooldowns remain exempt. Their dedup keys contain the item lifecycle, exception class, and a
   finite cause code (normally its source site), never the full error message: the first occurrence
-  of each cause logs at error level and uninterrupted repeats log at debug without a traceback. Any
-  clean item processing pass clears its preflight keys, including when the item no longer needs
-  dispatch, so a later recurrence is reported at error level again.
-  Registry updates use same-directory atomic replacement. A child discovered only while unwinding
-  a failed dispatch is first persisted as running before bounded termination, so a hard leader crash
-  remains recoverable, and then persisted once more as removed or stuck; this fallback performs at
-  most two atomic writes. Dispatched agents
+  of each cause logs at error level and uninterrupted repeats log at debug without a traceback. A
+  successful dispatch or definitive terminal/no-dispatch result clears the item's preflight keys;
+  incomplete observation and provider-cooldown deferrals retain them, since neither is a clean pass.
+  Registry updates use same-directory atomic replacement. Invalid registry roots/history containers
+  recover as empty, malformed entries are skipped individually, and every real poll reconciles
+  inherited `running`/`stuck` records once their process tree exits. The 500-record history limit is
+  a soft diagnostic budget: completed-event, bounded-retry, live/stuck, and provider-cooldown state
+  needed for dispatch safety survives compaction. A child discovered while unwinding after adoption
+  but before registration persistence is first saved as running before bounded termination, so a
+  hard leader crash remains recoverable, and then persisted once more as removed or stuck; this
+  fallback performs at most two atomic writes. Dispatched agents
   require isolated POSIX process groups; unsupported platforms fail before the write preflight or
   runtime-file creation. Shutdown and normal leader exit signal all eligible process groups in a
   batch, then terminate residual descendants within one shared supervision deadline and one shared
   forced-exit grace. Polling and `--once` share the same signal controller. A shutdown signal
   arriving during the narrow spawn-to-in-memory-adoption ownership transfer defers its exception
-  until the child is supervised, even when spawn or adoption raises; both modes stop before any
-  later lifecycle work. Registry persistence happens outside that deferral window. A
+  until the child is supervised, even when spawn or adoption raises; checkout/environment preflight
+  happens before that window, and both modes stop before any later lifecycle work. In particular,
+  `--once` skips merged-task cleanup after shutdown. Registry persistence happens outside that
+  deferral window. A
   failed termination becomes a persisted `stuck` state, is never
   automatically re-signalled by numeric PGID, and blocks only that lifecycle event until an operator
   terminates the residual tree; shutdown stays non-zero instead of silently leaving an untracked

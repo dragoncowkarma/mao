@@ -227,18 +227,26 @@ launch failure before successful registration consumes the bounded retry budget.
 preflight blockers, whether configuration or transient, remain retryable. Their bounded dedup key
 uses the item lifecycle, exception class, and finite cause code (normally its source site) rather
 than the full error text; the first occurrence of each cause logs at error level, uninterrupted
-repeats log at debug without a traceback, and any clean item processing pass clears the keys so a
-later recurrence is reported at error level again even when the item no longer needs dispatch.
+repeats log at debug without a traceback. A successful dispatch or a definitive terminal/no-dispatch
+result clears the item's keys so a later recurrence is reported at error level again; incomplete
+observation and provider-cooldown deferrals retain them, because neither establishes a clean pass.
 Provider-wide quota cooldowns stay exempt, while repeated event-local
-timeouts do not retry forever. The process registry is replaced atomically. Each agent requires an
+timeouts do not retry forever. The process registry is replaced atomically. A malformed root or
+history container is recoverable as empty history, malformed entries are skipped individually, and
+each real poll reconciles inherited `running`/`stuck` records after their process tree exits. History
+compaction treats 500 records as a diagnostic budget: the latest completed state per event, bounded
+retry evidence, live/stuck ownership, and provider-cooldown state remain authoritative even when that
+requires a larger registry. Each agent requires an
 isolated POSIX process group, so unsupported platforms fail before the write preflight or runtime
 file creation. Normal leader exit as well as shutdown signals eligible groups in a batch and removes
 residual descendants within a shared bounded cleanup deadline plus one shared forced-exit grace.
 Polling and `--once` use the same signal controller. A shutdown signal during spawn-to-in-memory-
 adoption ownership transfer defers its exception until the child is supervised even if spawn or
-adoption raises, and both modes stop before later lifecycle work. Registry persistence remains
-outside that deferral window. When a failed dispatch exposes an unregistered child, its temporary
-running ownership is persisted before bounded termination for hard-crash recovery, followed by one
+adoption raises; checkout/environment preflight runs before that narrow window, and both modes stop
+before later lifecycle work (`--once` does not run merged-task cleanup after shutdown). Registry
+persistence remains outside that deferral window. When a failed dispatch exposes an adopted but
+unpersisted child, its temporary running ownership is persisted before bounded termination for
+hard-crash recovery, followed by one
 final removal-or-stuck save, for at most two atomic writes. A tree that cannot be stopped is persisted as
 `stuck`, is not repeatedly signalled by numeric PGID, and blocks that lifecycle event until an
 operator removes it; shutdown also remains non-zero.

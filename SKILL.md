@@ -146,6 +146,24 @@ replaces its entry", so the flags you pass (or omit) win, and omitting `--no-aut
 polling. Where two entries for one repository disagree about `autoTrigger`, the fold resolves to
 `false`: re-enabling unattended polling by accident is far worse than leaving it off.
 
+**Recovering a `config.json` whose `githubRepos` is not a list.** `config.json` is unvalidated JSON, so
+a hand-edit (or a file an older build wrote) can leave `githubRepos` as an object, a string, `null` —
+anything but the array the schema declares. Every read now goes through a guard in `core/store.ts` that
+answers with an empty list instead, and reports once per command on **stderr** naming the field, what
+the file actually holds, and the file's path:
+
+```
+[store] "githubRepos" in /path/to/config.json is an object, not a JSON array of { owner, repo }
+entries — ignoring it, so no repositories are tracked until it is replaced. …
+```
+
+So `mao repos list` prints `[]` (and `mao config show`'s JSON stays parseable on stdout), and `mao run`'s
+scheduler keeps ticking instead of dying on its first poll. Nothing is repaired on read — the unusable
+value stays in the file, so copy any repositories you still need out of it first; the next list write
+(`mao repos add <owner> <repo>`, `mao repos remove`, or the sidebar's Add form) overwrites it with a real
+list. Because the guard makes the store name no usable repository, a repo re-added this way counts as a
+first registration and **is** preflighted for write access.
+
 The GUI shows the same unverified-grants caveat the CLI prints (`github:setRepos` returns the
 verdicts), and the board's **Refresh** surfaces a failed preflight instead of reporting a clean sync —
 `github:refreshRepo` drives a real poll, so its verdict has to reach the operator. The board's own 30s
@@ -349,7 +367,11 @@ Two traps:
 ### Add a store field
 
 1. Add to **both** `MaoStoreSchema` and `MAO_STORE_DEFAULTS` in `core/store.ts`.
-2. Backends (`electron/store.ts`, `FileStore`) pick it up automatically.
+2. Backends (`electron/store.ts`, `FileStore`) pick up get/set automatically — but not shape
+   validation. Neither backend validates the JSON it reads, so a field whose declared type a
+   hand-edited `config.json` can violate (an array, an object) also belongs in
+   `createStoredReadGuard()` in the same file. Read its doc comment first: coercing a field whose
+   value is recoverable state is not automatically the right call.
 3. Renderer needs it? Add get/set IPC channels (recipe above). CLI needs it?
    Extend `cli/index.ts` (keep `config show` redaction for anything secret).
 

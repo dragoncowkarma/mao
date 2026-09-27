@@ -36,14 +36,14 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
 | `core/swarm-runner.ts` | Shell-free launcher and repository/asset validation for the autonomous Swarm Orchestrator |
 | `core/auto-trigger.ts` | Per-repo polling scheduler; auto-enqueues new open issues |
 | `core/assignment.ts` | Issue/PR body directive parser — `parseAssignmentTags()` for swarm_orchestrator-style `[Worker: id]`/`[Reviewer: id]`/`[Maintainer: id]` role tags, and `parseProviderOverride()` which folds those plus task-level `[Model: id]`/`[Effort: level]` tags into a `ProviderOverride` |
-| `core/store.ts` | `MaoStoreSchema`, `MAO_STORE_DEFAULTS`, the `MaoStore` interface, and `FileStore` (JSON impl for the CLI) |
+| `core/store.ts` | `MaoStoreSchema`, `MAO_STORE_DEFAULTS`, the `MaoStore` interface, `FileStore` (JSON impl for the CLI), and `createStoredReadGuard()` — the read-path guard every backend applies so a field's declared type survives contact with unvalidated JSON |
 | `core/app.ts` | `createMaoApp()` — the **single composition root** both frontends call |
 | `core/paths.ts` | Platform-appropriate data dir for the CLI (mirrors Electron's `userData`) |
 | `core/ai/` | `AiProvider` interface + adapters: `api-provider.ts` (Anthropic / OpenAI-compatible HTTP) and `cli-provider.ts` (spawns `claude`, `codex`, …) |
 | `electron/main.ts` | BrowserWindow, external-link handling, dev/prod load |
 | `electron/ipc.ts` | All `ipcMain.handle` channels — thin delegations only |
 | `electron/preload.ts` | `contextBridge` exposing `window.electronAPI` |
-| `electron/store.ts` | 7-line `electron-store` adapter satisfying `MaoStore` |
+| `electron/store.ts` | `electron-store` adapter satisfying `MaoStore`, reads routed through core's `createStoredReadGuard()` |
 | `src/` | React 18 renderer (Vite + Tailwind); `App.tsx` owns all cross-view state |
 | `src/electron-api.ts` | The renderer's only door to the preload bridge: `setElectronApi()` binds it (production from `src/main.tsx`, tests from a stub), `electronApi()` reads it |
 | `src/test/` | Renderer test harness — `setup.ts` (jsdom polyfills, unmount + unbind between tests) and `electron-api-stub.ts` (a typed fake bridge, `satisfies ElectronApi`) |
@@ -161,6 +161,12 @@ There is no codegen — these couplings are maintained by hand and only `npm run
 - **New store field** → both `MaoStoreSchema` and `MAO_STORE_DEFAULTS` in
   `core/store.ts` (tsc enforces the pair). `electron/store.ts` and `FileStore` pick
   the field up automatically.
+- **New `MaoStore` backend** → it must route reads through `createStoredReadGuard()`
+  (`core/store.ts`), as `FileStore` and `electron/store.ts` both do. Nothing enforces this: the
+  interface's `get<K>(key): MaoStoreSchema[K]` is an assertion over unvalidated JSON, so a backend that
+  skips the guard compiles and then hands every reader a value of the wrong shape (see the invariant
+  below). A field whose shape the guard checks must also be added to the guard, not only to the pair
+  above.
 - **Repository capability policy** → `core/repo-capabilities.ts` and the intentionally
   duplicated policy tables/verdict logic in `.agents/workflows/swarm_orchestrator.py` must be
   audited together. Gap ids and reasons, remedy kinds/ranking, public-vs-private scope rules,
@@ -328,6 +334,35 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   operator removed while its registration was still checking (the store keeps it, the sidebar does
   not, and auto-trigger keeps polling it). Never write `githubRepos` through `store` directly, and
   never move this sequence into a shell.
+- **A stored field's declared type is an assertion, not a guarantee — `githubRepos` is read through a
+  guard.** Both shipped backends read unvalidated JSON and fill in only the keys that are *missing*
+  (`FileStore` spreads the parsed file over `MAO_STORE_DEFAULTS`; electron-store's `defaults` works the
+  same way), so a key that is present but the wrong shape survives and is handed to every reader as
+  `MaoStoreSchema[K]`. A `githubRepos` that was not an array therefore broke every repository path at
+  once: `.filter` threw for `mao repos remove` and `github:getRepos`, `canonicalRepoList` threw on a
+  non-iterable `previous` for `mao repos add` and for auto-trigger's per-tick canonicalisation, and `mao
+  repos list` printed the malformed value as if it were the list — and because nothing could write the
+  list either, the only way out was hand-editing JSON. `createStoredReadGuard()` (`core/store.ts`)
+  answers `[]` instead, reporting once per process through `console.warn` with the field, the value's
+  actual type and the config file path. Coercing rather than throwing is what makes recovery possible —
+  `updateRepos` reads before it writes, so a throwing read takes `repos add`/`repos remove` down with it.
+  The read is deliberately **not** a repair: nothing in the guard writes, so a read-only command leaves
+  the file as it found it and the operator can still salvage what the unusable value named. Element-level
+  validity stays `isRepoRef`/`canonicalRepoList`'s job — the guard owns the container only. Do not make
+  the guard silent, and do not extend the coercion to a field where an empty value would destroy
+  recoverable state without saying so (`aiProviders` would be the same one-liner; `workflowTasks` first
+  needs an answer for how an unreadable queue interacts with `resume` and the persistence-broken marker).
+  The **write** side is the mirror image and deliberately refuses rather than coerces: `canonicalRepoList`
+  throws when `next` is not an array, because every non-array it can still iterate folds to an empty list
+  (a string yields characters `isRepoRef` rejects; a `Set` yields entries in an unpromised order) and
+  `createRepoRegistrar` would persist that over every tracked repository with no error. The check runs
+  before `previous` is walked so auto-trigger — which passes the stored list as both arguments — reports
+  the refusal rather than a bare `previous is not iterable`. Coerce on read so recovery is possible;
+  refuse on write so a caller's mistake cannot delete the list. Same rule's other half: `FileStore`
+  **clones** `MAO_STORE_DEFAULTS` rather than spreading it, so a read never hands out a mutable reference
+  into the module-level defaults — a shallow spread let a caller that pushed into the empty list it read
+  leak a phantom entry into the default, which the next `FileStore` in that process read back as a
+  tracked repository for auto-trigger to poll.
 - **Repository identity is case-insensitive, and the list is canonicalised before it is stored**:
   GitHub resolves owner/repo without regard to case, so `sameRepoRef()`/`repoRefKey()` lower-case
   both halves — otherwise `mao repos add DragonCowKarma MAO` registered a *second* entry for an

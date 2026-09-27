@@ -148,6 +148,27 @@ function mergeOccurrences(earlier: RepoRef, later: RepoRef): RepoRef {
 }
 
 export function canonicalRepoList(previous: RepoRef[], next: RepoRef[]): RepoRef[] {
+  // Refused, not interpreted. Every non-array this function can still iterate folds to an empty list —
+  // a string yields characters that `isRepoRef` rejects one by one, a Set yields entries in an order
+  // nothing here promises — and `createRepoRegistrar` persists whatever comes back, so a malformed
+  // `next` would silently overwrite every tracked repository instead of failing. Both shells surface a
+  // throw here (`github:setRepos` rejects into the sidebar's error slot, `mao repos add` exits non-zero)
+  // and neither writes, so the stored list survives a caller's mistake.
+  //
+  // Checked before `previous` is walked so that auto-trigger, which passes the stored list as *both*
+  // arguments, reports this rather than a bare `previous is not iterable`. `previous` itself is not
+  // guarded: it comes from `MaoStore.get('githubRepos')`, which both backends read through
+  // `createStoredReadGuard` (see core/store.ts, and the source-text test that pins it), and throwing on
+  // it would re-break the very recovery that guard exists to enable.
+  if (!Array.isArray(next)) {
+    // The type only — `config.json` holds the GitHub token in the same blob, so no stored value is ever
+    // interpolated into a message that lands in terminal and agent logs.
+    throw new Error(
+      'Refusing to write a repository list that is not an array: expected RepoRef[], got ' +
+        `${next === null ? 'null' : typeof next}. No repositories were changed.`,
+    )
+  }
+
   const stored = new Map<string, RepoRef>()
   for (const ref of previous) {
     if (!isRepoRef(ref)) continue

@@ -111,6 +111,37 @@ describe('App project selection', () => {
     expect(stub.storedRepos()).toEqual([ONE, TWO])
   })
 
+  /**
+   * The already-tracked fast path, in its positive direction.
+   *
+   * `addRepo` decides new-versus-tracked against what the *store* holds rather than this component's
+   * mirror, which is read once at mount — so a repository registered by `mao repos add` in a terminal
+   * since then is already tracked even though nothing on screen shows it. The branch adopts that
+   * authoritative list and opens the repository instead of returning silently, because leaving the
+   * mirror stale would hide a project that really is being tracked and polled until the app restarts.
+   *
+   * Nothing else in this file reaches that branch with the navigation guard satisfied: the
+   * global-settings test below exercises the same branch but asserts its *declined* half. Delete the
+   * guarded block at the early return and every other test here stays green — only this one fails.
+   *
+   * The case variant is what makes `projectHeading(TWO)` mean something: the board has to show the
+   * stored spelling — the one the preflight vouched for — not the one just typed into the form.
+   */
+  it('opens an already tracked repository the renderer had never seen', async () => {
+    const { stub, user } = await renderApp([ONE])
+
+    // Registered elsewhere after this renderer mounted. The mirror still holds only ONE; the store is
+    // what `addRepo` asks, and it already has both.
+    stub.applyRepos([ONE, TWO])
+
+    await submitAdd(user, TWO_SHOUTED)
+
+    expect(await projectHeading(TWO)).toBeInTheDocument()
+    expect(sidebarProject(TWO)).toBeInTheDocument()
+    // The fast path returns before it writes, so a persisted list would mean it took the wrong branch.
+    expect(stub.setRepos).not.toHaveBeenCalled()
+  })
+
   it('falls back to the first project when the selected one is removed', async () => {
     const { stub, user } = await renderApp([ONE, TWO])
 

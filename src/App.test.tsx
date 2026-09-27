@@ -55,6 +55,37 @@ function sidebarProject(repo: RepoRef) {
   return screen.getByRole('button', { name: `${repo.owner}/${repo.repo}` })
 }
 
+/** The sidebar entry that swaps the main pane for the global settings form. */
+function globalSettingsNav() {
+  return screen.getByRole('button', { name: 'Global settings' })
+}
+
+/**
+ * The GitHub token field inside the global settings pane. `GlobalSettings` renders it on its first
+ * synchronous render — only the provider cards below it wait on a read — so a plain query is enough
+ * once the pane is open.
+ */
+function tokenField() {
+  return screen.getByPlaceholderText('ghp_...')
+}
+
+/** Fills the sidebar's Add form and submits it. Resolves as soon as the click is dispatched. */
+async function submitAdd(user: ReturnType<typeof userEvent.setup>, repo: RepoRef) {
+  await user.click(screen.getByRole('button', { name: '+ Add' }))
+  await user.type(screen.getByPlaceholderText('owner'), repo.owner)
+  await user.type(screen.getByPlaceholderText('repo'), repo.repo)
+  await user.click(screen.getByRole('button', { name: 'Add' }))
+}
+
+/**
+ * Waits for `addRepo` to have fully resolved. Sidebar clears and closes the Add form only after the
+ * promise settles, so the disappearing `owner` input is the signal that every continuation which could
+ * still navigate has run — a `waitFor` on the assertion itself would pass before it did.
+ */
+function addSettled() {
+  return waitFor(() => expect(screen.queryByPlaceholderText('owner')).toBeNull())
+}
+
 /** Opens a project's Settings tab, which is the only route to Remove. */
 async function openSettings(user: ReturnType<typeof userEvent.setup>) {
   await user.click(screen.getByRole('button', { name: 'Settings' }))
@@ -73,10 +104,7 @@ describe('App project selection', () => {
   it('opens a repository it has just added', async () => {
     const { stub, user } = await renderApp([ONE])
 
-    await user.click(screen.getByRole('button', { name: '+ Add' }))
-    await user.type(screen.getByPlaceholderText('owner'), 'acme')
-    await user.type(screen.getByPlaceholderText('repo'), 'two')
-    await user.click(screen.getByRole('button', { name: 'Add' }))
+    await submitAdd(user, TWO)
 
     expect(await projectHeading(TWO)).toBeInTheDocument()
     expect(stub.setRepos).toHaveBeenCalledWith([ONE, TWO])
@@ -173,10 +201,7 @@ describe('App project selection', () => {
       return []
     })
 
-    await user.click(screen.getByRole('button', { name: '+ Add' }))
-    await user.type(screen.getByPlaceholderText('owner'), 'acme')
-    await user.type(screen.getByPlaceholderText('repo'), 'three')
-    await user.click(screen.getByRole('button', { name: 'Add' }))
+    await submitAdd(user, THREE)
 
     // Still checking access. The operator loses patience and goes back to the first project.
     expect(screen.getByRole('button', { name: 'Checking access…' })).toBeInTheDocument()
@@ -184,9 +209,7 @@ describe('App project selection', () => {
     expect(await projectHeading(ONE)).toBeInTheDocument()
 
     release()
-    // The add form closes only after `addRepo` has fully resolved, so this waits for the continuation
-    // that would overwrite the selection rather than racing it.
-    await waitFor(() => expect(screen.queryByPlaceholderText('owner')).toBeNull())
+    await addSettled()
 
     expect(sidebarProject(THREE)).toBeInTheDocument()
     expect(screen.getByRole('heading', { name: 'acme/one' })).toBeInTheDocument()
@@ -233,5 +256,91 @@ describe('App project selection', () => {
     expect(screen.getByRole('heading', { name: 'acme/three' })).toBeInTheDocument()
     expect(screen.queryByRole('heading', { name: 'acme/one' })).toBeNull()
     expect(stub.setRepos).toHaveBeenCalledWith([ONE, THREE])
+  })
+})
+
+/**
+ * Registering a repository must not switch the main pane away from the global settings form.
+ *
+ * `App` mounts `GlobalSettings` from a ternary, and that component keeps the GitHub token and every
+ * provider's API key in component state until "Save changes" is pressed. So a view switch is not a
+ * cosmetic annoyance here: it unmounts the form and discards credentials the operator pasted, with no
+ * warning and nothing to undo — they are most likely to believe those were kept.
+ *
+ * Both halves of `addRepo`'s guard are covered because they answer different questions and either can
+ * be removed without the other noticing. The navigation counter sees a move made *during* the add;
+ * the starting view sees an add submitted from a sidebar form that is visible from the settings pane
+ * too, where nobody moves at all.
+ */
+describe('App repository add and unsaved global settings', () => {
+  /** Not token-shaped on purpose: a fixture should never look like a credential to a secret scanner. */
+  const DRAFT_TOKEN = 'pasted-but-not-yet-saved'
+
+  it('stays in global settings when an add started from a project lands', async () => {
+    const { stub, user } = await renderApp([ONE])
+    let release!: () => void
+    const preflight = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    stub.setRepos.mockImplementationOnce(async (next: RepoRef[]) => {
+      await preflight
+      stub.applyRepos(next)
+      return []
+    })
+
+    await submitAdd(user, TWO)
+
+    // Still checking access. The operator uses the wait to paste a token, and does not press Save.
+    expect(screen.getByRole('button', { name: 'Checking access…' })).toBeInTheDocument()
+    await user.click(globalSettingsNav())
+    await user.type(tokenField(), DRAFT_TOKEN)
+
+    release()
+    await addSettled()
+
+    expect(screen.getByRole('heading', { name: 'Global settings' })).toBeInTheDocument()
+    expect(tokenField()).toHaveValue(DRAFT_TOKEN)
+    expect(screen.queryByRole('heading', { name: 'acme/two' })).toBeNull()
+    // The registration itself still has to have happened — declining to navigate is not declining to add.
+    expect(sidebarProject(TWO)).toBeInTheDocument()
+    expect(stub.storedRepos()).toEqual([ONE, TWO])
+  })
+
+  it('stays in global settings when the add was submitted from it', async () => {
+    const { stub, user } = await renderApp([ONE])
+
+    await user.click(globalSettingsNav())
+    await user.type(tokenField(), DRAFT_TOKEN)
+    // The Add form lives in the always-visible sidebar, so this add begins and ends without the
+    // operator navigating once — which is why the navigation counter alone leaves this case broken.
+    await submitAdd(user, TWO)
+    await addSettled()
+
+    expect(screen.getByRole('heading', { name: 'Global settings' })).toBeInTheDocument()
+    expect(tokenField()).toHaveValue(DRAFT_TOKEN)
+    expect(screen.queryByRole('heading', { name: 'acme/two' })).toBeNull()
+    expect(sidebarProject(TWO)).toBeInTheDocument()
+    expect(stub.storedRepos()).toEqual([ONE, TWO])
+  })
+
+  /**
+   * The already-tracked branch returns before it ever writes, and it navigates from its own guard, so
+   * the registration test above says nothing about it. Re-adding under a different capitalisation is
+   * the shortest route into it — one repository to GitHub, to `sameRepoRef`, and to core — and
+   * `setRepos` never being called is what proves this test took that branch rather than the other one.
+   */
+  it('stays in global settings when the add names an already tracked repository', async () => {
+    const { stub, user } = await renderApp([ONE, TWO])
+
+    await user.click(globalSettingsNav())
+    await user.type(tokenField(), DRAFT_TOKEN)
+    await submitAdd(user, TWO_SHOUTED)
+    await addSettled()
+
+    expect(screen.getByRole('heading', { name: 'Global settings' })).toBeInTheDocument()
+    expect(tokenField()).toHaveValue(DRAFT_TOKEN)
+    expect(screen.queryByRole('heading', { name: 'acme/two' })).toBeNull()
+    expect(stub.setRepos).not.toHaveBeenCalled()
+    expect(screen.queryByRole('button', { name: 'ACME/TWO' })).toBeNull()
   })
 })

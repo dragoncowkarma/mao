@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -4080,6 +4081,47 @@ class WorktreeSafetyTest(unittest.TestCase):
         self.assertIn(("issue#1", "worker"), attempt_tracker._lifecycle_states)
         self.assertNotIn(("pr#2", "reviewer"), attempt_tracker._lifecycle_states)
         save.assert_called_once_with()
+
+    def test_running_revision_worker_blocks_every_other_role_on_its_pr(self):
+        attempt_tracker = self.swarm.ProcessTracker.__new__(self.swarm.ProcessTracker)
+        attempt_tracker._active = {}
+        attempt_tracker._history = []
+        attempt_tracker._lifecycle_states = {}
+        attempt_tracker._provider_cooldowns = {}
+        attempt_tracker._store_lifecycle_record(
+            self._tracked_process(
+                "revise#9-signal",
+                self.swarm.ProcessStatus.RUNNING,
+                role="worker_revise",
+            ),
+            count_failure=False,
+        )
+
+        # A revision Worker rewrites the PR's worktree and force-pushes its branch,
+        # so no other role may run against that PR while it is alive. Omitting its
+        # role from LIFECYCLE_ROLES silently allows exactly that.
+        for task_ref, role in (
+            ("revise#9-signal", "worker_revise"),
+            ("review#9-head", "reviewer"),
+            ("maintain#9-signal", "maintainer"),
+        ):
+            with self.subTest(role=role):
+                allowed, reason = attempt_tracker.should_dispatch(task_ref, role)
+                self.assertFalse(allowed)
+                self.assertEqual(reason, self.swarm.DISPATCH_RUNNING)
+
+        # Issue #9 and PR #9 are different GitHub objects that merely share a
+        # number, so the PR's running agent must not block the Issue's Worker.
+        allowed, reason = attempt_tracker.should_dispatch("issue#9:initial", "worker")
+        self.assertTrue(allowed)
+        self.assertEqual(reason, "new event")
+
+    def test_every_dispatched_role_is_a_blocking_lifecycle_role(self):
+        source = SCRIPT_PATH.read_text(encoding="utf-8")
+        dispatched_roles = set(re.findall(r'^\s+role="(\w+)",$', source, re.M))
+
+        self.assertTrue(dispatched_roles)
+        self.assertEqual(dispatched_roles - set(self.swarm.LIFECYCLE_ROLES), set())
 
     def test_registry_load_skips_only_malformed_records(self):
         registry = self.repo / ".agents" / "malformed-entry-registry.json"

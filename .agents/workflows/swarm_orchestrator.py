@@ -120,10 +120,14 @@ DISPATCH_PROVIDER_COOLDOWN = "provider cooldown"
 # retaining it never turns this history budget back into an unbounded registry.
 MAX_HISTORY_RECORDS = 500
 
-# An Issue has one Worker slot; a PR can have Worker, Reviewer, and Maintainer
-# slots. The extra diagnostic-sized margin accommodates supervised processes
-# whose item closed while the child was still running.
-LIFECYCLE_ROLES = ("worker", "reviewer", "maintainer")
+# An Issue has one Worker slot; a PR can have Worker, revision Worker, Reviewer,
+# and Maintainer slots. Every role a dispatcher can register must be listed here:
+# should_dispatch() blocks a new dispatch while ANY of these roles is running or
+# stuck on the same item, so a role omitted from this tuple would let a second
+# agent run against a worktree another agent is still rewriting and pushing. The
+# extra diagnostic-sized margin accommodates supervised processes whose item
+# closed while the child was still running.
+LIFECYCLE_ROLES = ("worker", "worker_revise", "reviewer", "maintainer")
 MAX_LIFECYCLE_STATES = OPEN_ITEMS_LIMIT * 4 + MAX_HISTORY_RECORDS
 MAX_PROVIDER_COOLDOWNS = MAX_LIFECYCLE_STATES
 LIFECYCLE_STATE_VERSION = 2

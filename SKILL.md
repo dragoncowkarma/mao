@@ -235,9 +235,11 @@ timeouts do not retry forever. The process registry is replaced atomically. A ma
 history container is recoverable as empty history, malformed entries are skipped individually, and
 each real poll reconciles inherited `running`/`stuck` records after their process tree exits. History
 has a hard 500-record diagnostic cap. Dispatch authority is stored separately in a bounded table
-with one current event per Issue or PR, so each new PR head/comment replaces the prior terminal
-event; a successful open-item snapshot prunes closed terminal items but preserves live/stuck
-ownership. Provider cooldowns use their own bounded map, and legacy history is collapsed into this
+with one current event per role for each Issue or PR. A new event replaces only that role's prior
+event, so Reviewer, Worker revision, and Maintainer state do not erase one another while repeated PR
+heads remain bounded. Closed terminal items are pruned only when the corresponding open-item result
+is shorter than the 1,000-item query limit and therefore complete; live/stuck ownership is always
+preserved. Provider cooldowns use their own bounded map, and legacy history is collapsed into this
 schema on load. Each agent requires an
 isolated POSIX process group, so unsupported platforms fail before the write preflight or runtime
 file creation. Normal leader exit as well as shutdown signals eligible groups in a batch and removes

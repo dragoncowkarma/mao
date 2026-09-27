@@ -430,10 +430,12 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   recover as empty, malformed entries are skipped individually, and every real poll reconciles
   inherited `running`/`stuck` records once their process tree exits. Recent diagnostic history has a
   hard 500-record cap; dispatch authority lives in a separate bounded table with one current event
-  per Issue or PR, so a new PR head/comment replaces the previous terminal event instead of growing
-  the registry. A successful open-item snapshot prunes closed terminal items while retaining live or
-  stuck ownership, and provider cooldowns are stored in their own bounded map. Legacy registries are
-  collapsed into this schema on load. A child discovered while unwinding after adoption
+  per role for each Issue or PR. A new event replaces only that role's prior event, so normal
+  Reviewer → Worker revision → Maintainer transitions do not erase one another while repeated PR
+  heads still cannot grow the registry without limit. Only an open-item result shorter than the
+  1,000-item query limit proves that its snapshot is complete enough to prune closed terminal items;
+  live or stuck ownership always survives. Provider cooldowns are stored in their own bounded map,
+  and legacy registries are collapsed into this schema on load. A child discovered while unwinding after adoption
   but before registration persistence is first saved as running before bounded termination, so a
   hard leader crash remains recoverable, and then persisted once more as removed or stuck; this
   fallback performs at most two atomic writes. Dispatched agents

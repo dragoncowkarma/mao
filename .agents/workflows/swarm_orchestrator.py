@@ -116,15 +116,17 @@ DISPATCH_UNCONFIRMED = "completed without confirmed lifecycle transition"
 DISPATCH_PROVIDER_COOLDOWN = "provider cooldown"
 
 # Hard cap for recent diagnostic records. Dispatch authority is persisted
-# separately as one current lifecycle state per Issue/PR, so retaining it never
-# turns this history budget back into an unbounded registry.
+# separately as one current lifecycle state per role for each Issue/PR, so
+# retaining it never turns this history budget back into an unbounded registry.
 MAX_HISTORY_RECORDS = 500
 
-# One current lifecycle event can exist for every Issue and PR returned by the
-# bounded GitHub scans. The extra diagnostic-sized margin accommodates supervised
-# processes whose item closed while the child was still running.
-MAX_LIFECYCLE_STATES = OPEN_ITEMS_LIMIT * 2 + MAX_HISTORY_RECORDS
+# An Issue has one Worker slot; a PR can have Worker, Reviewer, and Maintainer
+# slots. The extra diagnostic-sized margin accommodates supervised processes
+# whose item closed while the child was still running.
+LIFECYCLE_ROLES = ("worker", "reviewer", "maintainer")
+MAX_LIFECYCLE_STATES = OPEN_ITEMS_LIMIT * 4 + MAX_HISTORY_RECORDS
 MAX_PROVIDER_COOLDOWNS = MAX_LIFECYCLE_STATES
+LIFECYCLE_STATE_VERSION = 2
 
 # Metadata tag patterns
 WORKER_PATTERN = re.compile(
@@ -494,7 +496,7 @@ class TrackedProcess:
 
 @dataclass
 class LifecycleState:
-    """Minimal dispatch authority for the current event of one Issue or PR."""
+    """Minimal dispatch authority for one role's current event on an Issue or PR."""
     record: TrackedProcess
     failure_count: int = 0
     last_observed_at: str = ""
@@ -619,7 +621,7 @@ class ProcessTracker:
     def __init__(self):
         self._active: dict[int, tuple[subprocess.Popen, TrackedProcess]] = {}
         self._history: list[TrackedProcess] = []
-        self._lifecycle_states: dict[str, LifecycleState] = {}
+        self._lifecycle_states: dict[tuple[str, str], LifecycleState] = {}
         self._provider_cooldowns: dict[str, str] = {}
         self._load_registry()
 
@@ -669,6 +671,8 @@ class ProcessTracker:
             )
         if not loaded_lifecycle_states:
             self._rebuild_lifecycle_states_from_history()
+        elif data.get("lifecycle_state_version") != LIFECYCLE_STATE_VERSION:
+            self._merge_missing_lifecycle_states_from_history()
 
         if isinstance(data, dict):
             cooldowns = data.get("provider_cooldowns", {})
@@ -705,6 +709,11 @@ class ProcessTracker:
         item_kind = "issue" if match.group(1) == "issue" else "pr"
         return f"{item_kind}#{match.group(2)}"
 
+    @classmethod
+    def _lifecycle_state_key(cls, task_ref: str, role: str) -> tuple[str, str]:
+        """Keep one bounded current event per role without cross-role erasure."""
+        return cls._lifecycle_item_key(task_ref), role
+
     @staticmethod
     def _record_timestamp(record: TrackedProcess) -> str:
         return record.ended_at or record.started_at
@@ -715,6 +724,8 @@ class ProcessTracker:
             self._lifecycle_states = {}
             self._provider_cooldowns = {}
             self._rebuild_lifecycle_states_from_history()
+            for _, tracked in getattr(self, "_active", {}).values():
+                self._store_lifecycle_record(tracked, count_failure=False)
         elif not hasattr(self, "_provider_cooldowns"):
             self._provider_cooldowns = {}
 
@@ -742,10 +753,10 @@ class ProcessTracker:
                 continue
 
             state = LifecycleState(record, failure_count, last_observed_at)
-            item_key = self._lifecycle_item_key(record.task_ref)
-            existing = self._lifecycle_states.get(item_key)
+            state_key = self._lifecycle_state_key(record.task_ref, record.role)
+            existing = self._lifecycle_states.get(state_key)
             if existing is None or existing.last_observed_at <= last_observed_at:
-                self._lifecycle_states[item_key] = state
+                self._lifecycle_states[state_key] = state
             loaded += 1
 
         if skipped:
@@ -757,10 +768,22 @@ class ProcessTracker:
         return not entries or loaded > 0
 
     def _rebuild_lifecycle_states_from_history(self) -> None:
-        """Migrate legacy history into one current authoritative event per item."""
+        """Migrate legacy history into one current authoritative event per role."""
         self._lifecycle_states = {}
         self._provider_cooldowns = {}
         for record in self._history:
+            self._store_lifecycle_record(
+                record,
+                count_failure=self._is_bounded_failure(record),
+            )
+
+    def _merge_missing_lifecycle_states_from_history(self) -> None:
+        """Recover role slots omitted by the first single-slot registry schema."""
+        persisted_keys = set(self._lifecycle_states)
+        for record in self._history:
+            state_key = self._lifecycle_state_key(record.task_ref, record.role)
+            if state_key in persisted_keys:
+                continue
             self._store_lifecycle_record(
                 record,
                 count_failure=self._is_bounded_failure(record),
@@ -774,8 +797,8 @@ class ProcessTracker:
     ) -> None:
         """Replace a superseded item event while retaining its bounded retry count."""
         self._ensure_lifecycle_storage()
-        item_key = self._lifecycle_item_key(record.task_ref)
-        previous = self._lifecycle_states.get(item_key)
+        state_key = self._lifecycle_state_key(record.task_ref, record.role)
+        previous = self._lifecycle_states.get(state_key)
         same_event = bool(
             previous
             and previous.record.task_ref == record.task_ref
@@ -784,7 +807,7 @@ class ProcessTracker:
         failure_count = previous.failure_count if same_event else 0
         if count_failure:
             failure_count += 1
-        self._lifecycle_states[item_key] = LifecycleState(
+        self._lifecycle_states[state_key] = LifecycleState(
             record=record,
             failure_count=failure_count,
             last_observed_at=self._record_timestamp(record),
@@ -796,15 +819,15 @@ class ProcessTracker:
     def _discard_lifecycle_record(self, record: TrackedProcess) -> None:
         """Drop temporary ownership after a child was stopped before registration."""
         self._ensure_lifecycle_storage()
-        item_key = self._lifecycle_item_key(record.task_ref)
-        current = self._lifecycle_states.get(item_key)
+        state_key = self._lifecycle_state_key(record.task_ref, record.role)
+        current = self._lifecycle_states.get(state_key)
         if (
             current
             and current.record.task_ref == record.task_ref
             and current.record.role == record.role
             and current.record.status == ProcessStatus.RUNNING
         ):
-            del self._lifecycle_states[item_key]
+            del self._lifecycle_states[state_key]
 
     def _remember_provider_cooldown(self, ai_name: str, retry_after: str) -> None:
         try:
@@ -943,6 +966,7 @@ class ProcessTracker:
         self._compact_provider_cooldowns()
         payload = {
             "last_updated": datetime.now(timezone.utc).isoformat(),
+            "lifecycle_state_version": LIFECYCLE_STATE_VERSION,
             "history": [vars(record) for record in self._history],
             "lifecycle_states": [
                 {
@@ -1241,41 +1265,19 @@ class ProcessTracker:
         tool withdrawals do consume it after their cooldown, so one broken
         lifecycle event cannot be relaunched forever.
         """
-        if hasattr(self, "_lifecycle_states"):
-            return self._should_dispatch_from_lifecycle_state(
-                task_ref,
-                role,
-                completion_confirmed=completion_confirmed,
-                ai_name=ai_name,
-            )
-        return self._should_dispatch_from_legacy_history(
-            task_ref,
-            role,
-            completion_confirmed=completion_confirmed,
-            ai_name=ai_name,
-        )
-
-    def _should_dispatch_from_lifecycle_state(
-        self,
-        task_ref: str,
-        role: str,
-        *,
-        completion_confirmed: bool,
-        ai_name: Optional[str],
-    ) -> tuple[bool, str]:
-        """Consult the bounded current-event table instead of diagnostic history."""
         self._ensure_lifecycle_storage()
-        state = self._lifecycle_states.get(self._lifecycle_item_key(task_ref))
-        same_event = bool(
-            state
-            and state.record.task_ref == task_ref
-            and state.record.role == role
-        )
+        item_key = self._lifecycle_item_key(task_ref)
+        blocking_roles = set(LIFECYCLE_ROLES)
+        blocking_roles.add(role)
+        for blocking_role in blocking_roles:
+            blocking_state = self._lifecycle_states.get((item_key, blocking_role))
+            if blocking_state and blocking_state.record.status == ProcessStatus.RUNNING:
+                return False, DISPATCH_RUNNING
+            if blocking_state and blocking_state.record.status == ProcessStatus.STUCK:
+                return False, DISPATCH_RESIDUAL
 
-        if state and state.record.status == ProcessStatus.RUNNING:
-            return False, DISPATCH_RUNNING
-        if state and state.record.status == ProcessStatus.STUCK:
-            return False, DISPATCH_RESIDUAL
+        state = self._lifecycle_states.get((item_key, role))
+        same_event = bool(state and state.record.task_ref == task_ref)
         if same_event and state:
             if state.record.status == ProcessStatus.COMPLETED:
                 if completion_confirmed:
@@ -1325,103 +1327,41 @@ class ProcessTracker:
             f"retry {state.failure_count + 1}/{MAX_DISPATCH_ATTEMPTS} after failure",
         )
 
-    def _should_dispatch_from_legacy_history(
-        self,
-        task_ref: str,
-        role: str,
-        *,
-        completion_confirmed: bool,
-        ai_name: Optional[str],
-    ) -> tuple[bool, str]:
-        """Compatibility path for focused tests and pre-split in-memory trackers."""
-        attempts = [
-            record for record in self.all_records
-            if record.task_ref == task_ref and record.role == role
-        ]
-        if any(record.status == ProcessStatus.RUNNING for record in attempts):
-            return False, DISPATCH_RUNNING
-        if any(record.status == ProcessStatus.STUCK for record in attempts):
-            return False, DISPATCH_RESIDUAL
-        bounded_failures = [
-            record for record in attempts
-            if self._is_bounded_failure(record)
-        ]
-        completed_attempts = [
-            record for record in attempts
-            if record.status == ProcessStatus.COMPLETED
-        ]
-        if completed_attempts:
-            if completion_confirmed:
-                return False, DISPATCH_COMPLETED
-            return False, DISPATCH_UNCONFIRMED
-        if len(bounded_failures) >= MAX_DISPATCH_ATTEMPTS:
-            return False, f"exhausted {len(bounded_failures)} failed attempts"
-
-        provider_cooldowns = []
-        if ai_name:
-            for record in self.all_records:
-                if (
-                    record.status != ProcessStatus.DEFERRED
-                    or record.ai_name != ai_name
-                    or record.defer_scope != "provider"
-                    or not record.retry_after
-                ):
-                    continue
-                retry_at = datetime.fromisoformat(record.retry_after)
-                if datetime.now(timezone.utc) < retry_at:
-                    provider_cooldowns.append(retry_at)
-        if provider_cooldowns:
-            retry_at = max(provider_cooldowns).isoformat()
-            return False, f"{DISPATCH_PROVIDER_COOLDOWN} until {retry_at}"
-        if not attempts:
-            return True, "new event"
-        deferred = [
-            record for record in attempts
-            if record.status == ProcessStatus.DEFERRED
-        ]
-        if deferred:
-            latest = deferred[-1]
-            if latest.retry_after:
-                retry_at = datetime.fromisoformat(latest.retry_after)
-                if datetime.now(timezone.utc) < retry_at:
-                    return (
-                        False,
-                        f"{DISPATCH_PROVIDER_COOLDOWN} until {latest.retry_after}",
-                    )
-        if deferred:
-            return True, "retry after provider cooldown"
-        return (
-            True,
-            f"retry {len(bounded_failures) + 1}/{MAX_DISPATCH_ATTEMPTS} after failure",
-        )
-
     def reconcile_open_items(
         self,
         open_issues: list[dict],
         open_prs: list[dict],
     ) -> None:
-        """Prune terminal authority once a successful snapshot shows an item closed."""
+        """Prune terminal authority only when a complete snapshot proves closure."""
         self._ensure_lifecycle_storage()
-        open_item_keys = {
+        open_issue_keys = {
             f"issue#{item['number']}"
             for item in open_issues
             if isinstance(item.get("number"), int)
         }
-        open_item_keys.update(
+        open_pr_keys = {
             f"pr#{item['number']}"
             for item in open_prs
             if isinstance(item.get("number"), int)
-        )
+        }
+        complete_item_kinds = set()
+        if len(open_issues) < OPEN_ITEMS_LIMIT:
+            complete_item_kinds.add("issue")
+        if len(open_prs) < OPEN_ITEMS_LIMIT:
+            complete_item_kinds.add("pr")
+        open_item_keys = open_issue_keys | open_pr_keys
         stale_keys = [
-            item_key
-            for item_key, state in self._lifecycle_states.items()
-            if item_key not in open_item_keys
+            state_key
+            for state_key, state in self._lifecycle_states.items()
+            if self._lifecycle_item_key(state.record.task_ref).partition("#")[0]
+            in complete_item_kinds
+            and self._lifecycle_item_key(state.record.task_ref) not in open_item_keys
             and state.record.status not in (ProcessStatus.RUNNING, ProcessStatus.STUCK)
         ]
         if not stale_keys:
             return
-        for item_key in stale_keys:
-            del self._lifecycle_states[item_key]
+        for state_key in stale_keys:
+            del self._lifecycle_states[state_key]
         self._save_registry()
 
     @property

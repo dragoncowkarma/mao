@@ -41,8 +41,11 @@ export default function App() {
    * A repo-list write can take seconds (an add's preflight is a network call and `updateRepos`
    * serializes everything behind it), so the completion must not drag the operator back from another
    * project, tab, or global settings. The selected repository itself is stored by identity below, but
-   * identity cannot tell whether opening the newly added repository is still wanted. Never read this
-   * counter during render.
+   * identity cannot tell whether opening the newly added repository is still wanted.
+   *
+   * It counts moves; it does not say where the operator is. An add submitted from the sidebar while
+   * Global settings is already open never moves anyone, so `addRepo` pairs this counter with the view
+   * it started from. Never read this counter during render.
    */
   const navigationGeneration = useRef(0)
 
@@ -199,6 +202,27 @@ export default function App() {
    */
   async function addRepo(repo: RepoRef): Promise<RepoWorkflowCapability[]> {
     const startedAt = navigationGeneration.current
+    /**
+     * Whether the operator was looking at a project when they submitted the form. Read at entry
+     * rather than at completion, which is sound in the one direction that matters here: the only way
+     * *out of* the project view is `selectView`, the sidebar's Global settings button, and it bumps
+     * `navigationGeneration`. So an unchanged counter — which `mayOpenAddedRepo()` also requires —
+     * means the operator has not left. Every other `setView` call moves *into* the project view, and
+     * is preceded by a `selectRepo`/`selectIndex` that bumps regardless. A new call site that can
+     * leave the project view has to bump the counter too, or this capture goes stale.
+     */
+    const startedInProject = view === 'project'
+    /**
+     * Opening the repository just registered is a courtesy, and getting it wrong costs more than a
+     * stray click. `GlobalSettings` is mounted by a ternary below and holds the GitHub token and each
+     * provider's API key in component state until "Save changes" is pressed, so switching the view out
+     * from under it discards pasted credentials silently — and an operator who pasted a token has
+     * every reason to think it was kept. So decline unless the operator is still exactly where they
+     * were when they asked: the counter catches a move made during the preflight (a multi-second
+     * network call), and `startedInProject` catches what the counter cannot see, an add submitted from
+     * the always-visible sidebar form while Global settings was already open.
+     */
+    const mayOpenAddedRepo = () => startedInProject && navigationGeneration.current === startedAt
     // Decided against what the store actually holds, not this component's mirror, which is read once at
     // mount: a repo added by `mao repos add` in a terminal since then would be missing from it. That
     // matters twice over — core can only protect a tracked repo's settings from a bare Add-form
@@ -212,7 +236,7 @@ export default function App() {
       // the repo may be one this component has never seen, and leaving the mirror stale would hide a
       // repository that really is being tracked and polled until the app restarts.
       setRepos(current)
-      if (navigationGeneration.current === startedAt) {
+      if (mayOpenAddedRepo()) {
         selectIndex(existing, current)
         setView('project')
         setProjectTab('board')
@@ -235,9 +259,8 @@ export default function App() {
     // repository, so the entry just registered (or the existing one it merged into) is last.
     const stored = await electronApi().github.getRepos().catch(() => [...current, repo])
     setRepos(stored)
-    // Open the added repository only if the operator has not navigated elsewhere during the preflight.
     // Selection is written as identity, so later list folding cannot silently retarget it.
-    if (navigationGeneration.current === startedAt) {
+    if (mayOpenAddedRepo()) {
       const added = stored.findIndex((r) => sameRepoRef(r, repo))
       selectIndex(added === -1 ? (stored.length > 0 ? stored.length - 1 : null) : added, stored)
       setView('project')

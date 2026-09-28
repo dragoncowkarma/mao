@@ -36,14 +36,14 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
 | `core/swarm-runner.ts` | Shell-free launcher and repository/asset validation for the autonomous Swarm Orchestrator |
 | `core/auto-trigger.ts` | Per-repo polling scheduler; auto-enqueues new open issues |
 | `core/assignment.ts` | Issue/PR body directive parser — `parseAssignmentTags()` for swarm_orchestrator-style `[Worker: id]`/`[Reviewer: id]`/`[Maintainer: id]` role tags, and `parseProviderOverride()` which folds those plus task-level `[Model: id]`/`[Effort: level]` tags into a `ProviderOverride` |
-| `core/store.ts` | `MaoStoreSchema`, `MAO_STORE_DEFAULTS`, the `MaoStore` interface, `FileStore` (JSON impl for the CLI), and `createStoredReadGuard()` — the read-path guard every backend applies so a field's declared type survives contact with unvalidated JSON |
+| `core/store.ts` | `MaoStoreSchema`, `MAO_STORE_DEFAULTS`, the `MaoStore` interface, `FileStore` (JSON impl for the CLI), `createStoredReadGuard()` — the read-path guard every backend applies so a field's declared type survives contact with unvalidated JSON — and `describeStoredProblems()` behind `MaoStore.problems()`, which answers *which* values it had to replace |
 | `core/app.ts` | `createMaoApp()` — the **single composition root** both frontends call |
 | `core/paths.ts` | Platform-appropriate data dir for the CLI (mirrors Electron's `userData`) |
 | `core/ai/` | `AiProvider` interface + adapters: `api-provider.ts` (Anthropic / OpenAI-compatible HTTP) and `cli-provider.ts` (spawns `claude`, `codex`, …) |
 | `electron/main.ts` | BrowserWindow, external-link handling, dev/prod load |
 | `electron/ipc.ts` | All `ipcMain.handle` channels — thin delegations only |
 | `electron/preload.ts` | `contextBridge` exposing `window.electronAPI` |
-| `electron/store.ts` | `electron-store` adapter satisfying `MaoStore`, reads routed through core's `createStoredReadGuard()` |
+| `electron/store.ts` | `electron-store` adapter satisfying `MaoStore`; reads routed through core's `createStoredReadGuard()`, `problems()` through core's `describeStoredProblems()` |
 | `src/` | React 18 renderer (Vite + Tailwind); `App.tsx` owns all cross-view state |
 | `src/electron-api.ts` | The renderer's only door to the preload bridge: `setElectronApi()` binds it (production from `src/main.tsx`, tests from a stub), `electronApi()` reads it |
 | `src/test/` | Renderer test harness — `setup.ts` (jsdom polyfills, unmount + unbind between tests) and `electron-api-stub.ts` (a typed fake bridge, `satisfies ElectronApi`) |
@@ -161,12 +161,13 @@ There is no codegen — these couplings are maintained by hand and only `npm run
 - **New store field** → both `MaoStoreSchema` and `MAO_STORE_DEFAULTS` in
   `core/store.ts` (tsc enforces the pair). `electron/store.ts` and `FileStore` pick
   the field up automatically.
-- **New `MaoStore` backend** → it must route reads through `createStoredReadGuard()`
-  (`core/store.ts`), as `FileStore` and `electron/store.ts` both do. Nothing enforces this: the
-  interface's `get<K>(key): MaoStoreSchema[K]` is an assertion over unvalidated JSON, so a backend that
-  skips the guard compiles and then hands every reader a value of the wrong shape (see the invariant
-  below). A field whose shape the guard checks must also be added to the guard, not only to the pair
-  above.
+- **New `MaoStore` backend** → it must route reads through `createStoredReadGuard()` and answer
+  `problems()` with `describeStoredProblems()` (`core/store.ts`), as `FileStore` and
+  `electron/store.ts` both do. Nothing in the compiler enforces this: the interface's
+  `get<K>(key): MaoStoreSchema[K]` is an assertion over unvalidated JSON, so a backend that skips the
+  guard compiles and then hands every reader a value of the wrong shape (see the invariant below).
+  `core/store.test.ts` reads `electron/store.ts`'s source and fails if either mediator is bypassed. A
+  field whose shape the guard checks must also be added to the guard, not only to the pair above.
 - **Repository capability policy** → `core/repo-capabilities.ts` and the intentionally
   duplicated policy tables/verdict logic in `.agents/workflows/swarm_orchestrator.py` must be
   audited together. Gap ids and reasons, remedy kinds/ranking, public-vs-private scope rules,
@@ -352,6 +353,16 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   the guard silent, and do not extend the coercion to a field where an empty value would destroy
   recoverable state without saying so (`aiProviders` would be the same one-liner; `workflowTasks` first
   needs an answer for how an unreadable queue interacts with `resume` and the persistence-broken marker).
+  The discard is not silent in either shell, and that is a contract, not a log line: `get()` answers the
+  same `[]` for an unusable list as for an empty one, so the fact cannot ride on the value. `MaoStore`
+  therefore carries `problems()` — evaluated on demand against what the backend holds *now*, never
+  accumulated as reads happen, because the renderer polls it over a channel of its own and the order of
+  two IPC calls must not decide whether the operator is told. `mao config show` prints it; the GUI polls
+  `app:storeProblems` and the sidebar shows the report with a **Reset stored list** action, because the
+  guard's `console.warn` reaches a main-process console a packaged-app operator never sees and an
+  unusable list leaves no row to select, hence no Settings tab and no Remove button. That reset writes an
+  *empty* list on purpose: an unusable value names no tracked repository, so every row would count as a
+  new registration and be preflighted — a missing or revoked token would block the one recovery left.
   The **write** side is the mirror image and deliberately refuses rather than coerces: `canonicalRepoList`
   throws when `next` is not an array, because every non-array it can still iterate folds to an empty list
   (a string yields characters `isRepoRef` rejects; a `Set` yields entries in an unpromised order) and

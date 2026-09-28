@@ -5,6 +5,7 @@ import { describe, expect, it } from 'vitest'
 import App from './App'
 import { createElectronApiStub } from './test/electron-api-stub'
 import type { RepoRef } from '../core/workflow-engine'
+import type { StoredValueProblem } from '../core/store'
 
 const ONE: RepoRef = { owner: 'acme', repo: 'one' }
 const TWO: RepoRef = { owner: 'acme', repo: 'two' }
@@ -23,6 +24,20 @@ const TWO_SHOUTED: RepoRef = { owner: 'ACME', repo: 'TWO', autoTrigger: false }
 const OTHER_TWO: RepoRef = { owner: 'other', repo: 'two' }
 
 /**
+ * What the main process answers `app:storeProblems` with when `config.json` holds a `githubRepos` the
+ * schema cannot use. Spelled out rather than built from core's own describer: `core/store.ts` is a
+ * Node module the renderer may not import, and the renderer's job here is to render what it is handed,
+ * whatever the wording turns out to be.
+ */
+const UNUSABLE_REPO_LIST: StoredValueProblem = {
+  field: 'githubRepos',
+  source: '/data/config.json',
+  message:
+    '[store] "githubRepos" in /data/config.json is an object, not a JSON array of { owner, repo } ' +
+    'entries — ignoring it, so no repositories are tracked until it is replaced.',
+}
+
+/**
  * Mounts the real App against a fake bridge, inside StrictMode because that is what `src/main.tsx`
  * does. The doubled mount/unmount is a development-and-test check — the packaged build runs effects
  * once — but it is the check AGENTS.md requires polling effects to survive, so running tests under it
@@ -33,9 +48,9 @@ const OTHER_TWO: RepoRef = { owner: 'other', repo: 'two' }
  * Waits for the first project to be on screen before handing control back: App reads the repo list in
  * an effect, so everything a test wants to click is one resolved promise away from the initial render.
  */
-async function renderApp(repos: RepoRef[]) {
+async function renderApp(repos: RepoRef[], problems: StoredValueProblem[] = []) {
   const user = userEvent.setup()
-  const stub = createElectronApiStub(repos)
+  const stub = createElectronApiStub(repos, problems)
   render(
     <StrictMode>
       <App />
@@ -90,6 +105,72 @@ function addSettled() {
 async function openSettings(user: ReturnType<typeof userEvent.setup>) {
   await user.click(screen.getByRole('button', { name: 'Settings' }))
 }
+
+describe('App unusable stored settings', () => {
+  it('tells the operator what was discarded instead of showing an empty project list', async () => {
+    // The gap this closes: a `githubRepos` the schema cannot use reaches the renderer as `[]`, so the
+    // sidebar said "No projects yet — add a repository to get started" — indistinguishable from having
+    // none, while the only report went to a main-process console a packaged-app operator never sees.
+    await renderApp([], [UNUSABLE_REPO_LIST])
+
+    expect(await screen.findByText(/is an object, not a JSON array/)).toBeInTheDocument()
+    expect(screen.getByText(/could not be read/)).toBeInTheDocument()
+    expect(screen.queryByText(/No projects yet/)).toBeNull()
+  })
+
+  it('offers a recovery the operator can actually reach, and it needs no token', async () => {
+    // With no usable list there is no sidebar row, so no project is selected and the Settings tab's
+    // Remove button never renders — the recovery the store's own report used to name was unreachable.
+    // Writing an empty list registers nothing, so unlike Add it is never refused by the preflight.
+    const { stub, user } = await renderApp([], [UNUSABLE_REPO_LIST])
+    await screen.findByText(/is an object, not a JSON array/)
+
+    await user.click(screen.getByRole('button', { name: 'Reset stored list' }))
+    await user.click(screen.getByRole('button', { name: 'Confirm reset' }))
+
+    await waitFor(() => expect(screen.queryByText(/is an object, not a JSON array/)).toBeNull())
+    expect(stub.setRepos).toHaveBeenCalledWith([])
+    expect(stub.storedRepos()).toEqual([])
+    expect(screen.getByText(/No projects yet/)).toBeInTheDocument()
+  })
+
+  it('keeps the report up when the recovery write itself fails', async () => {
+    // A refused write leaves the unusable value on disk, so clearing the notice optimistically would
+    // tell the operator the problem was fixed when nothing had changed.
+    const { stub, user } = await renderApp([], [UNUSABLE_REPO_LIST])
+    await screen.findByText(/is an object, not a JSON array/)
+    stub.setRepos.mockRejectedValueOnce(new Error("Error invoking remote method 'github:setRepos': Error: disk is full"))
+
+    await user.click(screen.getByRole('button', { name: 'Reset stored list' }))
+    await user.click(screen.getByRole('button', { name: 'Confirm reset' }))
+
+    expect(await screen.findByText('disk is full')).toBeInTheDocument()
+    expect(screen.getByText(/is an object, not a JSON array/)).toBeInTheDocument()
+  })
+
+  it('leaves the operator where they were when the reset lands', async () => {
+    // The sidebar is visible from Global settings too, so a reset can be started there — and it
+    // finishes two awaits later. Navigating on completion is the race `navigationGeneration` exists to
+    // stop, and after a reset there is nothing to navigate to anyway.
+    const { stub, user } = await renderApp([], [UNUSABLE_REPO_LIST])
+    await screen.findByText(/is an object, not a JSON array/)
+    await user.click(globalSettingsNav())
+    expect(tokenField()).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Reset stored list' }))
+    await user.click(screen.getByRole('button', { name: 'Confirm reset' }))
+
+    await waitFor(() => expect(stub.setRepos).toHaveBeenCalledWith([]))
+    expect(tokenField()).toBeInTheDocument()
+  })
+
+  it('says nothing when the store is healthy', async () => {
+    await renderApp([ONE])
+
+    expect(screen.queryByText(/could not be read/)).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Reset stored list' })).toBeNull()
+  })
+})
 
 describe('App project selection', () => {
   it('opens the project the operator picks in the sidebar', async () => {

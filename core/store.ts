@@ -54,13 +54,18 @@ function describeStoredType(value: unknown): string {
  * states the recovery explicitly: the unusable value stays on disk, so the next list write is what
  * replaces it, and anything the operator wants to salvage has to be copied out first.
  *
- * The recovery it names is a *removal*, not an add, and that ordering is load-bearing. Any list write
- * heals the file, but only a write that registers nothing new is exempt from the write-permission
- * preflight (see `reposNeedingCapabilityCheck`) — and because an unusable value names no tracked
- * repository, every repository in an `add` counts as new. So with no token configured, or access since
- * revoked, `mao repos add` fails in the preflight and leaves the unusable value exactly where it was,
- * while `mao repos remove` heals regardless. Recommending the blockable path first would send an
- * operator whose token is the reason they were editing `config.json` straight back into the wall.
+ * The recovery it names first registers nothing, and that ordering is load-bearing. Any list write heals
+ * the file, but only a write that registers nothing new is exempt from the write-permission preflight
+ * (see `reposNeedingCapabilityCheck`) — and because an unusable value names no tracked repository, every
+ * repository in an `add` counts as new. So with no token configured, or access since revoked, `mao repos
+ * add` fails in the preflight and leaves the unusable value exactly where it was, while `mao repos
+ * remove` heals regardless. Recommending the blockable path first would send an operator whose token is
+ * the reason they were editing `config.json` straight back into the wall.
+ *
+ * It names the GUI's **Reset stored list**, not its Remove, for a reason that is easy to get wrong: an
+ * unusable list leaves the sidebar with no row, so no project is selected, so the Settings tab and the
+ * Remove button inside it never render. Naming an action the operator cannot reach is worse than naming
+ * none. Reset is the sidebar control this report itself is shown next to, and it writes an empty list.
  */
 export function describeUnusableRepoList(value: unknown, source: string): string | null {
   if (Array.isArray(value)) return null
@@ -68,10 +73,58 @@ export function describeUnusableRepoList(value: unknown, source: string): string
     `[store] "githubRepos" in ${source} is ${describeStoredType(value)}, not a JSON array of ` +
     '{ owner, repo } entries — ignoring it, so no repositories are tracked until it is replaced. The ' +
     'unusable value is still in the file; any repository-list write overwrites it. `mao repos remove ' +
-    "<owner> <repo>` (or the sidebar's Remove) always works; `mao repos add` has to pass a write-access " +
-    'check first, so it needs a working GitHub token. Copy any repositories you still need out of ' +
-    `${source} first.`
+    "<owner> <repo>`, or the sidebar's Reset stored list, always works — neither registers anything, so " +
+    'neither is checked for write access. `mao repos add` and the sidebar\'s Add are, so they need a ' +
+    `working GitHub token. Copy any repositories you still need out of ${source} first.`
   )
+}
+
+/**
+ * The single list of fields whose stored *shape* is validated, and the report for each — so the guard
+ * below and `describeStoredProblems()` cannot disagree about which values are usable.
+ */
+function unusableStoredValue<K extends keyof MaoStoreSchema>(
+  key: K,
+  raw: MaoStoreSchema[K],
+  source: string,
+): string | null {
+  return key === 'githubRepos' ? describeUnusableRepoList(raw, source) : null
+}
+
+/** A stored value the schema cannot use, in the form a shell can show an operator. */
+export interface StoredValueProblem {
+  /** The `MaoStoreSchema` field whose stored value was replaced with the schema default. */
+  field: keyof MaoStoreSchema
+  /** The config file the unusable value is still sitting in. */
+  source: string
+  /** The operator-facing report: the field, the value's actual type, the file, and the way back. */
+  message: string
+}
+
+/**
+ * Which of the values a backend holds **right now** the schema cannot use.
+ *
+ * Evaluated on demand rather than accumulated as reads happen, and that is the whole point. The guard
+ * only learns about a field when something reads it, so a recorded-as-you-go list would answer "no
+ * problems" until the right read had happened — and the renderer polls this *independently* of
+ * `github:getRepos`, so the order of two IPC calls would decide whether the operator was told. Asking
+ * the backend directly makes the answer true whenever it is asked. It is also live for Electron, whose
+ * electron-store backend re-reads the file on every `get`.
+ *
+ * Read-only, like the guard: nothing here repairs the file. `MAO_STORE_DEFAULTS`' own keys are the
+ * field list, so a field added to the schema is considered automatically and answers `null` until
+ * `unusableStoredValue()` has a rule for it.
+ */
+export function describeStoredProblems(
+  readRaw: <K extends keyof MaoStoreSchema>(key: K) => MaoStoreSchema[K],
+  source: string,
+): StoredValueProblem[] {
+  const problems: StoredValueProblem[] = []
+  for (const field of Object.keys(MAO_STORE_DEFAULTS) as Array<keyof MaoStoreSchema>) {
+    const message = unusableStoredValue(field, readRaw(field), source)
+    if (message !== null) problems.push({ field, source, message })
+  }
+  return problems
 }
 
 /** A backend's read, corrected to the shape `MaoStoreSchema` declares. See `createStoredReadGuard`. */
@@ -122,18 +175,16 @@ export function createStoredReadGuard(
   const reported = new Set<keyof MaoStoreSchema>()
 
   return function guardStoredRead<K extends keyof MaoStoreSchema>(key: K, raw: MaoStoreSchema[K]): MaoStoreSchema[K] {
-    if (key !== 'githubRepos') return raw
-    const problem = describeUnusableRepoList(raw, source)
+    const problem = unusableStoredValue(key, raw, source)
     if (problem === null) return raw
     if (!reported.has(key)) {
       reported.add(key)
       warn(problem)
     }
-    // The only cast in this module, and the reason it exists: comparing `key` cannot narrow `K`, so the
-    // replacement list has to be asserted back into the field's declared type. A fresh array each time,
-    // never `MAO_STORE_DEFAULTS.githubRepos` — that instance is shared, and one caller pushing into it
-    // would poison the defaults for the rest of the process.
-    return [] as unknown as MaoStoreSchema[K]
+    // The schema's own default, *cloned*. Returning `MAO_STORE_DEFAULTS[key]` itself would hand every
+    // caller the same shared instance, and one of them pushing into what it read would poison the
+    // default for the rest of the process — the same aliasing `FileStore`'s constructor avoids below.
+    return structuredClone(MAO_STORE_DEFAULTS[key])
   }
 }
 
@@ -154,6 +205,16 @@ export function createStoredReadGuard(
 export interface MaoStore {
   get<K extends keyof MaoStoreSchema>(key: K): MaoStoreSchema[K]
   set<K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]): void
+  /**
+   * The stored values this backend cannot use, evaluated against what it holds now (see
+   * `describeStoredProblems()`).
+   *
+   * Part of the contract rather than a backend detail, because `get()` alone cannot tell a caller that
+   * it answered with a default instead of what is on disk — it returns the same `[]` either way. Both
+   * shells need to say so: `mao config show` reports it, and the GUI has no other way to learn at all,
+   * since the guard's own report goes to a main-process console a packaged-app operator never sees.
+   */
+  problems(): StoredValueProblem[]
 }
 
 /** JSON-file-backed MaoStore for CLI/headless environments that don't have electron-store available. */
@@ -198,5 +259,9 @@ export class FileStore implements MaoStore {
   set<K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]): void {
     this.data[key] = value
     this.persist()
+  }
+
+  problems(): StoredValueProblem[] {
+    return describeStoredProblems(<K extends keyof MaoStoreSchema>(key: K) => this.data[key], this.filePath)
   }
 }

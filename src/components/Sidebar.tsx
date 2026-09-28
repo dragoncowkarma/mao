@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import type { RepoRef } from '../../core/workflow-engine'
 import type { RepoWorkflowCapability } from '../../core/repo-capabilities'
+import type { StoredValueProblem } from '../../core/store'
 
 /**
  * Electron re-wraps anything thrown inside `ipcMain.handle` as
@@ -37,17 +38,40 @@ interface SidebarProps {
    * in the form. Resolves with the verdicts so the unverified-grants caveat can be shown on success.
    */
   onAddRepo: (repo: RepoRef) => Promise<RepoWorkflowCapability[]>
+  /**
+   * Stored values the main process could not use, answered with a schema default instead.
+   *
+   * Shown here because this is where their absence is: an unusable `githubRepos` reaches the renderer
+   * as `[]`, which is indistinguishable from having no repositories — and with no row to select, the
+   * project's Settings tab and its Remove button never render, so the guard's own advice to use the
+   * sidebar's Remove was not something the operator could actually do.
+   */
+  storeProblems: StoredValueProblem[]
+  /** Discards the unusable stored value by writing an empty list. Rejects if even that write fails. */
+  onResetRepoList: () => Promise<void>
   view: 'project' | 'global-settings'
   onViewChange: (view: 'project' | 'global-settings') => void
 }
 
-export default function Sidebar({ repos, selectedIndex, onSelect, onAddRepo, view, onViewChange }: SidebarProps) {
+export default function Sidebar({
+  repos,
+  selectedIndex,
+  onSelect,
+  onAddRepo,
+  storeProblems,
+  onResetRepoList,
+  view,
+  onViewChange,
+}: SidebarProps) {
   const [adding, setAdding] = useState(false)
   const [owner, setOwner] = useState('')
   const [repo, setRepo] = useState('')
   const [checking, setChecking] = useState(false)
   const [addError, setAddError] = useState('')
   const [addNotice, setAddNotice] = useState('')
+  const [confirmingReset, setConfirmingReset] = useState(false)
+  const [resetting, setResetting] = useState(false)
+  const [resetError, setResetError] = useState('')
 
   /**
    * The main process preflights issue/PR write access before it persists anything, so this can fail
@@ -74,6 +98,29 @@ export default function Sidebar({ repos, selectedIndex, onSelect, onAddRepo, vie
     }
   }
 
+  /**
+   * Two-step, like removing a project: this throws away whatever the file holds for the list, and the
+   * report above it says to copy anything still wanted out of that file first.
+   *
+   * Writing an *empty* list rather than the rows on screen is what makes this always available.
+   * `updateRepos` preflights write access for every entry it considers newly registered, and an
+   * unusable stored value names no tracked repository — so every row would be new, and a missing or
+   * revoked token would block the one action the operator has left. An empty list registers nothing.
+   */
+  async function submitReset() {
+    if (resetting) return
+    setResetting(true)
+    setResetError('')
+    try {
+      await onResetRepoList()
+      setConfirmingReset(false)
+    } catch (err) {
+      setResetError(readableIpcError(err))
+    } finally {
+      setResetting(false)
+    }
+  }
+
   return (
     <aside className="sidebar">
       <div className="sidebar-section">
@@ -94,6 +141,36 @@ export default function Sidebar({ repos, selectedIndex, onSelect, onAddRepo, vie
             + Add
           </button>
         </div>
+
+        {storeProblems.length > 0 && (
+          <div className="card mb-2 gap-1.5 p-2">
+            <p className="card-title text-[13px]">Stored settings could not be read</p>
+            {storeProblems.map((problem) => (
+              <p key={problem.field} className="text-muted text-[11px] leading-snug">
+                {problem.message}
+              </p>
+            ))}
+            {confirmingReset ? (
+              <div className="flex gap-2">
+                <button onClick={submitReset} className="btn btn-primary text-xs" disabled={resetting}>
+                  {resetting ? 'Resetting…' : 'Confirm reset'}
+                </button>
+                <button onClick={() => setConfirmingReset(false)} className="btn btn-secondary text-xs">
+                  Cancel
+                </button>
+              </div>
+            ) : (
+              <button onClick={() => setConfirmingReset(true)} className="btn btn-secondary self-start text-xs">
+                Reset stored list
+              </button>
+            )}
+            {resetError && (
+              <p className="text-xs" style={{ color: 'var(--color-accent-700)' }}>
+                {resetError}
+              </p>
+            )}
+          </div>
+        )}
 
         {adding && (
           <div className="card mb-2 gap-1.5 p-2">
@@ -136,7 +213,7 @@ export default function Sidebar({ repos, selectedIndex, onSelect, onAddRepo, vie
               {r.autoTrigger === false && <span className="text-[10px] opacity-70">off</span>}
             </button>
           ))}
-          {repos.length === 0 && !adding && (
+          {repos.length === 0 && !adding && storeProblems.length === 0 && (
             <p className="text-muted text-xs px-2">No projects yet — add a repository to get started.</p>
           )}
         </nav>

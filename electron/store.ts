@@ -1,5 +1,12 @@
 import Store from 'electron-store'
-import { createStoredReadGuard, MAO_STORE_DEFAULTS, type MaoStore, type MaoStoreSchema } from '../core/store.ts'
+import {
+  createStoredReadGuard,
+  describeStoredProblems,
+  MAO_STORE_DEFAULTS,
+  type MaoStore,
+  type MaoStoreSchema,
+  type StoredValueProblem,
+} from '../core/store.ts'
 
 const backing = new Store<MaoStoreSchema>({ defaults: MAO_STORE_DEFAULTS })
 
@@ -28,5 +35,8 @@ export const store: MaoStore = {
   },
   set<K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]): void {
     backing.set(key, value)
+  },
+  problems(): StoredValueProblem[] {
+    return describeStoredProblems(<K extends keyof MaoStoreSchema>(key: K) => backing.get(key), backing.path)
   },
 }

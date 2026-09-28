@@ -2,7 +2,14 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { FileStore, MAO_STORE_DEFAULTS, createStoredReadGuard, describeUnusableRepoList } from './store.ts'
+import {
+  FileStore,
+  MAO_STORE_DEFAULTS,
+  createStoredReadGuard,
+  describeStoredProblems,
+  describeUnusableRepoList,
+  type MaoStoreSchema,
+} from './store.ts'
 import { canonicalRepoList } from './repo-registry.ts'
 import type { RepoRef } from './workflow-engine.ts'
 
@@ -85,11 +92,14 @@ describe('FileStore githubRepos read guard', () => {
     expect(message).toContain('"githubRepos"')
     expect(message).toContain('is an object')
     expect(message).toContain(filePath)
-    // The unconditional recovery is named first: a removal registers nothing, so it is exempt from the
-    // write-permission preflight, while `repos add` needs a working token — and a missing token is a
-    // likely reason the operator was editing config.json in the first place.
+    // The unconditional recovery is named first: neither a removal nor the GUI's Reset registers
+    // anything, so neither is preflighted, while `repos add` needs a working token — and a missing token
+    // is a likely reason the operator was editing config.json in the first place.
     expect(message).toContain('mao repos remove')
     expect(message.indexOf('mao repos remove')).toBeLessThan(message.indexOf('mao repos add'))
+    // Names the sidebar control that exists when the list is unusable. Remove lives in a project's
+    // Settings tab, which needs a selected project — and an unusable list leaves no row to select.
+    expect(message).toContain('Reset stored list')
   })
 
   it('reports once, however many times the list is read', () => {
@@ -200,6 +210,61 @@ describe('FileStore githubRepos read guard', () => {
   })
 })
 
+describe('MaoStore.problems', () => {
+  it('reports nothing for a healthy store', () => {
+    const { store } = storeHolding({ githubRepos: [widgets] })
+
+    expect(store.problems()).toEqual([])
+  })
+
+  it('answers without needing the field to have been read first', () => {
+    // The property the GUI depends on. The guard only learns about a field when something reads it, so
+    // a list recorded as reads happen would answer "no problems" until `github:getRepos` had run — and
+    // the renderer polls this over a *different* channel, so the order of two IPC calls would decide
+    // whether the operator was ever told.
+    const warn = captureWarnings()
+    const { store, filePath } = storeHolding({ githubRepos: { 'acme/widgets': widgets } })
+
+    const problems = store.problems()
+
+    expect(problems).toHaveLength(1)
+    expect(problems[0]!.field).toBe('githubRepos')
+    expect(problems[0]!.source).toBe(filePath)
+    expect(problems[0]!.message).toContain('is an object')
+    // A query, not a read: it must not consume the guard's one report, or polling it would decide
+    // whether the CLI's own stderr line ever appeared.
+    expect(warn).not.toHaveBeenCalled()
+  })
+
+  it('stops reporting once a list write has replaced the value, and repairs nothing itself', () => {
+    captureWarnings()
+    const { store, filePath } = storeHolding({ githubRepos: 'acme/widgets' })
+
+    expect(store.problems()).toHaveLength(1)
+    // Still on disk — querying is not a repair, so the operator can still salvage from the file.
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).githubRepos).toBe('acme/widgets')
+
+    store.set('githubRepos', [])
+
+    expect(store.problems()).toEqual([])
+    expect(new FileStore(filePath).problems()).toEqual([])
+  })
+})
+
+describe('describeStoredProblems', () => {
+  it('reports the fields the schema cannot use, from whatever raw values it is handed', () => {
+    // Driven by a raw reader rather than a store, because that is what lets the two backends share it:
+    // FileStore hands it its in-memory snapshot, electron/store.ts hands it electron-store's live get.
+    const raw = { ...structuredClone(MAO_STORE_DEFAULTS), githubRepos: 7 } as unknown as MaoStoreSchema
+
+    const problems = describeStoredProblems((key) => raw[key], '/tmp/config.json')
+
+    expect(problems.map((problem) => problem.field)).toEqual(['githubRepos'])
+    expect(problems[0]!.source).toBe('/tmp/config.json')
+    expect(describeStoredProblems((key) => structuredClone(MAO_STORE_DEFAULTS)[key], '/tmp/c.json')).toEqual([])
+  })
+})
+
 describe('describeUnusableRepoList', () => {
   it('reports nothing for a list', () => {
     expect(describeUnusableRepoList([], '/tmp/config.json')).toBeNull()
@@ -270,14 +335,26 @@ describe("electron/store.ts, the other MaoStore backend", () => {
     const backend = source.match(/const\s+(\w+)\s*=\s*new Store</)?.[1]
     expect(backend, 'electron/store.ts must construct an electron-store instance').toBeTruthy()
 
-    // Stated as "every read of the raw backend is wrapped" rather than by matching the body of `get`,
+    // Stated as "no read of the raw backend is unmediated" rather than by matching the body of `get`,
     // which would make the assertion depend on this file's indentation — there is no autoformatter to
-    // keep that stable, and a guard that fails for a reformat is a guard people learn to dismiss.
-    const raw = [...source.matchAll(new RegExp(`${backend}\\.get\\(`, 'g'))]
-    const wrapped = [...source.matchAll(new RegExp(`${guard}\\(\\s*key\\s*,\\s*${backend}\\.get\\(`, 'g'))]
+    // keep that stable, and a guard that fails for a reformat is a guard people learn to dismiss. The
+    // two mediators are core's: the read guard, and `describeStoredProblems` for `problems()`. The
+    // cost is that it reads a read and its mediator as being on one line, which is how they are written.
+    const reads = source.split('\n').filter((line) => line.includes(`${backend}.get(`))
+    const unmediated = reads.filter((line) => !new RegExp(`(?:${guard}|describeStoredProblems)\\(`).test(line))
 
-    expect(raw.length).toBeGreaterThan(0)
-    expect(wrapped.length).toBe(raw.length)
+    expect(reads.length).toBeGreaterThan(0)
+    expect(unmediated).toEqual([])
+  })
+
+  it('answers problems() through core, against the same backend', () => {
+    // The other half of the contract `MaoStore` now carries. A hand-rolled `problems()` here would be
+    // policy in a shell (AGENTS.md rule 2) and could disagree with what the guard actually replaced.
+    const backend = source.match(/const\s+(\w+)\s*=\s*new Store</)?.[1]
+
+    expect(source).toMatch(/problems\(\)\s*:\s*StoredValueProblem\[\]/)
+    expect(source).toMatch(new RegExp(`describeStoredProblems\\([\\s\\S]*?${backend}\\.get\\(`))
+    expect(source).toMatch(new RegExp(`describeStoredProblems\\([\\s\\S]*?${backend}\\.path`))
   })
 
   it("builds the guard with the backend's own resolved config path", () => {

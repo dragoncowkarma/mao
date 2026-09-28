@@ -9,7 +9,7 @@ import { electronApi } from './electron-api'
 import type { RepoRef } from '../core/workflow-engine'
 import type { RepoWorkflowCapability } from '../core/repo-capabilities'
 import { sameRepoRef } from '../core/repo-registry'
-import type { ThemePreference } from '../core/store'
+import type { StoredValueProblem, ThemePreference } from '../core/store'
 import type { AppUpdateCheck } from './electron'
 
 type ProjectTab = 'board' | 'queue' | 'settings'
@@ -34,6 +34,13 @@ export default function App() {
   const [dismissedUpdateSha, setDismissedUpdateSha] = useState<string | null>(null)
   /** Surfaces a failed settings edit or removal, which are otherwise silent (no preflight, no form). */
   const [repoError, setRepoError] = useState('')
+  /**
+   * Stored values the main process could not use. Polled rather than pushed (AGENTS.md rule 6), and
+   * kept separate from `repos` on purpose: a `githubRepos` the schema cannot use arrives here as `[]`,
+   * exactly like an empty list, so the list itself can never carry the fact that something was
+   * discarded — and the guard's own report goes to a console a packaged-app operator never sees.
+   */
+  const [storeProblems, setStoreProblems] = useState<StoredValueProblem[]>([])
   /**
    * Counts every navigation choice, so an async add can ask whether the operator moved elsewhere
    * while its permission preflight was running.
@@ -72,6 +79,23 @@ export default function App() {
   const matchingSelectedIndex = selectedRepo === null ? null : selectedRepoIndex(repos, selectedRepo)
   const selectedIndex = matchingSelectedIndex === -1 ? null : matchingSelectedIndex
   const selected = selectedIndex === null ? undefined : repos[selectedIndex]
+
+  /**
+   * Best-effort: a diagnostic that cannot be read must not take the app down with it, so a rejection
+   * leaves the notice as it was rather than propagating. Re-read after every list write instead of
+   * assumed cleared — a write heals the store, but a *failed* write leaves the unusable value in
+   * place, which is precisely when the notice has to stay up.
+   */
+  function refreshStoreProblems(): Promise<void> {
+    return electronApi()
+      .app.storeProblems()
+      .then(setStoreProblems)
+      .catch(() => {})
+  }
+
+  useEffect(() => {
+    void refreshStoreProblems()
+  }, [])
 
   useEffect(() => {
     electronApi().github.getRepos().then((savedRepos) => {
@@ -193,6 +217,10 @@ export default function App() {
       // built from a write we know was refused.
       setRepos(await electronApi().github.getRepos().catch(() => previous))
       throw err
+    } finally {
+      // Every list write replaces an unusable stored value, and a refused one does not — so this is
+      // read back on both paths rather than cleared optimistically on the success path.
+      void refreshStoreProblems()
     }
   }
 
@@ -298,6 +326,26 @@ export default function App() {
     }
   }
 
+  /**
+   * The in-app way out of a stored repository list the schema cannot use.
+   *
+   * Reachable when nothing else is: with no usable list there is no sidebar row, so no project is
+   * selected and the Settings tab's Remove button — the guard's own suggested recovery — never
+   * renders. Writing an empty list registers nothing, so unlike Add it is never refused by the
+   * write-permission preflight, which is what an operator with a missing or revoked token is left
+   * with. Sidebar confirms first, and shows the report naming the file to salvage from.
+   */
+  async function resetRepoList() {
+    setRepoError('')
+    await persistRepos([])
+    // Adopt what the store now holds, for the same reason removal does: the write is the authority.
+    // Deliberately nothing else. Selection reconciles itself — the effect above clears `selectedRepo`
+    // when the list empties — and forcing a view/tab here would be a navigation decision made after
+    // two awaits, which is exactly what `navigationGeneration` exists to stop: the sidebar is visible
+    // from Global settings too, so a reset started there would otherwise yank the operator away from it.
+    setRepos(await electronApi().github.getRepos().catch(() => []))
+  }
+
   async function removeSelectedRepo() {
     if (selectedIndex === null) return
     const target = repos[selectedIndex]
@@ -348,6 +396,8 @@ export default function App() {
         selectedIndex={selectedIndex}
         onSelect={selectProject}
         onAddRepo={addRepo}
+        storeProblems={storeProblems}
+        onResetRepoList={resetRepoList}
         view={view}
         onViewChange={selectView}
       />

@@ -154,15 +154,28 @@ the file actually holds, and the file's path:
 
 ```
 [store] "githubRepos" in /path/to/config.json is an object, not a JSON array of { owner, repo }
-entries — ignoring it, so no repositories are tracked until it is replaced. …
+entries — ignoring it, so no repositories are tracked until it is replaced. The unusable value is
+still in the file; any repository-list write overwrites it. `mao repos remove <owner> <repo>`, or the
+sidebar's Reset stored list, always works — neither registers anything, so neither is checked for
+write access. …
 ```
 
 So `mao repos list` prints `[]` (and `mao config show`'s JSON stays parseable on stdout), and `mao run`'s
 scheduler keeps ticking instead of dying on its first poll. Nothing is repaired on read — the unusable
 value stays in the file, so copy any repositories you still need out of it first; the next list write
-(`mao repos add <owner> <repo>`, `mao repos remove`, or the sidebar's Add form) overwrites it with a real
-list. Because the guard makes the store name no usable repository, a repo re-added this way counts as a
-first registration and **is** preflighted for write access.
+(`mao repos remove <owner> <repo>`, `mao repos add <owner> <repo>`, or the GUI's Reset/Add) overwrites it
+with a real list. A **removal registers nothing, so it is never preflighted and always works**; an `add`
+is preflighted, and because the unusable value names no tracked repository every entry counts as a first
+registration — so `repos add` needs a working GitHub token, and fails leaving the bad value in place
+without one.
+
+Because stderr is easy to miss (`2>/dev/null` discards it), the same thing is queryable. `mao config
+show` reports it as `storeProblems` — one entry per field, each with the field name, the config file and
+the message — so a diagnostic command never reports a value that is not in the file. The GUI polls the
+same list over `app:storeProblems` and the sidebar shows it in place of "No projects yet", with a
+**Reset stored list** button (two-step) that discards the unusable value by writing an empty list. That
+is the GUI's only always-available recovery: with no usable list there is no project row, so no Settings
+tab and no Remove button, and Add can be refused by the preflight.
 
 The GUI shows the same unverified-grants caveat the CLI prints (`github:setRepos` returns the
 verdicts), and the board's **Refresh** surfaces a failed preflight instead of reporting a clean sync —

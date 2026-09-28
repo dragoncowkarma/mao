@@ -29,6 +29,13 @@ export function registerIpcHandlers() {
     }
   })
 
+  // The GUI's only way to learn that a stored value was unusable. The guard in core/store.ts reports
+  // through `console.warn`, which in a packaged app goes to a main-process console the operator never
+  // sees — and `github:getRepos` answers `[]` for a corrupt list exactly as it does for an empty one,
+  // so the sidebar cannot tell the two apart. Pulled rather than pushed, per AGENTS.md rule 6: the
+  // renderer re-reads it at mount and after each list write. A pure read of what the store holds now.
+  ipcMain.handle('app:storeProblems', () => store.problems())
+
   ipcMain.handle('app:relaunch', (_event, force = false) => {
     assertCanRelaunchForUpdate(workflowEngine.getTasks(), force)
     app.relaunch()

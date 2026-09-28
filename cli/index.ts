@@ -114,6 +114,10 @@ config
       aiProviders: store.get('aiProviders').map((p) => ({ ...p, apiKey: p.apiKey ? '[set]' : undefined })),
       theme: store.get('theme'),
       workflowPersistenceBroken: hasPersistenceBrokenMarker(resolveDataDir()),
+      // Otherwise this command reports a value that is not in the file: a `githubRepos` the schema
+      // cannot use is answered as `[]` above, and the guard's own warning goes to stderr, which
+      // `config show 2>/dev/null` discards. Same list the GUI polls over `app:storeProblems`.
+      storeProblems: store.problems(),
     })
   })
 

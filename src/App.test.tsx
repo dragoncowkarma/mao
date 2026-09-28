@@ -159,6 +159,23 @@ describe('App unusable stored settings', () => {
     expect(screen.getByText(/is an object, not a JSON array/)).toBeInTheDocument()
   })
 
+  it('re-reads the report after a write that failed, rather than just leaving it alone', async () => {
+    // Asserted through Add, not the reset: the reset re-reads on its own before it writes, so a delta
+    // measured there would be its pre-check rather than `persistRepos`' `finally`. A report that
+    // survives only because nothing cleared it goes stale the first time a failure and a heal happen in
+    // either order. The 30s poll cannot have fired inside a test this short, so the delta is
+    // attributable to the write.
+    const { stub, user } = await renderApp([], [UNUSABLE_REPO_LIST])
+    await screen.findByText(/is an object, not a JSON array/)
+    stub.setRepos.mockRejectedValueOnce(new Error('acme/one cannot host the MAO workflow'))
+    const readsBefore = stub.storeProblems.mock.calls.length
+
+    await submitAdd(user, ONE)
+
+    expect(await screen.findByText('acme/one cannot host the MAO workflow')).toBeInTheDocument()
+    await waitFor(() => expect(stub.storeProblems.mock.calls.length).toBeGreaterThan(readsBefore))
+  })
+
   it('refuses to reset a store something else has already healed', async () => {
     // The store is not this window's alone: the report tells the operator to go to `config.json`, and
     // `mao repos add` in a terminal heals it — while this card, read at mount and after writes, keeps

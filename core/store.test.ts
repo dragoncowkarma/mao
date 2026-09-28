@@ -8,7 +8,9 @@ import {
   createStoredReadGuard,
   describeStoredProblems,
   describeUnusableRepoList,
+  createGuardedStore,
   type MaoStoreSchema,
+  type StoredValueBackend,
 } from './store.ts'
 import { canonicalRepoList } from './repo-registry.ts'
 import type { RepoRef } from './workflow-engine.ts'
@@ -251,6 +253,68 @@ describe('MaoStore.problems', () => {
   })
 })
 
+/**
+ * A backend that behaves the way electron-store's does — a key the file does not hold comes back
+ * `undefined`, not a schema default. `FileStore`'s own snapshot never does that, which is exactly the
+ * divergence `createGuardedStore` exists to iron out, so the fake has to model the harder one.
+ */
+function fakeBackend(contents: Partial<Record<keyof MaoStoreSchema, unknown>> = {}) {
+  const data: Record<string, unknown> = { ...contents }
+  const backend: StoredValueBackend = {
+    get: <K extends keyof MaoStoreSchema>(key: K) => data[key] as MaoStoreSchema[K] | undefined,
+    set: <K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]) => {
+      data[key] = value
+    },
+  }
+  return { backend, data }
+}
+
+describe('createGuardedStore', () => {
+  it('reports from the raw stored value, not from what the guard already replaced', () => {
+    // The whole GUI half of issue #60 rests on this distinction, and it is invisible to a source-text
+    // check: hand `problems()` the *guarded* value and it sees the schema default the guard just
+    // substituted, answers "nothing is wrong" for every corrupt store, and the packaged app goes blind
+    // again with every other assertion still green.
+    const { backend } = fakeBackend({ githubRepos: { 'acme/widgets': widgets } })
+    const reports: string[] = []
+    const store = createGuardedStore(backend, '/data/config.json', (message) => reports.push(message))
+
+    expect(store.get('githubRepos')).toEqual([])
+    expect(store.problems().map((problem) => problem.field)).toEqual(['githubRepos'])
+    expect(store.problems()[0]!.source).toBe('/data/config.json')
+    expect(reports).toHaveLength(1)
+  })
+
+  it('fills a key the backend does not have from the schema, and calls that no problem', () => {
+    // conf merges `defaults` only when it first writes the file, so a key an operator deletes by hand
+    // comes back `undefined` — which must read as "the default applies", not as a discarded value, or
+    // the GUI shows a corruption card offering a destructive reset while the CLI reports clean.
+    const { backend } = fakeBackend()
+    const reports: string[] = []
+    const store = createGuardedStore(backend, '/data/config.json', (message) => reports.push(message))
+
+    expect(store.get('githubRepos')).toEqual([])
+    expect(store.problems()).toEqual([])
+    expect(reports).toEqual([])
+    // And it is the caller's array, not the shared default.
+    store.get('githubRepos').push(widgets)
+    expect(MAO_STORE_DEFAULTS.githubRepos).toEqual([])
+    expect(store.get('githubRepos')).toEqual([])
+  })
+
+  it('writes through, and a write is what clears the report', () => {
+    const { backend, data } = fakeBackend({ githubRepos: 'acme/widgets' })
+    const store = createGuardedStore(backend, '/data/config.json', () => {})
+
+    expect(store.problems()).toHaveLength(1)
+    store.set('githubRepos', [widgets])
+
+    expect(data.githubRepos).toEqual([widgets])
+    expect(store.get('githubRepos')).toEqual([widgets])
+    expect(store.problems()).toEqual([])
+  })
+})
+
 describe('describeStoredProblems', () => {
   it('reports the fields the schema cannot use, from whatever raw values it is handed', () => {
     // Driven by a raw reader rather than a store, because that is what lets the two backends share it:
@@ -328,39 +392,17 @@ function withoutComments(source: string): string {
 describe("electron/store.ts, the other MaoStore backend", () => {
   const source = withoutComments(fs.readFileSync(path.join(REPO_ROOT, 'electron', 'store.ts'), 'utf-8'))
 
-  it('routes its reads through core\'s guard', () => {
-    const guard = source.match(/const\s+(\w+)\s*=\s*createStoredReadGuard\(/)?.[1]
-    expect(guard, 'electron/store.ts must build a guard with createStoredReadGuard()').toBeTruthy()
-
+  it("is core's composition and nothing else", () => {
+    // What is left to check once the behaviour lives in `createGuardedStore` (covered above against a
+    // fake that models conf's absent-key answer): that this file only composes, and never reaches for
+    // the instance again. A second reference is the bypass — `backing.store[key]`, say, which is
+    // tsc-clean, names no `get`, and would hand the renderer unvalidated values with nothing to flag it.
     const backend = source.match(/const\s+(\w+)\s*=\s*new Store</)?.[1]
     expect(backend, 'electron/store.ts must construct an electron-store instance').toBeTruthy()
 
-    // Stated as "the raw backend is read in exactly one accessor, and `get` hands that to the guard",
-    // rather than by matching the body of `get` — which would make the assertion depend on this file's
-    // indentation, and a guard that fails for a reformat is a guard people learn to dismiss. The single
-    // accessor is what makes the rule checkable at all: a second member reaching for the instance
-    // directly would read past both the guard and conf's absent-key quirk.
-    expect([...source.matchAll(new RegExp(`${backend}\\.get\\(`, 'g'))]).toHaveLength(1)
-    expect(source).toMatch(new RegExp(`${guard}\\(\\s*key\\s*,`))
-  })
-
-  it('answers problems() through core, against the same backend', () => {
-    // The other half of the contract `MaoStore` now carries. A hand-rolled `problems()` here would be
-    // policy in a shell (AGENTS.md rule 2) and could disagree with what the guard actually replaced.
-    const backend = source.match(/const\s+(\w+)\s*=\s*new Store</)?.[1]
-
-    expect(source).toMatch(/problems\(\)\s*:\s*StoredValueProblem\[\]/)
-    expect(source).toMatch(new RegExp(`describeStoredProblems\\([\\s\\S]*?${backend}\\.path`))
-  })
-
-  it("builds the guard with the backend's own resolved config path", () => {
-    // Requirement 2 is an *actionable* message, and the only thing that makes it actionable in the GUI is
-    // the real file path — a hand-written literal would name a file the operator does not have. The
-    // backend's variable name is derived rather than hardcoded so a rename stays free.
-    const backend = source.match(/const\s+(\w+)\s*=\s*new Store</)?.[1]
-    expect(backend, 'electron/store.ts must construct an electron-store instance').toBeTruthy()
-
-    expect(source).toMatch(new RegExp(`createStoredReadGuard\\(\\s*${backend}\\.path\\s*\\)`))
+    expect(source).toMatch(new RegExp(`createGuardedStore\\(\\s*${backend}\\s*,\\s*${backend}\\.path\\s*\\)`))
+    // Three: where it is made, and the two arguments it is handed to core as.
+    expect([...source.matchAll(new RegExp(`\\b${backend}\\b`, 'g'))]).toHaveLength(3)
   })
 
   it('exports only the guarded store, never the raw backend', () => {

@@ -43,7 +43,7 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
 | `electron/main.ts` | BrowserWindow, external-link handling, dev/prod load |
 | `electron/ipc.ts` | All `ipcMain.handle` channels — thin delegations only |
 | `electron/preload.ts` | `contextBridge` exposing `window.electronAPI` |
-| `electron/store.ts` | `electron-store` adapter satisfying `MaoStore`; reads routed through core's `createStoredReadGuard()`, `problems()` through core's `describeStoredProblems()` |
+| `electron/store.ts` | One line: `createGuardedStore(backing, backing.path)`. The electron-store instance is never exported and never read anywhere else |
 | `src/` | React 18 renderer (Vite + Tailwind); `App.tsx` owns all cross-view state |
 | `src/electron-api.ts` | The renderer's only door to the preload bridge: `setElectronApi()` binds it (production from `src/main.tsx`, tests from a stub), `electronApi()` reads it |
 | `src/test/` | Renderer test harness — `setup.ts` (jsdom polyfills, unmount + unbind between tests) and `electron-api-stub.ts` (a typed fake bridge, `satisfies ElectronApi`) |
@@ -159,15 +159,16 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   preflight is not proof of write access, and a shell that stays silent about that claims more than
   the check established.
 - **New store field** → both `MaoStoreSchema` and `MAO_STORE_DEFAULTS` in
-  `core/store.ts` (tsc enforces the pair). `electron/store.ts` and `FileStore` pick
+  `core/store.ts` (tsc enforces the pair). Both backends pick
   the field up automatically.
-- **New `MaoStore` backend** → it must route reads through `createStoredReadGuard()` and answer
-  `problems()` with `describeStoredProblems()` (`core/store.ts`), as `FileStore` and
-  `electron/store.ts` both do. Nothing in the compiler enforces this: the interface's
-  `get<K>(key): MaoStoreSchema[K]` is an assertion over unvalidated JSON, so a backend that skips the
-  guard compiles and then hands every reader a value of the wrong shape (see the invariant below).
-  `core/store.test.ts` reads `electron/store.ts`'s source and fails if either mediator is bypassed. A
-  field whose shape the guard checks must also be added to the guard, not only to the pair above.
+- **New `MaoStore` backend** → write the raw key/value surface (`StoredValueBackend`) and hand it to
+  `createGuardedStore(backend, source)` (`core/store.ts`). Do not re-implement the composition: both
+  shipped backends *are* that function, which is what makes "the two shells cannot answer differently
+  for the same corrupt file" true by construction. Nothing in the compiler enforces it — the interface's
+  `get<K>(key): MaoStoreSchema[K]` is an assertion over unvalidated JSON, so a backend that reads past
+  the guard compiles and then hands every reader a value of the wrong shape — so `core/store.test.ts`
+  reads `electron/store.ts`'s source and fails if the instance is referenced anywhere but the
+  composition. A field whose shape is checked goes in `STORED_SHAPE_RULES`, not only in the pair above.
 - **Repository capability policy** → `core/repo-capabilities.ts` and the intentionally
   duplicated policy tables/verdict logic in `.agents/workflows/swarm_orchestrator.py` must be
   audited together. Gap ids and reasons, remedy kinds/ranking, public-vs-private scope rules,
@@ -376,9 +377,12 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   to decide what to *read* — electron-store re-reads and re-parses the whole file on every `get`, so
   walking all six schema keys cost six full file reads per call on the main process. And conf merges
   `defaults` only when it first writes the file, so a key an operator deletes by hand comes back
-  `undefined` where `FileStore`'s constructor substitutes the schema default; `electron/store.ts`'s
-  single `readRaw()` accessor closes that, and `core/store.test.ts` pins that it is the only place
-  the raw instance is read.
+  `undefined` where `FileStore`'s constructor substitutes the schema default; `createGuardedStore()`
+  closes that for both. That composition is also what makes the Electron backend *testable*: it cannot
+  be imported from `core/` (rule 1) and electron-store needs a live Electron app, so its only possible
+  coverage was a regex over its source — which a mutation feeding `problems()` the **guarded** value
+  rather than the raw one passed, while making the GUI permanently blind. `problems()` must read raw:
+  the guard has already substituted the default, so asking it what is wrong always answers "nothing".
   The **write** side is the mirror image and deliberately refuses rather than coerces: `canonicalRepoList`
   throws when `next` is not an array, because every non-array it can still iterate folds to an empty list
   (a string yields characters `isRepoRef` rejects; a `Set` yields entries in an unpromised order) and

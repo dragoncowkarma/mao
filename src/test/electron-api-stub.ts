@@ -40,8 +40,10 @@ export function createElectronApiStub(initialRepos: RepoRef[] = [], initialProbl
   const getRepos = vi.fn(async (): Promise<RepoRef[]> => stored.map((repo) => ({ ...repo })))
   const setRepos = vi.fn(async (next: RepoRef[]): Promise<RepoWorkflowCapability[]> => {
     stored = next.map((repo) => ({ ...repo }))
-    // Any list write replaces the unusable value, which is the recovery the real store provides.
-    problems = []
+    // A repository-list write replaces `githubRepos` and nothing else — `store.set` writes one key, and
+    // `describeStoredProblems` re-evaluates the rest — so a stub that healed every field would make the
+    // natural mixed-state test fail against a *correct* renderer once a second field is guarded.
+    problems = problems.filter((problem) => problem.field !== 'githubRepos')
     return []
   })
   const storeProblems = vi.fn(async (): Promise<StoredValueProblem[]> => problems.map((p) => ({ ...p })))

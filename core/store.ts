@@ -229,16 +229,72 @@ export interface MaoStore {
   problems(): StoredValueProblem[]
 }
 
+/**
+ * The raw key/value surface a backend offers before anything validates it.
+ *
+ * `get` may answer `undefined`: electron-store merges its `defaults` into the file only when it first
+ * writes it, and reads the file's *current* contents afterwards, so a key an operator deletes by hand
+ * comes back missing. `createGuardedStore()` substitutes the schema default for exactly that case.
+ */
+export interface StoredValueBackend {
+  get<K extends keyof MaoStoreSchema>(key: K): MaoStoreSchema[K] | undefined
+  set<K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]): void
+}
+
+/**
+ * The one composition of a raw backend into a `MaoStore`: absent keys filled from the schema, reads
+ * guarded, and `problems()` answered from the **raw** values.
+ *
+ * Both shipped backends are this function — `FileStore` below over its in-memory snapshot,
+ * `electron/store.ts` over electron-store — so "the two shells cannot answer differently for the same
+ * corrupt file" is true by construction rather than by two files being kept in step by hand. It also
+ * puts the whole of the Electron backend's behaviour somewhere a `core` test can reach it: that backend
+ * cannot be imported from `core/` (architecture rule 1) and electron-store needs a live Electron app, so
+ * before this the only coverage it could have was a regex over its source — which a mutation feeding
+ * `problems()` the *guarded* value instead of the raw one passed while making the GUI permanently blind.
+ *
+ * That distinction is the subtle part and the reason `readRaw` is not the guard: the guard has already
+ * replaced an unusable value with the schema default, so asking it what is wrong always answers
+ * "nothing".
+ */
+export function createGuardedStore(
+  backend: StoredValueBackend,
+  source: string,
+  warn?: (message: string) => void,
+): MaoStore {
+  const guardRead = createStoredReadGuard(source, warn)
+
+  function readRaw<K extends keyof MaoStoreSchema>(key: K): MaoStoreSchema[K] {
+    const value = backend.get(key)
+    // Cloned, never the shared `MAO_STORE_DEFAULTS` instance — one caller pushing into what it read
+    // would otherwise poison the default for the rest of the process.
+    return value === undefined ? structuredClone(MAO_STORE_DEFAULTS[key]) : value
+  }
+
+  return {
+    get<K extends keyof MaoStoreSchema>(key: K): MaoStoreSchema[K] {
+      return guardRead(key, readRaw(key))
+    },
+    set<K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]): void {
+      backend.set(key, value)
+    },
+    problems(): StoredValueProblem[] {
+      return describeStoredProblems(readRaw, source)
+    },
+  }
+}
+
 /** JSON-file-backed MaoStore for CLI/headless environments that don't have electron-store available. */
 export class FileStore implements MaoStore {
   private data: MaoStoreSchema
   private filePath: string
   /**
-   * Shared with Electron's backend rather than reimplemented — see `createStoredReadGuard`. Held per
-   * instance because "already reported" is per store, and the CLI builds a fresh `FileStore` for every
-   * invocation, so each command that touches an unusable list says so exactly once.
+   * The same composition Electron's backend is (see `createGuardedStore`), over this instance's own
+   * snapshot rather than reimplemented beside it. Held per instance because "already reported" is per
+   * store, and the CLI builds a fresh `FileStore` for every invocation, so each command that touches an
+   * unusable list says so exactly once.
    */
-  private guardRead: StoredReadGuard
+  private guarded: MaoStore
 
   constructor(filePath: string) {
     this.filePath = filePath
@@ -246,9 +302,18 @@ export class FileStore implements MaoStore {
     // file does not set, `get()` handed out the module-level `MAO_STORE_DEFAULTS` value itself — one
     // caller pushing into the list it read leaked a phantom entry into the default, and the next
     // `FileStore` built in that process then read it back as a tracked repository for auto-trigger to
-    // poll. The read guard below owes callers a value that is theirs; this is the other half of that.
+    // poll. The read guard owes callers a value that is theirs; this is the other half of that.
     this.data = { ...structuredClone(MAO_STORE_DEFAULTS), ...this.load() }
-    this.guardRead = createStoredReadGuard(filePath)
+    this.guarded = createGuardedStore(
+      {
+        get: <K extends keyof MaoStoreSchema>(key: K) => this.data[key],
+        set: <K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]) => {
+          this.data[key] = value
+          this.persist()
+        },
+      },
+      filePath,
+    )
   }
 
   private load(): Partial<MaoStoreSchema> {
@@ -265,15 +330,14 @@ export class FileStore implements MaoStore {
   }
 
   get<K extends keyof MaoStoreSchema>(key: K): MaoStoreSchema[K] {
-    return this.guardRead(key, this.data[key])
+    return this.guarded.get(key)
   }
 
   set<K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]): void {
-    this.data[key] = value
-    this.persist()
+    this.guarded.set(key, value)
   }
 
   problems(): StoredValueProblem[] {
-    return describeStoredProblems(<K extends keyof MaoStoreSchema>(key: K) => this.data[key], this.filePath)
+    return this.guarded.problems()
   }
 }

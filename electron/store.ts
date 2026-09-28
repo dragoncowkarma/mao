@@ -11,7 +11,13 @@ const backing = new Store<MaoStoreSchema>({ defaults: MAO_STORE_DEFAULTS })
  * the list that would have healed it. Reads therefore go through core's guard, the same one `FileStore`
  * applies, so the two shells cannot answer differently for the same corrupt file.
  *
- * The policy and its operator-facing message live in core (`createStoredReadGuard`); this file stays a
+ * The GUI had it worse than the CLI for the schema's other two array fields, which is why the guard now
+ * covers all three: a non-array `workflowTasks` threw inside `createMaoApp()`, so `registerIpcHandlers()`
+ * returned without registering a single channel and the renderer's every call failed on a bridge that had
+ * nothing behind it; a non-array `aiProviders` white-screened the Global settings pane, which renders
+ * `providers.map` with no error boundary above it.
+ *
+ * The policy and its operator-facing messages live in core (`createStoredReadGuard`); this file stays a
  * delegation, as AGENTS.md rule 2 requires of a shell. `backing.path` is electron-store's resolved
  * config file, so the report names the file the operator actually has to edit.
  */

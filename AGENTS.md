@@ -160,13 +160,16 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   the check established.
 - **New store field** → both `MaoStoreSchema` and `MAO_STORE_DEFAULTS` in
   `core/store.ts` (tsc enforces the pair). `electron/store.ts` and `FileStore` pick
-  the field up automatically.
+  the field up automatically. An **array**-typed field additionally needs an entry in
+  `GUARDED_LIST_FIELDS` — `StoredListField` derives the guarded set from the schema, so tsc enforces
+  that pair too, and what it is asking for is the field's consequence and recovery hint (see the
+  read-guard invariant below).
 - **New `MaoStore` backend** → it must route reads through `createStoredReadGuard()`
   (`core/store.ts`), as `FileStore` and `electron/store.ts` both do. Nothing enforces this: the
   interface's `get<K>(key): MaoStoreSchema[K]` is an assertion over unvalidated JSON, so a backend that
   skips the guard compiles and then hands every reader a value of the wrong shape (see the invariant
-  below). A field whose shape the guard checks must also be added to the guard, not only to the pair
-  above.
+  below). A non-array field whose shape the guard should check must also be added to the guard by hand,
+  not only to the pair above; array fields are caught by tsc, as the bullet above describes.
 - **Repository capability policy** → `core/repo-capabilities.ts` and the intentionally
   duplicated policy tables/verdict logic in `.agents/workflows/swarm_orchestrator.py` must be
   audited together. Gap ids and reasons, remedy kinds/ranking, public-vs-private scope rules,
@@ -334,28 +337,55 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   operator removed while its registration was still checking (the store keeps it, the sidebar does
   not, and auto-trigger keeps polling it). Never write `githubRepos` through `store` directly, and
   never move this sequence into a shell.
-- **A stored field's declared type is an assertion, not a guarantee — `githubRepos` is read through a
-  guard.** Both shipped backends read unvalidated JSON and fill in only the keys that are *missing*
-  (`FileStore` spreads the parsed file over `MAO_STORE_DEFAULTS`; electron-store's `defaults` works the
-  same way), so a key that is present but the wrong shape survives and is handed to every reader as
-  `MaoStoreSchema[K]`. A `githubRepos` that was not an array therefore broke every repository path at
+- **A stored field's declared type is an assertion, not a guarantee — every array-typed field is read
+  through a guard.** Both shipped backends read unvalidated JSON and fill in only the keys that are
+  *missing* (`FileStore` spreads the parsed file over `MAO_STORE_DEFAULTS`; electron-store's `defaults`
+  works the same way), so a key that is present but the wrong shape survives and is handed to every reader
+  as `MaoStoreSchema[K]`. A `githubRepos` that was not an array therefore broke every repository path at
   once: `.filter` threw for `mao repos remove` and `github:getRepos`, `canonicalRepoList` threw on a
   non-iterable `previous` for `mao repos add` and for auto-trigger's per-tick canonicalisation, and `mao
   repos list` printed the malformed value as if it were the list — and because nothing could write the
   list either, the only way out was hand-editing JSON. `createStoredReadGuard()` (`core/store.ts`)
-  answers `[]` instead, reporting once per process through `console.warn` with the field, the value's
-  actual type and the config file path. Coercing rather than throwing is what makes recovery possible —
-  `updateRepos` reads before it writes, so a throwing read takes `repos add`/`repos remove` down with it.
-  The read is deliberately **not** a repair: nothing in the guard writes, so a read-only command leaves
-  the file as it found it and the operator can still salvage what the unusable value named. Element-level
-  validity stays `isRepoRef`/`canonicalRepoList`'s job — the guard owns the container only. Do not make
-  the guard silent, and do not extend the coercion to a field where an empty value would destroy
-  recoverable state without saying so (`aiProviders` would be the same one-liner; `workflowTasks` first
-  needs an answer for how an unreadable queue interacts with `resume` and the persistence-broken marker).
-  The **write** side is the mirror image and deliberately refuses rather than coerces: `canonicalRepoList`
-  throws when `next` is not an array, because every non-array it can still iterate folds to an empty list
-  (a string yields characters `isRepoRef` rejects; a `Set` yields entries in an unpromised order) and
-  `createRepoRegistrar` would persist that over every tracked repository with no error. The check runs
+  answers `[]` instead, reporting once **per field** per process through `console.warn` with the field,
+  the value's actual type and the config file path — never the value, because `config.json` is one blob
+  that also holds `githubToken` in plaintext. Coercing rather than throwing is what makes recovery
+  possible — `updateRepos` reads before it writes, so a throwing read takes `repos add`/`repos remove`
+  down with it. The read is deliberately **not** a repair: nothing in the guard writes, so a read-only
+  command leaves the file as it found it and the operator can still salvage what the unusable value
+  named. Element-level validity stays `isRepoRef`/`canonicalRepoList`'s job — the guard owns the
+  container only. All three array fields are covered, and the other two were worse than `githubRepos`:
+  a non-array `workflowTasks` threw in `restore()`'s `tasks.map(...)` *inside* `createMaoApp()`, so every
+  `mao` command died on boot — the `mao repos remove` recovery included — and `registerIpcHandlers()`
+  registered no channel at all; a non-array `aiProviders` booted but killed `mao config show` on `.map`
+  and white-screened the GUI's Global settings pane, which renders `providers.map` with no error boundary
+  above it. Each field carries its own recovery hint naming the **cheapest unconditional** write that
+  heals it, and those differ on purpose: `mao repos remove` because `repos add` must clear the
+  write-permission preflight (and an unusable list makes every repo in an `add` count as new), `mao
+  config import-providers` because it needs no GitHub token, `mao workflow clear-completed` because it
+  is the only queue write that performs no GitHub write of its own.
+- **An unreadable `workflowTasks` neither blocks auto-resume nor writes the persistence-broken marker.**
+  That mechanism (`core/persistence-guard.ts`, consulted by `createMaoApp` before it honours `resume`) is
+  reserved for one hazard: a process that could no longer persist advanced a task's stage in memory,
+  including real GitHub writes, so the stored queue lags reality and resuming *its entries* re-runs work
+  already done. That hazard needs entries; the coerced queue has none, and `resumeProcessing()` on an
+  empty queue reaches a `processQueue()` that iterates nothing and returns — so blocking resume would
+  protect nothing. Writing the marker would be wrong three ways: it reports a *write* failure for a
+  read-shape problem, so `mao config show` would answer `workflowPersistenceBroken: true` while
+  persistence is fine; it is sticky and operator-gated, so it would outlive the corruption and keep
+  blocking auto-resume of every later legitimate queue until someone ran `mao config
+  clear-persistence-broken`, where the read problem heals on the next queue write; and it is a filesystem
+  write, costing the guard its "a read never writes" property. The real cost of an empty queue is
+  visibility — a mid-pipeline task is simply gone — so the report says so and points at the
+  `workflow-active` label as where to look. Do not make the guard silent, and do not add a field to it
+  without answering the same question that field raises: what does an empty value cost, which command
+  heals it, and does losing it interact with unattended resume? `StoredListField` derives the guarded set
+  from `MaoStoreSchema` with a mapped type, so a new array-typed field fails `npm run lint` until that
+  answer is written — the coupling is enforced, not remembered.
+- **The `githubRepos` write side is the mirror image** and deliberately refuses rather than coerces:
+  `canonicalRepoList` throws when `next` is not an array, because every non-array it can still iterate
+  folds to an empty list (a string yields characters `isRepoRef` rejects; a `Set` yields entries in an
+  unpromised order) and `createRepoRegistrar` would persist that over every tracked repository with no
+  error. The check runs
   before `previous` is walked so auto-trigger — which passes the stored list as both arguments — reports
   the refusal rather than a bare `previous is not iterable`. Coerce on read so recovery is possible;
   refuse on write so a caller's mistake cannot delete the list. Same rule's other half: `FileStore`

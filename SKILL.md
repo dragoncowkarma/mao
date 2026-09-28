@@ -146,23 +146,38 @@ replaces its entry", so the flags you pass (or omit) win, and omitting `--no-aut
 polling. Where two entries for one repository disagree about `autoTrigger`, the fold resolves to
 `false`: re-enabling unattended polling by accident is far worse than leaving it off.
 
-**Recovering a `config.json` whose `githubRepos` is not a list.** `config.json` is unvalidated JSON, so
-a hand-edit (or a file an older build wrote) can leave `githubRepos` as an object, a string, `null` —
-anything but the array the schema declares. Every read now goes through a guard in `core/store.ts` that
-answers with an empty list instead, and reports once per command on **stderr** naming the field, what
-the file actually holds, and the file's path:
+**Recovering a `config.json` whose `githubRepos`, `aiProviders` or `workflowTasks` is not a list.**
+`config.json` is unvalidated JSON, so a hand-edit (or a file an older build wrote) can leave any of the
+schema's three array fields as an object, a string, `null` — anything but the array it declares. Every
+read of all three now goes through a guard in `core/store.ts` that answers with an empty list instead,
+and reports once **per field** per command on **stderr** naming the field, what the file actually holds,
+and the file's path. It never prints the value: `config.json` is a single blob that also holds
+`githubToken` in plaintext, and a malformed field is exactly the hand-edit that can leave a fragment of a
+neighbouring key inside it.
 
 ```
 [store] "githubRepos" in /path/to/config.json is an object, not a JSON array of { owner, repo }
 entries — ignoring it, so no repositories are tracked until it is replaced. …
 ```
 
-So `mao repos list` prints `[]` (and `mao config show`'s JSON stays parseable on stdout), and `mao run`'s
-scheduler keeps ticking instead of dying on its first poll. Nothing is repaired on read — the unusable
-value stays in the file, so copy any repositories you still need out of it first; the next list write
-(`mao repos add <owner> <repo>`, `mao repos remove`, or the sidebar's Add form) overwrites it with a real
-list. Because the guard makes the store name no usable repository, a repo re-added this way counts as a
-first registration and **is** preflighted for write access.
+Nothing is repaired on read — the unusable value stays in the file, so **copy anything you still need out
+of it first**; the next write of that field overwrites it. Each field's report names the cheapest write
+that heals it, and they differ because the gating does:
+
+| Field | What the empty list costs | Heals it |
+| --- | --- | --- |
+| `githubRepos` | `mao repos list` prints `[]`, no repo is tracked, `mao run`'s scheduler keeps ticking instead of dying on its first poll | `mao repos remove <owner> <repo>` or the sidebar's Remove — always works. `mao repos add` heals it too but must clear the write-access preflight first, and since the store now names no repository, every repo in an `add` counts as a **first** registration and **is** preflighted |
+| `aiProviders` | no provider is registered, so every workflow stage fails for want of an agent to route to; `mao config show` stays parseable instead of dying on `.map`, and the GUI's Global settings pane renders instead of white-screening | `mao config import-providers <file>` or the GUI's Global settings pane — neither needs a GitHub token. Copy the old `apiKey` values out first; they exist nowhere else |
+| `workflowTasks` | the queue starts empty, so `loadApp()` boots instead of taking every `mao` command down with it, and Electron registers its IPC channels instead of none | `mao workflow clear-completed` — the only queue write that makes no GitHub write of its own (`mao workflow enqueue` would heal it by running the whole unattended pipeline) |
+
+An unreadable `workflowTasks` does **not** set the persistence-broken marker and does **not** block
+auto-resume, so `mao config show` still answers `workflowPersistenceBroken: false` and you do not need
+`mao config clear-persistence-broken` to get going again — the coerced queue is empty, and resuming
+nothing cannot duplicate work (see AGENTS.md for why the marker would be the wrong mechanism here). What
+you do lose is the record of anything that was mid-pipeline: before queueing more work, check the target
+repo for an issue still carrying the `workflow-active` label whose branch or PR is half-finished, and
+either finish or clean it up by hand. Re-enqueueing it blind can open a second branch and PR for the same
+issue.
 
 The GUI shows the same unverified-grants caveat the CLI prints (`github:setRepos` returns the
 verdicts), and the board's **Refresh** surfaces a failed preflight instead of reporting a clean sync —
@@ -371,7 +386,13 @@ Two traps:
    validation. Neither backend validates the JSON it reads, so a field whose declared type a
    hand-edited `config.json` can violate (an array, an object) also belongs in
    `createStoredReadGuard()` in the same file. Read its doc comment first: coercing a field whose
-   value is recoverable state is not automatically the right call.
+   value is recoverable state is not automatically the right call, and the hint you write has to name
+   the cheapest *unconditional* write that heals that field — one that no preflight can block and that
+   performs no GitHub write of its own. For an **array** field this is not optional and tsc enforces
+   it: `StoredListField` derives the guarded set from `MaoStoreSchema`, so a new array-typed field
+   makes `GUARDED_LIST_FIELDS` stop satisfying its `Record` and `npm run lint` fails until you have
+   answered what an empty value costs, which command heals it, and whether losing it interacts with
+   unattended `resume`.
 3. Renderer needs it? Add get/set IPC channels (recipe above). CLI needs it?
    Extend `cli/index.ts` (keep `config show` redaction for anything secret).
 

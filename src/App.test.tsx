@@ -5,6 +5,7 @@ import { describe, expect, it } from 'vitest'
 import App from './App'
 import { createElectronApiStub } from './test/electron-api-stub'
 import type { RepoRef } from '../core/workflow-engine'
+import type { StoredValueProblem } from '../core/store'
 
 const ONE: RepoRef = { owner: 'acme', repo: 'one' }
 const TWO: RepoRef = { owner: 'acme', repo: 'two' }
@@ -373,5 +374,101 @@ describe('App repository add and unsaved global settings', () => {
     expect(screen.queryByRole('heading', { name: 'acme/two' })).toBeNull()
     expect(stub.setRepos).not.toHaveBeenCalled()
     expect(screen.queryByRole('button', { name: 'ACME/TWO' })).toBeNull()
+  })
+})
+
+/**
+ * A stand-in for what `createStoredReadGuard` produces for a `config.json` whose `githubRepos` is a
+ * JSON object. The exact wording is core's to own and is pinned in `core/store.test.ts`; what these
+ * tests are about is that whatever the main process reports reaches the operator verbatim, and that it
+ * names a type and a path rather than anything that was in the file.
+ */
+const UNUSABLE_LIST: StoredValueProblem = {
+  key: 'githubRepos',
+  message:
+    '[store] "githubRepos" in /tmp/config.json is an object, not a JSON array of { owner, repo } ' +
+    'entries — ignoring it, so no repositories are tracked until it is replaced.',
+}
+
+/** The empty-state line, which is a claim about the operator's repositories and not always true. */
+const EMPTY_STATE = /No projects yet/
+
+/**
+ * Mounts App with the store already answering `problems`. Programmed before the first render because
+ * App asks on mount, and `mockResolvedValue` after `render` would race the effect it is meant to feed.
+ */
+function renderAppWithStore(problems: StoredValueProblem[], repos: RepoRef[] = []) {
+  const user = userEvent.setup()
+  const stub = createElectronApiStub(repos)
+  stub.storeProblems.mockResolvedValue(problems)
+  render(
+    <StrictMode>
+      <App />
+    </StrictMode>,
+  )
+  return { stub, user }
+}
+
+/**
+ * The GUI half of issue #60's requirement 3.
+ *
+ * Core's guard answers `[]` for a stored list it cannot use and reports through `console.warn`, which in
+ * a packaged Electron app goes to a console no operator opens — so for the GUI that is the same as
+ * saying nothing. The sidebar showed "No projects yet — add a repository to get started", which is
+ * exactly what a genuinely empty list shows, and acting on it is what destroys data: the first Add
+ * writes the whole list over the unusable value that still holds the only copy of their repositories.
+ */
+describe('App unusable repository list', () => {
+  it('shows what the store discarded instead of the empty state', async () => {
+    renderAppWithStore([UNUSABLE_LIST])
+
+    expect(await screen.findByText(UNUSABLE_LIST.message)).toBeInTheDocument()
+    expect(screen.queryByText(EMPTY_STATE)).toBeNull()
+  })
+
+  /**
+   * The control for the assertion above. Without it, "the empty-state line is absent" would also be
+   * satisfied by a build that had simply stopped rendering it — and a sidebar that says nothing at all
+   * to an operator with no repositories yet is its own regression.
+   */
+  it('keeps the ordinary empty state when the store reports nothing', async () => {
+    renderAppWithStore([])
+
+    expect(await screen.findByText(EMPTY_STATE)).toBeInTheDocument()
+  })
+
+  it('stops warning once the add that replaces the value lands', async () => {
+    const { stub, user } = renderAppWithStore([UNUSABLE_LIST])
+    await screen.findByText(UNUSABLE_LIST.message)
+
+    // A repository-list write is the only thing that replaces the unusable value, so from here the store
+    // has nothing left to report. The renderer has to ask again at that point rather than waiting out
+    // its interval: a warning still on screen after the fix reads as a fix that did not work.
+    stub.storeProblems.mockResolvedValue([])
+    await submitAdd(user, ONE)
+    await addSettled()
+
+    await waitFor(() => expect(screen.queryByText(UNUSABLE_LIST.message)).toBeNull())
+    expect(stub.storedRepos()).toEqual([ONE])
+  })
+
+  /**
+   * The other way the sidebar can be empty for a reason it was not saying out loud: App's mount-time
+   * `getRepos()` was the only one of its call sites with no `.catch`, so a rejected read left an empty
+   * sidebar behind an unhandled rejection — again indistinguishable from having no repositories.
+   */
+  it('surfaces a repository-list read that failed outright', async () => {
+    const stub = createElectronApiStub([])
+    // Shaped the way Electron re-wraps a main-process throw, so the assertion below is also about the
+    // channel name being stripped back out rather than shown to the operator.
+    stub.getRepos.mockRejectedValue(new Error("Error invoking remote method 'github:getRepos': Error: EACCES"))
+    render(
+      <StrictMode>
+        <App />
+      </StrictMode>,
+    )
+
+    expect(await screen.findByText('Could not read the repository list: EACCES')).toBeInTheDocument()
+    expect(screen.queryByText(EMPTY_STATE)).toBeNull()
   })
 })

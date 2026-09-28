@@ -3,6 +3,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { FileStore, MAO_STORE_DEFAULTS, createStoredReadGuard, describeUnusableRepoList } from './store.ts'
+import type { MaoStoreSchema } from './store.ts'
 import { canonicalRepoList } from './repo-registry.ts'
 import type { RepoRef } from './workflow-engine.ts'
 
@@ -217,22 +218,127 @@ describe('describeUnusableRepoList', () => {
 })
 
 describe('createStoredReadGuard', () => {
-  it('reports through the injected reporter', () => {
+  /**
+   * A guard over a mutable bag standing in for a backend's own storage, so a test can change the
+   * "file" under it — which is the only way to observe that `problems()` re-derives its answer rather
+   * than replaying what an earlier read happened to see.
+   */
+  function guardOver(initial: Partial<MaoStoreSchema> & Record<string, unknown>) {
+    const raw = { ...MAO_STORE_DEFAULTS, ...initial } as MaoStoreSchema
     const reports: string[] = []
-    const guard = createStoredReadGuard('/tmp/config.json', (message) => reports.push(message))
+    const guard = createStoredReadGuard('/tmp/config.json', (key) => raw[key], (message) => reports.push(message))
+    return { guard, reports, raw }
+  }
 
-    expect(guard('githubRepos', {} as unknown as RepoRef[])).toEqual([])
+  it('reports through the injected reporter', () => {
+    const { guard, reports } = guardOver({ githubRepos: {} as unknown as RepoRef[] })
+
+    expect(guard.read('githubRepos')).toEqual([])
     expect(reports).toHaveLength(1)
     expect(reports[0]).toContain('/tmp/config.json')
   })
 
   it('touches no field but githubRepos', () => {
-    const reports: string[] = []
-    const guard = createStoredReadGuard('/tmp/config.json', (message) => reports.push(message))
+    const { guard, reports } = guardOver({ githubToken: 'ghp_x', theme: 'dark' })
 
-    expect(guard('githubToken', 'ghp_x')).toBe('ghp_x')
-    expect(guard('theme', 'dark')).toBe('dark')
+    expect(guard.read('githubToken')).toBe('ghp_x')
+    expect(guard.read('theme')).toBe('dark')
+    expect(guard.problems()).toEqual([])
     expect(reports).toEqual([])
+  })
+
+  it('answers problems() without a prior read, and without reporting again', () => {
+    // The point of the query existing at all. `mao config show` builds one JSON object and the GUI polls
+    // a channel; neither can be made to depend on some other call having read the field first, and
+    // neither may turn a 30s poll into 30s of repeated stderr paragraphs.
+    const { guard, reports } = guardOver({ githubRepos: 'acme/widgets' as unknown as RepoRef[] })
+
+    expect(guard.problems()).toEqual([{ key: 'githubRepos', message: expect.stringContaining('is a string') }])
+    expect(guard.problems()).toHaveLength(1)
+    expect(reports).toEqual([])
+  })
+
+  it('stops reporting a problem once the stored value is usable again', () => {
+    // A flag that latched would be worse than none: an operator who has just fixed `config.json` and
+    // still sees the warning cannot tell a working fix from a failed one. `problems()` re-reads, so the
+    // next poll after a healing list write says nothing.
+    const { guard, raw } = guardOver({ githubRepos: null as unknown as RepoRef[] })
+    expect(guard.problems()).toHaveLength(1)
+
+    raw.githubRepos = [widgets]
+
+    expect(guard.problems()).toEqual([])
+    expect(guard.read('githubRepos')).toEqual([widgets])
+  })
+
+  it('reports exactly the fields it corrects', () => {
+    // `read` and `problems` name the guarded field independently, so a change to one has to be a change
+    // to both: a problem reported for a field nothing coerces is a warning about a non-problem, and a
+    // coercion with no problem to report is issue #60's silence all over again. Every schema field is
+    // given a value its declared type forbids so neither side can pass by ignoring the question.
+    const corrupt = {
+      githubToken: 1 as unknown as string,
+      githubRepos: {} as unknown as RepoRef[],
+      aiProviders: 'nope' as unknown as MaoStoreSchema['aiProviders'],
+      workflowTasks: null as unknown as MaoStoreSchema['workflowTasks'],
+      buildSha: [] as unknown as string,
+      theme: 7 as unknown as MaoStoreSchema['theme'],
+    } satisfies MaoStoreSchema
+    const { guard } = guardOver(corrupt)
+
+    const corrected = (Object.keys(corrupt) as Array<keyof MaoStoreSchema>).filter(
+      (key) => guard.read(key) !== corrupt[key],
+    )
+
+    expect(guard.problems().map((problem) => problem.key)).toEqual(corrected)
+    expect(corrected).toEqual(['githubRepos'])
+  })
+
+  it('never puts the stored value in the report', () => {
+    // `githubToken` sits in plaintext in the same JSON blob, and this message now travels further than
+    // stderr — into `mao config show`'s consumers, an IPC payload, and a sidebar an operator may be
+    // screen-sharing. So the report names the value's *type*; echoing what it found is the one thing it
+    // must never do, whatever an operator managed to paste into the field. Keys are as disclosing as
+    // values here, which is why both halves are asserted — and why both are spelled distinctively
+    // enough not to collide with the message's own prose, which does legitimately mention a token.
+    const secretKey = 'pasted-credential-XYZZY'
+    const secretValue = 'ghp_averyrealtokenshapedstring'
+    const { guard } = guardOver({ githubRepos: { [secretKey]: secretValue } as unknown as RepoRef[] })
+
+    const [problem] = guard.problems()
+
+    expect(problem.message).toContain('is an object')
+    expect(problem.message).not.toContain(secretValue)
+    expect(problem.message).not.toContain(secretKey)
+  })
+})
+
+describe('FileStore.problems()', () => {
+  it('reports the unusable list it discarded on read', () => {
+    captureWarnings()
+    const { store, filePath } = storeHolding({ githubRepos: { 'acme/widgets': widgets } })
+
+    expect(store.get('githubRepos')).toEqual([])
+    expect(store.problems()).toEqual([{ key: 'githubRepos', message: expect.stringContaining(filePath) }])
+  })
+
+  it('reports nothing for a file it can read', () => {
+    const { store } = storeHolding({ githubRepos: [widgets, gadgets] })
+
+    expect(store.problems()).toEqual([])
+  })
+
+  it('goes quiet after the write that heals the file', () => {
+    // The whole recovery story, end to end: the guard does not repair, so the unusable value survives
+    // until something writes the list — and the diagnostic has to follow the file, not the process.
+    captureWarnings()
+    const { store } = storeHolding({ githubRepos: 'acme/widgets' })
+    expect(store.problems()).toHaveLength(1)
+
+    store.set('githubRepos', [widgets])
+
+    expect(store.problems()).toEqual([])
+    expect(store.get('githubRepos')).toEqual([widgets])
   })
 })
 
@@ -270,14 +376,17 @@ describe("electron/store.ts, the other MaoStore backend", () => {
     const backend = source.match(/const\s+(\w+)\s*=\s*new Store</)?.[1]
     expect(backend, 'electron/store.ts must construct an electron-store instance').toBeTruthy()
 
-    // Stated as "every read of the raw backend is wrapped" rather than by matching the body of `get`,
-    // which would make the assertion depend on this file's indentation — there is no autoformatter to
-    // keep that stable, and a guard that fails for a reformat is a guard people learn to dismiss.
+    // The guard now takes the backend's read once instead of a value per call, so "wrapped" stopped
+    // being a property each call site has to get right: there is exactly one raw read in the file, and
+    // tsc will not compile a `createStoredReadGuard` without one. Both exported readers are then stated
+    // as delegations, which is what says that single raw read is the guard's and not a bypass. Matching
+    // the returned expressions rather than the bodies keeps this independent of indentation — there is
+    // no autoformatter here, and a guard that fails for a reformat is one people learn to dismiss.
     const raw = [...source.matchAll(new RegExp(`${backend}\\.get\\(`, 'g'))]
-    const wrapped = [...source.matchAll(new RegExp(`${guard}\\(\\s*key\\s*,\\s*${backend}\\.get\\(`, 'g'))]
+    expect(raw.length, `every ${backend}.get() must be the one handed to the guard`).toBe(1)
 
-    expect(raw.length).toBeGreaterThan(0)
-    expect(wrapped.length).toBe(raw.length)
+    expect(source).toMatch(new RegExp(`return\\s+${guard}\\.read\\(\\s*key\\s*\\)`))
+    expect(source).toMatch(new RegExp(`return\\s+${guard}\\.problems\\(\\s*\\)`))
   })
 
   it("builds the guard with the backend's own resolved config path", () => {
@@ -287,7 +396,7 @@ describe("electron/store.ts, the other MaoStore backend", () => {
     const backend = source.match(/const\s+(\w+)\s*=\s*new Store</)?.[1]
     expect(backend, 'electron/store.ts must construct an electron-store instance').toBeTruthy()
 
-    expect(source).toMatch(new RegExp(`createStoredReadGuard\\(\\s*${backend}\\.path\\s*\\)`))
+    expect(source).toMatch(new RegExp(`createStoredReadGuard\\(\\s*${backend}\\.path\\s*,`))
   })
 
   it('exports only the guarded store, never the raw backend', () => {

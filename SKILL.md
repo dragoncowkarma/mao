@@ -91,7 +91,7 @@ State lives at `$MAO_DATA_DIR/config.json` (default: the platform data dir from
 ```bash
 npm run cli -- config set-token <token>          # store GitHub token
 npm run cli -- config import-providers <file>    # JSON array of AiProviderConfig
-npm run cli -- config show                       # secrets redacted as '[set]'
+npm run cli -- config show                       # secrets redacted as '[set]'; githubReposUnusable flags a discarded list
 npm run cli -- repos add <owner> <repo> [--no-auto-trigger] [--poll-interval-ms <ms>]  # preflights write access
 npm run cli -- repos list
 npm run cli -- github check <owner> <repo>       # open issues/PRs as JSON
@@ -163,6 +163,17 @@ value stays in the file, so copy any repositories you still need out of it first
 (`mao repos add <owner> <repo>`, `mao repos remove`, or the sidebar's Add form) overwrites it with a real
 list. Because the guard makes the store name no usable repository, a repo re-added this way counts as a
 first registration and **is** preflighted for write access.
+
+That stderr line is the *actionable* report, not the only one — a diagnostic you cannot query is a
+diagnostic `2>/dev/null` deletes. `mao config show` therefore prints `"githubReposUnusable": true`
+alongside the `[]` it had to substitute, so the JSON on stdout says by itself that it is not reporting
+what the file holds. And the GUI, where a main-process `console.warn` reaches nobody at all, polls the
+same verdict (`store:problems`) and shows the message in the sidebar **instead of** "No projects yet —
+add a repository to get started" — the line that made an unreadable list look like an empty one, right
+above the Add form whose first use would have overwritten it. The report is re-derived on every call, so
+it disappears as soon as a list write heals the file; the GUI re-asks immediately after each write rather
+than waiting out its 30s poll. Neither surface ever prints the stored value — only its type and the
+file's path — because `githubToken` is in plaintext in that same file.
 
 The GUI shows the same unverified-grants caveat the CLI prints (`github:setRepos` returns the
 verdicts), and the board's **Refresh** surfaces a failed preflight instead of reporting a clean sync —
@@ -355,7 +366,7 @@ Two traps:
 
 1. Implement the logic in `core/` (engine/service method), not in the shell.
 2. `electron/ipc.ts` — `ipcMain.handle('<domain>:<camelCaseAction>', …)` as a
-   one-line delegation (domains: `ai`, `github`, `workflow`).
+   one-line delegation (domains: `app`, `ai`, `github`, `workflow`, `store`, `ui`).
 3. `electron/preload.ts` — same channel string, same namespace, positional args.
 4. `src/electron.d.ts` — mirror the method signature.
 5. `src/test/electron-api-stub.ts` — add the channel to the fake bridge. It is written

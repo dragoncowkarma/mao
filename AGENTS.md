@@ -36,7 +36,7 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
 | `core/swarm-runner.ts` | Shell-free launcher and repository/asset validation for the autonomous Swarm Orchestrator |
 | `core/auto-trigger.ts` | Per-repo polling scheduler; auto-enqueues new open issues |
 | `core/assignment.ts` | Issue/PR body directive parser — `parseAssignmentTags()` for swarm_orchestrator-style `[Worker: id]`/`[Reviewer: id]`/`[Maintainer: id]` role tags, and `parseProviderOverride()` which folds those plus task-level `[Model: id]`/`[Effort: level]` tags into a `ProviderOverride` |
-| `core/store.ts` | `MaoStoreSchema`, `MAO_STORE_DEFAULTS`, the `MaoStore` interface, `FileStore` (JSON impl for the CLI), and `createStoredReadGuard()` — the read-path guard every backend applies so a field's declared type survives contact with unvalidated JSON |
+| `core/store.ts` | `MaoStoreSchema`, `MAO_STORE_DEFAULTS`, the `MaoStore` interface (`get`/`set`/`problems`), `FileStore` (JSON impl for the CLI), and `createStoredReadGuard()` — the read-path guard every backend applies so a field's declared type survives contact with unvalidated JSON, plus its `problems()` query that makes a discarded value answerable rather than only printable |
 | `core/app.ts` | `createMaoApp()` — the **single composition root** both frontends call |
 | `core/paths.ts` | Platform-appropriate data dir for the CLI (mirrors Electron's `userData`) |
 | `core/ai/` | `AiProvider` interface + adapters: `api-provider.ts` (Anthropic / OpenAI-compatible HTTP) and `cli-provider.ts` (spawns `claude`, `codex`, …) |
@@ -143,7 +143,7 @@ There is no codegen — these couplings are maintained by hand and only `npm run
 (tsc) catches part of the drift:
 
 - **New IPC channel** → 3 files in lockstep: `electron/ipc.ts`
-  (`ipcMain.handle('<domain>:<camelCaseAction>', …)`, domains `ai`/`github`/`workflow`),
+  (`ipcMain.handle('<domain>:<camelCaseAction>', …)`, domains `app`/`ai`/`github`/`workflow`/`store`/`ui`),
   `electron/preload.ts` (same channel string, same namespace), `src/electron.d.ts`
   (mirror the signature). Channel strings are duplicated literals; a typo surfaces
   only at runtime. A fourth file follows automatically:
@@ -363,6 +363,23 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   into the module-level defaults — a shallow spread let a caller that pushed into the empty list it read
   leak a phantom entry into the default, which the next `FileStore` in that process read back as a
   tracked repository for auto-trigger to poll.
+- **A discarded value must be answerable, not only printable.** The guard's `console.warn` is the
+  report; it is not the whole requirement. stderr is invisible to `mao config show | jq`, thrown away
+  by `2>/dev/null`, and in a packaged Electron app it lands in a console no operator opens — so a GUI
+  relying on it showed the operator an empty sidebar reading "No projects yet", which is exactly what a
+  genuinely empty list shows, and the first Add then overwrote the only copy of their repository list.
+  So `MaoStore` also exposes `problems(): StoredValueProblem[]` (required, so tsc catches a backend
+  that omits it), `mao config show` prints `githubReposUnusable`, and the GUI polls `store:problems` and
+  renders the message in the sidebar **in place of** the empty-state line. `problems()` is re-derived
+  from the backend on every call, never accumulated as reads go by: the condition ends at the next list
+  write, so a latched flag would leave the warning up after the fix and make a working recovery
+  indistinguishable from a failed one — and re-deriving is also what frees `mao config show` from having
+  to read the field first. Two rules bind any extension of this. It stays a **pull**: AGENTS.md rule 6
+  allows no IPC push events, so the renderer polls (and re-asks after each list write, which is what
+  heals the value). And it reports a value's **type, never the value** — `githubToken` sits in plaintext
+  in the same JSON blob, and this message now travels into CLI output people paste, an IPC payload, and
+  a window an operator may be screen-sharing. `describeStoredType` is what keeps that true; a regression
+  test pins it.
 - **Repository identity is case-insensitive, and the list is canonicalised before it is stored**:
   GitHub resolves owner/repo without regard to case, so `sameRepoRef()`/`repoRefKey()` lower-case
   both halves — otherwise `mao repos add DragonCowKarma MAO` registered a *second* entry for an

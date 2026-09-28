@@ -126,6 +126,21 @@ export function registerIpcHandlers() {
 
   ipcMain.handle('workflow:clearCompleted', () => workflowEngine.clearCompleted())
 
+  // The renderer's only way to learn that a stored value was discarded. The guard's own report is a
+  // `console.warn` in the main process — which in a packaged app goes to a console no operator opens, so
+  // for the GUI it is the same as saying nothing: the sidebar shows "No projects yet", which is exactly
+  // what a genuinely empty list shows, and the first Add then overwrites the only copy of the operator's
+  // repository list.
+  //
+  // A channel rather than a push: AGENTS.md rule 6 keeps the renderer on a pull model, so App polls this
+  // (and re-reads it after a list write, which is what heals the value). That is why `problems()`
+  // re-derives from the store on every call instead of replaying what an earlier read saw — a latched
+  // flag would leave the warning up after the operator fixed the file, and the poll would never clear.
+  //
+  // Reports a type, never a value: `githubToken` sits in plaintext in the same JSON blob, and this
+  // payload crosses into a renderer that puts it on screen. core/store.ts owns that guarantee.
+  ipcMain.handle('store:problems', () => store.problems())
+
   ipcMain.handle('ui:getTheme', () => store.get('theme'))
 
   ipcMain.handle('ui:setTheme', (_event, theme: ThemePreference) => {

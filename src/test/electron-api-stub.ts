@@ -4,7 +4,7 @@ import type { AppUpdateCheck } from '../electron'
 import type { AiProviderConfig } from '../../core/ai/types'
 import type { GithubTask } from '../../core/github-service'
 import type { RepoWorkflowCapability } from '../../core/repo-capabilities'
-import type { ThemePreference } from '../../core/store'
+import type { StoredValueProblem, ThemePreference } from '../../core/store'
 import type { QueuedTask, RepoRef } from '../../core/workflow-engine'
 
 /**
@@ -52,6 +52,12 @@ export function createElectronApiStub(initialRepos: RepoRef[] = []) {
   const fetchTasks = vi.fn(async (): Promise<GithubTask[]> => [])
   const listProviders = vi.fn(async (): Promise<AiProviderConfig[]> => [])
   const listWorkflowTasks = vi.fn(async (): Promise<QueuedTask[]> => [])
+  /**
+   * Answers "nothing is wrong with the store" by default, which is what makes it a usable default for
+   * every other test — and leaves a test about a corrupt `config.json` to say so with
+   * `storeProblems.mockResolvedValue([...])`.
+   */
+  const storeProblems = vi.fn(async (): Promise<StoredValueProblem[]> => [])
 
   const api = {
     platform: 'test',
@@ -82,6 +88,9 @@ export function createElectronApiStub(initialRepos: RepoRef[] = []) {
       setAutoAdvance: notStubbed('workflow.setAutoAdvance'),
       clearCompleted: notStubbed('workflow.clearCompleted'),
     },
+    store: {
+      problems: storeProblems,
+    },
     ui: {
       getTheme,
       setTheme,
@@ -98,6 +107,7 @@ export function createElectronApiStub(initialRepos: RepoRef[] = []) {
     fetchTasks,
     listProviders,
     listWorkflowTasks,
+    storeProblems,
     /** What the fake store holds right now — the assertion target for "did the write land". */
     storedRepos: () => stored.map((repo) => ({ ...repo })),
     /** For a `setRepos` override that defers: apply the write the default implementation would have. */

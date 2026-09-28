@@ -6,6 +6,7 @@ import ProjectSettings from './components/ProjectSettings'
 import GlobalSettings from './components/GlobalSettings'
 import UpdateBanner from './components/UpdateBanner'
 import { electronApi } from './electron-api'
+import { readableIpcError } from './ipc-error'
 import type { RepoRef } from '../core/workflow-engine'
 import type { RepoWorkflowCapability } from '../core/repo-capabilities'
 import { sameRepoRef } from '../core/repo-registry'
@@ -34,6 +35,22 @@ export default function App() {
   const [dismissedUpdateSha, setDismissedUpdateSha] = useState<string | null>(null)
   /** Surfaces a failed settings edit or removal, which are otherwise silent (no preflight, no form). */
   const [repoError, setRepoError] = useState('')
+  /**
+   * The main process's report that it discarded the stored repository list, or '' when it did not.
+   *
+   * Without it the GUI cannot distinguish "you have no repositories" from "your repositories are in a
+   * `config.json` MAO could not read": the guard in core answers `[]` for both, and its own report is a
+   * `console.warn` in the main process, which a packaged app shows to nobody. The sidebar then invites
+   * the operator to add a repository, and that first add writes the whole list over the unusable value
+   * that still holds the only copy of theirs.
+   */
+  const [storeProblem, setStoreProblem] = useState('')
+  /**
+   * A repository-list *read* that failed outright — distinct from `storeProblem`, which is the store
+   * answering successfully that what it holds is unusable. Kept separate so neither can overwrite the
+   * other; both feed the sidebar's one slot, `storeProblem` first because it is the actionable one.
+   */
+  const [repoReadError, setRepoReadError] = useState('')
   /**
    * Counts every navigation choice, so an async add can ask whether the operator moved elsewhere
    * while its permission preflight was running.
@@ -74,10 +91,44 @@ export default function App() {
   const selected = selectedIndex === null ? undefined : repos[selectedIndex]
 
   useEffect(() => {
-    electronApi().github.getRepos().then((savedRepos) => {
-      setRepos(savedRepos)
-      if (savedRepos.length > 0) setSelectedRepo(savedRepos[0])
-    })
+    electronApi()
+      .github.getRepos()
+      .then((savedRepos) => {
+        setRepos(savedRepos)
+        setRepoReadError('')
+        if (savedRepos.length > 0) setSelectedRepo(savedRepos[0])
+      })
+      // The one read whose failure the operator cannot otherwise infer. Every other `getRepos()` call
+      // site already falls back to a list it holds, but this one *is* the list — an unhandled rejection
+      // here leaves an empty sidebar reading "No projects yet", which is a statement about their
+      // repositories that MAO is in no position to make.
+      .catch((err) => setRepoReadError(`Could not read the repository list: ${readableIpcError(err)}`))
+  }, [])
+
+  /**
+   * Asks the main process what it had to discard. Polled rather than pushed — AGENTS.md rule 6 keeps the
+   * renderer on a pull model — and re-read after every list write, because a write is what heals the
+   * value and an operator who has just fixed it should not have to wait out the interval to see the
+   * warning go. The interval catches the other direction: `config.json` is also editable from a terminal
+   * and by `mao repos add`, and electron-store reads the file per `get`, so an external change shows up
+   * here without a restart. 30s matches the board's listing poll.
+   *
+   * Swallows its own failure. This is the diagnostic, not the app: if the channel itself is unreachable
+   * the mount read above has already failed and says so in the same slot.
+   */
+  async function refreshStoreProblems() {
+    try {
+      const problems = await electronApi().store.problems()
+      setStoreProblem(problems.find((problem) => problem.key === 'githubRepos')?.message ?? '')
+    } catch {
+      // Leave whatever is on screen; a missing diagnostic must not replace the window with an error.
+    }
+  }
+
+  useEffect(() => {
+    void refreshStoreProblems()
+    const interval = setInterval(() => void refreshStoreProblems(), 30_000)
+    return () => clearInterval(interval)
   }, [])
 
   useEffect(() => {
@@ -187,7 +238,13 @@ export default function App() {
     const previous = repos
     setRepos(next)
     try {
-      return await electronApi().github.setRepos(next)
+      const checked = await electronApi().github.setRepos(next)
+      // A list write is the only thing that replaces an unusable stored value, so this is the moment the
+      // warning should go — waiting out the 30s poll would leave a fixed problem on screen, which reads
+      // as a fix that did not work. Fire-and-forget: the write itself has already succeeded, and the
+      // interval re-asks anyway.
+      void refreshStoreProblems()
+      return checked
     } catch (err) {
       // Fall back to the snapshot only if even the read fails; showing a stale list beats showing one
       // built from a write we know was refused.
@@ -348,6 +405,7 @@ export default function App() {
         selectedIndex={selectedIndex}
         onSelect={selectProject}
         onAddRepo={addRepo}
+        repoListProblem={storeProblem || repoReadError}
         view={view}
         onViewChange={selectView}
       />

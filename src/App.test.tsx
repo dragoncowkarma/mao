@@ -204,6 +204,20 @@ describe('App unusable stored settings', () => {
     expect(screen.getByText(/No projects yet/)).toBeInTheDocument()
   })
 
+  it('offers the reset when the repo list is one of several unusable values', async () => {
+    // Both fixtures, with the unrelated one first: with a single report on screen, a positional check
+    // (`storeProblems[0].field === 'githubRepos'`) satisfies every other test in this file, and the
+    // mixed state is the one it gets wrong — which is the state issue #68 makes reachable.
+    const { user } = await renderApp([], [UNUSABLE_PROVIDERS, UNUSABLE_REPO_LIST])
+
+    // Matched by field, because both fixture messages say "is an object, not a JSON array".
+    expect(await screen.findByText(/"aiProviders" in/)).toBeInTheDocument()
+    expect(screen.getByText(/"githubRepos" in/)).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Reset stored list' }))
+
+    expect(screen.getByRole('button', { name: 'Confirm reset' })).toBeInTheDocument()
+  })
+
   it('clears a failed reset when the operator backs out', async () => {
     const { stub, user } = await renderApp([], [UNUSABLE_REPO_LIST])
     await screen.findByText(/is an object, not a JSON array/)

@@ -365,13 +365,16 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   *empty* list on purpose: an unusable value names no tracked repository, so every row would count as a
   new registration and be preflighted — a missing or revoked token would block the one recovery left.
   Two properties of that button are load-bearing and tested: it re-reads `problems()` and **aborts** if
-  something already healed the store (the report sends the operator to `config.json`, and a `mao repos
+  that read shows something already healed the store (a separate IPC round trip, so it narrows the
+  cross-process race rather than closing it — `github:setRepos` writes unconditionally) (the report sends the operator to `config.json`, and a `mao repos
   add` in a terminal heals it — writing `[]` blind would then delete the healthy list they just built),
   and it is offered only for a `githubRepos` problem, never for another field's report, because the
   write it performs deletes `githubRepos` and nothing else. The renderer **polls** it rather than only
   reading it at mount: the report sends the operator to `config.json`, and an edit made there while
   the window is open would otherwise stay invisible until the next list write — which is the thing
-  that destroys the value, so reading it only afterwards cannot warn anyone in time.
+  that destroys the value, so reading it only afterwards cannot warn anyone in time. It narrows that
+  to one poll interval rather than eliminating it: an Add is not gated on a fresh read, deliberately,
+  because gating it would make the GUI refuse a recovery `mao repos add` still performs.
   Two backend details make "the two shells cannot answer differently" true rather than aspirational.
   `STORED_SHAPE_RULES` is the one table of checked fields, and `describeStoredProblems()` iterates it
   to decide what to *read* — electron-store re-reads and re-parses the whole file on every `get`, so

@@ -36,7 +36,7 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
 | `core/swarm-runner.ts` | Shell-free launcher and repository/asset validation for the autonomous Swarm Orchestrator |
 | `core/auto-trigger.ts` | Per-repo polling scheduler; auto-enqueues new open issues |
 | `core/assignment.ts` | Issue/PR body directive parser — `parseAssignmentTags()` for swarm_orchestrator-style `[Worker: id]`/`[Reviewer: id]`/`[Maintainer: id]` role tags, and `parseProviderOverride()` which folds those plus task-level `[Model: id]`/`[Effort: level]` tags into a `ProviderOverride` |
-| `core/store.ts` | `MaoStoreSchema`, `MAO_STORE_DEFAULTS`, the `MaoStore` interface, `FileStore` (JSON impl for the CLI), and `createStoredReadGuard()` — the read-path guard every backend applies so a field's declared type survives contact with unvalidated JSON |
+| `core/store.ts` | `MaoStoreSchema`, `MAO_STORE_DEFAULTS`, the `MaoStore` interface, `FileStore` (JSON impl for the CLI), `createStoredReadGuard()` — the read-path guard every backend applies so a field's declared type survives contact with unvalidated JSON — and `UnreadableStoreError`, which stops the process for a `config.json` that exists and cannot be parsed or read |
 | `core/app.ts` | `createMaoApp()` — the **single composition root** both frontends call |
 | `core/paths.ts` | Platform-appropriate data dir for the CLI (mirrors Electron's `userData`) |
 | `core/ai/` | `AiProvider` interface + adapters: `api-provider.ts` (Anthropic / OpenAI-compatible HTTP) and `cli-provider.ts` (spawns `claude`, `codex`, …) |
@@ -167,6 +167,11 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   skips the guard compiles and then hands every reader a value of the wrong shape (see the invariant
   below). A field whose shape the guard checks must also be added to the guard, not only to the pair
   above.
+- **Store boot behaviour** → `core/store.ts` (`classifyStoreReadFailure` / `UnreadableStoreError`) and
+  `electron/store.ts` must fail closed on the same inputs. The CLI backend does it explicitly; the GUI
+  backend does it by *not* passing `clearInvalidConfig` to electron-store, so conf's `false` default
+  stands. Nothing in tsc connects the two — adding that option, or reintroducing a defaulting `catch`,
+  silently un-fixes one half — so `core/store.test.ts` asserts the Electron half by reading its source.
 - **Repository capability policy** → `core/repo-capabilities.ts` and the intentionally
   duplicated policy tables/verdict logic in `.agents/workflows/swarm_orchestrator.py` must be
   audited together. Gap ids and reasons, remedy kinds/ranking, public-vs-private scope rules,
@@ -363,6 +368,27 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   into the module-level defaults — a shallow spread let a caller that pushed into the empty list it read
   leak a phantom entry into the default, which the next `FileStore` in that process read back as a
   tracked repository for auto-trigger to poll.
+- **A `config.json` that exists but cannot be loaded stops the process — only a *missing* one boots on
+  defaults.** `FileStore.load()` used to answer every read failure with `{}`, so a truncated write, a
+  hand-edit with a trailing comma, or a permission change started MAO as though it were a fresh install,
+  printing nothing. `persist()` then rewrote the whole blob on the next `set()` — any `set()`, from any
+  unrelated command — replacing `githubToken`, `aiProviders`, `githubRepos` and `workflowTasks` with
+  defaults. The token is stored in plain text and exists nowhere else, so that is credential loss; and an
+  unreadable store is an unreadable *queue*, so tasks mid-pipeline were dropped and the drop persisted.
+  `FileStore`'s constructor now throws `UnreadableStoreError` for anything but `ENOENT`, naming the file
+  and the failure kind and never its contents (V8 puts a prefix of the input into `SyntaxError.message`,
+  so the original error is deliberately not attached as `cause` either). Warning and carrying on is not
+  an acceptable substitute — the warning scrolls past and the destroying write still happens. Refusing to
+  construct is also what preserves the file: nothing is renamed or copied aside, because `config.json` is
+  secret-bearing and an automatic move would plant the token at a path the operator never chose. This is
+  *stronger* than the persistence-broken marker rather than a use of it — `createMaoApp()` never runs, so
+  `restore()` never runs and `resume` has nothing to act on — and the marker is deliberately not written,
+  since it records a confirmed *write* failure and stays until an operator clears it, whereas a read
+  failure is cured by repairing the file. Electron's backend must keep failing the same way: conf's
+  `clearInvalidConfig` defaults to `false`, and turning it on would reset *and* rewrite the file from
+  electron-store's own constructor — worse than the CLI bug, because it lands before any `set()`. Note
+  this is the whole-file half of the read-guard bullet above; a single field that is present but
+  wrong-shaped is still that guard's job, not this one's.
 - **Repository identity is case-insensitive, and the list is canonicalised before it is stored**:
   GitHub resolves owner/repo without regard to case, so `sameRepoRef()`/`repoRefKey()` lower-case
   both halves — otherwise `mao repos add DragonCowKarma MAO` registered a *second* entry for an

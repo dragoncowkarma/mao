@@ -156,6 +156,129 @@ export interface MaoStore {
   set<K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]): void
 }
 
+/**
+ * Why a `config.json` that is *present* could not be turned into a settings object.
+ *
+ * A missing file is deliberately not one of these. That is a fresh install — the one case where starting
+ * from `MAO_STORE_DEFAULTS` is exactly right, and where saying anything at all would be noise on every
+ * first run.
+ */
+export type StoreReadFailure = 'unreadable' | 'unparseable' | 'not-an-object'
+
+/**
+ * Sorts a failed load into a `StoreReadFailure`, or `null` for the fresh-install case that is not a
+ * failure at all.
+ *
+ * `ENOENT` is the only errno treated as "nothing is wrong". Everything else the filesystem can raise —
+ * `EACCES` on a file whose mode or owner changed, `EISDIR`, `EIO` on a failing disk — describes a file
+ * that exists and cannot be read, which is the opposite of a fresh install and must never be answered
+ * with defaults. Split out from `FileStore.load()` so that one distinction, which is the whole of this
+ * module's boot behaviour, is testable without a filesystem.
+ */
+export function classifyStoreReadFailure(error: unknown): StoreReadFailure | null {
+  if ((error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') return null
+  return error instanceof SyntaxError ? 'unparseable' : 'unreadable'
+}
+
+/**
+ * The operator-facing report for a `config.json` that exists but cannot be loaded.
+ *
+ * ## Why this refuses to boot rather than warning and carrying on
+ *
+ * `FileStore.load()` used to answer every read failure with `{}`, which spreads over `MAO_STORE_DEFAULTS`
+ * into a complete, entirely empty settings object. Nothing was printed, so the first symptom was the app
+ * behaving like a fresh install. The damage came one step later: `persist()` serializes the *whole* schema
+ * on every `set()`, so the next write of any kind — `mao config set-theme`, a queue `'change'` event, a
+ * repository-list update — replaced the file with those defaults. A truncated write, a hand-edit with a
+ * trailing comma, or a disk error therefore destroyed `githubToken`, `aiProviders`, `githubRepos` and
+ * `workflowTasks` in one go, silently, triggered by an ordinary unrelated command. The token is stored in
+ * plain text and exists nowhere else, so that is credential loss, not a settings reset.
+ *
+ * Warning and carrying on does not fix it. The warning scrolls past and the destroying write still
+ * happens — under `mao run`, within seconds of boot. Refusing to construct the store is what actually
+ * preserves the file, because the process never reaches a `set()`.
+ *
+ * ## Why the file is left exactly where it is, rather than renamed aside
+ *
+ * Not writing preserves the file more completely than moving it would, and moving has a cost this repo
+ * takes seriously: `config.json` is secret-bearing (AGENTS.md's safety rails), so an automatic
+ * `fs.renameSync` to a salvage name would plant the token at a second path the operator never chose and
+ * would not think to clean up. Copying it aside would be worse — two files holding one credential — which
+ * is why that option is closed rather than merely unused. An operator moving the file by hand is the same
+ * act with informed consent, and the message below asks for exactly that.
+ *
+ * ## How this relates to `resume` and the persistence-broken marker
+ *
+ * An unreadable store is an unreadable *queue* — `workflowTasks` lives in this file too. Booting on
+ * defaults would silently drop tasks mid-pipeline (a PR already opened and awaiting review, simply gone)
+ * and then persist that drop. That is the same "MAO cannot trust its queue" hazard
+ * `core/persistence-guard.ts` exists for, reached from the read side instead of the write side.
+ *
+ * It is answered here by never constructing the store, which is strictly stronger than what the marker
+ * buys: `createMaoApp()` is never called, so `restore()` never runs and `resume` — true or false — has
+ * nothing to act on, and no GitHub or AI call can follow. The marker is deliberately *not* written for
+ * this. It records a confirmed *write* failure, it is sticky, and clearing it is a separate operator
+ * ritual (`mao config clear-persistence-broken`); a read failure is cured by repairing the file, after
+ * which the queue inside it is precisely what was last persisted and is trustworthy again. A marker left
+ * behind would be a second, unrelated chore imposed on someone who has already fixed the problem.
+ *
+ * ## The other backend
+ *
+ * Electron's `electron-store` (conf) already fails this way and needs no change: `clearInvalidConfig`
+ * defaults to `false`, so conf's `store` getter rethrows a `SyntaxError` and every non-`ENOENT` errno, and
+ * that getter is read from conf's own constructor — `new Store(...)` throws and nothing is written.
+ * Setting `clearInvalidConfig: true` would reintroduce this bug in a worse form: conf would read `{}`,
+ * merge the defaults, find them unequal and write them back *from the constructor*, destroying the file at
+ * boot without waiting for a `set()`. `core/store.test.ts` pins that option off for that reason.
+ *
+ * `source` is the config file path, which is not itself secret (the token lives inside the file). No
+ * stored value is ever included — see `UnreadableStoreError` for the leak that rules out.
+ */
+export function describeUnreadableStore(source: string, failure: StoreReadFailure): string {
+  const cause =
+    failure === 'unparseable'
+      ? 'it is not valid JSON'
+      : failure === 'not-an-object'
+        ? 'it is valid JSON, but not a JSON object'
+        : 'the filesystem refused to open it — most often a permissions or ownership change'
+  const remedy =
+    failure === 'unreadable'
+      ? 'Restore read access to it, or move it aside to start from an empty config'
+      : 'Repair the JSON by hand, or move the file aside to start from an empty config'
+  return (
+    `[store] ${source} could not be read — ${cause}. MAO is refusing to start rather than boot on empty ` +
+    'settings, because the next change to any setting rewrites this whole file: the stored GitHub token, ' +
+    'AI providers, tracked repositories and workflow queue would all be replaced by defaults, with nothing ' +
+    `left to recover them from. Nothing has been written — the file is exactly as it was. ${remedy}. Its ` +
+    'contents are deliberately not shown here, because the GitHub token is stored in it in plain text.'
+  )
+}
+
+/**
+ * Thrown by `FileStore`'s constructor for a `config.json` that exists and cannot be loaded. Carries the
+ * classification so a caller can branch on it, and a message that is already the whole operator-facing
+ * report — the CLI's top-level handler prints `err.message` to stderr and nothing else, which is the same
+ * path-and-kind, never-the-contents shape `createStoredReadGuard` reports in.
+ *
+ * Deliberately does **not** set `cause`. V8 puts a prefix of the offending input into
+ * `SyntaxError.message` — `JSON.parse('ghp_…')` reports ``Unexpected token 'g', "ghp_…" is not valid
+ * JSON`` — and a `config.json` clobbered down to a bare token is exactly the hand-edit that produces it.
+ * Node prints the `[cause]` chain for an uncaught throw and any handler may log it, so attaching the
+ * original error would reintroduce the very token leak the rest of this module avoids. The classification
+ * is everything a caller can act on; the text that would leak is nothing a caller needs.
+ */
+export class UnreadableStoreError extends Error {
+  readonly source: string
+  readonly failure: StoreReadFailure
+
+  constructor(source: string, failure: StoreReadFailure) {
+    super(describeUnreadableStore(source, failure))
+    this.name = 'UnreadableStoreError'
+    this.source = source
+    this.failure = failure
+  }
+}
+
 /** JSON-file-backed MaoStore for CLI/headless environments that don't have electron-store available. */
 export class FileStore implements MaoStore {
   private data: MaoStoreSchema
@@ -178,12 +301,27 @@ export class FileStore implements MaoStore {
     this.guardRead = createStoredReadGuard(filePath)
   }
 
+  /**
+   * Reads the settings file, or `{}` when there is none. Every other outcome throws — see
+   * `describeUnreadableStore` for why a present-but-unloadable file stops the process instead of becoming
+   * `{}`. The throw happens in the constructor, before `persist()` can ever overwrite what is on disk.
+   */
   private load(): Partial<MaoStoreSchema> {
+    let parsed: unknown
     try {
-      return JSON.parse(fs.readFileSync(this.filePath, 'utf-8'))
-    } catch {
-      return {}
+      parsed = JSON.parse(fs.readFileSync(this.filePath, 'utf-8'))
+    } catch (error) {
+      const failure = classifyStoreReadFailure(error)
+      if (failure === null) return {}
+      throw new UnreadableStoreError(this.filePath, failure)
     }
+    // A top-level `null`, array, string or number parses cleanly and then spreads to nothing (or, for a
+    // string, to numeric index keys), so it would reach `set()` as a full defaults object and destroy the
+    // file exactly as an unparseable one did. Same failure, same answer.
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new UnreadableStoreError(this.filePath, 'not-an-object')
+    }
+    return parsed as Partial<MaoStoreSchema>
   }
 
   private persist() {

@@ -164,6 +164,23 @@ value stays in the file, so copy any repositories you still need out of it first
 list. Because the guard makes the store name no usable repository, a repo re-added this way counts as a
 first registration and **is** preflighted for write access.
 
+**A `config.json` MAO refuses to open at all.** The guard above covers a *field* of the wrong shape. A
+file that will not parse — a truncated write, a stray trailing comma, a disk error — or one the process
+is not allowed to read is a different failure, and MAO stops rather than starting. Every command that
+loads the store exits 1 with one report on **stderr** naming the file and what is wrong with it:
+
+```
+[mao] [store] /path/to/config.json could not be read - it is not valid JSON. MAO is refusing to start
+rather than boot on empty settings, because the next change to any setting rewrites this whole file: ...
+```
+
+Nothing is written, moved, or copied, so the file - and the plaintext token in it - is byte-for-byte as
+it was; repair the JSON (or restore read access) and the same command works again. Booting on empty
+settings instead is what used to destroy the token, providers, repositories and queue on the next write
+of *any* setting, from an ordinary unrelated command. A **missing** `config.json` is not this case: that
+is a fresh install, it stays silent, and the file is still not created until something is actually saved.
+`mao config clear-persistence-broken` does not load the store, so it keeps working regardless.
+
 The GUI shows the same unverified-grants caveat the CLI prints (`github:setRepos` returns the
 verdicts), and the board's **Refresh** surfaces a failed preflight instead of reporting a clean sync —
 `github:refreshRepo` drives a real poll, so its verdict has to reach the operator. The board's own 30s
@@ -371,7 +388,9 @@ Two traps:
    validation. Neither backend validates the JSON it reads, so a field whose declared type a
    hand-edited `config.json` can violate (an array, an object) also belongs in
    `createStoredReadGuard()` in the same file. Read its doc comment first: coercing a field whose
-   value is recoverable state is not automatically the right call.
+   value is recoverable state is not automatically the right call. Note the guard only ever sees a
+   file that loaded — one that cannot be parsed or read stops the process before any field is
+   reached (`UnreadableStoreError`, same file, also deliberate).
 3. Renderer needs it? Add get/set IPC channels (recipe above). CLI needs it?
    Extend `cli/index.ts` (keep `config show` redaction for anything secret).
 

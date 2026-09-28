@@ -3,7 +3,7 @@ import type { GithubTask, GithubTaskDetail } from '../core/github-service'
 import type { RepoWorkflowCapability } from '../core/repo-capabilities'
 import type { QueuedTask, RepoRef, RunOverride } from '../core/workflow-engine'
 import type { AutoTriggerStatus } from '../core/auto-trigger'
-import type { ThemePreference } from '../core/store'
+import type { StoredValueProblem, ThemePreference } from '../core/store'
 import type { SelfUpdateCheck } from '../core/self-update'
 
 export interface AppUpdateCheck extends SelfUpdateCheck {
@@ -50,6 +50,14 @@ declare global {
         advance: (taskId: string, runOverride?: RunOverride) => Promise<QueuedTask>
         setAutoAdvance: (taskId: string, autoAdvance: boolean) => Promise<QueuedTask>
         clearCompleted: () => Promise<void>
+      }
+      store: {
+        /**
+         * Stored values the main process had to discard, each naming the field, the value's *type* and
+         * the config file — never the value (the GitHub token lives in that same file). Polled, not
+         * pushed; re-derived per call, so it goes empty once a repository-list write heals the file.
+         */
+        problems: () => Promise<StoredValueProblem[]>
       }
       ui: {
         getTheme: () => Promise<ThemePreference>

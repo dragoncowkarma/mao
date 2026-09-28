@@ -108,9 +108,19 @@ config
   .description('Print the current stored config (secrets redacted)')
   .action(() => {
     const { store } = loadApp()
+    // `githubRepos` prints what the app will actually use, which for an unusable stored value is `[]` —
+    // and a diagnostic command that reported a value the file does not contain, with the only sign of it
+    // on a stderr line `2>/dev/null` throws away, would be worse than one that said nothing. So the
+    // discard is also stated on stdout, as a flag alongside `workflowPersistenceBroken` rather than by
+    // printing the malformed value: that value is unvalidated JSON an operator hand-edited, this output
+    // is piped and pasted, and `githubToken` lives in the same file. `store.problems()` re-derives from
+    // the file, so it neither depends on the read above having happened nor survives the write that
+    // heals it. The actionable paragraph — what the file holds and how to recover — still goes to stderr.
+    const unusable = new Set(store.problems().map((problem) => problem.key))
     printJson({
       githubToken: store.get('githubToken') ? '[set]' : '[unset]',
       githubRepos: store.get('githubRepos'),
+      githubReposUnusable: unusable.has('githubRepos'),
       aiProviders: store.get('aiProviders').map((p) => ({ ...p, apiKey: p.apiKey ? '[set]' : undefined })),
       theme: store.get('theme'),
       workflowPersistenceBroken: hasPersistenceBrokenMarker(resolveDataDir()),

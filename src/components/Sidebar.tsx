@@ -1,18 +1,7 @@
 import { useState } from 'react'
+import { readableIpcError } from '../ipc-error'
 import type { RepoRef } from '../../core/workflow-engine'
 import type { RepoWorkflowCapability } from '../../core/repo-capabilities'
-
-/**
- * Electron re-wraps anything thrown inside `ipcMain.handle` as
- * `Error invoking remote method '<channel>': <ErrorName>: <message>`. The preflight's message is
- * written to be read by an operator, so strip the plumbing rather than showing a channel name and
- * pushing the actionable half out of this narrow column.
- */
-function readableIpcError(err: unknown): string {
-  const raw = err instanceof Error ? err.message : String(err)
-  const match = raw.match(/^Error invoking remote method '[^']*':\s*(?:\w*Error:\s*)?(.*)$/s)
-  return match ? match[1] : raw
-}
 
 /**
  * The three pipeline grants GitHub cannot confirm without a write. Shown after a successful add so the
@@ -37,11 +26,25 @@ interface SidebarProps {
    * in the form. Resolves with the verdicts so the unverified-grants caveat can be shown on success.
    */
   onAddRepo: (repo: RepoRef) => Promise<RepoWorkflowCapability[]>
+  /**
+   * Why `repos` is empty when it is empty for a reason other than "nothing has been added yet" — an
+   * unusable stored list the main process discarded, or a list read that failed outright. Empty string
+   * when the list is simply empty.
+   */
+  repoListProblem: string
   view: 'project' | 'global-settings'
   onViewChange: (view: 'project' | 'global-settings') => void
 }
 
-export default function Sidebar({ repos, selectedIndex, onSelect, onAddRepo, view, onViewChange }: SidebarProps) {
+export default function Sidebar({
+  repos,
+  selectedIndex,
+  onSelect,
+  onAddRepo,
+  repoListProblem,
+  view,
+  onViewChange,
+}: SidebarProps) {
   const [adding, setAdding] = useState(false)
   const [owner, setOwner] = useState('')
   const [repo, setRepo] = useState('')
@@ -136,8 +139,21 @@ export default function Sidebar({ repos, selectedIndex, onSelect, onAddRepo, vie
               {r.autoTrigger === false && <span className="text-[10px] opacity-70">off</span>}
             </button>
           ))}
-          {repos.length === 0 && !adding && (
-            <p className="text-muted text-xs px-2">No projects yet — add a repository to get started.</p>
+          {repoListProblem ? (
+            /*
+             * Replaces the empty-state line rather than joining it. "No projects yet — add a repository
+             * to get started" is the one sentence that must not be shown here: it is indistinguishable
+             * from a genuinely empty list, and acting on it is what destroys the operator's data — the
+             * first Add writes the whole list, overwriting the unusable value that still holds the only
+             * copy of their repositories. Rendered in the error colour for the same reason, and kept
+             * outside the `!adding` condition: opening the Add form is exactly when this matters most.
+             */
+            <p className="px-2 text-[11px] leading-snug" style={{ color: 'var(--color-accent-700)' }}>
+              {repoListProblem}
+            </p>
+          ) : (
+            repos.length === 0 &&
+            !adding && <p className="text-muted text-xs px-2">No projects yet — add a repository to get started.</p>
           )}
         </nav>
 

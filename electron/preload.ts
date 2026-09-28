@@ -4,7 +4,7 @@ import type { GithubTask, GithubTaskDetail } from '../core/github-service.ts'
 import type { RepoWorkflowCapability } from '../core/repo-capabilities.ts'
 import type { QueuedTask, RepoRef, RunOverride } from '../core/workflow-engine.ts'
 import type { AutoTriggerStatus } from '../core/auto-trigger.ts'
-import type { ThemePreference } from '../core/store.ts'
+import type { StoredValueProblem, ThemePreference } from '../core/store.ts'
 import type { SelfUpdateCheck } from '../core/self-update.ts'
 
 export interface AppUpdateCheck extends SelfUpdateCheck {
@@ -60,6 +60,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
     setAutoAdvance: (taskId: string, autoAdvance: boolean): Promise<QueuedTask> =>
       ipcRenderer.invoke('workflow:setAutoAdvance', taskId, autoAdvance),
     clearCompleted: (): Promise<void> => ipcRenderer.invoke('workflow:clearCompleted'),
+  },
+  store: {
+    /**
+     * Stored values the main process had to discard, each naming the field, the value's *type* and the
+     * config file — never the value (the GitHub token lives in that same file). Polled, not pushed;
+     * re-derived per call, so it goes empty once a repository-list write heals the file.
+     */
+    problems: (): Promise<StoredValueProblem[]> => ipcRenderer.invoke('store:problems'),
   },
   ui: {
     getTheme: (): Promise<ThemePreference> => ipcRenderer.invoke('ui:getTheme'),

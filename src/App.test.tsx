@@ -38,6 +38,17 @@ const UNUSABLE_REPO_LIST: StoredValueProblem = {
 }
 
 /**
+ * A report about a field this sidebar's reset does not touch. The reset deletes `githubRepos` and
+ * nothing else, and `describeStoredProblems` is written to grow to the other array-typed fields
+ * (issue #68) — so the card has to tell the difference before it offers a destructive button.
+ */
+const UNUSABLE_PROVIDERS: StoredValueProblem = {
+  field: 'aiProviders',
+  source: '/data/config.json',
+  message: '[store] "aiProviders" in /data/config.json is an object, not a JSON array of providers.',
+}
+
+/**
  * Mounts the real App against a fake bridge, inside StrictMode because that is what `src/main.tsx`
  * does. The doubled mount/unmount is a development-and-test check — the packaged build runs effects
  * once — but it is the check AGENTS.md requires polling effects to survive, so running tests under it
@@ -146,6 +157,104 @@ describe('App unusable stored settings', () => {
 
     expect(await screen.findByText('disk is full')).toBeInTheDocument()
     expect(screen.getByText(/is an object, not a JSON array/)).toBeInTheDocument()
+  })
+
+  it('refuses to reset a store something else has already healed', async () => {
+    // The store is not this window's alone: the report tells the operator to go to `config.json`, and
+    // `mao repos add` in a terminal heals it — while this card, read at mount and after writes, keeps
+    // offering a button that writes an empty list. Blind, that deletes the healthy list they just built.
+    const { stub, user } = await renderApp([], [UNUSABLE_REPO_LIST])
+    await screen.findByText(/is an object, not a JSON array/)
+    stub.storeProblems.mockResolvedValue([])
+    stub.applyRepos([ONE])
+
+    await user.click(screen.getByRole('button', { name: 'Reset stored list' }))
+    await user.click(screen.getByRole('button', { name: 'Confirm reset' }))
+
+    await waitFor(() => expect(screen.queryByText(/is an object, not a JSON array/)).toBeNull())
+    expect(stub.setRepos).not.toHaveBeenCalled()
+    expect(await screen.findByRole('button', { name: 'acme/one' })).toBeInTheDocument()
+  })
+
+  it('offers no reset for a report about a field the reset does not touch', async () => {
+    // Today the guard checks only `githubRepos`, so this state is not yet reachable — which is why it is
+    // pinned now rather than discovered when a second field joins it and an `aiProviders` message ends
+    // up sitting above a button that wipes every tracked repository.
+    await renderApp([], [UNUSABLE_PROVIDERS])
+
+    expect(await screen.findByText(/"aiProviders" in/)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Reset stored list' })).toBeNull()
+    expect(screen.getByText(/No projects yet/)).toBeInTheDocument()
+  })
+
+  it('clears a failed reset when the operator backs out', async () => {
+    const { stub, user } = await renderApp([], [UNUSABLE_REPO_LIST])
+    await screen.findByText(/is an object, not a JSON array/)
+    stub.setRepos.mockRejectedValueOnce(new Error('disk is full'))
+
+    await user.click(screen.getByRole('button', { name: 'Reset stored list' }))
+    await user.click(screen.getByRole('button', { name: 'Confirm reset' }))
+    expect(await screen.findByText('disk is full')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Cancel' }))
+
+    // A failure message left under an un-pressed button misreports the state of an action the operator
+    // explicitly backed out of.
+    expect(screen.queryByText('disk is full')).toBeNull()
+  })
+
+  it('does not pretend a queued reset can be called back', async () => {
+    // The write is already queued behind `updateRepos`' serialization by the time this renders, and
+    // nothing can recall it — a Cancel that looked live would say otherwise.
+    let release = () => {}
+    const inFlight = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const { stub, user } = await renderApp([], [UNUSABLE_REPO_LIST])
+    await screen.findByText(/is an object, not a JSON array/)
+    stub.setRepos.mockImplementationOnce(async (next: RepoRef[]) => {
+      await inFlight
+      stub.applyRepos(next)
+      return []
+    })
+
+    await user.click(screen.getByRole('button', { name: 'Reset stored list' }))
+    await user.click(screen.getByRole('button', { name: 'Confirm reset' }))
+
+    expect(await screen.findByRole('button', { name: 'Resetting…' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Cancel' })).toBeDisabled()
+    release()
+    await waitFor(() => expect(stub.storedRepos()).toEqual([]))
+  })
+
+  it('takes the report down once an add has healed the store', async () => {
+    // The other way out, and the one the reviewer's "Add overwrote it before the operator was ever
+    // told" case turns on: any list write replaces the unusable value, so the card has to be re-read
+    // after every write — not only after the reset that this card owns.
+    const { stub, user } = await renderApp([], [UNUSABLE_REPO_LIST])
+    await screen.findByText(/is an object, not a JSON array/)
+
+    await submitAdd(user, ONE)
+    await addSettled()
+
+    await waitFor(() => expect(screen.queryByText(/is an object, not a JSON array/)).toBeNull())
+    expect(stub.setRepos).toHaveBeenCalledWith([ONE])
+  })
+
+  it('reports the write failure even when the diagnostic read throws', async () => {
+    // `refreshStoreProblems` runs in `persistRepos`' `finally`, and a synchronous throw there *replaces*
+    // the rejection already on its way to the caller — the operator would be told the bridge was missing
+    // instead of why their write failed. A diagnostic must not be able to hide the thing it annotates.
+    const { stub, user } = await renderApp([], [UNUSABLE_REPO_LIST])
+    await screen.findByText(/is an object, not a JSON array/)
+    stub.setRepos.mockRejectedValueOnce(new Error('acme/one cannot host the MAO workflow'))
+    stub.storeProblems.mockImplementation(() => {
+      throw new Error('preload bridge did not load')
+    })
+
+    await submitAdd(user, ONE)
+
+    expect(await screen.findByText('acme/one cannot host the MAO workflow')).toBeInTheDocument()
+    expect(screen.queryByText('preload bridge did not load')).toBeNull()
   })
 
   it('leaves the operator where they were when the reset lands', async () => {

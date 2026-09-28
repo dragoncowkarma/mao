@@ -175,7 +175,10 @@ the message — so a diagnostic command never reports a value that is not in the
 same list over `app:storeProblems` and the sidebar shows it in place of "No projects yet", with a
 **Reset stored list** button (two-step) that discards the unusable value by writing an empty list. That
 is the GUI's only always-available recovery: with no usable list there is no project row, so no Settings
-tab and no Remove button, and Add can be refused by the preflight.
+tab and no Remove button, and Add can be refused by the preflight. The button re-checks before it
+writes — heal the store from a terminal while the window is open and confirming the reset picks up the
+repaired list instead of wiping it — and it appears only when `githubRepos` itself is the unusable
+value.
 
 The GUI shows the same unverified-grants caveat the CLI prints (`github:setRepos` returns the
 verdicts), and the board's **Refresh** surfaces a failed preflight instead of reporting a clean sync —

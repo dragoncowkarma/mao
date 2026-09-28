@@ -363,6 +363,11 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   unusable list leaves no row to select, hence no Settings tab and no Remove button. That reset writes an
   *empty* list on purpose: an unusable value names no tracked repository, so every row would count as a
   new registration and be preflighted — a missing or revoked token would block the one recovery left.
+  Two properties of that button are load-bearing and tested: it re-reads `problems()` and **aborts** if
+  something already healed the store (the report sends the operator to `config.json`, and a `mao repos
+  add` in a terminal heals it — writing `[]` blind would then delete the healthy list they just built),
+  and it is offered only for a `githubRepos` problem, never for another field's report, because the
+  write it performs deletes `githubRepos` and nothing else.
   The **write** side is the mirror image and deliberately refuses rather than coerces: `canonicalRepoList`
   throws when `next` is not an array, because every non-array it can still iterate folds to an empty list
   (a string yields characters `isRepoRef` rejects; a `Set` yields entries in an unpromised order) and

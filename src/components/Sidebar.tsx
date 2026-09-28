@@ -74,6 +74,16 @@ export default function Sidebar({
   const [resetError, setResetError] = useState('')
 
   /**
+   * Whether it is the *repository list* that is unusable, not merely something in the same file.
+   *
+   * The reset deletes `githubRepos` and nothing else, so offering it for any other field's report would
+   * put a destructive button under a message that is not about repositories. Today the guard only checks
+   * this one field, so the distinction is invisible — which is exactly why it is written down now rather
+   * than discovered when a second field joins it (issue #68).
+   */
+  const repoListUnusable = storeProblems.some((problem) => problem.field === 'githubRepos')
+
+  /**
    * The main process preflights issue/PR write access before it persists anything, so this can fail
    * on a real repository. Keep the form open with what the operator typed and show the message —
    * clearing the fields would make them retype it just to read the reason.
@@ -150,20 +160,30 @@ export default function Sidebar({
                 {problem.message}
               </p>
             ))}
-            {confirmingReset ? (
-              <div className="flex gap-2">
-                <button onClick={submitReset} className="btn btn-primary text-xs" disabled={resetting}>
-                  {resetting ? 'Resetting…' : 'Confirm reset'}
+            {repoListUnusable &&
+              (confirmingReset ? (
+                <div className="flex gap-2">
+                  <button onClick={submitReset} className="btn btn-primary text-xs" disabled={resetting}>
+                    {resetting ? 'Resetting…' : 'Confirm reset'}
+                  </button>
+                  {/* Disabled mid-write rather than hidden: the write is already queued and cannot be
+                      called back, and a Cancel that appears to work would say otherwise. */}
+                  <button
+                    onClick={() => {
+                      setConfirmingReset(false)
+                      setResetError('')
+                    }}
+                    className="btn btn-secondary text-xs"
+                    disabled={resetting}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              ) : (
+                <button onClick={() => setConfirmingReset(true)} className="btn btn-secondary self-start text-xs">
+                  Reset stored list
                 </button>
-                <button onClick={() => setConfirmingReset(false)} className="btn btn-secondary text-xs">
-                  Cancel
-                </button>
-              </div>
-            ) : (
-              <button onClick={() => setConfirmingReset(true)} className="btn btn-secondary self-start text-xs">
-                Reset stored list
-              </button>
-            )}
+              ))}
             {resetError && (
               <p className="text-xs" style={{ color: 'var(--color-accent-700)' }}>
                 {resetError}
@@ -213,7 +233,7 @@ export default function Sidebar({
               {r.autoTrigger === false && <span className="text-[10px] opacity-70">off</span>}
             </button>
           ))}
-          {repos.length === 0 && !adding && storeProblems.length === 0 && (
+          {repos.length === 0 && !adding && !repoListUnusable && (
             <p className="text-muted text-xs px-2">No projects yet — add a repository to get started.</p>
           )}
         </nav>

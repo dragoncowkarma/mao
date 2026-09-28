@@ -87,8 +87,12 @@ export default function App() {
    * place, which is precisely when the notice has to stay up.
    */
   function refreshStoreProblems(): Promise<void> {
-    return electronApi()
-      .app.storeProblems()
+    // The bridge lookup is deferred into the chain rather than called here, because this runs inside
+    // `persistRepos`' `finally`: `electronApi()` throws synchronously when nothing is bound, and a
+    // synchronous throw in a `finally` *replaces* the rejection already on its way to the caller — the
+    // operator would be told the bridge was missing instead of why their write failed.
+    return Promise.resolve()
+      .then(() => electronApi().app.storeProblems())
       .then(setStoreProblems)
       .catch(() => {})
   }
@@ -337,6 +341,16 @@ export default function App() {
    */
   async function resetRepoList() {
     setRepoError('')
+    // Re-read before destroying anything. This store is not this window's alone: the report itself tells
+    // the operator to go to `config.json`, and `mao repos add` in a terminal heals it — while this card,
+    // read at mount and after writes, keeps offering a button that writes an empty list. Blind, that
+    // deletes the healthy list they just built. Fail closed: a read that throws aborts the reset.
+    const current = await electronApi().app.storeProblems()
+    setStoreProblems(current)
+    if (!current.some((problem) => problem.field === 'githubRepos')) {
+      setRepos(await electronApi().github.getRepos().catch(() => repos))
+      return
+    }
     await persistRepos([])
     // Adopt what the store now holds, for the same reason removal does: the write is the authority.
     // Deliberately nothing else. Selection reconciles itself — the effect above clears `selectedRepo`

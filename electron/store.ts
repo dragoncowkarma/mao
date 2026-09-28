@@ -29,14 +29,30 @@ const guardRead = createStoredReadGuard(backing.path)
  * process may do with persistence is the core contract, and narrowing it here keeps a future handler
  * from reaching past the guard through electron-store's own API.
  */
+/**
+ * The raw stored value, with conf's one behavioural difference from `FileStore` ironed out.
+ *
+ * conf merges `defaults` into the file once, when it first writes it, and its `get()` is then
+ * `key in store ? store[key] : defaultValue` over the file's *current* contents — so a key an operator
+ * deletes by hand comes back `undefined`, where `FileStore`'s constructor spread substitutes the schema
+ * default. Left alone, the same edited file made the GUI report a discarded value (and offer to reset
+ * it) while the CLI reported a clean store, which is exactly the divergence routing both backends
+ * through one guard exists to prevent. Cloned, never the shared `MAO_STORE_DEFAULTS` instance, for the
+ * reason `FileStore`'s constructor clones it too.
+ */
+function readRaw<K extends keyof MaoStoreSchema>(key: K): MaoStoreSchema[K] {
+  const value = backing.get(key) as MaoStoreSchema[K] | undefined
+  return value === undefined ? structuredClone(MAO_STORE_DEFAULTS[key]) : value
+}
+
 export const store: MaoStore = {
   get<K extends keyof MaoStoreSchema>(key: K): MaoStoreSchema[K] {
-    return guardRead(key, backing.get(key))
+    return guardRead(key, readRaw(key))
   },
   set<K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]): void {
     backing.set(key, value)
   },
   problems(): StoredValueProblem[] {
-    return describeStoredProblems(<K extends keyof MaoStoreSchema>(key: K) => backing.get(key), backing.path)
+    return describeStoredProblems(readRaw, backing.path)
   },
 }

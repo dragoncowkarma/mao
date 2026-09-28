@@ -178,7 +178,10 @@ is the GUI's only always-available recovery: with no usable list there is no pro
 tab and no Remove button, and Add can be refused by the preflight. The button re-checks before it
 writes — heal the store from a terminal while the window is open and confirming the reset picks up the
 repaired list instead of wiping it — and it appears only when `githubRepos` itself is the unusable
-value.
+value. A hand-edit made while the window is open is picked up by the sidebar's 30s poll, so the notice
+does not wait for the next write to appear. `mao repos remove` also says which unusable value it
+replaced — without that line the command that always heals prints only `No tracked repo matches …`
+and reads like a no-op.
 
 The GUI shows the same unverified-grants caveat the CLI prints (`github:setRepos` returns the
 verdicts), and the board's **Refresh** surfaces a failed preflight instead of reporting a clean sync —

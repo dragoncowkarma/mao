@@ -335,16 +335,13 @@ describe("electron/store.ts, the other MaoStore backend", () => {
     const backend = source.match(/const\s+(\w+)\s*=\s*new Store</)?.[1]
     expect(backend, 'electron/store.ts must construct an electron-store instance').toBeTruthy()
 
-    // Stated as "no read of the raw backend is unmediated" rather than by matching the body of `get`,
-    // which would make the assertion depend on this file's indentation — there is no autoformatter to
-    // keep that stable, and a guard that fails for a reformat is a guard people learn to dismiss. The
-    // two mediators are core's: the read guard, and `describeStoredProblems` for `problems()`. The
-    // cost is that it reads a read and its mediator as being on one line, which is how they are written.
-    const reads = source.split('\n').filter((line) => line.includes(`${backend}.get(`))
-    const unmediated = reads.filter((line) => !new RegExp(`(?:${guard}|describeStoredProblems)\\(`).test(line))
-
-    expect(reads.length).toBeGreaterThan(0)
-    expect(unmediated).toEqual([])
+    // Stated as "the raw backend is read in exactly one accessor, and `get` hands that to the guard",
+    // rather than by matching the body of `get` — which would make the assertion depend on this file's
+    // indentation, and a guard that fails for a reformat is a guard people learn to dismiss. The single
+    // accessor is what makes the rule checkable at all: a second member reaching for the instance
+    // directly would read past both the guard and conf's absent-key quirk.
+    expect([...source.matchAll(new RegExp(`${backend}\\.get\\(`, 'g'))]).toHaveLength(1)
+    expect(source).toMatch(new RegExp(`${guard}\\(\\s*key\\s*,`))
   })
 
   it('answers problems() through core, against the same backend', () => {
@@ -353,7 +350,6 @@ describe("electron/store.ts, the other MaoStore backend", () => {
     const backend = source.match(/const\s+(\w+)\s*=\s*new Store</)?.[1]
 
     expect(source).toMatch(/problems\(\)\s*:\s*StoredValueProblem\[\]/)
-    expect(source).toMatch(new RegExp(`describeStoredProblems\\([\\s\\S]*?${backend}\\.get\\(`))
     expect(source).toMatch(new RegExp(`describeStoredProblems\\([\\s\\S]*?${backend}\\.path`))
   })
 

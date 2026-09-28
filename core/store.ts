@@ -79,16 +79,29 @@ export function describeUnusableRepoList(value: unknown, source: string): string
   )
 }
 
+type StoredShapeRule<K extends keyof MaoStoreSchema> = (raw: MaoStoreSchema[K], source: string) => string | null
+
 /**
- * The single list of fields whose stored *shape* is validated, and the report for each — so the guard
- * below and `describeStoredProblems()` cannot disagree about which values are usable.
+ * The single table of fields whose stored *shape* is validated, and the report for each — so the guard
+ * below and `describeStoredProblems()` cannot disagree about which values are usable, and so adding a
+ * field is one entry rather than an edit in two places (issue #68 adds the other array-typed fields).
+ *
+ * A table rather than a predicate over every schema key, because `describeStoredProblems()` iterates it
+ * to decide what to *read*: electron-store re-reads and re-parses the whole config file on every `get`,
+ * so walking all six fields to have five of them answer `null` cost six full file reads per call, on the
+ * main process, in the `finally` of every repository-list write.
  */
+const STORED_SHAPE_RULES: { [K in keyof MaoStoreSchema]?: StoredShapeRule<K> } = {
+  githubRepos: (raw, source) => describeUnusableRepoList(raw, source),
+}
+
 function unusableStoredValue<K extends keyof MaoStoreSchema>(
   key: K,
   raw: MaoStoreSchema[K],
   source: string,
 ): string | null {
-  return key === 'githubRepos' ? describeUnusableRepoList(raw, source) : null
+  const rule = STORED_SHAPE_RULES[key] as StoredShapeRule<K> | undefined
+  return rule ? rule(raw, source) : null
 }
 
 /** A stored value the schema cannot use, in the form a shell can show an operator. */
@@ -111,16 +124,15 @@ export interface StoredValueProblem {
  * the backend directly makes the answer true whenever it is asked. It is also live for Electron, whose
  * electron-store backend re-reads the file on every `get`.
  *
- * Read-only, like the guard: nothing here repairs the file. `MAO_STORE_DEFAULTS`' own keys are the
- * field list, so a field added to the schema is considered automatically and answers `null` until
- * `unusableStoredValue()` has a rule for it.
+ * Read-only, like the guard: nothing here repairs the file. Only the fields `STORED_SHAPE_RULES` has a
+ * rule for are read at all — see there for why reading the rest would not be free.
  */
 export function describeStoredProblems(
   readRaw: <K extends keyof MaoStoreSchema>(key: K) => MaoStoreSchema[K],
   source: string,
 ): StoredValueProblem[] {
   const problems: StoredValueProblem[] = []
-  for (const field of Object.keys(MAO_STORE_DEFAULTS) as Array<keyof MaoStoreSchema>) {
+  for (const field of Object.keys(STORED_SHAPE_RULES) as Array<keyof MaoStoreSchema>) {
     const message = unusableStoredValue(field, readRaw(field), source)
     if (message !== null) problems.push({ field, source, message })
   }

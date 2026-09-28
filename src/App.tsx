@@ -12,6 +12,9 @@ import { sameRepoRef } from '../core/repo-registry'
 import type { StoredValueProblem, ThemePreference } from '../core/store'
 import type { AppUpdateCheck } from './electron'
 
+/** Matches the board's own listing poll: this is a background diagnostic, not something to spin on. */
+const STORE_PROBLEM_POLL_MS = 30_000
+
 type ProjectTab = 'board' | 'queue' | 'settings'
 type View = 'project' | 'global-settings'
 
@@ -97,8 +100,19 @@ export default function App() {
       .catch(() => {})
   }
 
+  /**
+   * Polled, not only read at mount, because the file is not this window's to own: an operator who
+   * hand-edits `config.json` while the app is open — which the report itself sends them to do — would
+   * otherwise see nothing until their next repository-list write, and that write is what destroys the
+   * value. Reading it *after* a write cannot warn anyone in time; only reading it on a clock can.
+   *
+   * Cleared on unmount, and safe under StrictMode's double invocation: the read is idempotent and both
+   * mounts install and clear their own interval.
+   */
   useEffect(() => {
     void refreshStoreProblems()
+    const handle = setInterval(() => void refreshStoreProblems(), STORE_PROBLEM_POLL_MS)
+    return () => clearInterval(handle)
   }, [])
 
   useEffect(() => {

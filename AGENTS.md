@@ -367,7 +367,18 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   something already healed the store (the report sends the operator to `config.json`, and a `mao repos
   add` in a terminal heals it — writing `[]` blind would then delete the healthy list they just built),
   and it is offered only for a `githubRepos` problem, never for another field's report, because the
-  write it performs deletes `githubRepos` and nothing else.
+  write it performs deletes `githubRepos` and nothing else. The renderer **polls** it rather than only
+  reading it at mount: the report sends the operator to `config.json`, and an edit made there while
+  the window is open would otherwise stay invisible until the next list write — which is the thing
+  that destroys the value, so reading it only afterwards cannot warn anyone in time.
+  Two backend details make "the two shells cannot answer differently" true rather than aspirational.
+  `STORED_SHAPE_RULES` is the one table of checked fields, and `describeStoredProblems()` iterates it
+  to decide what to *read* — electron-store re-reads and re-parses the whole file on every `get`, so
+  walking all six schema keys cost six full file reads per call on the main process. And conf merges
+  `defaults` only when it first writes the file, so a key an operator deletes by hand comes back
+  `undefined` where `FileStore`'s constructor substitutes the schema default; `electron/store.ts`'s
+  single `readRaw()` accessor closes that, and `core/store.test.ts` pins that it is the only place
+  the raw instance is read.
   The **write** side is the mirror image and deliberately refuses rather than coerces: `canonicalRepoList`
   throws when `next` is not an array, because every non-array it can still iterate folds to an empty list
   (a string yields characters `isRepoRef` rejects; a `Set` yields entries in an unpromised order) and

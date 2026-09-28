@@ -1,7 +1,7 @@
 import { StrictMode } from 'react'
-import { render, screen, waitFor } from '@testing-library/react'
+import { act, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import App from './App'
 import { createElectronApiStub } from './test/electron-api-stub'
 import type { RepoRef } from '../core/workflow-engine'
@@ -271,6 +271,46 @@ describe('App unusable stored settings', () => {
 
     await waitFor(() => expect(stub.setRepos).toHaveBeenCalledWith([]))
     expect(tokenField()).toBeInTheDocument()
+  })
+
+  it('notices a store that became unusable while the window was open', async () => {
+    // The file is not this window's to own: the report sends the operator to `config.json`, and a
+    // hand-edit made there is invisible until the next repository-list write — which is the thing that
+    // destroys the value. Reading it only after a write cannot warn anyone in time.
+    //
+    // Fake timers here and no `userEvent`: the two deadlock (SKILL.md), so this drives the interval
+    // directly and asserts on what the operator sees.
+    vi.useFakeTimers()
+    try {
+      const stub = createElectronApiStub([ONE])
+      const { unmount } = render(
+        <StrictMode>
+          <App />
+        </StrictMode>,
+      )
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(screen.queryByText(/could not be read/)).toBeNull()
+
+      stub.storeProblems.mockResolvedValue([UNUSABLE_REPO_LIST])
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+
+      expect(screen.getByText(/is an object, not a JSON array/)).toBeInTheDocument()
+
+      // AGENTS.md requires a polling effect to clear its interval; a leaked one is otherwise invisible
+      // here, because `refreshStoreProblems` swallows the error an unbound bridge would throw.
+      const readsBeforeUnmount = stub.storeProblems.mock.calls.length
+      unmount()
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(60_000)
+      })
+      expect(stub.storeProblems.mock.calls.length).toBe(readsBeforeUnmount)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('says nothing when the store is healthy', async () => {

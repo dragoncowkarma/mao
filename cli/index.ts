@@ -196,9 +196,19 @@ repos
     // echoes the stored spelling, so `remove` claiming to have removed a name the store never held
     // would be the one place the two commands disagree about what a repository is called.
     const tracked = store.get('githubRepos').filter((r) => sameRepoRef(r, target))
+    const problemsBefore = store.problems()
     await updateRepos((previous) => previous.filter((r) => !sameRepoRef(r, target)))
     if (tracked.length === 0) log(`No tracked repo matches ${owner}/${repo}`)
     else for (const r of tracked) log(`Stopped tracking ${r.owner}/${r.repo}`)
+    // A removal against an unusable stored value matches nothing, so `No tracked repo matches …` was all
+    // it said — while the write it had just performed was the recovery the store's own report told the
+    // operator to run. Left there, the one command that always heals reads like a no-op.
+    const remaining = store.problems()
+    for (const before of problemsBefore) {
+      if (!remaining.some((problem) => problem.field === before.field)) {
+        log(`Replaced the unusable "${before.field}" value in ${before.source}.`)
+      }
+    }
   })
 
 repos

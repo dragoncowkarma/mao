@@ -2,7 +2,15 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { FileStore, MAO_STORE_DEFAULTS, createStoredReadGuard, describeUnusableRepoList } from './store.ts'
+import {
+  FileStore,
+  MAO_STORE_DEFAULTS,
+  UnreadableStoreError,
+  classifyStoreReadFailure,
+  createStoredReadGuard,
+  describeUnreadableStore,
+  describeUnusableRepoList,
+} from './store.ts'
 import { canonicalRepoList } from './repo-registry.ts'
 import type { RepoRef } from './workflow-engine.ts'
 
@@ -236,6 +244,164 @@ describe('createStoredReadGuard', () => {
   })
 })
 
+
+/**
+ * A real `config.json` holding exactly these bytes, with no `FileStore` opened on it yet.
+ *
+ * Separate from `storeHolding` because these cases are about files `JSON.stringify` cannot produce and a
+ * `FileStore` cannot be constructed over — the constructor is what throws, so it has to be called inside
+ * the assertion rather than by the helper.
+ */
+function rawConfigFile(contents: string): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mao-store-test-'))
+  tmpDirs.push(dir)
+  const filePath = path.join(dir, 'config.json')
+  fs.writeFileSync(filePath, contents)
+  return filePath
+}
+
+/** The path a fresh install starts from: a real directory with no `config.json` written in it yet. */
+function missingConfigFile(): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mao-store-test-'))
+  tmpDirs.push(dir)
+  return path.join(dir, 'config.json')
+}
+
+/** Captures the constructor's throw without `expect(...).toThrow`, which hands back no error to inspect. */
+function openFailure(filePath: string): unknown {
+  try {
+    new FileStore(filePath)
+  } catch (error) {
+    return error
+  }
+  return null
+}
+
+describe('FileStore on a config.json it cannot load', () => {
+  const token = 'ghp_realTokenThatMustSurvive'
+
+  it('refuses to construct on an unparseable file, and leaves it byte-for-byte intact', () => {
+    // The point of the whole change. `persist()` rewrites the entire blob on every `set()`, so booting on
+    // defaults meant the next write of any kind — a theme change, a queue 'change' event — replaced a
+    // hand-broken file's token, providers, repositories and queue with empty ones. Throwing from the
+    // constructor is the only moment that preserves the file: after it, there is no copy left to preserve.
+    const broken = `{ "githubToken": "${token}", }`
+    const filePath = rawConfigFile(broken)
+
+    expect(() => new FileStore(filePath)).toThrow(UnreadableStoreError)
+    expect(fs.readFileSync(filePath, 'utf-8')).toBe(broken)
+  })
+
+  it('names the file and the failure kind', () => {
+    // Requirement inherited from issue #60's report shape: the operator gets the path they have to edit and
+    // what is wrong with it, from the message alone.
+    const filePath = rawConfigFile('{ "githubToken": ')
+    const error = openFailure(filePath)
+
+    expect(error).toBeInstanceOf(UnreadableStoreError)
+    expect((error as UnreadableStoreError).failure).toBe('unparseable')
+    expect((error as UnreadableStoreError).source).toBe(filePath)
+    expect((error as UnreadableStoreError).message).toContain(filePath)
+    expect((error as UnreadableStoreError).message).toContain('not valid JSON')
+  })
+
+  it('reports neither the file contents nor the original parse error', () => {
+    // V8 embeds a prefix of the input in SyntaxError.message: JSON.parse('ghp_x') reports
+    // `Unexpected token 'g', "ghp_x" is not valid JSON`. A config.json clobbered down to a bare token is
+    // exactly that input, so rethrowing the original — or hanging it off `cause` — would print the
+    // credential through any handler that logs it, or through Node's uncaught-exception [cause] chain.
+    const filePath = rawConfigFile(token)
+    const error = openFailure(filePath) as UnreadableStoreError
+
+    expect(error).toBeInstanceOf(UnreadableStoreError)
+    expect(error.message).not.toContain(token)
+    expect(error.cause).toBeUndefined()
+  })
+
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    'refuses to construct on a file it is not allowed to read',
+    () => {
+      // EACCES is not ENOENT: the file exists and holds settings this process simply cannot see. Answering
+      // it with defaults is how a mode or ownership change — or a store written by another user — became a
+      // wiped token on the next write. Skipped on Windows (no mode bits) and as root (which ignores them).
+      const filePath = rawConfigFile(JSON.stringify({ githubToken: token }))
+      fs.chmodSync(filePath, 0o000)
+
+      const error = openFailure(filePath)
+
+      expect(error).toBeInstanceOf(UnreadableStoreError)
+      expect((error as UnreadableStoreError).failure).toBe('unreadable')
+      expect((error as UnreadableStoreError).message).toContain(filePath)
+
+      fs.chmodSync(filePath, 0o600)
+      expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).githubToken).toBe(token)
+    },
+  )
+
+  it('refuses a file that parses cleanly but is not a JSON object', () => {
+    // `null` and a top-level array spread to nothing; a top-level string spreads to numeric index keys.
+    // Each one reached `set()` as a full defaults object and destroyed the file exactly as an unparseable
+    // one did, so the same answer applies — a parse that succeeds is not the same as a load that did.
+    for (const contents of ['null', '[]', '"ghp_x"', '42']) {
+      const error = openFailure(rawConfigFile(contents))
+
+      expect(error, `contents: ${contents}`).toBeInstanceOf(UnreadableStoreError)
+      expect((error as UnreadableStoreError).failure, `contents: ${contents}`).toBe('not-an-object')
+    }
+  })
+
+  it('stays silent for a missing file, and writes nothing — the fresh-install path', () => {
+    // The one read failure that is not a failure. Every CLI command builds a FileStore, so treating ENOENT
+    // like the rest would make a clean install unusable; warning about it would put a line of noise in
+    // front of every first run. Constructing also must not create the file, so `mao config show` on a fresh
+    // machine stays a pure read.
+    const warn = captureWarnings()
+    const filePath = missingConfigFile()
+
+    const store = new FileStore(filePath)
+
+    expect(store.get('githubToken')).toBe('')
+    expect(store.get('githubRepos')).toEqual([])
+    expect(warn).not.toHaveBeenCalled()
+    expect(fs.existsSync(filePath)).toBe(false)
+  })
+})
+
+describe('classifyStoreReadFailure', () => {
+  it('reports nothing for ENOENT, because a missing file is a fresh install', () => {
+    expect(classifyStoreReadFailure(Object.assign(new Error('x'), { code: 'ENOENT' }))).toBeNull()
+  })
+
+  it('separates a parse failure from everything the filesystem refuses', () => {
+    // The bare `catch {}` this replaced could not tell these apart, which is why a permission problem and a
+    // truncated write both arrived as "fresh install".
+    expect(classifyStoreReadFailure(new SyntaxError('x'))).toBe('unparseable')
+    expect(classifyStoreReadFailure(Object.assign(new Error('x'), { code: 'EACCES' }))).toBe('unreadable')
+    expect(classifyStoreReadFailure(Object.assign(new Error('x'), { code: 'EISDIR' }))).toBe('unreadable')
+    expect(classifyStoreReadFailure('not even an error')).toBe('unreadable')
+  })
+})
+
+describe('describeUnreadableStore', () => {
+  it('names the file and says MAO stopped, for every failure kind', () => {
+    for (const failure of ['unreadable', 'unparseable', 'not-an-object'] as const) {
+      const message = describeUnreadableStore('/tmp/mao/config.json', failure)
+
+      expect(message, failure).toContain('/tmp/mao/config.json')
+      expect(message, failure).toContain('refusing to start')
+      expect(message, failure).toContain('Nothing has been written')
+    }
+  })
+
+  it('distinguishes the three kinds, because they have different remedies', () => {
+    // "fix your JSON" is useless advice for a file the process is not allowed to open, and "check the
+    // permissions" is useless for a trailing comma.
+    expect(describeUnreadableStore('/tmp/config.json', 'unparseable')).toContain('not valid JSON')
+    expect(describeUnreadableStore('/tmp/config.json', 'not-an-object')).toContain('not a JSON object')
+    expect(describeUnreadableStore('/tmp/config.json', 'unreadable')).toContain('permissions')
+  })
+})
+
 /**
  * The repository root, anchored to this file rather than to whatever directory vitest was started in —
  * a guard that fails with ENOENT because someone narrowed a run from a subdirectory is a guard people
@@ -297,5 +463,16 @@ describe("electron/store.ts, the other MaoStore backend", () => {
 
     expect(exported).toEqual(['store'])
     expect(source).toMatch(/export const store: MaoStore\b/)
+  })
+
+  it("never turns on electron-store's clearInvalidConfig recovery", () => {
+    // conf's default is `clearInvalidConfig: false`, and that default is what makes the GUI backend fail
+    // the same way FileStore now does: conf reads the file from its own constructor, so a SyntaxError or a
+    // non-ENOENT errno throws out of `new Store(...)` and nothing is written. Turning the option on is the
+    // obvious-looking fix for "the GUI won't start" and is precisely the bug — conf would read `{}`, merge
+    // the defaults, find them unequal and write them back *from the constructor*, destroying the stored
+    // token before any `set()` ran. Asserted on comment-stripped source, so the option can still be named
+    // in a comment explaining why it is absent.
+    expect(source).not.toMatch(/clearInvalidConfig/)
   })
 })

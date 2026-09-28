@@ -1,6 +1,14 @@
 import Store from 'electron-store'
 import { createStoredReadGuard, MAO_STORE_DEFAULTS, type MaoStore, type MaoStoreSchema } from '../core/store.ts'
 
+/**
+ * Constructed with no `clearInvalidConfig`, so conf's `false` default stands — and that is deliberate, not
+ * an omission. conf reads the config file from inside this constructor, so an unparseable or unreadable
+ * `config.json` throws here and nothing is written, which is the behaviour `FileStore` was changed to match
+ * (see `describeUnreadableStore` in core/store.ts for why booting on defaults instead destroys the stored
+ * token). Enabling the option would read `{}`, merge the defaults, and write them straight back from this
+ * line — losing the file before any `set()` ran. `core/store.test.ts` pins it off.
+ */
 const backing = new Store<MaoStoreSchema>({ defaults: MAO_STORE_DEFAULTS })
 
 /**

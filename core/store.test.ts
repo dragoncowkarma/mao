@@ -7,7 +7,7 @@ import {
   MAO_STORE_DEFAULTS,
   createStoredReadGuard,
   describeStoredProblems,
-  describeUnusableRepoList,
+  describeRepoListProblem,
   createGuardedStore,
   type MaoStoreSchema,
   type StoredValueBackend,
@@ -185,14 +185,49 @@ describe('FileStore githubRepos read guard', () => {
     expect(MAO_STORE_DEFAULTS.githubRepos).toEqual([])
   })
 
-  it('leaves element-level validity to repo-registry', () => {
-    // The boundary PR #57 drew: `isRepoRef`/`canonicalRepoList` own which *entries* are usable, and they
-    // need to see the junk to drop it. This guard owns the *container* only — the gap issue #60 found.
-    captureWarnings()
+  it('reports entries it cannot use, and still hands the usable ones through', () => {
+    // The two halves of the boundary this closes, asserted together because separating them is the bug.
+    // PR #57 gave `isRepoRef`/`canonicalRepoList` ownership of which *entries* are usable, and they need
+    // to see the junk in order to drop it — so this guard must not substitute `[]` here, or a list write
+    // would delete acme/widgets along with the null. But the drop was also completely silent, which is
+    // the dead end this fixes: nothing on stdout, nothing on stderr, nothing in the sidebar.
+    const warn = captureWarnings()
     const { store } = storeHolding({ githubRepos: [null, widgets] })
 
     expect(store.get('githubRepos')).toEqual([null, widgets])
     expect(canonicalRepoList(store.get('githubRepos'), store.get('githubRepos'))).toEqual([widgets])
+    expect(warn).toHaveBeenCalledTimes(1)
+    expect(warn.mock.calls[0]![0] as string).toContain('1 of its 2 entries does not name a repository')
+  })
+
+  it('substitutes nothing for a list whose entries are all unusable either', () => {
+    // `[null]` has nothing worth keeping, so coercing it to `[]` would be harmless — and that is exactly
+    // why it must not be special-cased into the substitution branch. The rule is "the value's own type
+    // decides whether it is replaced", and a rule that also inspected entries is one edit away from
+    // replacing `[null, widgets]` too. `canonicalRepoList` already yields `[]` here.
+    captureWarnings()
+    const { store } = storeHolding({ githubRepos: [null, 'acme/widgets'] })
+
+    expect(store.get('githubRepos')).toEqual([null, 'acme/widgets'])
+    expect(canonicalRepoList(store.get('githubRepos'), store.get('githubRepos'))).toEqual([])
+  })
+
+  it('counts the dropped entries and names only their types', () => {
+    // The count is the one fact an operator cannot get anywhere else: the sidebar and `github:getRepos`
+    // show the survivors, so "three of your repositories are in the file and about to be overwritten" is
+    // invisible without it. The types stay `typeof`-level and deduplicated — `config.json` holds
+    // githubToken in the same blob, so no stored value may reach a message that lands in piped output,
+    // agent logs, an IPC payload, or a screen-shared window.
+    const halfWritten = { owner: 'sekrit-owner' }
+    const problem = describeRepoListProblem([null, null, halfWritten, widgets], '/tmp/config.json')
+
+    expect(problem?.defect).toBe('some-entries')
+    expect(problem?.message).toContain('3 of its 4 entries do not name a repository (null, an object)')
+    expect(problem?.message).toContain('/tmp/config.json')
+    expect(problem?.message).not.toContain('sekrit-owner')
+    // The partial report must not carry the whole-list recovery: the sidebar has rows here, so Remove is
+    // reachable and Reset is withheld — "Reset stored list" as advice would be advice to lose data.
+    expect(problem?.message).not.toContain('Reset stored list')
   })
 
   it('returns a value the expression auto-trigger runs per tick can consume', () => {
@@ -236,6 +271,59 @@ describe('MaoStore.problems', () => {
     // A query, not a read: it must not consume the guard's one report, or polling it would decide
     // whether the CLI's own stderr line ever appeared.
     expect(warn).not.toHaveBeenCalled()
+  })
+
+  it('reports dropped entries, and says a reset would still cost the operator something', () => {
+    // The gap PR #66 left: `problems()` only ever described the *container*, so `[null]` and
+    // `[null, widgets]` both reported clean. The sidebar read "No projects yet" for the first and showed
+    // acme/widgets for the second, and in neither case was anything said about the entry that was gone.
+    const warn = captureWarnings()
+    const { store, filePath } = storeHolding({ githubRepos: [null, widgets] })
+
+    const problems = store.problems()
+
+    expect(problems).toHaveLength(1)
+    expect(problems[0]!.field).toBe('githubRepos')
+    expect(problems[0]!.source).toBe(filePath)
+    // The whole point of the second card: acme/widgets is still tracked, so writing the schema default
+    // over this value would delete data the operator can see working. A shell must not offer that.
+    expect(problems[0]!.nothingUsable).toBe(false)
+    expect(problems[0]!.message).toContain('1 of its 2 entries does not name a repository')
+    // Still a query, not a read — polling it must not consume the guard's one stderr line.
+    expect(warn).not.toHaveBeenCalled()
+  })
+
+  it('says a reset is safe when a list holds nothing usable at all', () => {
+    // `[null]` is the case the operator has no other way out of: `github:getRepos` filters it to `[]`, so
+    // there is no row, so no project is selected, so the Settings tab's Remove never renders — and with
+    // no token (or revoked access) Add is refused by the registration preflight. The destructive reset is
+    // the only recovery left, and it costs nothing here, so it has to be offered.
+    captureWarnings()
+    const { store } = storeHolding({ githubRepos: [null, { owner: 'acme' }] })
+
+    expect(store.problems()).toHaveLength(1)
+    expect(store.problems()[0]!.nothingUsable).toBe(true)
+  })
+
+  it('calls a non-list value nothing-usable too, so the two dead ends recover the same way', () => {
+    captureWarnings()
+    const { store } = storeHolding({ githubRepos: { 'acme/widgets': widgets } })
+
+    expect(store.problems()[0]!.nothingUsable).toBe(true)
+  })
+
+  it('stops reporting once a list write has dropped the unusable entries', () => {
+    // The recovery for the partial case, and the reason its message says the next write destroys them:
+    // any repository-list write runs the value through `canonicalRepoList()`, which keeps the good rows.
+    captureWarnings()
+    const { store, filePath } = storeHolding({ githubRepos: [null, widgets] })
+
+    expect(store.problems()).toHaveLength(1)
+    // A removal of something else entirely — the least destructive write there is — still heals it.
+    store.set('githubRepos', canonicalRepoList(store.get('githubRepos'), store.get('githubRepos')))
+
+    expect(store.problems()).toEqual([])
+    expect(new FileStore(filePath).get('githubRepos')).toEqual([widgets])
   })
 
   it('stops reporting once a list write has replaced the value, and repairs nothing itself', () => {
@@ -302,6 +390,21 @@ describe('createGuardedStore', () => {
     expect(store.get('githubRepos')).toEqual([])
   })
 
+  it('carries the entry-level verdict through the composition both backends share', () => {
+    // `problems()` is the GUI's only channel, and this composition is the Electron backend — which no
+    // `core` test can import (architecture rule 1) and which electron-store cannot run outside a live
+    // app. So the one thing the packaged app depends on is asserted here: a partly usable list reports,
+    // is *not* replaced on read, and says a reset would cost something.
+    const { backend } = fakeBackend({ githubRepos: [null, widgets] })
+    const reports: string[] = []
+    const store = createGuardedStore(backend, '/data/config.json', (message) => reports.push(message))
+
+    expect(store.get('githubRepos')).toEqual([null, widgets])
+    expect(store.problems()).toHaveLength(1)
+    expect(store.problems()[0]!.nothingUsable).toBe(false)
+    expect(reports).toHaveLength(1)
+  })
+
   it('writes through, and a write is what clears the report', () => {
     const { backend, data } = fakeBackend({ githubRepos: 'acme/widgets' })
     const store = createGuardedStore(backend, '/data/config.json', () => {})
@@ -329,19 +432,65 @@ describe('describeStoredProblems', () => {
   })
 })
 
-describe('describeUnusableRepoList', () => {
-  it('reports nothing for a list', () => {
-    expect(describeUnusableRepoList([], '/tmp/config.json')).toBeNull()
-    expect(describeUnusableRepoList([widgets], '/tmp/config.json')).toBeNull()
+describe('describeRepoListProblem', () => {
+  it('reports nothing for a list of usable entries', () => {
+    expect(describeRepoListProblem([], '/tmp/config.json')).toBeNull()
+    expect(describeRepoListProblem([widgets], '/tmp/config.json')).toBeNull()
+    expect(describeRepoListProblem([widgets, gadgets], '/tmp/config.json')).toBeNull()
   })
 
   it('distinguishes null from an object', () => {
     // `typeof` prints `object` for both, and they are the two likeliest hand-edits — an operator told
     // "is an object" about a `null` would go looking for the wrong thing.
-    expect(describeUnusableRepoList(null, '/tmp/config.json')).toContain('is null')
-    expect(describeUnusableRepoList({}, '/tmp/config.json')).toContain('is an object')
-    expect(describeUnusableRepoList('x', '/tmp/config.json')).toContain('is a string')
-    expect(describeUnusableRepoList(undefined, '/tmp/config.json')).toContain('is absent')
+    expect(describeRepoListProblem(null, '/tmp/config.json')?.message).toContain('is null')
+    expect(describeRepoListProblem({}, '/tmp/config.json')?.message).toContain('is an object')
+    expect(describeRepoListProblem('x', '/tmp/config.json')?.message).toContain('is a string')
+    expect(describeRepoListProblem(undefined, '/tmp/config.json')?.message).toContain('is absent')
+  })
+
+  it('separates a value that cannot be read from entries that were dropped', () => {
+    // The distinction the guard's substitution hangs off: only `'value'` is replaced with the schema
+    // default on read. Collapsing the three states into "unusable / fine" is what would either wipe a
+    // working entry on read or put a destructive reset under a list that still has rows in it.
+    expect(describeRepoListProblem(7, '/tmp/c.json')?.defect).toBe('value')
+    expect(describeRepoListProblem([null], '/tmp/c.json')?.defect).toBe('every-entry')
+    expect(describeRepoListProblem([null, widgets], '/tmp/c.json')?.defect).toBe('some-entries')
+  })
+
+  it('rejects every entry shape a hand-edit leaves behind, with the same rule that drops them', () => {
+    // Deliberately the shapes `isRepoRef` rejects rather than a list of guesses: the report has to count
+    // what `canonicalRepoList()` and `github:getRepos` actually drop, or it tells an operator two entries
+    // vanished while three did. `{repo}` and `{owner:''}` are the half-written cases; the nested array is
+    // what an object spread would have turned into `{"0":"acme","1":"widgets"}` junk.
+    const rejected: unknown[] = [null, 'acme/widgets', 42, true, ['acme', 'widgets']]
+    rejected.push({}, { owner: 'acme' }, { repo: 'widgets' }, { owner: '', repo: 'x' })
+
+    const problem = describeRepoListProblem([...rejected, widgets], '/tmp/config.json')
+
+    expect(problem?.defect).toBe('some-entries')
+    expect(problem?.message).toContain(`${rejected.length} of its ${rejected.length + 1} entries do not name`)
+  })
+
+  it('stays grammatical at every count', () => {
+    // A report an operator squints at is a report they distrust, and the counts that read worst are the
+    // ones a half-finished hand-edit produces: exactly one entry, or one bad entry among several.
+    const counted = (list: unknown[]) => describeRepoListProblem(list, '/tmp/c.json')?.message ?? ''
+
+    expect(counted([null])).toContain('its only entry does not name')
+    expect(counted([null, null])).toContain('none of its 2 entries names')
+    expect(counted([null, widgets])).toContain('1 of its 2 entries does not')
+    expect(counted([null, null, widgets])).toContain('2 of its 3 entries do not')
+  })
+
+  it('offers the whole-list recovery only when nothing usable is left', () => {
+    // `mao repos remove` / Reset stored list heal by *replacing the list*, which is the right advice only
+    // when there is nothing in it to lose. Printed under a partly usable list it would read as an
+    // instruction to delete the repositories that still work.
+    expect(describeRepoListProblem([null], '/tmp/c.json')?.message).toContain('Reset stored list')
+    expect(describeRepoListProblem([null], '/tmp/c.json')?.message).toContain('mao repos remove')
+    expect(describeRepoListProblem([null, widgets], '/tmp/c.json')?.message).not.toContain('mao repos remove')
+    // What it says instead: the entries are still on disk and the next write is what destroys them.
+    expect(describeRepoListProblem([null, widgets], '/tmp/c.json')?.message).toContain('repair them there')
   })
 })
 

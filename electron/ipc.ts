@@ -31,9 +31,12 @@ export function registerIpcHandlers() {
 
   // The GUI's only way to learn that a stored value was unusable. The guard in core/store.ts reports
   // through `console.warn`, which in a packaged app goes to a main-process console the operator never
-  // sees — and `github:getRepos` answers `[]` for a corrupt list exactly as it does for an empty one,
-  // so the sidebar cannot tell the two apart. Pulled rather than pushed, per AGENTS.md rule 6: the
-  // renderer re-reads it at mount and after each list write. A pure read of what the store holds now.
+  // sees — and the list itself can never carry the fact: `github:getRepos` answers `[]` for a corrupt
+  // list exactly as it does for an empty one, and answers the survivors for a list whose entries were
+  // dropped exactly as it does for a list with nothing wrong. Pulled rather than pushed, per AGENTS.md
+  // rule 6: the renderer re-reads it at mount, on a clock, and after each list write. A pure read of
+  // what the store holds now — and each report says whether replacing the value would cost anything
+  // (`nothingUsable`), which is what gates the sidebar's destructive Reset.
   ipcMain.handle('app:storeProblems', () => store.problems())
 
   ipcMain.handle('app:relaunch', (_event, force = false) => {
@@ -85,6 +88,10 @@ export function registerIpcHandlers() {
   // throws during render and blanks the whole window, taking with it the Remove button that would have
   // healed the store. Dropping unusable entries here costs nothing (they can be neither polled nor
   // named) and the next list write persists the same list core would have canonicalised anyway.
+  //
+  // Silent by design *here*: this channel's job is to answer with rows that render. That the drop
+  // happened travels over `app:storeProblems` instead, counted by the same `isRepoRef` this filter
+  // uses (core/store.ts imports it, so the two cannot disagree about how many rows went missing).
   ipcMain.handle('github:getRepos', () => store.get('githubRepos').filter(isRepoRef))
 
   ipcMain.handle('github:autoTriggerStatus', (_event, owner: string, repo: string) =>

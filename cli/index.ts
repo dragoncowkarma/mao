@@ -203,11 +203,15 @@ repos
     // A removal against an unusable stored value matches nothing, so `No tracked repo matches …` was all
     // it said — while the write it had just performed was the recovery the store's own report told the
     // operator to run. Left there, the one command that always heals reads like a no-op.
+    //
+    // Which of the two it healed is core's verdict, not this shell's inference: a partly usable list had
+    // its junk *entries* dropped while every tracked repository stayed, and calling that "replaced the
+    // unusable value" would describe a destructive write that did not happen.
     const remaining = store.problems()
     for (const before of problemsBefore) {
-      if (!remaining.some((problem) => problem.field === before.field)) {
-        log(`Replaced the unusable "${before.field}" value in ${before.source}.`)
-      }
+      if (remaining.some((problem) => problem.field === before.field)) continue
+      if (before.nothingUsable) log(`Replaced the unusable "${before.field}" value in ${before.source}.`)
+      else log(`Dropped the unusable "${before.field}" entries from ${before.source}.`)
     }
   })
 

@@ -36,7 +36,7 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
 | `core/swarm-runner.ts` | Shell-free launcher and repository/asset validation for the autonomous Swarm Orchestrator |
 | `core/auto-trigger.ts` | Per-repo polling scheduler; auto-enqueues new open issues |
 | `core/assignment.ts` | Issue/PR body directive parser — `parseAssignmentTags()` for swarm_orchestrator-style `[Worker: id]`/`[Reviewer: id]`/`[Maintainer: id]` role tags, and `parseProviderOverride()` which folds those plus task-level `[Model: id]`/`[Effort: level]` tags into a `ProviderOverride` |
-| `core/store.ts` | `MaoStoreSchema`, `MAO_STORE_DEFAULTS`, the `MaoStore` interface, `FileStore` (JSON impl for the CLI), `createStoredReadGuard()` — the read-path guard every backend applies so a field's declared type survives contact with unvalidated JSON — and `describeStoredProblems()` behind `MaoStore.problems()`, which answers *which* values it had to replace |
+| `core/store.ts` | `MaoStoreSchema`, `MAO_STORE_DEFAULTS`, the `MaoStore` interface, `FileStore` (JSON impl for the CLI), `createStoredReadGuard()` — the read-path guard every backend applies so a field's declared type survives contact with unvalidated JSON, for the container **and** its entries — and `describeStoredProblems()` behind `MaoStore.problems()`, which answers which values it had to replace and whether anything usable is left (`StoredValueProblem.nothingUsable`) |
 | `core/app.ts` | `createMaoApp()` — the **single composition root** both frontends call |
 | `core/paths.ts` | Platform-appropriate data dir for the CLI (mirrors Electron's `userData`) |
 | `core/ai/` | `AiProvider` interface + adapters: `api-provider.ts` (Anthropic / OpenAI-compatible HTTP) and `cli-provider.ts` (spawns `claude`, `codex`, …) |
@@ -102,6 +102,13 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
    in `src/` instead is worse, and is what let the board and the registry disagree
    about whether two spellings were the same repository. Imports stay extensionless. There are no IPC push events — the
    UI polls and re-fetches after each mutation; keep that pull model.
+   The "all `import type`" half of this rule is load-bearing in a second direction that is easy to miss:
+   `core/store.ts` **value**-imports `isRepoRef` from `core/repo-registry.ts`, because the report for a
+   dropped entry must count with the same predicate that actually drops it (`canonicalRepoList()`,
+   `github:getRepos`) or it tells the operator two entries vanished while three did. That edge is safe
+   only because `repo-registry.ts`'s own `core/` imports are erased, so nothing there imports
+   `core/store.ts` at runtime; drop a `type` keyword in `repo-registry.ts` and the pair becomes a genuine
+   module-initialisation cycle. `core/repo-registry.test.ts` asserts this rather than leaving it to prose.
 7. **Electron security posture.** `webPreferences` set only `preload` so Electron 33
    defaults apply (contextIsolation on, nodeIntegration off, sandbox on) — never
    weaken them. `setWindowOpenHandler` must keep returning `{ action: 'deny' }` and
@@ -349,11 +356,34 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   actual type and the config file path. Coercing rather than throwing is what makes recovery possible —
   `updateRepos` reads before it writes, so a throwing read takes `repos add`/`repos remove` down with it.
   The read is deliberately **not** a repair: nothing in the guard writes, so a read-only command leaves
-  the file as it found it and the operator can still salvage what the unusable value named. Element-level
-  validity stays `isRepoRef`/`canonicalRepoList`'s job — the guard owns the container only. Do not make
+  the file as it found it and the operator can still salvage what the unusable value named. Do not make
   the guard silent, and do not extend the coercion to a field where an empty value would destroy
   recoverable state without saying so (`aiProviders` would be the same one-liner; `workflowTasks` first
   needs an answer for how an unreadable queue interacts with `resume` and the persistence-broken marker).
+  **The guard reports more than it corrects, and that asymmetry is the invariant** — it does *not* own the
+  container only. `isRepoRef`/`canonicalRepoList` still own which *entries* are usable and still need to
+  see the junk in order to drop it, so a list whose **entries** are wrong is reported and handed back
+  **untouched**; only a value whose own *type* is wrong is replaced with the schema default. Substituting
+  `[]` for `[null, {owner:'acme',repo:'one'}]` would convert PR #57's recovery — a list write drops the
+  junk while keeping the good rows — into "delete every tracked repository". But the drop was also
+  completely silent, which is the same dead end for an operator as the unguarded crash was: a
+  `config.json` holding `[null]`, a half-written `[{"owner":"acme"}]`, or a bare `["acme/widgets"]` left
+  the sidebar reading *"No projects yet"* and `mao repos list` printing `[]` on a clean stderr, and with
+  no token (or revoked access) even Add was refused by the registration preflight, so there was no
+  in-app recovery at all. `STORED_SHAPE_RULES` therefore answers a three-state `StoredValueDefect`
+  (`'value'` | `'every-entry'` | `'some-entries'`): the first decides whether the guard substitutes, and
+  `describeStoredProblems()` flattens the last into `StoredValueProblem.nothingUsable` for the shells.
+  **A report and a destructive recovery are separate things, and the reset is gated on `nothingUsable`,
+  never on the report's existence.** `[null, {owner:'acme',repo:'one'}]` is worth reporting — an entry
+  vanished and the next list write erases it from the file for good — while acme/one is on screen and
+  working, so writing an empty list to clear the notice would delete the operator's own data. The
+  sidebar shows every report and withholds **Reset stored list** unless nothing usable would be lost;
+  `resetRepoList` re-checks the same bit before it writes, because a hand-edit can make a list partly
+  usable after the card rendered. Every dropped-entry message stays **type-only and counted** — how many
+  entries of how many, and their `typeof`-level types, never their contents: `config.json` holds
+  `githubToken` in the same JSON blob, and these messages travel into piped output, agent logs, an IPC
+  payload and a possibly screen-shared window. The count is the one fact the operator cannot get
+  elsewhere, since the sidebar and `github:getRepos` show only the survivors.
   The discard is not silent in either shell, and that is a contract, not a log line: `get()` answers the
   same `[]` for an unusable list as for an empty one, so the fact cannot ride on the value. `MaoStore`
   therefore carries `problems()` — evaluated on demand against what the backend holds *now*, never
@@ -368,8 +398,9 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   that read shows something already healed the store (a separate IPC round trip, so it narrows the
   cross-process race rather than closing it — `github:setRepos` writes unconditionally) (the report sends the operator to `config.json`, and a `mao repos
   add` in a terminal heals it — writing `[]` blind would then delete the healthy list they just built),
-  and it is offered only for a `githubRepos` problem, never for another field's report, because the
-  write it performs deletes `githubRepos` and nothing else. The renderer **polls** it rather than only
+  and it is offered only for a `githubRepos` problem whose `nothingUsable` is true — never for another
+  field's report, because the write it performs deletes `githubRepos` and nothing else, and never for a
+  list that still has usable entries in it. The renderer **polls** it rather than only
   reading it at mount: the report sends the operator to `config.json`, and an edit made there while
   the window is open would otherwise stay invisible until the next list write — which is the thing
   that destroys the value, so reading it only afterwards cannot warn anyone in time. It narrows that

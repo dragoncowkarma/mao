@@ -40,8 +40,9 @@ export default function App() {
   /**
    * Stored values the main process could not use. Polled rather than pushed (AGENTS.md rule 6), and
    * kept separate from `repos` on purpose: a `githubRepos` the schema cannot use arrives here as `[]`,
-   * exactly like an empty list, so the list itself can never carry the fact that something was
-   * discarded — and the guard's own report goes to a console a packaged-app operator never sees.
+   * exactly like an empty list, and one whose entries were dropped arrives as the survivors, exactly
+   * like a list with nothing wrong with it — so the list itself can never carry the fact that something
+   * was discarded, and the guard's own report goes to a console a packaged-app operator never sees.
    */
   const [storeProblems, setStoreProblems] = useState<StoredValueProblem[]>([])
   /**
@@ -361,7 +362,12 @@ export default function App() {
     // deletes the healthy list they just built. Fail closed: a read that throws aborts the reset.
     const current = await electronApi().app.storeProblems()
     setStoreProblems(current)
-    if (!current.some((problem) => problem.field === 'githubRepos')) {
+    // `nothingUsable`, not merely "a githubRepos report exists". A hand-edit between this card
+    // rendering and the click can leave the list *partly* usable — repair one of two junk entries and
+    // the report stays, but an empty list would now delete the repository that edit just rescued. The
+    // button is not offered in that state either (see Sidebar's `canResetRepoList`); this is the
+    // re-read that makes it true at the moment of the write rather than at the moment of the render.
+    if (!current.some((problem) => problem.field === 'githubRepos' && problem.nothingUsable)) {
       setRepos(await electronApi().github.getRepos().catch(() => repos))
       return
     }

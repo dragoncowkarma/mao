@@ -1,5 +1,16 @@
 import fs from 'node:fs'
 import path from 'node:path'
+// The one definition of "this element can name a repository", imported as a *value* rather than
+// re-stated here. It has to be the same predicate that `canonicalRepoList()` drops entries with and
+// that `github:getRepos` filters the sidebar's rows with, or the report below would count differently
+// from what actually happens — telling an operator two entries were dropped while three vanished.
+//
+// The direction is safe, and pinned rather than argued: `core/repo-registry.ts`'s own `core/` imports
+// are all `import type` (architecture rule 6 requires that — it is what keeps the module importable
+// from the renderer), so they are erased and `repo-registry` imports nothing from here at runtime.
+// `core/repo-registry.test.ts` asserts that, so the edge cannot quietly become a cycle. A third module
+// holding just `isRepoRef` would buy nothing over this: one definition either way, one more hop.
+import { isRepoRef } from './repo-registry.ts'
 import type { AiProviderConfig } from './ai/types.ts'
 import type { QueuedTask, RepoRef } from './workflow-engine.ts'
 
@@ -36,6 +47,10 @@ export const MAO_STORE_DEFAULTS: MaoStoreSchema = {
  * How a value reads in an operator-facing message, so a report says what is actually in the file
  * rather than only what was expected. `typeof` alone prints `object` for both `null` and `{…}`, which
  * are the two likeliest hand-edits, so those are separated out.
+ *
+ * A *type*, never a value, and that is a secrets rule rather than a stylistic one: `config.json` holds
+ * `githubToken` in the same JSON blob, and these messages travel into piped CLI output, agent logs, an
+ * IPC payload, and a window an operator may be screen-sharing.
  */
 function describeStoredType(value: unknown): string {
   if (value === null) return 'null'
@@ -46,13 +61,35 @@ function describeStoredType(value: unknown): string {
 }
 
 /**
- * The actionable report for a stored `githubRepos` that is not a list — or `null` when it is one and
- * there is nothing to report.
+ * What the schema could not use about a stored value. Three states rather than a boolean, because two
+ * consumers read this and they need different cuts of it.
  *
- * Names the field, what the file actually holds, and the file itself, because none of those were
- * recoverable from what the operator used to get (`store.get(...).filter is not a function`). It also
- * states the recovery explicitly: the unusable value stays on disk, so the next list write is what
- * replaces it, and anything the operator wants to salvage has to be copied out first.
+ * - `'value'` — the value's own type is wrong, so none of it is usable *and* it is not safe to hand on:
+ *   a non-array `githubRepos` throws on `.filter` at every read site (issue #60). `createStoredReadGuard`
+ *   substitutes the schema default for this case, and only this case.
+ * - `'every-entry'` — the right type, but no element is usable. Handed to callers **unchanged**, because
+ *   the layers below already drop elements (`canonicalRepoList()`, `github:getRepos`) and there is
+ *   nothing here for them to keep. For a *shell* this is the same verdict as `'value'`: nothing works, so
+ *   replacing the whole value discards nothing.
+ * - `'some-entries'` — the right type, and some elements work. Handed through, and a destructive reset
+ *   must **not** be offered: it would delete the repositories the operator can see working.
+ *
+ * The middle state is why this is not a boolean. "Is the value usable as-is?" and "would replacing it
+ * lose anything?" are different questions with different answers for `[null]`, and collapsing them is
+ * what would either wipe a working entry on read or offer a reset that deletes one.
+ */
+export type StoredValueDefect = 'value' | 'every-entry' | 'some-entries'
+
+/** What a `STORED_SHAPE_RULES` entry answers: how much of the stored value is unusable, and the report. */
+export interface StoredShapeVerdict {
+  defect: StoredValueDefect
+  /** The operator-facing report: the field, the value's or entries' actual type, the file, the way back. */
+  message: string
+}
+
+/**
+ * The recovery out of a `githubRepos` that leaves nothing tracked — shared verbatim by the two states
+ * that reach it: a value that is not a list at all, and a list no entry of which names a repository.
  *
  * The recovery it names first registers nothing, and that ordering is load-bearing. Any list write heals
  * the file, but only a write that registers nothing new is exempt from the write-permission preflight
@@ -62,24 +99,100 @@ function describeStoredType(value: unknown): string {
  * remove` heals regardless. Recommending the blockable path first would send an operator whose token is
  * the reason they were editing `config.json` straight back into the wall.
  *
- * It names the GUI's **Reset stored list**, not its Remove, for a reason that is easy to get wrong: an
- * unusable list leaves the sidebar with no row, so no project is selected, so the Settings tab and the
- * Remove button inside it never render. Naming an action the operator cannot reach is worse than naming
- * none. Reset is the sidebar control this report itself is shown next to, and it writes an empty list.
+ * It names the GUI's **Reset stored list**, not its Remove, for a reason that is easy to get wrong: a
+ * list with nothing usable in it leaves the sidebar with no row, so no project is selected, so the
+ * Settings tab and the Remove button inside it never render. Naming an action the operator cannot reach
+ * is worse than naming none. Reset is the sidebar control this report itself is shown next to, and it
+ * writes an empty list.
+ *
+ * Deliberately not reused for `'some-entries'`: there the sidebar has rows, Remove *is* reachable, and
+ * Reset is withheld — so every sentence here would be wrong or dangerous advice.
  */
-export function describeUnusableRepoList(value: unknown, source: string): string | null {
-  if (Array.isArray(value)) return null
+function describeRepoListRecovery(source: string): string {
   return (
-    `[store] "githubRepos" in ${source} is ${describeStoredType(value)}, not a JSON array of ` +
-    '{ owner, repo } entries — ignoring it, so no repositories are tracked until it is replaced. The ' +
-    'unusable value is still in the file; any repository-list write overwrites it. `mao repos remove ' +
-    "<owner> <repo>`, or the sidebar's Reset stored list, always works — neither registers anything, so " +
-    'neither is checked for write access. `mao repos add` and the sidebar\'s Add are, so they need a ' +
-    `working GitHub token. Copy any repositories you still need out of ${source} first.`
+    'The unusable value is still in the file; any repository-list write overwrites it. `mao repos ' +
+    "remove <owner> <repo>`, or the sidebar's Reset stored list, always works — neither registers " +
+    "anything, so neither is checked for write access. `mao repos add` and the sidebar's Add are, so " +
+    `they need a working GitHub token. Copy any repositories you still need out of ${source} first.`
   )
 }
 
-type StoredShapeRule<K extends keyof MaoStoreSchema> = (raw: MaoStoreSchema[K], source: string) => string | null
+/**
+ * `<n> of its <m> entries do not name a repository`, phrased so the sentence stays grammatical at every
+ * count — including the one-entry list, where "none of its 1 entry" reads like a typo.
+ *
+ * A count, not the entries. The count is what tells an operator whether the file lost the one row they
+ * were mid-way through hand-writing or all twelve of them, and it is derivable from nothing they can
+ * otherwise see: the sidebar and `github:getRepos` show only the survivors.
+ */
+function describeDroppedEntryCount(dropped: number, total: number): string {
+  if (dropped !== total) {
+    return `${dropped} of its ${total} entries ${dropped === 1 ? 'does' : 'do'} not name a repository`
+  }
+  if (total === 1) return 'its only entry does not name a repository'
+  return `none of its ${total} entries names a repository`
+}
+
+/**
+ * The actionable report for a stored `githubRepos` the schema cannot fully use — or `null` when every
+ * part of it is usable.
+ *
+ * Covers the container *and* its entries, which is the gap PR #66 left. PR #57 made individual entries
+ * safe by having `canonicalRepoList()` drop anything `isRepoRef` rejects, and `github:getRepos` filter
+ * the same way — but the drop was silent, so a `config.json` holding `[null]`, a half-written
+ * `[{"owner":"acme"}]`, or a bare `["acme/widgets"]` reached a dead end: the sidebar read "No projects
+ * yet", identical to a genuinely empty list, and `mao repos list` printed `[]` with nothing on stderr.
+ * With no token configured (or access revoked) even Add is refused by the registration preflight, so
+ * there was no in-app recovery at all.
+ *
+ * All three messages name the field, the type of what the file actually holds, and the file itself,
+ * because none of those were recoverable from what the operator used to get
+ * (`store.get(...).filter is not a function`, or in the entry case: silence). None of them names a stored
+ * *value* — see `describeStoredType`.
+ */
+export function describeRepoListProblem(value: unknown, source: string): StoredShapeVerdict | null {
+  if (!Array.isArray(value)) {
+    return {
+      defect: 'value',
+      message:
+        `[store] "githubRepos" in ${source} is ${describeStoredType(value)}, not a JSON array of ` +
+        '{ owner, repo } entries — ignoring it, so no repositories are tracked until it is replaced. ' +
+        describeRepoListRecovery(source),
+    }
+  }
+
+  const dropped = value.filter((entry) => !isRepoRef(entry))
+  if (dropped.length === 0) return null
+  // Deduplicated and type-only: five `null`s are one fact, and `an object` is as much as may be said
+  // about a half-written `{"owner":"acme"}` without printing what is in the file beside the token.
+  const types = [...new Set(dropped.map(describeStoredType))].join(', ')
+  const counted = `${describeDroppedEntryCount(dropped.length, value.length)} (${types})`
+
+  if (dropped.length === value.length) {
+    return {
+      defect: 'every-entry',
+      message:
+        `[store] "githubRepos" in ${source} is a JSON array, but ${counted} — each entry needs a ` +
+        'non-empty "owner" and "repo" string, so no repositories are tracked. ' +
+        describeRepoListRecovery(source),
+    }
+  }
+
+  return {
+    defect: 'some-entries',
+    message:
+      `[store] "githubRepos" in ${source} is a JSON array, but ${counted} — each entry needs a ` +
+      'non-empty "owner" and "repo" string. Those entries are ignored, so they are not tracked; every ' +
+      `other entry is tracked as usual. They are still in ${source}, and the next repository-list ` +
+      'write — adding or removing any repository is one — drops them for good, so repair them there ' +
+      'first if they were meant to name repositories.',
+  }
+}
+
+type StoredShapeRule<K extends keyof MaoStoreSchema> = (
+  raw: MaoStoreSchema[K],
+  source: string,
+) => StoredShapeVerdict | null
 
 /**
  * The single table of fields whose stored *shape* is validated, and the report for each — so the guard
@@ -92,25 +205,40 @@ type StoredShapeRule<K extends keyof MaoStoreSchema> = (raw: MaoStoreSchema[K], 
  * main process, in the `finally` of every repository-list write.
  */
 const STORED_SHAPE_RULES: { [K in keyof MaoStoreSchema]?: StoredShapeRule<K> } = {
-  githubRepos: (raw, source) => describeUnusableRepoList(raw, source),
+  githubRepos: (raw, source) => describeRepoListProblem(raw, source),
 }
 
-function unusableStoredValue<K extends keyof MaoStoreSchema>(
+function storedShapeVerdict<K extends keyof MaoStoreSchema>(
   key: K,
   raw: MaoStoreSchema[K],
   source: string,
-): string | null {
+): StoredShapeVerdict | null {
   const rule = STORED_SHAPE_RULES[key] as StoredShapeRule<K> | undefined
   return rule ? rule(raw, source) : null
 }
 
-/** A stored value the schema cannot use, in the form a shell can show an operator. */
+/** A stored value the schema cannot fully use, in the form a shell can show an operator. */
 export interface StoredValueProblem {
-  /** The `MaoStoreSchema` field whose stored value was replaced with the schema default. */
+  /** The `MaoStoreSchema` field whose stored value was replaced, in whole or in part, by the schema. */
   field: keyof MaoStoreSchema
   /** The config file the unusable value is still sitting in. */
   source: string
-  /** The operator-facing report: the field, the value's actual type, the file, and the way back. */
+  /**
+   * Whether *nothing* the field currently holds is usable — so replacing its stored value with the
+   * schema default discards nothing that works.
+   *
+   * The gate a shell must hang a destructive "reset this to the default" control off, and the reason
+   * this report and that recovery are separate things. A `githubRepos` of
+   * `[null, { owner: 'acme', repo: 'one' }]` is worth reporting — an entry vanished, and the next list
+   * write erases it from the file for good — but acme/one is on screen and working, so writing an empty
+   * list to clear the notice would delete the very data the operator still has.
+   *
+   * On the wire as a boolean rather than left for a shell to infer from `field`, the message text, or
+   * the `StoredValueDefect` union: `src/` may not value-import this module (architecture rule 6 — it
+   * reads `node:fs`), so the renderer can only act on what travels as data.
+   */
+  nothingUsable: boolean
+  /** The operator-facing report: the field, the unusable part's actual type, the file, and the way back. */
   message: string
 }
 
@@ -133,8 +261,14 @@ export function describeStoredProblems(
 ): StoredValueProblem[] {
   const problems: StoredValueProblem[] = []
   for (const field of Object.keys(STORED_SHAPE_RULES) as Array<keyof MaoStoreSchema>) {
-    const message = unusableStoredValue(field, readRaw(field), source)
-    if (message !== null) problems.push({ field, source, message })
+    const verdict = storedShapeVerdict(field, readRaw(field), source)
+    // `'some-entries'` is the only defect that leaves something behind worth protecting; see
+    // `StoredValueDefect`. Flattened to the boolean here rather than passed on, because the union is a
+    // `core/` type the renderer cannot read and a shell needs exactly this one bit of it.
+    if (verdict !== null) {
+      const nothingUsable = verdict.defect !== 'some-entries'
+      problems.push({ field, source, nothingUsable, message: verdict.message })
+    }
   }
   return problems
 }
@@ -160,6 +294,14 @@ export type StoredReadGuard = <K extends keyof MaoStoreSchema>(key: K, raw: MaoS
  * with it, while a read that answers `[]` lets the very next list write replace the unusable value. The
  * read is deliberately not a repair — nothing here writes — so a command that only reads leaves the
  * file exactly as it found it, and the operator keeps the chance to salvage it by hand.
+ *
+ * It reports more than it corrects, and the asymmetry is the point. A value whose own *type* is wrong is
+ * substituted; a list whose *entries* are wrong is reported and handed back untouched, because the layers
+ * below (`canonicalRepoList()`, `github:getRepos`) drop the bad entries and keep the good ones, and
+ * substituting `[]` here would throw away the repositories that still work. Before that split, entry-level
+ * corruption was corrected silently and said nothing at all: a `config.json` holding `[null]` left the
+ * sidebar reading "No projects yet" and `mao repos list` printing `[]` on stdout with a clean stderr, which
+ * is the same dead end for an operator as the unguarded crash was. See `StoredValueDefect`.
  *
  * Reported at most once per field per guard, because the cadence of reads is not the cadence of the
  * problem: auto-trigger re-reads the list on every 5s tick and `mao run` runs for days. Once per
@@ -187,12 +329,16 @@ export function createStoredReadGuard(
   const reported = new Set<keyof MaoStoreSchema>()
 
   return function guardStoredRead<K extends keyof MaoStoreSchema>(key: K, raw: MaoStoreSchema[K]): MaoStoreSchema[K] {
-    const problem = unusableStoredValue(key, raw, source)
-    if (problem === null) return raw
+    const verdict = storedShapeVerdict(key, raw, source)
+    if (verdict === null) return raw
     if (!reported.has(key)) {
       reported.add(key)
-      warn(problem)
+      warn(verdict.message)
     }
+    // Reported, but handed back as it is. An entry-level defect is one the layers below are built to
+    // absorb — and PR #57's whole recovery is that a list write drops the junk *while keeping the good
+    // rows*, which a substituted `[]` here would silently convert into "delete every tracked repository".
+    if (verdict.defect !== 'value') return raw
     // The schema's own default, *cloned*. Returning `MAO_STORE_DEFAULTS[key]` itself would hand every
     // caller the same shared instance, and one of them pushing into what it read would poison the
     // default for the rest of the process — the same aliasing `FileStore`'s constructor avoids below.

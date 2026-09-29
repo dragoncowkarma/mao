@@ -726,3 +726,35 @@ describe('createRepoRegistrar', () => {
     expect(github.assertRepoWorkflowWritable).not.toHaveBeenCalled()
   })
 })
+
+/**
+ * The repository root, anchored to this file rather than to whatever directory vitest was started in —
+ * a guard that fails with ENOENT because someone narrowed a run from a subdirectory is a guard people
+ * learn to dismiss. Mirrors the anchoring in core/store.test.ts and src/electron-api.test.ts.
+ */
+const MODULE_DIR = (import.meta as unknown as { dirname?: string }).dirname ?? path.join(process.cwd(), 'core')
+
+/**
+ * Architecture rule 6's "renderer-importable" claim about this module, as a checked invariant.
+ *
+ * The rule is that `src/` may value-import this module because its own `core/` imports are *all*
+ * `import type` — nothing Node-side is pulled into the renderer bundle. Nothing in the toolchain says
+ * so: dropping the `type` keyword from `import type { MaoStore } from './store.ts'` compiles cleanly,
+ * every test stays green, and `node:fs` lands in the renderer bundle by way of `core/store.ts`.
+ *
+ * It also pins the other direction, which is why this is here rather than left as prose.
+ * `core/store.ts` value-imports `isRepoRef` from this module (it needs the same predicate
+ * `canonicalRepoList()` drops entries with, or its report would count differently from what happens).
+ * That edge is only safe because the reverse one is erased at compile time. Turn a `import type` below
+ * into a value import and it becomes a genuine runtime cycle between the two modules, whose symptom is
+ * an `undefined` at module-initialisation time in whichever of them loads second.
+ */
+describe('core/repo-registry.ts, imported by the renderer', () => {
+  const source = fs.readFileSync(path.join(MODULE_DIR, 'repo-registry.ts'), 'utf-8')
+
+  it('takes no value import from core/', () => {
+    const valueImports = [...source.matchAll(/^import\s+(?!type\b)[^\n]*?from\s+'([^']+)'/gm)].map((m) => m[1])
+
+    expect(valueImports).toEqual([])
+  })
+})

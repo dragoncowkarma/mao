@@ -39,15 +39,23 @@ interface SidebarProps {
    */
   onAddRepo: (repo: RepoRef) => Promise<RepoWorkflowCapability[]>
   /**
-   * Stored values the main process could not use, answered with a schema default instead.
+   * Stored values the main process could not use, in whole or in part.
    *
    * Shown here because this is where their absence is: an unusable `githubRepos` reaches the renderer
    * as `[]`, which is indistinguishable from having no repositories — and with no row to select, the
    * project's Settings tab and its Remove button never render, so the guard's own advice to use the
-   * sidebar's Remove was not something the operator could actually do.
+   * sidebar's Remove was not something the operator could actually do. A list whose *entries* were
+   * dropped is the quieter half of the same problem: the rows that survived look complete, and nothing
+   * else on screen can say that others are sitting in the file about to be overwritten.
    */
   storeProblems: StoredValueProblem[]
-  /** Discards the unusable stored value by writing an empty list. Rejects if even that write fails. */
+  /**
+   * Discards the unusable stored value by writing an empty list. Rejects if even that write fails.
+   *
+   * Only ever invoked for a report whose `nothingUsable` is true — see `canResetRepoList`. It re-checks
+   * that itself before writing, because this card can be minutes stale, but the button is not offered
+   * where an empty list would destroy entries that still work.
+   */
   onResetRepoList: () => Promise<void>
   view: 'project' | 'global-settings'
   onViewChange: (view: 'project' | 'global-settings') => void
@@ -73,15 +81,26 @@ export default function Sidebar({
   const [resetting, setResetting] = useState(false)
   const [resetError, setResetError] = useState('')
 
+  /** Whether the *repository list* is one of the things reported, whatever else is. */
+  const repoListProblem = storeProblems.find((problem) => problem.field === 'githubRepos')
+
   /**
-   * Whether it is the *repository list* that is unusable, not merely something in the same file.
+   * Whether the destructive reset may be offered at all. Two independent conditions, both load-bearing.
    *
-   * The reset deletes `githubRepos` and nothing else, so offering it for any other field's report would
-   * put a destructive button under a message that is not about repositories. Today the guard only checks
-   * this one field, so the distinction is invisible — which is exactly why it is written down now rather
-   * than discovered when a second field joins it (issue #68).
+   * **It has to be about the repository list.** The reset writes `githubRepos` and nothing else, so
+   * offering it under another field's report would put a destructive button below a message that is not
+   * about repositories. Today the guard checks only this one field, so the distinction is invisible —
+   * which is exactly why it is written down rather than discovered when a second field joins it (#68).
+   *
+   * **Nothing the stored value holds may still be usable.** A report no longer means the whole list is
+   * gone: a `githubRepos` of `[null, { owner: 'acme', repo: 'one' }]` is reported — an entry vanished, and
+   * the next list write erases it from the file for good — while acme/one is right there in the rows
+   * below, working. Writing an empty list to clear that notice would delete it. So the notice and the
+   * recovery separate here: the operator is always told, and the destructive button is withheld unless
+   * it would cost them nothing. `nothingUsable` is core's verdict, not a guess from the row count —
+   * `repos` is this window's optimistic mirror and can disagree with the store mid-write.
    */
-  const repoListUnusable = storeProblems.some((problem) => problem.field === 'githubRepos')
+  const canResetRepoList = repoListProblem?.nothingUsable === true
 
   /**
    * The main process preflights issue/PR write access before it persists anything, so this can fail
@@ -160,7 +179,7 @@ export default function Sidebar({
                 {problem.message}
               </p>
             ))}
-            {repoListUnusable &&
+            {canResetRepoList &&
               (confirmingReset ? (
                 <div className="flex gap-2">
                   <button onClick={submitReset} className="btn btn-primary text-xs" disabled={resetting}>
@@ -233,7 +252,12 @@ export default function Sidebar({
               {r.autoTrigger === false && <span className="text-[10px] opacity-70">off</span>}
             </button>
           ))}
-          {repos.length === 0 && !adding && !repoListUnusable && (
+          {/* Suppressed for any repository-list report, not only the resettable ones: "No projects yet"
+              is the sentence that made a discarded list indistinguishable from an empty one, and acting
+              on it is what destroys the file. (A `'some-entries'` report leaves rows, so this branch is
+              unreachable for it — the condition is written for what it means, not for what is
+              currently reachable.) */}
+          {repos.length === 0 && !adding && !repoListProblem && (
             <p className="text-muted text-xs px-2">No projects yet — add a repository to get started.</p>
           )}
         </nav>

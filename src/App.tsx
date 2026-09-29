@@ -96,20 +96,40 @@ export default function App() {
    * place, which is precisely when the notice has to stay up.
    */
   /**
-   * Stores a report and answers whether it is the moment the repository list stopped being unusable.
+   * Stores a report and answers whether the repository list still has to be re-read because it was
+   * repaired since the last one.
    *
-   * That transition is the only one worth acting on. While the list is unusable the renderer holds `[]`
-   * — the guard's answer, not a list — so it is not stale, it is correct; and once a repair has been
-   * seen there is nothing further to adopt. Re-reading on *every* poll instead would reintroduce the
-   * hazard `persistRepos`' success path avoids: a round trip landing mid-typing stomps newer keystrokes
-   * in the settings pane.
+   * That transition is the only thing worth acting on. While the list is unusable the renderer holds
+   * `[]` — the guard's answer, not a list — so it is not stale, it is correct; and once a repair has
+   * been adopted there is nothing further to take. Re-reading on *every* poll instead would reintroduce
+   * the hazard `persistRepos`' success path avoids: a round trip landing mid-typing stomps newer
+   * keystrokes in the settings pane.
+   *
+   * Deliberately does **not** clear the flag when it answers `true`: the transition is observable once,
+   * and clearing it here would spend it on a read that has not happened yet. `adoptRepairedRepoList()`
+   * clears it, and only once the list is in hand — so a transient failure leaves the repair pending and
+   * the next poll tries again, instead of stranding the sidebar on "No projects yet" until a restart.
    */
   function applyStoreProblems(next: StoredValueProblem[]): boolean {
     const unusable = next.some((problem) => problem.field === 'githubRepos')
     const healed = repoListWasUnusable.current && !unusable
-    repoListWasUnusable.current = unusable
+    if (!healed) repoListWasUnusable.current = unusable
     setStoreProblems(next)
     return healed
+  }
+
+  /**
+   * Takes the repaired list, and only then treats the repair as done.
+   *
+   * Throws if the read fails, which every caller swallows — on purpose. The renderer's current list is
+   * left exactly as it was rather than replaced with an empty one, and because the flag is still set the
+   * next poll re-enters here. Adopting `[]` on failure would look identical to "there really are no
+   * projects", which is the one thing this whole path exists to stop the operator being told.
+   */
+  async function adoptRepairedRepoList(): Promise<void> {
+    const repaired = await electronApi().github.getRepos()
+    repoListWasUnusable.current = false
+    setRepos(repaired)
   }
 
   function refreshStoreProblems(): Promise<void> {
@@ -125,7 +145,7 @@ export default function App() {
         // ever re-read the list. Taking only the diagnostic down would leave the card gone and the
         // sidebar still insisting there are no projects, which is worse than either alone. Selection
         // reconciles itself: the identity effect above adopts the first entry once one exists.
-        if (applyStoreProblems(next)) setRepos(await electronApi().github.getRepos().catch(() => []))
+        if (applyStoreProblems(next)) await adoptRepairedRepoList()
       })
       .catch(() => {})
   }
@@ -392,7 +412,7 @@ export default function App() {
     const current = await electronApi().app.storeProblems()
     applyStoreProblems(current)
     if (!current.some((problem) => problem.field === 'githubRepos')) {
-      setRepos(await electronApi().github.getRepos().catch(() => repos))
+      await adoptRepairedRepoList().catch(() => {})
       return
     }
     await persistRepos([])
@@ -401,7 +421,7 @@ export default function App() {
     // when the list empties — and forcing a view/tab here would be a navigation decision made after
     // two awaits, which is exactly what `navigationGeneration` exists to stop: the sidebar is visible
     // from Global settings too, so a reset started there would otherwise yank the operator away from it.
-    setRepos(await electronApi().github.getRepos().catch(() => []))
+    await adoptRepairedRepoList().catch(() => {})
   }
 
   async function removeSelectedRepo() {

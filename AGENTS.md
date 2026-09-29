@@ -380,7 +380,11 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   the renderer writing anything, so nothing else would re-read it, and taking only the diagnostic
   down leaves the card gone and the sidebar still insisting there are no projects. Only on that
   transition: re-reading every poll would reintroduce the round-trip-lands-mid-typing hazard
-  `persistRepos`' success path exists to avoid.
+  `persistRepos`' success path exists to avoid. The transition is observable **once**, so it is not
+  consumed until the list is actually in hand — a read that fails leaves the repair pending and the
+  renderer's current list untouched, and the next poll tries again. Clearing it first, or adopting
+  `[]` on failure, strands the sidebar on "No projects yet" until the window restarts, with the
+  diagnostic already gone and nothing left to say why.
   Two backend details make "the two shells cannot answer differently" true rather than aspirational.
   `STORED_SHAPE_RULES` is the one table of checked fields, and `describeStoredProblems()` iterates it
   to decide what to *read* — electron-store re-reads and re-parses the whole file on every `get`, so

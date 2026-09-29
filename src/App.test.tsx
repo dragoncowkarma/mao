@@ -380,6 +380,42 @@ describe('App unusable stored settings', () => {
     }
   })
 
+  it('retries the repaired list on the next poll when the first read fails', async () => {
+    // The repair transition is observable exactly once, so consuming it before the list is actually in
+    // hand spends it: one transient rejection and the sidebar is stuck on "No projects yet" until the
+    // window is restarted, with the diagnostic gone and nothing left to say why.
+    vi.useFakeTimers()
+    try {
+      const stub = createElectronApiStub([], [UNUSABLE_REPO_LIST])
+      render(
+        <StrictMode>
+          <App />
+        </StrictMode>,
+      )
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(screen.getByText(/"githubRepos" in/)).toBeInTheDocument()
+
+      stub.applyRepos([ONE])
+      stub.storeProblems.mockResolvedValue([])
+      stub.getRepos.mockRejectedValueOnce(new Error('main process is busy'))
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+      expect(screen.queryByRole('button', { name: 'acme/one' })).toBeNull()
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+
+      expect(screen.getByRole('button', { name: 'acme/one' })).toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('says nothing when the store is healthy', async () => {
     await renderApp([ONE])
 

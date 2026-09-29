@@ -20,13 +20,26 @@ const tmpDirs: string[] = []
 
 afterEach(() => {
   while (tmpDirs.length) fs.rmSync(tmpDirs.pop()!, { recursive: true, force: true })
+  vi.restoreAllMocks()
 })
 
-/** A real on-disk store, so "the stored list is unchanged" is asserted against actual persistence. */
-function makeRealStore(): FileStore {
+/**
+ * A real on-disk store, so "the stored list is unchanged" is asserted against actual persistence.
+ *
+ * `contents` writes raw JSON before the store is opened, which is the only way to produce a value the
+ * schema forbids — `store.set` cannot. A hand-edited `config.json`, or one an older build wrote, can.
+ */
+function makeRealStore(contents?: unknown): FileStore {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mao-registry-test-'))
   tmpDirs.push(dir)
-  return new FileStore(path.join(dir, 'config.json'))
+  const filePath = path.join(dir, 'config.json')
+  if (contents !== undefined) fs.writeFileSync(filePath, JSON.stringify(contents, null, 2))
+  return new FileStore(filePath)
+}
+
+/** The store's read guard reports an unusable list through console.warn; keep it out of test output. */
+function silenceStoreWarnings() {
+  return vi.spyOn(console, 'warn').mockImplementation(() => {})
 }
 
 const widgets: RepoRef = { owner: 'acme', repo: 'widgets' }
@@ -206,6 +219,41 @@ describe('canonicalRepoList', () => {
 
   it('leaves an ordinary list untouched', () => {
     expect(canonicalRepoList([widgets], [widgets, gadgets])).toEqual([widgets, gadgets])
+  })
+})
+
+describe('canonicalRepoList write refusal', () => {
+  it('refuses a next that is not an array rather than folding it to an empty list', () => {
+    // Not a hypothetical: a string is iterable, so `isRepoRef` rejected its characters one at a time and
+    // the fold returned [] — which `createRepoRegistrar` would then persist over every tracked
+    // repository, with no error anywhere. A Set was accepted outright, in an order nothing promises.
+    const previous = [widgets, gadgets]
+
+    expect(() => canonicalRepoList(previous, 'acme/widgets' as unknown as RepoRef[])).toThrow(/not an array/)
+    expect(() => canonicalRepoList(previous, new Set([widgets]) as unknown as RepoRef[])).toThrow(/not an array/)
+    expect(() => canonicalRepoList(previous, {} as unknown as RepoRef[])).toThrow(/not an array/)
+    expect(() => canonicalRepoList(previous, null as unknown as RepoRef[])).toThrow(/got null/)
+  })
+
+  it('names the type only, never the value', () => {
+    // config.json keeps the GitHub token in the same JSON blob, and this message lands in terminal and
+    // agent logs.
+    const secretish = { token: 'ghp_notarealtoken' } as unknown as RepoRef[]
+
+    expect(() => canonicalRepoList([], secretish)).toThrow(/got object/)
+    try {
+      canonicalRepoList([], secretish)
+    } catch (err) {
+      expect((err as Error).message).not.toContain('ghp_')
+    }
+  })
+
+  it('reports the refusal rather than a bare iteration failure when both lists are the same value', () => {
+    // auto-trigger passes the stored list as both arguments (`canonicalRepoList(repos, repos)`), so the
+    // check has to come before `previous` is walked or the operator gets `previous is not iterable`.
+    expect(() => canonicalRepoList({} as unknown as RepoRef[], {} as unknown as RepoRef[])).toThrow(
+      /Refusing to write a repository list/,
+    )
   })
 })
 
@@ -618,5 +666,95 @@ describe('createRepoRegistrar', () => {
     expect(github.assertRepoWorkflowWritable).toHaveBeenCalledWith('acme', 'gadgets')
     expect(store.get('githubRepos')).toHaveLength(2)
     expect(store.get('githubRepos').filter((r) => sameRepoRef(r, widgets))).toHaveLength(1)
+  })
+
+  it('refuses a non-array write and leaves the stored list byte-identical', async () => {
+    // The write-side mirror of issue #60: a caller (a shell, or `github:setRepos` over IPC) handing over
+    // something that is not a list must not be read as "delete every tracked repository".
+    const store = makeRealStore()
+    store.set('githubRepos', [widgets, gadgets])
+    const filePath = (store as unknown as { filePath: string }).filePath
+    const before = fs.readFileSync(filePath, 'utf-8')
+    const github = passingGithub()
+    const updateRepos = createRepoRegistrar(github, store)
+
+    await expect(updateRepos(() => 'acme/widgets' as unknown as RepoRef[])).rejects.toThrow(/not an array/)
+
+    expect(store.get('githubRepos')).toEqual([widgets, gadgets])
+    expect(fs.readFileSync(filePath, 'utf-8')).toBe(before)
+    expect(github.assertRepoWorkflowWritable).not.toHaveBeenCalled()
+    // A refused update must not wedge the queue for the next one.
+    await expect(updateRepos((previous) => previous.filter((r) => !sameRepoRef(r, widgets)))).resolves.toEqual([])
+    expect(store.get('githubRepos')).toEqual([gadgets])
+  })
+
+  it('recovers a store whose githubRepos is not a list at all, in `repos add`\'s update shape', async () => {
+    // Issue #60: the *container* being a non-array, not its elements. `previous.filter` threw inside the
+    // update callback and `canonicalRepoList` threw on a non-iterable `previous`, so every registration
+    // path was blocked — including the ones that would have written a healthy list back. The store's read
+    // guard is what makes this reachable; this pins the recovery end to end, on the real path.
+    const warn = silenceStoreWarnings()
+    const store = makeRealStore({ githubRepos: { 'acme/widgets': widgets } })
+    const github = passingGithub()
+    const updateRepos = createRepoRegistrar(github, store)
+
+    await updateRepos((previous) => [...previous.filter((r) => !sameRepoRef(r, widgets)), widgets])
+
+    // A store that named no usable repository makes this a genuine first registration, so it is
+    // preflighted — the unusable value must not be read as "already tracked, already vouched for".
+    expect(github.assertRepoWorkflowWritable).toHaveBeenCalledWith('acme', 'widgets')
+    expect(store.get('githubRepos')).toEqual([widgets])
+    expect(new FileStore((store as unknown as { filePath: string }).filePath).get('githubRepos')).toEqual([widgets])
+    // Not silently discarded: the operator is told once, by the same command that heals the store.
+    expect(warn).toHaveBeenCalledTimes(1)
+  })
+
+  it('lets `repos remove` reach a healthy store from a non-list value', async () => {
+    // The worst of the reported symptoms: `mao repos remove` was the documented way out of a bad
+    // repository list, and it was blocked by the same read, leaving hand-editing JSON as the only escape.
+    silenceStoreWarnings()
+    const store = makeRealStore({ githubRepos: 'acme/widgets' })
+    const github = passingGithub()
+    const updateRepos = createRepoRegistrar(github, store)
+
+    await expect(updateRepos((previous) => previous.filter((r) => !sameRepoRef(r, widgets)))).resolves.toEqual([])
+
+    expect(store.get('githubRepos')).toEqual([])
+    expect(new FileStore((store as unknown as { filePath: string }).filePath).get('githubRepos')).toEqual([])
+    // A removal introduces nothing new, so it still never preflights — that exemption must survive here
+    // too, or a repo whose access was revoked would be unremovable on top of being unreadable.
+    expect(github.assertRepoWorkflowWritable).not.toHaveBeenCalled()
+  })
+})
+
+/**
+ * The repository root, anchored to this file rather than to whatever directory vitest was started in —
+ * a guard that fails with ENOENT because someone narrowed a run from a subdirectory is a guard people
+ * learn to dismiss. Mirrors the anchoring in core/store.test.ts and src/electron-api.test.ts.
+ */
+const MODULE_DIR = (import.meta as unknown as { dirname?: string }).dirname ?? path.join(process.cwd(), 'core')
+
+/**
+ * Architecture rule 6's "renderer-importable" claim about this module, as a checked invariant.
+ *
+ * The rule is that `src/` may value-import this module because its own `core/` imports are *all*
+ * `import type` — nothing Node-side is pulled into the renderer bundle. Nothing in the toolchain says
+ * so: dropping the `type` keyword from `import type { MaoStore } from './store.ts'` compiles cleanly,
+ * every test stays green, and `node:fs` lands in the renderer bundle by way of `core/store.ts`.
+ *
+ * It also pins the other direction, which is why this is here rather than left as prose.
+ * `core/store.ts` value-imports `isRepoRef` from this module (it needs the same predicate
+ * `canonicalRepoList()` drops entries with, or its report would count differently from what happens).
+ * That edge is only safe because the reverse one is erased at compile time. Turn a `import type` below
+ * into a value import and it becomes a genuine runtime cycle between the two modules, whose symptom is
+ * an `undefined` at module-initialisation time in whichever of them loads second.
+ */
+describe('core/repo-registry.ts, imported by the renderer', () => {
+  const source = fs.readFileSync(path.join(MODULE_DIR, 'repo-registry.ts'), 'utf-8')
+
+  it('takes no value import from core/', () => {
+    const valueImports = [...source.matchAll(/^import\s+(?!type\b)[^\n]*?from\s+'([^']+)'/gm)].map((m) => m[1])
+
+    expect(valueImports).toEqual([])
   })
 })

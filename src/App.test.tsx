@@ -1,10 +1,11 @@
 import { StrictMode } from 'react'
-import { render, screen, waitFor } from '@testing-library/react'
+import { act, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import App from './App'
 import { createElectronApiStub } from './test/electron-api-stub'
 import type { RepoRef } from '../core/workflow-engine'
+import type { StoredValueProblem } from '../core/store'
 
 const ONE: RepoRef = { owner: 'acme', repo: 'one' }
 const TWO: RepoRef = { owner: 'acme', repo: 'two' }
@@ -23,6 +24,48 @@ const TWO_SHOUTED: RepoRef = { owner: 'ACME', repo: 'TWO', autoTrigger: false }
 const OTHER_TWO: RepoRef = { owner: 'other', repo: 'two' }
 
 /**
+ * What the main process answers `app:storeProblems` with when `config.json` holds a `githubRepos` the
+ * schema cannot use. Spelled out rather than built from core's own describer: `core/store.ts` is a
+ * Node module the renderer may not import, and the renderer's job here is to render what it is handed,
+ * whatever the wording turns out to be.
+ */
+const UNUSABLE_REPO_LIST: StoredValueProblem = {
+  field: 'githubRepos',
+  source: '/data/config.json',
+  nothingUsable: true,
+  message:
+    '[store] "githubRepos" in /data/config.json is an object, not a JSON array of { owner, repo } ' +
+    'entries — ignoring it, so no repositories are tracked until it is replaced.',
+}
+
+/**
+ * A repository list that is a real array and still holds a usable entry, with junk beside it —
+ * `[null, { owner: 'acme', repo: 'one' }]` on disk. `github:getRepos` filters the junk out, so the
+ * renderer is handed a list that looks perfectly healthy; `nothingUsable: false` is the only thing that
+ * says otherwise, and it is what must keep the destructive reset off the screen.
+ */
+const DROPPED_REPO_ENTRIES: StoredValueProblem = {
+  field: 'githubRepos',
+  source: '/data/config.json',
+  nothingUsable: false,
+  message:
+    '[store] "githubRepos" in /data/config.json is a JSON array, but 1 of its 2 entries does not name ' +
+    'a repository (null) — each entry needs a non-empty "owner" and "repo" string.',
+}
+
+/**
+ * A report about a field this sidebar's reset does not touch. The reset deletes `githubRepos` and
+ * nothing else, and `describeStoredProblems` is written to grow to the other array-typed fields
+ * (issue #68) — so the card has to tell the difference before it offers a destructive button.
+ */
+const UNUSABLE_PROVIDERS: StoredValueProblem = {
+  field: 'aiProviders',
+  source: '/data/config.json',
+  nothingUsable: true,
+  message: '[store] "aiProviders" in /data/config.json is an object, not a JSON array of providers.',
+}
+
+/**
  * Mounts the real App against a fake bridge, inside StrictMode because that is what `src/main.tsx`
  * does. The doubled mount/unmount is a development-and-test check — the packaged build runs effects
  * once — but it is the check AGENTS.md requires polling effects to survive, so running tests under it
@@ -33,9 +76,9 @@ const OTHER_TWO: RepoRef = { owner: 'other', repo: 'two' }
  * Waits for the first project to be on screen before handing control back: App reads the repo list in
  * an effect, so everything a test wants to click is one resolved promise away from the initial render.
  */
-async function renderApp(repos: RepoRef[]) {
+async function renderApp(repos: RepoRef[], problems: StoredValueProblem[] = []) {
   const user = userEvent.setup()
-  const stub = createElectronApiStub(repos)
+  const stub = createElectronApiStub(repos, problems)
   render(
     <StrictMode>
       <App />
@@ -90,6 +133,277 @@ function addSettled() {
 async function openSettings(user: ReturnType<typeof userEvent.setup>) {
   await user.click(screen.getByRole('button', { name: 'Settings' }))
 }
+
+describe('App unusable stored settings', () => {
+  it('tells the operator what was discarded instead of showing an empty project list', async () => {
+    // The gap this closes: a `githubRepos` the schema cannot use reaches the renderer as `[]`, so the
+    // sidebar said "No projects yet — add a repository to get started" — indistinguishable from having
+    // none, while the only report went to a main-process console a packaged-app operator never sees.
+    await renderApp([], [UNUSABLE_REPO_LIST])
+
+    expect(await screen.findByText(/is an object, not a JSON array/)).toBeInTheDocument()
+    expect(screen.getByText(/could not be read/)).toBeInTheDocument()
+    expect(screen.queryByText(/No projects yet/)).toBeNull()
+  })
+
+  it('offers a recovery the operator can actually reach, and it needs no token', async () => {
+    // With no usable list there is no sidebar row, so no project is selected and the Settings tab's
+    // Remove button never renders — the recovery the store's own report used to name was unreachable.
+    // Writing an empty list registers nothing, so unlike Add it is never refused by the preflight.
+    const { stub, user } = await renderApp([], [UNUSABLE_REPO_LIST])
+    await screen.findByText(/is an object, not a JSON array/)
+
+    await user.click(screen.getByRole('button', { name: 'Reset stored list' }))
+    await user.click(screen.getByRole('button', { name: 'Confirm reset' }))
+
+    await waitFor(() => expect(screen.queryByText(/is an object, not a JSON array/)).toBeNull())
+    expect(stub.setRepos).toHaveBeenCalledWith([])
+    expect(stub.storedRepos()).toEqual([])
+    expect(screen.getByText(/No projects yet/)).toBeInTheDocument()
+  })
+
+  it('keeps the report up when the recovery write itself fails', async () => {
+    // A refused write leaves the unusable value on disk, so clearing the notice optimistically would
+    // tell the operator the problem was fixed when nothing had changed.
+    const { stub, user } = await renderApp([], [UNUSABLE_REPO_LIST])
+    await screen.findByText(/is an object, not a JSON array/)
+    stub.setRepos.mockRejectedValueOnce(new Error("Error invoking remote method 'github:setRepos': Error: disk is full"))
+
+    await user.click(screen.getByRole('button', { name: 'Reset stored list' }))
+    await user.click(screen.getByRole('button', { name: 'Confirm reset' }))
+
+    expect(await screen.findByText('disk is full')).toBeInTheDocument()
+    expect(screen.getByText(/is an object, not a JSON array/)).toBeInTheDocument()
+  })
+
+  it('re-reads the report after a write that failed, rather than just leaving it alone', async () => {
+    // Asserted through Add, not the reset: the reset re-reads on its own before it writes, so a delta
+    // measured there would be its pre-check rather than `persistRepos`' `finally`. A report that
+    // survives only because nothing cleared it goes stale the first time a failure and a heal happen in
+    // either order. The 30s poll cannot have fired inside a test this short, so the delta is
+    // attributable to the write.
+    const { stub, user } = await renderApp([], [UNUSABLE_REPO_LIST])
+    await screen.findByText(/is an object, not a JSON array/)
+    stub.setRepos.mockRejectedValueOnce(new Error('acme/one cannot host the MAO workflow'))
+    const readsBefore = stub.storeProblems.mock.calls.length
+
+    await submitAdd(user, ONE)
+
+    expect(await screen.findByText('acme/one cannot host the MAO workflow')).toBeInTheDocument()
+    await waitFor(() => expect(stub.storeProblems.mock.calls.length).toBeGreaterThan(readsBefore))
+  })
+
+  it('refuses to reset a store something else has already healed', async () => {
+    // The store is not this window's alone: the report tells the operator to go to `config.json`, and
+    // `mao repos add` in a terminal heals it — while this card, read at mount and after writes, keeps
+    // offering a button that writes an empty list. Blind, that deletes the healthy list they just built.
+    const { stub, user } = await renderApp([], [UNUSABLE_REPO_LIST])
+    await screen.findByText(/is an object, not a JSON array/)
+    stub.storeProblems.mockResolvedValue([])
+    stub.applyRepos([ONE])
+
+    await user.click(screen.getByRole('button', { name: 'Reset stored list' }))
+    await user.click(screen.getByRole('button', { name: 'Confirm reset' }))
+
+    await waitFor(() => expect(screen.queryByText(/is an object, not a JSON array/)).toBeNull())
+    expect(stub.setRepos).not.toHaveBeenCalled()
+    expect(await screen.findByRole('button', { name: 'acme/one' })).toBeInTheDocument()
+  })
+
+  it('reports dropped entries without offering to delete the ones that still work', async () => {
+    // The card this PR separates from the one above. `[null, { owner: 'acme', repo: 'one' }]` on disk:
+    // `github:getRepos` filters the null away, so the sidebar looks entirely healthy and the operator has
+    // no way to learn that an entry is sitting in the file waiting to be overwritten. So the notice has to
+    // appear — and the destructive reset must NOT, because it writes an empty list, which would delete
+    // acme/one. Notice and recovery are different things, which is why this is not PR #66's card.
+    await renderApp([ONE], [DROPPED_REPO_ENTRIES])
+
+    expect(await screen.findByText(/1 of its 2 entries does not name a repository/)).toBeInTheDocument()
+    expect(screen.getByText(/could not be read/)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Reset stored list' })).toBeNull()
+    // And the repository that survived is still reachable — a notice must not cost the operator the rows.
+    expect(sidebarProject(ONE)).toBeInTheDocument()
+  })
+
+  it('refuses a reset when a hand-edit made the list partly usable after the card rendered', async () => {
+    // The same protection at the moment of the write rather than the moment of the render. The card can be
+    // minutes old — the report itself sends the operator to `config.json` — so repairing one of two junk
+    // entries in a terminal leaves the button on screen while an empty list would now destroy what that
+    // edit rescued. Fail closed: adopt what the store says and write nothing.
+    const { stub, user } = await renderApp([], [UNUSABLE_REPO_LIST])
+    await screen.findByText(/is an object, not a JSON array/)
+    stub.storeProblems.mockResolvedValue([DROPPED_REPO_ENTRIES])
+    stub.applyRepos([ONE])
+
+    await user.click(screen.getByRole('button', { name: 'Reset stored list' }))
+    await user.click(screen.getByRole('button', { name: 'Confirm reset' }))
+
+    await waitFor(() => expect(screen.getByText(/1 of its 2 entries does not name/)).toBeInTheDocument())
+    expect(stub.setRepos).not.toHaveBeenCalled()
+    expect(stub.storedRepos()).toEqual([ONE])
+    expect(await screen.findByRole('button', { name: 'acme/one' })).toBeInTheDocument()
+    // The button is gone with the verdict it hung off, so the operator cannot simply click again.
+    expect(screen.queryByRole('button', { name: 'Reset stored list' })).toBeNull()
+  })
+
+  it('offers no reset for a report about a field the reset does not touch', async () => {
+    // Today the guard checks only `githubRepos`, so this state is not yet reachable — which is why it is
+    // pinned now rather than discovered when a second field joins it and an `aiProviders` message ends
+    // up sitting above a button that wipes every tracked repository.
+    await renderApp([], [UNUSABLE_PROVIDERS])
+
+    expect(await screen.findByText(/"aiProviders" in/)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Reset stored list' })).toBeNull()
+    expect(screen.getByText(/No projects yet/)).toBeInTheDocument()
+  })
+
+  it('offers the reset when the repo list is one of several unusable values', async () => {
+    // Both fixtures, with the unrelated one first: with a single report on screen, a positional check
+    // (`storeProblems[0].field === 'githubRepos'`) satisfies every other test in this file, and the
+    // mixed state is the one it gets wrong — which is the state issue #68 makes reachable.
+    const { user } = await renderApp([], [UNUSABLE_PROVIDERS, UNUSABLE_REPO_LIST])
+
+    // Matched by field, because both fixture messages say "is an object, not a JSON array".
+    expect(await screen.findByText(/"aiProviders" in/)).toBeInTheDocument()
+    expect(screen.getByText(/"githubRepos" in/)).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Reset stored list' }))
+
+    expect(screen.getByRole('button', { name: 'Confirm reset' })).toBeInTheDocument()
+  })
+
+  it('clears a failed reset when the operator backs out', async () => {
+    const { stub, user } = await renderApp([], [UNUSABLE_REPO_LIST])
+    await screen.findByText(/is an object, not a JSON array/)
+    stub.setRepos.mockRejectedValueOnce(new Error('disk is full'))
+
+    await user.click(screen.getByRole('button', { name: 'Reset stored list' }))
+    await user.click(screen.getByRole('button', { name: 'Confirm reset' }))
+    expect(await screen.findByText('disk is full')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Cancel' }))
+
+    // A failure message left under an un-pressed button misreports the state of an action the operator
+    // explicitly backed out of.
+    expect(screen.queryByText('disk is full')).toBeNull()
+  })
+
+  it('does not pretend a queued reset can be called back', async () => {
+    // The write is already queued behind `updateRepos`' serialization by the time this renders, and
+    // nothing can recall it — a Cancel that looked live would say otherwise.
+    let release = () => {}
+    const inFlight = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const { stub, user } = await renderApp([], [UNUSABLE_REPO_LIST])
+    await screen.findByText(/is an object, not a JSON array/)
+    stub.setRepos.mockImplementationOnce(async (next: RepoRef[]) => {
+      await inFlight
+      stub.applyRepos(next)
+      return []
+    })
+
+    await user.click(screen.getByRole('button', { name: 'Reset stored list' }))
+    await user.click(screen.getByRole('button', { name: 'Confirm reset' }))
+
+    expect(await screen.findByRole('button', { name: 'Resetting…' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Cancel' })).toBeDisabled()
+    release()
+    await waitFor(() => expect(stub.storedRepos()).toEqual([]))
+  })
+
+  it('takes the report down once an add has healed the store', async () => {
+    // The other way out, and the one the reviewer's "Add overwrote it before the operator was ever
+    // told" case turns on: any list write replaces the unusable value, so the card has to be re-read
+    // after every write — not only after the reset that this card owns.
+    const { stub, user } = await renderApp([], [UNUSABLE_REPO_LIST])
+    await screen.findByText(/is an object, not a JSON array/)
+
+    await submitAdd(user, ONE)
+    await addSettled()
+
+    await waitFor(() => expect(screen.queryByText(/is an object, not a JSON array/)).toBeNull())
+    expect(stub.setRepos).toHaveBeenCalledWith([ONE])
+  })
+
+  it('reports the write failure even when the diagnostic read throws', async () => {
+    // `refreshStoreProblems` runs in `persistRepos`' `finally`, and a synchronous throw there *replaces*
+    // the rejection already on its way to the caller — the operator would be told the bridge was missing
+    // instead of why their write failed. A diagnostic must not be able to hide the thing it annotates.
+    const { stub, user } = await renderApp([], [UNUSABLE_REPO_LIST])
+    await screen.findByText(/is an object, not a JSON array/)
+    stub.setRepos.mockRejectedValueOnce(new Error('acme/one cannot host the MAO workflow'))
+    stub.storeProblems.mockImplementation(() => {
+      throw new Error('preload bridge did not load')
+    })
+
+    await submitAdd(user, ONE)
+
+    expect(await screen.findByText('acme/one cannot host the MAO workflow')).toBeInTheDocument()
+    expect(screen.queryByText('preload bridge did not load')).toBeNull()
+  })
+
+  it('leaves the operator where they were when the reset lands', async () => {
+    // The sidebar is visible from Global settings too, so a reset can be started there — and it
+    // finishes two awaits later. Navigating on completion is the race `navigationGeneration` exists to
+    // stop, and after a reset there is nothing to navigate to anyway.
+    const { stub, user } = await renderApp([], [UNUSABLE_REPO_LIST])
+    await screen.findByText(/is an object, not a JSON array/)
+    await user.click(globalSettingsNav())
+    expect(tokenField()).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Reset stored list' }))
+    await user.click(screen.getByRole('button', { name: 'Confirm reset' }))
+
+    await waitFor(() => expect(stub.setRepos).toHaveBeenCalledWith([]))
+    expect(tokenField()).toBeInTheDocument()
+  })
+
+  it('notices a store that became unusable while the window was open', async () => {
+    // The file is not this window's to own: the report sends the operator to `config.json`, and a
+    // hand-edit made there is invisible until the next repository-list write — which is the thing that
+    // destroys the value. Reading it only after a write cannot warn anyone in time.
+    //
+    // Fake timers here and no `userEvent`: the two deadlock (SKILL.md), so this drives the interval
+    // directly and asserts on what the operator sees.
+    vi.useFakeTimers()
+    try {
+      const stub = createElectronApiStub([ONE])
+      const { unmount } = render(
+        <StrictMode>
+          <App />
+        </StrictMode>,
+      )
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(screen.queryByText(/could not be read/)).toBeNull()
+
+      stub.storeProblems.mockResolvedValue([UNUSABLE_REPO_LIST])
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+
+      expect(screen.getByText(/is an object, not a JSON array/)).toBeInTheDocument()
+
+      // AGENTS.md requires a polling effect to clear its interval; a leaked one is otherwise invisible
+      // here, because `refreshStoreProblems` swallows the error an unbound bridge would throw.
+      const readsBeforeUnmount = stub.storeProblems.mock.calls.length
+      unmount()
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(60_000)
+      })
+      expect(stub.storeProblems.mock.calls.length).toBe(readsBeforeUnmount)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('says nothing when the store is healthy', async () => {
+    await renderApp([ONE])
+
+    expect(screen.queryByText(/could not be read/)).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Reset stored list' })).toBeNull()
+  })
+})
 
 describe('App project selection', () => {
   it('opens the project the operator picks in the sidebar', async () => {

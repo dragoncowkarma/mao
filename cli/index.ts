@@ -114,6 +114,10 @@ config
       aiProviders: store.get('aiProviders').map((p) => ({ ...p, apiKey: p.apiKey ? '[set]' : undefined })),
       theme: store.get('theme'),
       workflowPersistenceBroken: hasPersistenceBrokenMarker(resolveDataDir()),
+      // Otherwise this command reports a value that is not in the file: a `githubRepos` the schema
+      // cannot use is answered as `[]` above, and the guard's own warning goes to stderr, which
+      // `config show 2>/dev/null` discards. Same list the GUI polls over `app:storeProblems`.
+      storeProblems: store.problems(),
     })
   })
 
@@ -192,9 +196,23 @@ repos
     // echoes the stored spelling, so `remove` claiming to have removed a name the store never held
     // would be the one place the two commands disagree about what a repository is called.
     const tracked = store.get('githubRepos').filter((r) => sameRepoRef(r, target))
+    const problemsBefore = store.problems()
     await updateRepos((previous) => previous.filter((r) => !sameRepoRef(r, target)))
     if (tracked.length === 0) log(`No tracked repo matches ${owner}/${repo}`)
     else for (const r of tracked) log(`Stopped tracking ${r.owner}/${r.repo}`)
+    // A removal against an unusable stored value matches nothing, so `No tracked repo matches …` was all
+    // it said — while the write it had just performed was the recovery the store's own report told the
+    // operator to run. Left there, the one command that always heals reads like a no-op.
+    //
+    // Which of the two it healed is core's verdict, not this shell's inference: a partly usable list had
+    // its junk *entries* dropped while every tracked repository stayed, and calling that "replaced the
+    // unusable value" would describe a destructive write that did not happen.
+    const remaining = store.problems()
+    for (const before of problemsBefore) {
+      if (remaining.some((problem) => problem.field === before.field)) continue
+      if (before.nothingUsable) log(`Replaced the unusable "${before.field}" value in ${before.source}.`)
+      else log(`Dropped the unusable "${before.field}" entries from ${before.source}.`)
+    }
   })
 
 repos

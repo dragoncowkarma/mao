@@ -3,7 +3,7 @@ import type { GithubTask, GithubTaskDetail } from '../core/github-service'
 import type { RepoWorkflowCapability } from '../core/repo-capabilities'
 import type { QueuedTask, RepoRef, RunOverride } from '../core/workflow-engine'
 import type { AutoTriggerStatus } from '../core/auto-trigger'
-import type { ThemePreference } from '../core/store'
+import type { StoredValueProblem, ThemePreference } from '../core/store'
 import type { SelfUpdateCheck } from '../core/self-update'
 
 export interface AppUpdateCheck extends SelfUpdateCheck {
@@ -17,6 +17,8 @@ declare global {
       app: {
         checkUpdate: () => Promise<AppUpdateCheck>
         relaunch: (force?: boolean) => Promise<void>
+        /** Stored values the main process could not use and answered with a schema default instead. */
+        storeProblems: () => Promise<StoredValueProblem[]>
       }
       ai: {
         list: () => Promise<AiProviderConfig[]>

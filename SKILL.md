@@ -179,7 +179,9 @@ tab and no Remove button, and Add can be refused by the preflight. The button re
 writes — heal the store from a terminal while the window is open and confirming the reset picks up the
 repaired list instead of wiping it — and it appears only when `githubRepos` itself is the unusable
 value. A hand-edit made while the window is open is picked up by the sidebar's 30s poll, so the notice
-does not wait for the next write to appear. `mao repos remove` also says which unusable value it
+does not wait for the next write to appear — and when that poll finds the list repaired (by `mao repos
+add` in a terminal, say), the GUI re-reads the list too, so the projects appear instead of the sidebar
+going quiet but staying empty. `mao repos remove` also says which unusable value it
 replaced — without that line the command that always heals prints only `No tracked repo matches …`
 and reads like a no-op.
 

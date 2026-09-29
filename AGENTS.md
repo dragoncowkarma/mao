@@ -374,7 +374,13 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   the window is open would otherwise stay invisible until the next list write — which is the thing
   that destroys the value, so reading it only afterwards cannot warn anyone in time. It narrows that
   to one poll interval rather than eliminating it: an Add is not gated on a fresh read, deliberately,
-  because gating it would make the GUI refuse a recovery `mao repos add` still performs.
+  because gating it would make the GUI refuse a recovery `mao repos add` still performs. The poll
+  also re-reads the *list* on the one transition that matters — a report that said the list was
+  unusable followed by one that does not. A repair from outside this window heals the store without
+  the renderer writing anything, so nothing else would re-read it, and taking only the diagnostic
+  down leaves the card gone and the sidebar still insisting there are no projects. Only on that
+  transition: re-reading every poll would reintroduce the round-trip-lands-mid-typing hazard
+  `persistRepos`' success path exists to avoid.
   Two backend details make "the two shells cannot answer differently" true rather than aspirational.
   `STORED_SHAPE_RULES` is the one table of checked fields, and `describeStoredProblems()` iterates it
   to decide what to *read* — electron-store re-reads and re-parses the whole file on every `get`, so

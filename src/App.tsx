@@ -45,6 +45,12 @@ export default function App() {
    */
   const [storeProblems, setStoreProblems] = useState<StoredValueProblem[]>([])
   /**
+   * Whether the *last* report said the repository list was unusable, so a later one can be recognised as
+   * a repair rather than merely a quiet answer. A ref, not state: it is read to decide what to do with
+   * the value being stored, and a render is not what has to happen in between.
+   */
+  const repoListWasUnusable = useRef(false)
+  /**
    * Counts every navigation choice, so an async add can ask whether the operator moved elsewhere
    * while its permission preflight was running.
    *
@@ -89,6 +95,23 @@ export default function App() {
    * assumed cleared — a write heals the store, but a *failed* write leaves the unusable value in
    * place, which is precisely when the notice has to stay up.
    */
+  /**
+   * Stores a report and answers whether it is the moment the repository list stopped being unusable.
+   *
+   * That transition is the only one worth acting on. While the list is unusable the renderer holds `[]`
+   * — the guard's answer, not a list — so it is not stale, it is correct; and once a repair has been
+   * seen there is nothing further to adopt. Re-reading on *every* poll instead would reintroduce the
+   * hazard `persistRepos`' success path avoids: a round trip landing mid-typing stomps newer keystrokes
+   * in the settings pane.
+   */
+  function applyStoreProblems(next: StoredValueProblem[]): boolean {
+    const unusable = next.some((problem) => problem.field === 'githubRepos')
+    const healed = repoListWasUnusable.current && !unusable
+    repoListWasUnusable.current = unusable
+    setStoreProblems(next)
+    return healed
+  }
+
   function refreshStoreProblems(): Promise<void> {
     // The bridge lookup is deferred into the chain rather than called here, because this runs inside
     // `persistRepos`' `finally`: `electronApi()` throws synchronously when nothing is bound, and a
@@ -96,7 +119,14 @@ export default function App() {
     // operator would be told the bridge was missing instead of why their write failed.
     return Promise.resolve()
       .then(() => electronApi().app.storeProblems())
-      .then(setStoreProblems)
+      .then(async (next) => {
+        // A repair from outside this window — `mao repos add` in a terminal, or the hand-edit the report
+        // itself asks for — heals the store without the renderer writing anything, so nothing else would
+        // ever re-read the list. Taking only the diagnostic down would leave the card gone and the
+        // sidebar still insisting there are no projects, which is worse than either alone. Selection
+        // reconciles itself: the identity effect above adopts the first entry once one exists.
+        if (applyStoreProblems(next)) setRepos(await electronApi().github.getRepos().catch(() => []))
+      })
       .catch(() => {})
   }
 
@@ -360,7 +390,7 @@ export default function App() {
     // read at mount and after writes, keeps offering a button that writes an empty list. Blind, that
     // deletes the healthy list they just built. Fail closed: a read that throws aborts the reset.
     const current = await electronApi().app.storeProblems()
-    setStoreProblems(current)
+    applyStoreProblems(current)
     if (!current.some((problem) => problem.field === 'githubRepos')) {
       setRepos(await electronApi().github.getRepos().catch(() => repos))
       return

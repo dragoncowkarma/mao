@@ -344,6 +344,42 @@ describe('App unusable stored settings', () => {
     }
   })
 
+  it('adopts a repository list something else repaired while the window was open', async () => {
+    // The renderer read the list once, at mount, while the store could not answer — so healing the file
+    // from a terminal took the card away and left the sidebar insisting there were no projects. The
+    // diagnostic going green while the UI stays broken is worse than either alone.
+    vi.useFakeTimers()
+    try {
+      const stub = createElectronApiStub([], [UNUSABLE_REPO_LIST])
+      render(
+        <StrictMode>
+          <App />
+        </StrictMode>,
+      )
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(screen.getByText(/"githubRepos" in/)).toBeInTheDocument()
+
+      // `mao repos add acme one` in another terminal: the store now holds a real list and reports nothing.
+      stub.applyRepos([ONE])
+      stub.storeProblems.mockResolvedValue([])
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+
+      expect(screen.queryByText(/"githubRepos" in/)).toBeNull()
+      expect(screen.getByRole('button', { name: 'acme/one' })).toBeInTheDocument()
+      expect(screen.queryByText(/No projects yet/)).toBeNull()
+      // Selection reconciles too, by identity: the repaired list has an entry and nothing was selected,
+      // so the project opens rather than leaving the operator on an empty welcome pane.
+      expect(screen.getByRole('heading', { name: 'acme/one' })).toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('says nothing when the store is healthy', async () => {
     await renderApp([ONE])
 

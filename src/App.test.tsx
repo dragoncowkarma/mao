@@ -522,6 +522,162 @@ describe('App unusable stored settings', () => {
     }
   })
 
+  it('ignores a repair read that a later one has already answered', async () => {
+    // Two reads started while the report said the same thing share a generation, so ordering them needs
+    // more than that check: whichever *finishes* last would otherwise win, and an older answer landing
+    // late rolls the sidebar back to a list that is no longer what the store holds.
+    vi.useFakeTimers()
+    try {
+      const stub = createElectronApiStub([], [UNUSABLE_REPO_LIST])
+      render(
+        <StrictMode>
+          <App />
+        </StrictMode>,
+      )
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(screen.getByText(/"githubRepos" in/)).toBeInTheDocument()
+
+      let releaseFirst: (repos: RepoRef[]) => void = () => {}
+      let releaseSecond: (repos: RepoRef[]) => void = () => {}
+      const first = new Promise<RepoRef[]>((resolve) => {
+        releaseFirst = resolve
+      })
+      const second = new Promise<RepoRef[]>((resolve) => {
+        releaseSecond = resolve
+      })
+      stub.storeProblems.mockResolvedValue([])
+      stub.getRepos.mockImplementationOnce(() => first).mockImplementationOnce(() => second)
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+
+      // The newer answer lands first; the older one arrives after it.
+      await act(async () => {
+        releaseSecond([TWO])
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      await act(async () => {
+        releaseFirst([ONE])
+        await vi.advanceTimersByTimeAsync(0)
+      })
+
+      expect(screen.getByRole('button', { name: 'acme/two' })).toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'acme/one' })).toBeNull()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('holds a repair read back while this window is writing the list', async () => {
+    // A settings edit's success path deliberately does not re-read the list, so a repair read that slips
+    // in *during* that write and answers with the pre-write list has the last word — the store keeps the
+    // new interval while the pane shows the old one, and the next full list write puts the old one back.
+    vi.useFakeTimers()
+    try {
+      const stub = createElectronApiStub([ONE])
+      render(
+        <StrictMode>
+          <App />
+        </StrictMode>,
+      )
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+      })
+      expect(screen.getByRole('spinbutton')).toHaveValue(30)
+
+      // The store breaks, is repaired, and the first repair read fails — leaving a retry pending.
+      stub.storeProblems.mockResolvedValue([UNUSABLE_REPO_LIST])
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+      stub.storeProblems.mockResolvedValue([])
+      stub.getRepos.mockRejectedValueOnce(new Error('main process is busy'))
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+
+      // A slow settings write, with a poll landing in the middle of it.
+      let releaseWrite: () => void = () => {}
+      const written = new Promise<void>((resolve) => {
+        releaseWrite = resolve
+      })
+      stub.setRepos.mockImplementationOnce(async (next: RepoRef[]) => {
+        await written
+        stub.applyRepos(next)
+        return []
+      })
+      await act(async () => {
+        fireEvent.change(screen.getByRole('spinbutton'), { target: { value: '60' } })
+      })
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+      await act(async () => {
+        releaseWrite()
+        await vi.advanceTimersByTimeAsync(0)
+      })
+
+      expect(stub.storedRepos()).toEqual([{ ...ONE, pollIntervalMs: 60_000 }])
+      expect(screen.getByRole('spinbutton')).toHaveValue(60)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('still adopts a repair after an earlier write has finished', async () => {
+    // The other side of holding adoption back during a write: the hold has to be released. Leak it and
+    // the window never adopts another repair for the rest of its life, which is a worse failure than the
+    // race it exists to prevent — and an invisible one, since nothing else re-reads the list.
+    vi.useFakeTimers()
+    try {
+      const stub = createElectronApiStub([ONE])
+      render(
+        <StrictMode>
+          <App />
+        </StrictMode>,
+      )
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+      })
+
+      // An ordinary settings write, start to finish.
+      await act(async () => {
+        fireEvent.change(screen.getByRole('spinbutton'), { target: { value: '45' } })
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(stub.setRepos).toHaveBeenCalledWith([{ ...ONE, pollIntervalMs: 45_000 }])
+
+      // Only afterwards does the store break, and then get repaired to a different list.
+      stub.storeProblems.mockResolvedValue([UNUSABLE_REPO_LIST])
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+      expect(screen.getByText(/"githubRepos" in/)).toBeInTheDocument()
+
+      stub.applyRepos([TWO])
+      stub.storeProblems.mockResolvedValue([])
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+
+      expect(screen.getByRole('button', { name: 'acme/two' })).toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('says nothing when the store is healthy', async () => {
     await renderApp([ONE])
 

@@ -54,12 +54,23 @@ export default function App() {
    * - `repairOwed` — a repair has been seen but its list has not been adopted yet. Survives a failed
    *   read so the next poll tries again.
    * - `generation` — bumped whenever something invalidates a list read already in flight: the observed
-   *   state changing, or this window writing the list. Repairs are observed on a 30s poll but adopted
-   *   through a read that takes its own time, so the two interleave; without this, a read started for
-   *   one repair could land after the store had broken and been repaired again, show the list from
-   *   before that second repair, and spend `repairOwed` so nothing ever read the current one.
+   *   state changing, or this window starting a write. Repairs are observed on a 30s poll
+   *   but adopted through a read that takes its own time, so the two interleave; without this, a read
+   *   started for one repair could land after the store had broken and been repaired again, show the
+   *   list from before that second repair, and spend `repairOwed` so nothing ever read the current one.
+   * - `writesInFlight` — writes from this window that have not settled. A read taken across one answers
+   *   with a list the write is about to replace, and a generation captured *after* the write began looks
+   *   current, so the read is not started at all; the write's own completion re-enters and retries.
+   * - `adoption` — the most recently started adoption. Reads sharing a generation can still finish out
+   *   of order, and only the newest may apply, or a late older answer rolls the sidebar back.
    */
-  const repoListWatch = useRef({ lastUnusable: false, repairOwed: false, generation: 0 })
+  const repoListWatch = useRef({
+    lastUnusable: false,
+    repairOwed: false,
+    generation: 0,
+    writesInFlight: 0,
+    adoption: 0,
+  })
   /**
    * Counts every navigation choice, so an async add can ask whether the operator moved elsewhere
    * while its permission preflight was running.
@@ -143,12 +154,17 @@ export default function App() {
    */
   async function adoptRepairedRepoList(): Promise<void> {
     const watch = repoListWatch.current
+    // Not while this window is writing: the store is about to hold whatever the write is sending, so a
+    // read now can only produce a list to be discarded — and its generation, captured after the write
+    // began, would still look current when it answered. `persistRepos` re-enters here once it settles.
+    if (watch.writesInFlight > 0) return
     const startedAt = watch.generation
+    const request = (watch.adoption += 1)
     const repaired = await electronApi().github.getRepos()
-    // Superseded while this read was in flight — by a newer report, or by a write from this window. The
-    // answer describes a store that has since moved, so it is dropped rather than applied, and
-    // `repairOwed` is left standing so the next report reads the list that exists now.
-    if (watch.generation !== startedAt) return
+    // Superseded while this read was in flight — by a newer report, by a write from this window, or by a
+    // later adoption that has already answered. The list is dropped rather than applied, and
+    // `repairOwed` is left standing so the next report reads whatever exists then.
+    if (watch.generation !== startedAt || watch.adoption !== request) return
     watch.repairOwed = false
     setRepos(repaired)
   }
@@ -299,8 +315,9 @@ export default function App() {
   async function persistRepos(next: RepoRef[]): Promise<RepoWorkflowCapability[]> {
     const previous = repos
     // This window is now the newest thing to have touched the list, so any repair read already in flight
-    // is describing a store that predates it.
+    // is describing a store that predates it — and until this settles, no new one should start.
     repoListWatch.current.generation += 1
+    repoListWatch.current.writesInFlight += 1
     setRepos(next)
     try {
       return await electronApi().github.setRepos(next)
@@ -310,8 +327,12 @@ export default function App() {
       setRepos(await electronApi().github.getRepos().catch(() => previous))
       throw err
     } finally {
+      // No second generation bump on the way out: the one taken on entry already invalidates every read
+      // that spans this write, whichever order they settle in.
+      repoListWatch.current.writesInFlight -= 1
       // Every list write replaces an unusable stored value, and a refused one does not — so this is
-      // read back on both paths rather than cleared optimistically on the success path.
+      // read back on both paths rather than cleared optimistically on the success path. It is also what
+      // retries an adoption this write held back.
       void refreshStoreProblems()
     }
   }

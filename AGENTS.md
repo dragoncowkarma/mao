@@ -390,7 +390,14 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   list, and a read whose generation has moved is dropped rather than applied. Without it a read
   started for one repair could land after the store had broken and been repaired again — showing
   the list from before that second repair, spending the pending flag so nothing ever read the
-  current one, and leaving a stale mirror for the next list write to persist.
+  current one, and leaving a stale mirror for the next list write to persist. A generation alone is
+  not enough, so two more rules hold: adoption does not **start** while a write from this window is
+  in flight (a read taken across one answers with a list the write is about to replace, and its
+  generation — captured after the write began — would still look current), and only the
+  most-recently-started adoption may apply, because reads sharing a generation can finish out of
+  order and a late older answer rolls the sidebar back. The write's own completion re-enters
+  adoption, which is what retries the one it held back — releasing that hold is load-bearing and
+  tested: leak it and the window never adopts another repair, silently, for the rest of its life.
   Two backend details make "the two shells cannot answer differently" true rather than aspirational.
   `STORED_SHAPE_RULES` is the one table of checked fields, and `describeStoredProblems()` iterates it
   to decide what to *read* — electron-store re-reads and re-parses the whole file on every `get`, so

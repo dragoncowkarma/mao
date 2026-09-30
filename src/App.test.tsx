@@ -1,5 +1,5 @@
 import { StrictMode } from 'react'
-import { act, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 import App from './App'
@@ -408,6 +408,112 @@ describe('App unusable stored settings', () => {
 
       await act(async () => {
         await vi.advanceTimersByTimeAsync(30_000)
+      })
+
+      expect(screen.getByRole('button', { name: 'acme/one' })).toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('discards a repaired list a newer observation has already superseded', async () => {
+    // Repairs are observed on a 30s poll but adopted through a read that takes its own time, so the two
+    // can interleave: a read started for one repair can land after the store has broken and been
+    // repaired again. Applying it then would both show the list from before the second repair and spend
+    // the latch, so nothing would ever read the current one — and a later list write would persist that
+    // stale mirror.
+    vi.useFakeTimers()
+    try {
+      const stub = createElectronApiStub([], [UNUSABLE_REPO_LIST])
+      render(
+        <StrictMode>
+          <App />
+        </StrictMode>,
+      )
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(screen.getByText(/"githubRepos" in/)).toBeInTheDocument()
+
+      // The first repair is seen, and its read is held open.
+      let releaseStale: (repos: RepoRef[]) => void = () => {}
+      const stale = new Promise<RepoRef[]>((resolve) => {
+        releaseStale = resolve
+      })
+      stub.storeProblems.mockResolvedValue([])
+      stub.getRepos.mockImplementationOnce(() => stale)
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+
+      // While it is still in flight the store breaks again, and is then repaired to a different list.
+      stub.storeProblems.mockResolvedValue([UNUSABLE_REPO_LIST])
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+      stub.applyRepos([TWO])
+      stub.storeProblems.mockResolvedValue([])
+
+      // The held read answers at last, with the list from before the second repair.
+      await act(async () => {
+        releaseStale([ONE])
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(screen.queryByRole('button', { name: 'acme/one' })).toBeNull()
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+
+      expect(screen.getByRole('button', { name: 'acme/two' })).toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("discards a repaired list this window's own write has superseded", async () => {
+    // The other half of the same race: the newer information is not a report but a write from here.
+    // `fireEvent` rather than `userEvent` because fake timers are needed to drive the poll and the two
+    // deadlock (SKILL.md).
+    vi.useFakeTimers()
+    try {
+      const stub = createElectronApiStub([], [UNUSABLE_REPO_LIST])
+      render(
+        <StrictMode>
+          <App />
+        </StrictMode>,
+      )
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(screen.getByText(/"githubRepos" in/)).toBeInTheDocument()
+
+      let releaseStale: (repos: RepoRef[]) => void = () => {}
+      const stale = new Promise<RepoRef[]>((resolve) => {
+        releaseStale = resolve
+      })
+      stub.storeProblems.mockResolvedValue([])
+      stub.getRepos.mockImplementationOnce(() => stale)
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+
+      // The operator registers a repository while that read is still in flight.
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: '+ Add' }))
+      })
+      await act(async () => {
+        fireEvent.change(screen.getByPlaceholderText('owner'), { target: { value: ONE.owner } })
+        fireEvent.change(screen.getByPlaceholderText('repo'), { target: { value: ONE.repo } })
+        fireEvent.click(screen.getByRole('button', { name: 'Add' }))
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(stub.setRepos).toHaveBeenCalledWith([ONE])
+
+      // The held read answers with the list from before that write.
+      await act(async () => {
+        releaseStale([])
+        await vi.advanceTimersByTimeAsync(0)
       })
 
       expect(screen.getByRole('button', { name: 'acme/one' })).toBeInTheDocument()

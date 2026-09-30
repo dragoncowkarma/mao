@@ -384,7 +384,13 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   consumed until the list is actually in hand — a read that fails leaves the repair pending and the
   renderer's current list untouched, and the next poll tries again. Clearing it first, or adopting
   `[]` on failure, strands the sidebar on "No projects yet" until the window restarts, with the
-  diagnostic already gone and nothing left to say why.
+  diagnostic already gone and nothing left to say why. The adoption is also **generation-guarded**,
+  because repairs are observed on a poll but adopted through a read that takes its own time, so the
+  two interleave: a counter is bumped whenever the observed state changes or this window writes the
+  list, and a read whose generation has moved is dropped rather than applied. Without it a read
+  started for one repair could land after the store had broken and been repaired again — showing
+  the list from before that second repair, spending the pending flag so nothing ever read the
+  current one, and leaving a stale mirror for the next list write to persist.
   Two backend details make "the two shells cannot answer differently" true rather than aspirational.
   `STORED_SHAPE_RULES` is the one table of checked fields, and `describeStoredProblems()` iterates it
   to decide what to *read* — electron-store re-reads and re-parses the whole file on every `get`, so

@@ -182,7 +182,8 @@ value. A hand-edit made while the window is open is picked up by the sidebar's 3
 does not wait for the next write to appear — and when that poll finds the list repaired (by `mao repos
 add` in a terminal, say), the GUI re-reads the list too, so the projects appear instead of the sidebar
 going quiet but staying empty. If that re-read fails, the repair stays pending and the next poll
-retries rather than leaving the window stuck until it is restarted. `mao repos remove` also says which unusable value it
+retries rather than leaving the window stuck until it is restarted, and a read overtaken by a newer
+observation or by a write from the window itself is discarded rather than applied. `mao repos remove` also says which unusable value it
 replaced — without that line the command that always heals prints only `No tracked repo matches …`
 and reads like a no-op.
 

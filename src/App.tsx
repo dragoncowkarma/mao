@@ -45,11 +45,21 @@ export default function App() {
    */
   const [storeProblems, setStoreProblems] = useState<StoredValueProblem[]>([])
   /**
-   * Whether the *last* report said the repository list was unusable, so a later one can be recognised as
-   * a repair rather than merely a quiet answer. A ref, not state: it is read to decide what to do with
-   * the value being stored, and a render is not what has to happen in between.
+   * What the poll has to remember between reports about the repository list. A ref, not state: it is
+   * read to decide what to do with the value being stored, and a render is not what has to happen in
+   * between.
+   *
+   * - `lastUnusable` — what the previous report said, so the next one can be recognised as a repair
+   *   rather than merely a quiet answer.
+   * - `repairOwed` — a repair has been seen but its list has not been adopted yet. Survives a failed
+   *   read so the next poll tries again.
+   * - `generation` — bumped whenever something invalidates a list read already in flight: the observed
+   *   state changing, or this window writing the list. Repairs are observed on a 30s poll but adopted
+   *   through a read that takes its own time, so the two interleave; without this, a read started for
+   *   one repair could land after the store had broken and been repaired again, show the list from
+   *   before that second repair, and spend `repairOwed` so nothing ever read the current one.
    */
-  const repoListWasUnusable = useRef(false)
+  const repoListWatch = useRef({ lastUnusable: false, repairOwed: false, generation: 0 })
   /**
    * Counts every navigation choice, so an async add can ask whether the operator moved elsewhere
    * while its permission preflight was running.
@@ -111,9 +121,14 @@ export default function App() {
    * the next poll tries again, instead of stranding the sidebar on "No projects yet" until a restart.
    */
   function applyStoreProblems(next: StoredValueProblem[]): boolean {
+    const watch = repoListWatch.current
     const unusable = next.some((problem) => problem.field === 'githubRepos')
-    const healed = repoListWasUnusable.current && !unusable
-    if (!healed) repoListWasUnusable.current = unusable
+    if (unusable !== watch.lastUnusable) {
+      watch.lastUnusable = unusable
+      watch.generation += 1
+    }
+    const healed = watch.repairOwed && !unusable
+    if (!healed) watch.repairOwed = unusable
     setStoreProblems(next)
     return healed
   }
@@ -127,8 +142,14 @@ export default function App() {
    * projects", which is the one thing this whole path exists to stop the operator being told.
    */
   async function adoptRepairedRepoList(): Promise<void> {
+    const watch = repoListWatch.current
+    const startedAt = watch.generation
     const repaired = await electronApi().github.getRepos()
-    repoListWasUnusable.current = false
+    // Superseded while this read was in flight — by a newer report, or by a write from this window. The
+    // answer describes a store that has since moved, so it is dropped rather than applied, and
+    // `repairOwed` is left standing so the next report reads the list that exists now.
+    if (watch.generation !== startedAt) return
+    watch.repairOwed = false
     setRepos(repaired)
   }
 
@@ -277,6 +298,9 @@ export default function App() {
    */
   async function persistRepos(next: RepoRef[]): Promise<RepoWorkflowCapability[]> {
     const previous = repos
+    // This window is now the newest thing to have touched the list, so any repair read already in flight
+    // is describing a store that predates it.
+    repoListWatch.current.generation += 1
     setRepos(next)
     try {
       return await electronApi().github.setRepos(next)

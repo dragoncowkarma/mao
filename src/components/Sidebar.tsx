@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import type { RepoRef } from '../../core/workflow-engine'
+import type { QueueRecoveryState, RepoRef } from '../../core/workflow-engine'
 import type { RepoWorkflowCapability } from '../../core/repo-capabilities'
 import type { StoredValueProblem } from '../../core/store'
 
@@ -49,6 +49,23 @@ interface SidebarProps {
   storeProblems: StoredValueProblem[]
   /** Discards the unusable stored value by writing an empty list. Rejects if even that write fails. */
   onResetRepoList: () => Promise<void>
+  /**
+   * Whether unattended work is halted because the stored workflow queue is unreadable, and the store's
+   * own report saying why.
+   *
+   * Driven by the engine rather than by `storeProblems`, because the latch is monotone: after a repair
+   * made outside this window the store reads clean while this process stays halted, and the operator
+   * still needs to be told that — and told to restart — rather than shown a healthy-looking sidebar.
+   */
+  queueRecovery: QueueRecoveryState
+  /**
+   * Whether the config file *still* holds the unreadable queue. False while the latch is up means
+   * something else already repaired it, and then the discard must not be offered: it would replace the
+   * repair with this process's coerced empty queue.
+   */
+  queueStoredStillUnreadable: boolean
+  /** Discards the unreadable stored queue and releases the engine. Rejects if the write fails. */
+  onDiscardQueue: () => Promise<void>
   view: 'project' | 'global-settings'
   onViewChange: (view: 'project' | 'global-settings') => void
 }
@@ -60,6 +77,9 @@ export default function Sidebar({
   onAddRepo,
   storeProblems,
   onResetRepoList,
+  queueRecovery,
+  queueStoredStillUnreadable,
+  onDiscardQueue,
   view,
   onViewChange,
 }: SidebarProps) {
@@ -72,16 +92,40 @@ export default function Sidebar({
   const [confirmingReset, setConfirmingReset] = useState(false)
   const [resetting, setResetting] = useState(false)
   const [resetError, setResetError] = useState('')
+  const [confirmingDiscard, setConfirmingDiscard] = useState(false)
+  const [discarding, setDiscarding] = useState(false)
+  const [queueError, setQueueError] = useState('')
 
   /**
    * Whether it is the *repository list* that is unusable, not merely something in the same file.
    *
    * The reset deletes `githubRepos` and nothing else, so offering it for any other field's report would
-   * put a destructive button under a message that is not about repositories. Today the guard only checks
-   * this one field, so the distinction is invisible — which is exactly why it is written down now rather
-   * than discovered when a second field joins it (issue #68).
+   * put a destructive button under a message that is not about repositories. Issue #68 added the second
+   * and third fields this now has to be distinguished from, so the check is load-bearing rather than
+   * merely prospective.
    */
   const repoListUnusable = storeProblems.some((problem) => problem.field === 'githubRepos')
+
+  /**
+   * The queue's report is rendered by its own card below, which carries the discard action, so it is
+   * filtered out of the generic list — the latch holds the store's message verbatim, and showing both
+   * would print the same paragraph twice in a narrow column.
+   */
+  const otherProblems = storeProblems.filter((problem) => problem.field !== 'workflowTasks')
+
+  async function submitDiscard() {
+    if (discarding) return
+    setDiscarding(true)
+    setQueueError('')
+    try {
+      await onDiscardQueue()
+      setConfirmingDiscard(false)
+    } catch (err) {
+      setQueueError(readableIpcError(err))
+    } finally {
+      setDiscarding(false)
+    }
+  }
 
   /**
    * The main process preflights issue/PR write access before it persists anything, so this can fail
@@ -152,10 +196,60 @@ export default function Sidebar({
           </button>
         </div>
 
-        {storeProblems.length > 0 && (
+        {queueRecovery.required && (
+          <div className="card mb-2 gap-1.5 p-2">
+            <p className="card-title text-[13px]">Workflow automation is halted</p>
+            {/* The store's own report, verbatim — the same words `mao run` prints and every refused
+                queue action throws, so an operator reading one has read them all. */}
+            <p className="text-muted text-[11px] leading-snug">{queueRecovery.reason}</p>
+            {queueStoredStillUnreadable ? (
+              confirmingDiscard ? (
+                <div className="flex gap-2">
+                  <button onClick={submitDiscard} className="btn btn-primary text-xs" disabled={discarding}>
+                    {discarding ? 'Discarding…' : 'Confirm discard'}
+                  </button>
+                  {/* Disabled mid-write rather than hidden, like the repo-list reset: the write is
+                      already queued and a Cancel that appeared to work would say otherwise. */}
+                  <button
+                    onClick={() => {
+                      setConfirmingDiscard(false)
+                      setQueueError('')
+                    }}
+                    className="btn btn-secondary text-xs"
+                    disabled={discarding}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              ) : (
+                <button
+                  onClick={() => setConfirmingDiscard(true)}
+                  className="btn btn-secondary self-start text-xs"
+                >
+                  Discard unreadable queue
+                </button>
+              )
+            ) : (
+              /* Something outside this window already repaired the file. Offering the discard here
+                 would overwrite that repair with this process's coerced empty queue, so the way out is
+                 a restart instead — the real queue has to be loaded, and only a fresh boot does that. */
+              <p className="text-muted text-[11px] leading-snug">
+                The stored queue reads normally again. Restart MAO to load it — this session is still
+                halted because it is holding an empty queue.
+              </p>
+            )}
+            {queueError && (
+              <p className="text-xs" style={{ color: 'var(--color-accent-700)' }}>
+                {queueError}
+              </p>
+            )}
+          </div>
+        )}
+
+        {otherProblems.length > 0 && (
           <div className="card mb-2 gap-1.5 p-2">
             <p className="card-title text-[13px]">Stored settings could not be read</p>
-            {storeProblems.map((problem) => (
+            {otherProblems.map((problem) => (
               <p key={problem.field} className="text-muted text-[11px] leading-snug">
                 {problem.message}
               </p>

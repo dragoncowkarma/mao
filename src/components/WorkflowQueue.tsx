@@ -272,10 +272,29 @@ export default function WorkflowQueue({ repo }: WorkflowQueueProps) {
   // enqueued with, which need not be the one now stored for the same repository.
   const repoTasks = tasks.filter((t) => sameRepoRef(t.repo, repo))
 
+  /**
+   * Runs a queue action and shows what came back if it was refused.
+   *
+   * These three had no catch at all, which was survivable while the only rejections came from `retry`
+   * and `advance` (both routed through `runStage`, which does catch). Issue #68's queue-recovery latch
+   * refuses `enqueue`, `setAutoAdvance` and `clearCompleted` too, and an unhandled rejection presents as
+   * the button simply doing nothing — which would hide the one message explaining why.
+   */
+  async function withError(action: () => Promise<unknown>) {
+    try {
+      await action()
+      setError('')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    }
+  }
+
   async function startWorkflow() {
     if (!title.trim()) return
-    await electronApi().workflow.enqueue(title.trim(), repo, autoAdvanceNewTask)
-    setTitle('')
+    await withError(async () => {
+      await electronApi().workflow.enqueue(title.trim(), repo, autoAdvanceNewTask)
+      setTitle('')
+    })
     setTasks(await electronApi().workflow.list())
   }
 
@@ -306,12 +325,12 @@ export default function WorkflowQueue({ repo }: WorkflowQueueProps) {
   }
 
   async function toggleAutoAdvance(taskId: string, autoAdvance: boolean) {
-    await electronApi().workflow.setAutoAdvance(taskId, autoAdvance)
+    await withError(() => electronApi().workflow.setAutoAdvance(taskId, autoAdvance))
     setTasks(await electronApi().workflow.list())
   }
 
   async function clearCompleted() {
-    await electronApi().workflow.clearCompleted()
+    await withError(() => electronApi().workflow.clearCompleted())
     setTasks(await electronApi().workflow.list())
   }
 

@@ -4,7 +4,7 @@ import type { GithubTask, GithubTaskDetail } from '../core/github-service.ts'
 import type { RepoWorkflowCapability } from '../core/repo-capabilities.ts'
 import type { QueuedTask, RepoRef, RunOverride } from '../core/workflow-engine.ts'
 import type { AutoTriggerStatus } from '../core/auto-trigger.ts'
-import type { ThemePreference } from '../core/store.ts'
+import type { StoredValueProblem, ThemePreference } from '../core/store.ts'
 import type { SelfUpdateCheck } from '../core/self-update.ts'
 
 export interface AppUpdateCheck extends SelfUpdateCheck {
@@ -16,6 +16,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   app: {
     checkUpdate: (): Promise<AppUpdateCheck> => ipcRenderer.invoke('app:checkUpdate'),
     relaunch: (force?: boolean): Promise<void> => ipcRenderer.invoke('app:relaunch', force),
+    /** Stored values the main process could not use and answered with a schema default instead. */
+    storeProblems: (): Promise<StoredValueProblem[]> => ipcRenderer.invoke('app:storeProblems'),
   },
   ai: {
     list: (): Promise<AiProviderConfig[]> => ipcRenderer.invoke('ai:list'),

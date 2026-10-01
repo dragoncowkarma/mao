@@ -146,6 +146,48 @@ replaces its entry", so the flags you pass (or omit) win, and omitting `--no-aut
 polling. Where two entries for one repository disagree about `autoTrigger`, the fold resolves to
 `false`: re-enabling unattended polling by accident is far worse than leaving it off.
 
+**Recovering a `config.json` whose `githubRepos` is not a list.** `config.json` is unvalidated JSON, so
+a hand-edit (or a file an older build wrote) can leave `githubRepos` as an object, a string, `null` —
+anything but the array the schema declares. Every read now goes through a guard in `core/store.ts` that
+answers with an empty list instead, and reports once per command on **stderr** naming the field, what
+the file actually holds, and the file's path:
+
+```
+[store] "githubRepos" in /path/to/config.json is an object, not a JSON array of { owner, repo }
+entries — ignoring it, so no repositories are tracked until it is replaced. The unusable value is
+still in the file; any repository-list write overwrites it. `mao repos remove <owner> <repo>`, or the
+sidebar's Reset stored list, always works — neither registers anything, so neither is checked for
+write access. …
+```
+
+So `mao repos list` prints `[]` (and `mao config show`'s JSON stays parseable on stdout), and `mao run`'s
+scheduler keeps ticking instead of dying on its first poll. Nothing is repaired on read — the unusable
+value stays in the file, so copy any repositories you still need out of it first; the next list write
+(`mao repos remove <owner> <repo>`, `mao repos add <owner> <repo>`, or the GUI's Reset/Add) overwrites it
+with a real list. A **removal registers nothing, so it is never preflighted and always works**; an `add`
+is preflighted, and because the unusable value names no tracked repository every entry counts as a first
+registration — so `repos add` needs a working GitHub token, and fails leaving the bad value in place
+without one.
+
+Because stderr is easy to miss (`2>/dev/null` discards it), the same thing is queryable. `mao config
+show` reports it as `storeProblems` — one entry per field, each with the field name, the config file and
+the message — so a diagnostic command never reports a value that is not in the file. The GUI polls the
+same list over `app:storeProblems` and the sidebar shows it in place of "No projects yet", with a
+**Reset stored list** button (two-step) that discards the unusable value by writing an empty list. That
+is the GUI's only always-available recovery: with no usable list there is no project row, so no Settings
+tab and no Remove button, and Add can be refused by the preflight. The button re-checks before it
+writes — heal the store from a terminal while the window is open and confirming the reset picks up the
+repaired list instead of wiping it — and it appears only when `githubRepos` itself is the unusable
+value. A hand-edit made while the window is open is picked up by the sidebar's 30s poll, so the notice
+does not wait for the next write to appear — and when that poll finds the list repaired (by `mao repos
+add` in a terminal, say), the GUI re-reads the list too, so the projects appear instead of the sidebar
+going quiet but staying empty. If that re-read fails, the repair stays pending and the next poll
+retries rather than leaving the window stuck until it is restarted, and a read overtaken by a newer
+observation or by a write from the window itself is discarded rather than applied — so a settings edit
+saved while a repair is being picked up is not quietly rolled back to the pre-edit value. `mao repos remove` also says which unusable value it
+replaced — without that line the command that always heals prints only `No tracked repo matches …`
+and reads like a no-op.
+
 The GUI shows the same unverified-grants caveat the CLI prints (`github:setRepos` returns the
 verdicts), and the board's **Refresh** surfaces a failed preflight instead of reporting a clean sync —
 `github:refreshRepo` drives a real poll, so its verdict has to reach the operator. The board's own 30s
@@ -349,7 +391,11 @@ Two traps:
 ### Add a store field
 
 1. Add to **both** `MaoStoreSchema` and `MAO_STORE_DEFAULTS` in `core/store.ts`.
-2. Backends (`electron/store.ts`, `FileStore`) pick it up automatically.
+2. Backends (`electron/store.ts`, `FileStore`) pick up get/set automatically — but not shape
+   validation. Neither backend validates the JSON it reads, so a field whose declared type a
+   hand-edited `config.json` can violate (an array, an object) also belongs in
+   `createStoredReadGuard()` in the same file. Read its doc comment first: coercing a field whose
+   value is recoverable state is not automatically the right call.
 3. Renderer needs it? Add get/set IPC channels (recipe above). CLI needs it?
    Extend `cli/index.ts` (keep `config show` redaction for anything secret).
 

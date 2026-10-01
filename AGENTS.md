@@ -351,9 +351,12 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   The read is deliberately **not** a repair: nothing in the guard writes, so a read-only command leaves
   the file as it found it and the operator can still salvage what the unusable value named. Element-level
   validity stays `isRepoRef`/`canonicalRepoList`'s job — the guard owns the container only. Do not make
-  the guard silent, and do not extend the coercion to a field where an empty value would destroy
-  recoverable state without saying so (`aiProviders` would be the same one-liner; `workflowTasks` first
-  needs an answer for how an unreadable queue interacts with `resume` and the persistence-broken marker).
+  the guard silent, and do not add a field to `STORED_SHAPE_RULES` without answering the question that
+  field raises: what does the empty value cost, which write heals it, and **does losing it let unattended
+  work start against state MAO can no longer account for?** All three array-typed fields are guarded now
+  (issue #68). `aiProviders` is reported and coerced but halts nothing — an empty provider list stops
+  every stage at `selectAgent()` before any GitHub write, so latching for it would be a larger outage
+  than the fault. `workflowTasks` halts everything; see the next bullet.
   The discard is not silent in either shell, and that is a contract, not a log line: `get()` answers the
   same `[]` for an unusable list as for an empty one, so the fact cannot ride on the value. `MaoStore`
   therefore carries `problems()` — evaluated on demand against what the backend holds *now*, never
@@ -420,6 +423,54 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   into the module-level defaults — a shallow spread let a caller that pushed into the empty list it read
   leak a phantom entry into the default, which the next `FileStore` in that process read back as a
   tracked repository for auto-trigger to poll.
+- **An unreadable `workflowTasks` halts unattended automation, and the latch is derived — no marker, no
+  `clear-` command.** Review of PR #69 established why coercing the queue to `[]` and carrying on is not
+  enough: both long-lived hosts call `startAutoTrigger()` immediately after `createMaoApp()` and it ticks
+  at once rather than after its first interval, so the first poll's `enqueueFromIssue()` would `notify()`,
+  the `'change'` listener would `store.set('workflowTasks', …)`, and that single write both destroys the
+  only salvageable copy of the unreadable value **and** starts an unattended pipeline on a host that
+  cannot know what was already in flight (the `workflow-active` label is best-effort, so a task lost with
+  the queue may carry no label to stop its issue running twice). `createMaoApp` therefore reads
+  `findStoredQueueProblem(store.problems())` and calls `workflowEngine.requireQueueRecovery(message)`
+  **before** it subscribes the `'change'` listener and before `restore()`, and the engine then refuses
+  `enqueue`, `enqueueFromIssue`, `retry`, `advance`, `setAutoAdvance` and `clearCompleted` (each before
+  any mutation and before `notify()`) plus `processQueue` at entry and in its per-task loop. `clearCompleted`
+  is gated for a reason that is easy to get wrong: it emits `'change'` too, so leaving it open would let a
+  GUI "Clear completed" replace the unreadable value with no confirmation at all.
+  No new persisted state, because the corruption is already durable — both backends rewrite the blob from
+  a snapshot whose `workflowTasks` the guard never repaired, so only a write to *that field* heals it and
+  the next boot re-derives. That is also why the persistence-broken marker must **not** be reused: it
+  records a confirmed *write* failure, so `mao config show` would answer `workflowPersistenceBroken: true`
+  while persistence is fine, and it is sticky and operator-gated where this heals itself. The two are
+  reported as separate fields.
+- **Two readers, and only one of them may probe the store.** `isQueueRecoveryLatched()` reads the field
+  and nothing else; the probing accessors are for the pre-mutation gates and `confirmQueueRecovery()`.
+  `core/app.ts`'s `'change'` backstop must use the field-only one. This is not style: `confirmQueueRecovery()`
+  clears the field and *then* notifies, because that one emit **is** the write that replaces the
+  unreadable value — a backstop that re-inspected the store at that moment would see the still-dirty file,
+  re-latch inside the healing emit, and refuse the only write that can ever clear the latch, deadlocking
+  both recovery routes permanently. The backstop is also a **silent return, never a throw**: `notifyAfterStage`
+  reads a throwing `'change'` listener as a persistence failure and would escalate this read-shape halt
+  into a bogus `persistenceBroken`. For the same reason `notify()` itself is deliberately not a gate —
+  gate its callers. And the latch is derived **once at boot**, never re-probed per gate: a corruption
+  appearing after a *clean* boot is harmless (the engine holds the true queue, so its next write restores
+  the file faithfully), while probing per gate would put three whole-config reads on the `'change'` path
+  and let a transient read failure latch a healthy host.
+- **`confirmQueueRecovery()` owns its own postcondition, and probes before it writes.** It returns a
+  typed `QueueRecoveryOutcome` (`'replaced'` / `'already-readable'` / `'still-unreadable'`) so the CLI
+  command and the GUI button cannot disagree about whether confirmation worked — a bare boolean had the
+  CLI re-deriving success while the GUI reported it. `'already-readable'` is the case that must write
+  **nothing**: the latch is monotone, so after a repair made outside this process the store reads clean
+  while this process still holds the coerced empty queue, and persisting it would overwrite the repair
+  with exactly the loss the latch exists to prevent — the operator has to restart. A write that threw or
+  that a backend silently dropped re-latches rather than reporting success.
+- **What the halt does *not* cover, so it is not read as more than it is.** A `config.json` that is not
+  valid JSON at all is invisible: `FileStore.load()` catches the parse error and answers `{}`, so every
+  field reads as its schema default, nothing is reported and no latch arms (issue #67). Element-level
+  validity is out of scope exactly as for `githubRepos` — `workflowTasks: [null]` passes `Array.isArray`
+  and then throws inside `restore()` (issue #75). And `mao swarm` reads none of this: it is a separate
+  Python engine with a separate credential, so "the queue is latched" must never be read as "this host
+  performs no unattended GitHub writes".
 - **Repository identity is case-insensitive, and the list is canonicalised before it is stored**:
   GitHub resolves owner/repo without regard to case, so `sameRepoRef()`/`repoRefKey()` lower-case
   both halves — otherwise `mao repos add DragonCowKarma MAO` registered a *second* entry for an

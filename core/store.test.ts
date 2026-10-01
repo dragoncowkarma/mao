@@ -2,13 +2,18 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { FileStore, MAO_STORE_DEFAULTS, createStoredReadGuard, describeUnusableStoredList } from './store.ts'
-import type { MaoStoreSchema } from './store.ts'
+import {
+  FileStore,
+  MAO_STORE_DEFAULTS,
+  createStoredReadGuard,
+  describeStoredProblems,
+  describeUnusableRepoList,
+  createGuardedStore,
+  type MaoStoreSchema,
+  type StoredValueBackend,
+} from './store.ts'
 import { canonicalRepoList } from './repo-registry.ts'
-import { WorkflowEngine } from './workflow-engine.ts'
-import { GithubService } from './github-service.ts'
-import type { QueuedTask, RepoRef } from './workflow-engine.ts'
-import type { AiProviderConfig } from './ai/types.ts'
+import type { RepoRef } from './workflow-engine.ts'
 
 const tmpDirs: string[] = []
 
@@ -19,47 +24,6 @@ afterEach(() => {
 
 const widgets: RepoRef = { owner: 'acme', repo: 'widgets' }
 const gadgets: RepoRef = { owner: 'acme', repo: 'gadgets' }
-
-const claude: AiProviderConfig = { id: 'claude', name: 'Claude', kind: 'cli', command: 'claude' }
-
-const pendingTask: QueuedTask = {
-  id: 'task-1',
-  title: 'Pending task',
-  repo: widgets,
-  stage: 'issue',
-  history: [],
-  status: 'pending',
-  autoAdvance: false,
-  github: {},
-}
-
-/**
- * The shapes a hand-edit can leave behind, and the phrase each must produce. Shared by every field's
- * table so a field cannot be covered for fewer shapes than its neighbours — the object is issue #60's
- * own repro, and the rest are what `typeof` collapses or an editor's autocomplete produces.
- */
-const DISCARDED_SHAPES: Array<[unknown, string]> = [
-  [{ 'acme/widgets': { owner: 'acme', repo: 'widgets' } }, 'is an object'],
-  ['acme/widgets', 'is a string'],
-  [42, 'is a number'],
-  [true, 'is a boolean'],
-  [null, 'is null'],
-]
-
-/**
- * Every field the guard has to cover, discovered from `MAO_STORE_DEFAULTS` at runtime rather than typed
- * out here.
- *
- * `core/store.ts` derives the same set at the type level (`StoredListField`, a mapped type over
- * `MaoStoreSchema`), so tsc already refuses a new array-typed field that nobody wrote a recovery hint
- * for. This is the runtime half of that, and it is not redundant: `MAO_STORE_DEFAULTS` is the other file
- * a new field must be added to, so deriving from it means a field can be missed here only by being
- * missed there too — in which case `FileStore`'s `structuredClone(MAO_STORE_DEFAULTS)` would never fill
- * it in and the field has a bigger problem than this guard.
- */
-const GUARDED_FIELDS = (Object.keys(MAO_STORE_DEFAULTS) as Array<keyof MaoStoreSchema>).filter((field) =>
-  Array.isArray(MAO_STORE_DEFAULTS[field]),
-)
 
 /**
  * A real `config.json` holding exactly `contents`, opened through a real `FileStore`.
@@ -94,7 +58,15 @@ describe('FileStore githubRepos read guard', () => {
     // made null, strings, numbers or booleans discard *silently* would pass a loop that only checked the
     // returned value. Requirement 3 of issue #60 is that nothing is dropped without saying so, and it has
     // to be pinned for every shape a hand-edit can leave behind — the first is the issue's own repro.
-    for (const [githubRepos, expectedPhrase] of DISCARDED_SHAPES) {
+    const shapes: Array<[unknown, string]> = [
+      [{ 'acme/widgets': { owner: 'acme', repo: 'widgets' } }, 'is an object'],
+      ['acme/widgets', 'is a string'],
+      [42, 'is a number'],
+      [true, 'is a boolean'],
+      [null, 'is null'],
+    ]
+
+    for (const [githubRepos, expectedPhrase] of shapes) {
       const warn = captureWarnings()
       const { store, filePath } = storeHolding({ githubRepos })
 
@@ -122,11 +94,14 @@ describe('FileStore githubRepos read guard', () => {
     expect(message).toContain('"githubRepos"')
     expect(message).toContain('is an object')
     expect(message).toContain(filePath)
-    // The unconditional recovery is named first: a removal registers nothing, so it is exempt from the
-    // write-permission preflight, while `repos add` needs a working token — and a missing token is a
-    // likely reason the operator was editing config.json in the first place.
+    // The unconditional recovery is named first: neither a removal nor the GUI's Reset registers
+    // anything, so neither is preflighted, while `repos add` needs a working token — and a missing token
+    // is a likely reason the operator was editing config.json in the first place.
     expect(message).toContain('mao repos remove')
     expect(message.indexOf('mao repos remove')).toBeLessThan(message.indexOf('mao repos add'))
+    // Names the sidebar control that exists when the list is unusable. Remove lives in a project's
+    // Settings tab, which needs a selected project — and an unusable list leaves no row to select.
+    expect(message).toContain('Reset stored list')
   })
 
   it('reports once, however many times the list is read', () => {
@@ -237,248 +212,136 @@ describe('FileStore githubRepos read guard', () => {
   })
 })
 
-describe('every array-typed field is guarded', () => {
-  it('coerces and reports for each of them, with no field left to throw', () => {
-    // The regression that made this a table rather than one field: `githubRepos` was guarded and the
-    // other two were not, so a hand-edit to either still took the app down — `workflowTasks` hardest of
-    // all, since it threw inside `createMaoApp()` and left no `mao` command able to run at all.
-    expect(GUARDED_FIELDS).toEqual(['githubRepos', 'aiProviders', 'workflowTasks'])
+describe('MaoStore.problems', () => {
+  it('reports nothing for a healthy store', () => {
+    const { store } = storeHolding({ githubRepos: [widgets] })
 
-    for (const field of GUARDED_FIELDS) {
-      const reports: string[] = []
-      const guard = createStoredReadGuard('/tmp/config.json', (message) => reports.push(message))
-
-      expect(guard(field, 'nonsense' as never)).toEqual([])
-      expect(reports).toHaveLength(1)
-      expect(reports[0]).toContain(`"${field}"`)
-    }
+    expect(store.problems()).toEqual([])
   })
 
-  it('gives each field its own recovery command, not a shared one', () => {
-    // A hint is only actionable if it names the write that heals *this* field, and the three differ in
-    // what gates them: `repos add` is blocked by the write-permission preflight, `workflow enqueue`
-    // would heal the queue by running the whole unattended pipeline. So each field names the cheapest
-    // unconditional, side-effect-free write instead, and a copy-pasted hint must fail here.
-    const hintFor = (field: keyof MaoStoreSchema) =>
-      describeUnusableStoredList(field, {}, '/tmp/config.json')!
-
-    expect(hintFor('githubRepos')).toContain('mao repos remove')
-    expect(hintFor('aiProviders')).toContain('mao config import-providers')
-    expect(hintFor('workflowTasks')).toContain('mao workflow clear-completed')
-
-    // And each names only its own, so a reader cannot be sent to another field's command.
-    expect(hintFor('aiProviders')).not.toContain('mao repos')
-    expect(hintFor('workflowTasks')).not.toContain('mao repos')
-    expect(hintFor('githubRepos')).not.toContain('mao workflow')
-  })
-})
-
-describe('FileStore aiProviders read guard', () => {
-  it('reads a stored list back unchanged, and says nothing about it', () => {
+  it('answers without needing the field to have been read first', () => {
+    // The property the GUI depends on. The guard only learns about a field when something reads it, so
+    // a list recorded as reads happen would answer "no problems" until `github:getRepos` had run — and
+    // the renderer polls this over a *different* channel, so the order of two IPC calls would decide
+    // whether the operator was ever told.
     const warn = captureWarnings()
-    const { store } = storeHolding({ aiProviders: [claude] })
+    const { store, filePath } = storeHolding({ githubRepos: { 'acme/widgets': widgets } })
 
-    expect(store.get('aiProviders')).toEqual([claude])
+    const problems = store.problems()
+
+    expect(problems).toHaveLength(1)
+    expect(problems[0]!.field).toBe('githubRepos')
+    expect(problems[0]!.source).toBe(filePath)
+    expect(problems[0]!.message).toContain('is an object')
+    // A query, not a read: it must not consume the guard's one report, or polling it would decide
+    // whether the CLI's own stderr line ever appeared.
     expect(warn).not.toHaveBeenCalled()
   })
 
-  it('reports every shape it discards, not only the keyed object', () => {
-    // A shared spy would see only the first report (the guard dedups per field), so a regression that
-    // made null, strings, numbers or booleans discard *silently* would pass a loop that only checked
-    // the returned value.
-    for (const [aiProviders, expectedPhrase] of DISCARDED_SHAPES) {
-      const warn = captureWarnings()
-      const { store, filePath } = storeHolding({ aiProviders })
-
-      expect(store.get('aiProviders')).toEqual([])
-      expect(warn).toHaveBeenCalledTimes(1)
-      const message = warn.mock.calls[0]![0] as string
-      expect(message).toContain('"aiProviders"')
-      expect(message).toContain(expectedPhrase)
-      expect(message).toContain(filePath)
-
-      warn.mockRestore()
-    }
-  })
-
-  it("returns a value the expression `mao config show` runs can consume", () => {
-    // Copies cli/index.ts's redaction expression rather than driving the command, which would need the
-    // whole commander program. Before the guard this threw `store.get(...).map is not a function`, so
-    // `mao config show` — the one command an operator runs to find out what state they are in — was the
-    // command the broken state killed.
+  it('stops reporting once a list write has replaced the value, and repairs nothing itself', () => {
     captureWarnings()
-    const { store } = storeHolding({ aiProviders: { claude } })
+    const { store, filePath } = storeHolding({ githubRepos: 'acme/widgets' })
 
-    const providers = store.get('aiProviders')
+    expect(store.problems()).toHaveLength(1)
+    // Still on disk — querying is not a repair, so the operator can still salvage from the file.
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).githubRepos).toBe('acme/widgets')
 
-    expect(() =>
-      providers.map((provider) => ({ ...provider, apiKey: provider.apiKey ? '[set]' : undefined })),
-    ).not.toThrow()
-    expect(providers).toEqual([])
-  })
+    store.set('githubRepos', [])
 
-  it('names the recovery that needs no GitHub token', () => {
-    // `import-providers` is unconditional — unlike `repos add`, nothing preflights it — which matters
-    // because a provider list is exactly what an operator hand-edits when they have no working token.
-    const warn = captureWarnings()
-    const { store, filePath } = storeHolding({ aiProviders: 'claude' })
-
-    store.get('aiProviders')
-
-    const message = warn.mock.calls[0]![0] as string
-    expect(message).toContain('mao config import-providers')
-    expect(message).toContain(filePath)
-    // The apiKey warning: a provider config is the one stored list whose contents exist nowhere else.
-    expect(message).toContain('apiKey')
-  })
-
-  it('does not repair the file — only a write does', () => {
-    const warn = captureWarnings()
-    const corrupt = { claude }
-    const { store, filePath } = storeHolding({ aiProviders: corrupt })
-
-    store.get('aiProviders')
-    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).aiProviders).toEqual(corrupt)
-
-    store.set('aiProviders', [claude])
-
-    expect(new FileStore(filePath).get('aiProviders')).toEqual([claude])
-    expect(warn).toHaveBeenCalledTimes(1)
-  })
-
-  it('hands back a fresh array rather than the shared default', () => {
-    captureWarnings()
-    const { store } = storeHolding({ aiProviders: 7 })
-
-    store.get('aiProviders').push(claude)
-
-    expect(store.get('aiProviders')).toEqual([])
-    expect(MAO_STORE_DEFAULTS.aiProviders).toEqual([])
+    expect(store.problems()).toEqual([])
+    expect(new FileStore(filePath).problems()).toEqual([])
   })
 })
 
-describe('FileStore workflowTasks read guard', () => {
-  it('reads a stored queue back unchanged, and says nothing about it', () => {
-    const warn = captureWarnings()
-    const { store } = storeHolding({ workflowTasks: [pendingTask] })
+/**
+ * A backend that behaves the way electron-store's does — a key the file does not hold comes back
+ * `undefined`, not a schema default. `FileStore`'s own snapshot never does that, which is exactly the
+ * divergence `createGuardedStore` exists to iron out, so the fake has to model the harder one.
+ */
+function fakeBackend(contents: Partial<Record<keyof MaoStoreSchema, unknown>> = {}) {
+  const data: Record<string, unknown> = { ...contents }
+  const backend: StoredValueBackend = {
+    get: <K extends keyof MaoStoreSchema>(key: K) => data[key] as MaoStoreSchema[K] | undefined,
+    set: <K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]) => {
+      data[key] = value
+    },
+  }
+  return { backend, data }
+}
 
-    expect(store.get('workflowTasks')).toEqual([pendingTask])
-    expect(warn).not.toHaveBeenCalled()
+describe('createGuardedStore', () => {
+  it('reports from the raw stored value, not from what the guard already replaced', () => {
+    // The whole GUI half of issue #60 rests on this distinction, and it is invisible to a source-text
+    // check: hand `problems()` the *guarded* value and it sees the schema default the guard just
+    // substituted, answers "nothing is wrong" for every corrupt store, and the packaged app goes blind
+    // again with every other assertion still green.
+    const { backend } = fakeBackend({ githubRepos: { 'acme/widgets': widgets } })
+    const reports: string[] = []
+    const store = createGuardedStore(backend, '/data/config.json', (message) => reports.push(message))
+
+    expect(store.get('githubRepos')).toEqual([])
+    expect(store.problems().map((problem) => problem.field)).toEqual(['githubRepos'])
+    expect(store.problems()[0]!.source).toBe('/data/config.json')
+    expect(reports).toHaveLength(1)
   })
 
-  it('reports every shape it discards, not only the keyed object', () => {
-    for (const [workflowTasks, expectedPhrase] of DISCARDED_SHAPES) {
-      const warn = captureWarnings()
-      const { store, filePath } = storeHolding({ workflowTasks })
+  it('fills a key the backend does not have from the schema, and calls that no problem', () => {
+    // conf merges `defaults` only when it first writes the file, so a key an operator deletes by hand
+    // comes back `undefined` — which must read as "the default applies", not as a discarded value, or
+    // the GUI shows a corruption card offering a destructive reset while the CLI reports clean.
+    const { backend } = fakeBackend()
+    const reports: string[] = []
+    const store = createGuardedStore(backend, '/data/config.json', (message) => reports.push(message))
 
-      expect(store.get('workflowTasks')).toEqual([])
-      expect(warn).toHaveBeenCalledTimes(1)
-      const message = warn.mock.calls[0]![0] as string
-      expect(message).toContain('"workflowTasks"')
-      expect(message).toContain(expectedPhrase)
-      expect(message).toContain(filePath)
-
-      warn.mockRestore()
-    }
+    expect(store.get('githubRepos')).toEqual([])
+    expect(store.problems()).toEqual([])
+    expect(reports).toEqual([])
+    // And it is the caller's array, not the shared default.
+    store.get('githubRepos').push(widgets)
+    expect(MAO_STORE_DEFAULTS.githubRepos).toEqual([])
+    expect(store.get('githubRepos')).toEqual([])
   })
 
-  it('returns a value WorkflowEngine.restore() can consume', () => {
-    // The throw this guard exists for, at the site that produced it: `restore()` does `tasks.map(...)`,
-    // and it is called from `createMaoApp()` — so before the guard, a non-array `workflowTasks` failed
-    // every `mao` command and made `registerIpcHandlers()` register nothing. `resume` is left off, so
-    // this reaches no provider and no GitHub call.
-    captureWarnings()
-    const { store } = storeHolding({ workflowTasks: { 'task-1': pendingTask } })
+  it('writes through, and a write is what clears the report', () => {
+    const { backend, data } = fakeBackend({ githubRepos: 'acme/widgets' })
+    const store = createGuardedStore(backend, '/data/config.json', () => {})
 
-    const engine = new WorkflowEngine(new GithubService())
+    expect(store.problems()).toHaveLength(1)
+    store.set('githubRepos', [widgets])
 
-    expect(() => engine.restore(store.get('workflowTasks'))).not.toThrow()
-    expect(engine.getTasks()).toEqual([])
-  })
-
-  it('names the queue write that performs no GitHub write, and where the lost work went', () => {
-    // `clear-completed` over `enqueue`: both heal the field, and only one of them does so without
-    // running the pipeline. The label pointer is the other half — the coerced queue is empty, so the
-    // one thing the operator has lost is any record of what was in flight.
-    const warn = captureWarnings()
-    const { store, filePath } = storeHolding({ workflowTasks: 'task-1' })
-
-    store.get('workflowTasks')
-
-    const message = warn.mock.calls[0]![0] as string
-    expect(message).toContain('mao workflow clear-completed')
-    expect(message).toContain('workflow-active')
-    expect(message).toContain(filePath)
-  })
-
-  it('does not repair the file — only a write does', () => {
-    const warn = captureWarnings()
-    const corrupt = { 'task-1': pendingTask }
-    const { store, filePath } = storeHolding({ workflowTasks: corrupt })
-
-    store.get('workflowTasks')
-    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).workflowTasks).toEqual(corrupt)
-
-    store.set('workflowTasks', [pendingTask])
-
-    expect(new FileStore(filePath).get('workflowTasks')).toEqual([pendingTask])
-    expect(warn).toHaveBeenCalledTimes(1)
-  })
-
-  it('hands back a fresh array rather than the shared default', () => {
-    captureWarnings()
-    const { store } = storeHolding({ workflowTasks: 7 })
-
-    store.get('workflowTasks').push(pendingTask)
-
-    expect(store.get('workflowTasks')).toEqual([])
-    expect(MAO_STORE_DEFAULTS.workflowTasks).toEqual([])
+    expect(data.githubRepos).toEqual([widgets])
+    expect(store.get('githubRepos')).toEqual([widgets])
+    expect(store.problems()).toEqual([])
   })
 })
 
-describe('describeUnusableStoredList', () => {
+describe('describeStoredProblems', () => {
+  it('reports the fields the schema cannot use, from whatever raw values it is handed', () => {
+    // Driven by a raw reader rather than a store, because that is what lets the two backends share it:
+    // FileStore hands it its in-memory snapshot, electron/store.ts hands it electron-store's live get.
+    const raw = { ...structuredClone(MAO_STORE_DEFAULTS), githubRepos: 7 } as unknown as MaoStoreSchema
+
+    const problems = describeStoredProblems((key) => raw[key], '/tmp/config.json')
+
+    expect(problems.map((problem) => problem.field)).toEqual(['githubRepos'])
+    expect(problems[0]!.source).toBe('/tmp/config.json')
+    expect(describeStoredProblems((key) => structuredClone(MAO_STORE_DEFAULTS)[key], '/tmp/c.json')).toEqual([])
+  })
+})
+
+describe('describeUnusableRepoList', () => {
   it('reports nothing for a list', () => {
-    for (const field of GUARDED_FIELDS) {
-      expect(describeUnusableStoredList(field, [], '/tmp/config.json')).toBeNull()
-    }
-    expect(describeUnusableStoredList('githubRepos', [widgets], '/tmp/config.json')).toBeNull()
-    expect(describeUnusableStoredList('aiProviders', [claude], '/tmp/config.json')).toBeNull()
-    expect(describeUnusableStoredList('workflowTasks', [pendingTask], '/tmp/config.json')).toBeNull()
+    expect(describeUnusableRepoList([], '/tmp/config.json')).toBeNull()
+    expect(describeUnusableRepoList([widgets], '/tmp/config.json')).toBeNull()
   })
 
-  it('reports nothing for a field that is not a list at all', () => {
-    // `githubToken` is a string and `theme` a union of literals; a guard that described them as a
-    // "JSON array of ..." would send the operator looking for a bug that is not there.
-    expect(describeUnusableStoredList('githubToken', 'ghp_x', '/tmp/config.json')).toBeNull()
-    expect(describeUnusableStoredList('githubToken', 42, '/tmp/config.json')).toBeNull()
-    expect(describeUnusableStoredList('theme', 'dark', '/tmp/config.json')).toBeNull()
-    expect(describeUnusableStoredList('buildSha', null, '/tmp/config.json')).toBeNull()
-  })
-
-  it('distinguishes null from an object, for every guarded field', () => {
+  it('distinguishes null from an object', () => {
     // `typeof` prints `object` for both, and they are the two likeliest hand-edits — an operator told
     // "is an object" about a `null` would go looking for the wrong thing.
-    for (const field of GUARDED_FIELDS) {
-      expect(describeUnusableStoredList(field, null, '/tmp/config.json')).toContain('is null')
-      expect(describeUnusableStoredList(field, {}, '/tmp/config.json')).toContain('is an object')
-      expect(describeUnusableStoredList(field, 'x', '/tmp/config.json')).toContain('is a string')
-      expect(describeUnusableStoredList(field, undefined, '/tmp/config.json')).toContain('is absent')
-    }
-  })
-
-  it('never prints the value, whatever the value was', () => {
-    // `config.json` is one JSON blob that also holds `githubToken` in plaintext, and a malformed field
-    // is exactly the hand-edit that can leave a fragment of a neighbouring key inside it. The report
-    // therefore describes the shape and stops — a `String(value)` or a JSON dump would put a token in
-    // the operator's terminal, their scrollback and any agent log reading it.
-    const secretish = { token: 'ghp_liveSecretValue', nested: ['ghp_anotherSecret'] }
-
-    for (const field of GUARDED_FIELDS) {
-      const message = describeUnusableStoredList(field, secretish, '/tmp/config.json')!
-      expect(message).toContain('is an object')
-      expect(message).not.toContain('ghp_liveSecretValue')
-      expect(message).not.toContain('ghp_anotherSecret')
-    }
+    expect(describeUnusableRepoList(null, '/tmp/config.json')).toContain('is null')
+    expect(describeUnusableRepoList({}, '/tmp/config.json')).toContain('is an object')
+    expect(describeUnusableRepoList('x', '/tmp/config.json')).toContain('is a string')
+    expect(describeUnusableRepoList(undefined, '/tmp/config.json')).toContain('is absent')
   })
 })
 
@@ -492,31 +355,13 @@ describe('createStoredReadGuard', () => {
     expect(reports[0]).toContain('/tmp/config.json')
   })
 
-  it('touches no field that is not a guarded list', () => {
+  it('touches no field but githubRepos', () => {
     const reports: string[] = []
     const guard = createStoredReadGuard('/tmp/config.json', (message) => reports.push(message))
 
     expect(guard('githubToken', 'ghp_x')).toBe('ghp_x')
     expect(guard('theme', 'dark')).toBe('dark')
-    expect(guard('buildSha', 'abc123')).toBe('abc123')
     expect(reports).toEqual([])
-  })
-
-  it('dedups per field, so a file that broke two fields reports both', () => {
-    // The dedup exists because reads are far more frequent than the problem, not because one report
-    // per process is enough — each field names a different recovery command, so collapsing the two
-    // would leave the operator healing one field and none the wiser about the other.
-    const reports: string[] = []
-    const guard = createStoredReadGuard('/tmp/config.json', (message) => reports.push(message))
-
-    guard('githubRepos', {} as unknown as RepoRef[])
-    guard('aiProviders', {} as unknown as AiProviderConfig[])
-    guard('githubRepos', {} as unknown as RepoRef[])
-    guard('aiProviders', {} as unknown as AiProviderConfig[])
-
-    expect(reports).toHaveLength(2)
-    expect(reports[0]).toContain('"githubRepos"')
-    expect(reports[1]).toContain('"aiProviders"')
   })
 })
 
@@ -547,31 +392,17 @@ function withoutComments(source: string): string {
 describe("electron/store.ts, the other MaoStore backend", () => {
   const source = withoutComments(fs.readFileSync(path.join(REPO_ROOT, 'electron', 'store.ts'), 'utf-8'))
 
-  it('routes its reads through core\'s guard', () => {
-    const guard = source.match(/const\s+(\w+)\s*=\s*createStoredReadGuard\(/)?.[1]
-    expect(guard, 'electron/store.ts must build a guard with createStoredReadGuard()').toBeTruthy()
-
+  it("is core's composition and nothing else", () => {
+    // What is left to check once the behaviour lives in `createGuardedStore` (covered above against a
+    // fake that models conf's absent-key answer): that this file only composes, and never reaches for
+    // the instance again. A second reference is the bypass — `backing.store[key]`, say, which is
+    // tsc-clean, names no `get`, and would hand the renderer unvalidated values with nothing to flag it.
     const backend = source.match(/const\s+(\w+)\s*=\s*new Store</)?.[1]
     expect(backend, 'electron/store.ts must construct an electron-store instance').toBeTruthy()
 
-    // Stated as "every read of the raw backend is wrapped" rather than by matching the body of `get`,
-    // which would make the assertion depend on this file's indentation — there is no autoformatter to
-    // keep that stable, and a guard that fails for a reformat is a guard people learn to dismiss.
-    const raw = [...source.matchAll(new RegExp(`${backend}\\.get\\(`, 'g'))]
-    const wrapped = [...source.matchAll(new RegExp(`${guard}\\(\\s*key\\s*,\\s*${backend}\\.get\\(`, 'g'))]
-
-    expect(raw.length).toBeGreaterThan(0)
-    expect(wrapped.length).toBe(raw.length)
-  })
-
-  it("builds the guard with the backend's own resolved config path", () => {
-    // Requirement 2 is an *actionable* message, and the only thing that makes it actionable in the GUI is
-    // the real file path — a hand-written literal would name a file the operator does not have. The
-    // backend's variable name is derived rather than hardcoded so a rename stays free.
-    const backend = source.match(/const\s+(\w+)\s*=\s*new Store</)?.[1]
-    expect(backend, 'electron/store.ts must construct an electron-store instance').toBeTruthy()
-
-    expect(source).toMatch(new RegExp(`createStoredReadGuard\\(\\s*${backend}\\.path\\s*\\)`))
+    expect(source).toMatch(new RegExp(`createGuardedStore\\(\\s*${backend}\\s*,\\s*${backend}\\.path\\s*\\)`))
+    // Three: where it is made, and the two arguments it is handed to core as.
+    expect([...source.matchAll(new RegExp(`\\b${backend}\\b`, 'g'))]).toHaveLength(3)
   })
 
   it('exports only the guarded store, never the raw backend', () => {

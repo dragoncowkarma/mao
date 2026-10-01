@@ -4,7 +4,7 @@ import type { AppUpdateCheck } from '../electron'
 import type { AiProviderConfig } from '../../core/ai/types'
 import type { GithubTask } from '../../core/github-service'
 import type { RepoWorkflowCapability } from '../../core/repo-capabilities'
-import type { ThemePreference } from '../../core/store'
+import type { StoredValueProblem, ThemePreference } from '../../core/store'
 import type { QueuedTask, RepoRef } from '../../core/workflow-engine'
 
 /**
@@ -29,16 +29,24 @@ function notStubbed(channel: string) {
  * `setRepos.mockImplementationOnce()` is how the slow-write races are staged — without rebuilding the
  * whole bridge.
  */
-export function createElectronApiStub(initialRepos: RepoRef[] = []) {
+export function createElectronApiStub(initialRepos: RepoRef[] = [], initialProblems: StoredValueProblem[] = []) {
   let stored: RepoRef[] = initialRepos.map((repo) => ({ ...repo }))
+  // Answered live, like the real backend: `app:storeProblems` re-evaluates what the store holds now, so
+  // a test that heals the store has to see the notice go away without re-programming the stub.
+  let problems: StoredValueProblem[] = initialProblems
 
   // Copies on the way out as well as in: the renderer holds this list in state and spreads it into new
   // arrays, and a shared reference would let a component mutation silently rewrite the "store".
   const getRepos = vi.fn(async (): Promise<RepoRef[]> => stored.map((repo) => ({ ...repo })))
   const setRepos = vi.fn(async (next: RepoRef[]): Promise<RepoWorkflowCapability[]> => {
     stored = next.map((repo) => ({ ...repo }))
+    // A repository-list write replaces `githubRepos` and nothing else — `store.set` writes one key, and
+    // `describeStoredProblems` re-evaluates the rest — so a stub that healed every field would make the
+    // natural mixed-state test fail against a *correct* renderer once a second field is guarded.
+    problems = problems.filter((problem) => problem.field !== 'githubRepos')
     return []
   })
+  const storeProblems = vi.fn(async (): Promise<StoredValueProblem[]> => problems.map((p) => ({ ...p })))
   const getTheme = vi.fn(async (): Promise<ThemePreference> => 'system')
   const setTheme = vi.fn(async (): Promise<void> => {})
   const checkUpdate = vi.fn(
@@ -58,6 +66,7 @@ export function createElectronApiStub(initialRepos: RepoRef[] = []) {
     app: {
       checkUpdate,
       relaunch: notStubbed('app.relaunch'),
+      storeProblems,
     },
     ai: {
       list: listProviders,
@@ -95,6 +104,7 @@ export function createElectronApiStub(initialRepos: RepoRef[] = []) {
     getRepos,
     setRepos,
     checkUpdate,
+    storeProblems,
     fetchTasks,
     listProviders,
     listWorkflowTasks,

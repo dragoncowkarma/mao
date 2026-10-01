@@ -1,10 +1,11 @@
 import { StrictMode } from 'react'
-import { render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import App from './App'
 import { createElectronApiStub } from './test/electron-api-stub'
 import type { RepoRef } from '../core/workflow-engine'
+import type { StoredValueProblem } from '../core/store'
 
 const ONE: RepoRef = { owner: 'acme', repo: 'one' }
 const TWO: RepoRef = { owner: 'acme', repo: 'two' }
@@ -23,6 +24,31 @@ const TWO_SHOUTED: RepoRef = { owner: 'ACME', repo: 'TWO', autoTrigger: false }
 const OTHER_TWO: RepoRef = { owner: 'other', repo: 'two' }
 
 /**
+ * What the main process answers `app:storeProblems` with when `config.json` holds a `githubRepos` the
+ * schema cannot use. Spelled out rather than built from core's own describer: `core/store.ts` is a
+ * Node module the renderer may not import, and the renderer's job here is to render what it is handed,
+ * whatever the wording turns out to be.
+ */
+const UNUSABLE_REPO_LIST: StoredValueProblem = {
+  field: 'githubRepos',
+  source: '/data/config.json',
+  message:
+    '[store] "githubRepos" in /data/config.json is an object, not a JSON array of { owner, repo } ' +
+    'entries — ignoring it, so no repositories are tracked until it is replaced.',
+}
+
+/**
+ * A report about a field this sidebar's reset does not touch. The reset deletes `githubRepos` and
+ * nothing else, and `describeStoredProblems` is written to grow to the other array-typed fields
+ * (issue #68) — so the card has to tell the difference before it offers a destructive button.
+ */
+const UNUSABLE_PROVIDERS: StoredValueProblem = {
+  field: 'aiProviders',
+  source: '/data/config.json',
+  message: '[store] "aiProviders" in /data/config.json is an object, not a JSON array of providers.',
+}
+
+/**
  * Mounts the real App against a fake bridge, inside StrictMode because that is what `src/main.tsx`
  * does. The doubled mount/unmount is a development-and-test check — the packaged build runs effects
  * once — but it is the check AGENTS.md requires polling effects to survive, so running tests under it
@@ -33,9 +59,9 @@ const OTHER_TWO: RepoRef = { owner: 'other', repo: 'two' }
  * Waits for the first project to be on screen before handing control back: App reads the repo list in
  * an effect, so everything a test wants to click is one resolved promise away from the initial render.
  */
-async function renderApp(repos: RepoRef[]) {
+async function renderApp(repos: RepoRef[], problems: StoredValueProblem[] = []) {
   const user = userEvent.setup()
-  const stub = createElectronApiStub(repos)
+  const stub = createElectronApiStub(repos, problems)
   render(
     <StrictMode>
       <App />
@@ -90,6 +116,575 @@ function addSettled() {
 async function openSettings(user: ReturnType<typeof userEvent.setup>) {
   await user.click(screen.getByRole('button', { name: 'Settings' }))
 }
+
+describe('App unusable stored settings', () => {
+  it('tells the operator what was discarded instead of showing an empty project list', async () => {
+    // The gap this closes: a `githubRepos` the schema cannot use reaches the renderer as `[]`, so the
+    // sidebar said "No projects yet — add a repository to get started" — indistinguishable from having
+    // none, while the only report went to a main-process console a packaged-app operator never sees.
+    await renderApp([], [UNUSABLE_REPO_LIST])
+
+    expect(await screen.findByText(/is an object, not a JSON array/)).toBeInTheDocument()
+    expect(screen.getByText(/could not be read/)).toBeInTheDocument()
+    expect(screen.queryByText(/No projects yet/)).toBeNull()
+  })
+
+  it('offers a recovery the operator can actually reach, and it needs no token', async () => {
+    // With no usable list there is no sidebar row, so no project is selected and the Settings tab's
+    // Remove button never renders — the recovery the store's own report used to name was unreachable.
+    // Writing an empty list registers nothing, so unlike Add it is never refused by the preflight.
+    const { stub, user } = await renderApp([], [UNUSABLE_REPO_LIST])
+    await screen.findByText(/is an object, not a JSON array/)
+
+    await user.click(screen.getByRole('button', { name: 'Reset stored list' }))
+    await user.click(screen.getByRole('button', { name: 'Confirm reset' }))
+
+    await waitFor(() => expect(screen.queryByText(/is an object, not a JSON array/)).toBeNull())
+    expect(stub.setRepos).toHaveBeenCalledWith([])
+    expect(stub.storedRepos()).toEqual([])
+    expect(screen.getByText(/No projects yet/)).toBeInTheDocument()
+  })
+
+  it('keeps the report up when the recovery write itself fails', async () => {
+    // A refused write leaves the unusable value on disk, so clearing the notice optimistically would
+    // tell the operator the problem was fixed when nothing had changed.
+    const { stub, user } = await renderApp([], [UNUSABLE_REPO_LIST])
+    await screen.findByText(/is an object, not a JSON array/)
+    stub.setRepos.mockRejectedValueOnce(new Error("Error invoking remote method 'github:setRepos': Error: disk is full"))
+
+    await user.click(screen.getByRole('button', { name: 'Reset stored list' }))
+    await user.click(screen.getByRole('button', { name: 'Confirm reset' }))
+
+    expect(await screen.findByText('disk is full')).toBeInTheDocument()
+    expect(screen.getByText(/is an object, not a JSON array/)).toBeInTheDocument()
+  })
+
+  it('re-reads the report after a write that failed, rather than just leaving it alone', async () => {
+    // Asserted through Add, not the reset: the reset re-reads on its own before it writes, so a delta
+    // measured there would be its pre-check rather than `persistRepos`' `finally`. A report that
+    // survives only because nothing cleared it goes stale the first time a failure and a heal happen in
+    // either order. The 30s poll cannot have fired inside a test this short, so the delta is
+    // attributable to the write.
+    const { stub, user } = await renderApp([], [UNUSABLE_REPO_LIST])
+    await screen.findByText(/is an object, not a JSON array/)
+    stub.setRepos.mockRejectedValueOnce(new Error('acme/one cannot host the MAO workflow'))
+    const readsBefore = stub.storeProblems.mock.calls.length
+
+    await submitAdd(user, ONE)
+
+    expect(await screen.findByText('acme/one cannot host the MAO workflow')).toBeInTheDocument()
+    await waitFor(() => expect(stub.storeProblems.mock.calls.length).toBeGreaterThan(readsBefore))
+  })
+
+  it('refuses to reset a store something else has already healed', async () => {
+    // The store is not this window's alone: the report tells the operator to go to `config.json`, and
+    // `mao repos add` in a terminal heals it — while this card, read at mount and after writes, keeps
+    // offering a button that writes an empty list. Blind, that deletes the healthy list they just built.
+    const { stub, user } = await renderApp([], [UNUSABLE_REPO_LIST])
+    await screen.findByText(/is an object, not a JSON array/)
+    stub.storeProblems.mockResolvedValue([])
+    stub.applyRepos([ONE])
+
+    await user.click(screen.getByRole('button', { name: 'Reset stored list' }))
+    await user.click(screen.getByRole('button', { name: 'Confirm reset' }))
+
+    await waitFor(() => expect(screen.queryByText(/is an object, not a JSON array/)).toBeNull())
+    expect(stub.setRepos).not.toHaveBeenCalled()
+    expect(await screen.findByRole('button', { name: 'acme/one' })).toBeInTheDocument()
+  })
+
+  it('offers no reset for a report about a field the reset does not touch', async () => {
+    // Today the guard checks only `githubRepos`, so this state is not yet reachable — which is why it is
+    // pinned now rather than discovered when a second field joins it and an `aiProviders` message ends
+    // up sitting above a button that wipes every tracked repository.
+    await renderApp([], [UNUSABLE_PROVIDERS])
+
+    expect(await screen.findByText(/"aiProviders" in/)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Reset stored list' })).toBeNull()
+    expect(screen.getByText(/No projects yet/)).toBeInTheDocument()
+  })
+
+  it('offers the reset when the repo list is one of several unusable values', async () => {
+    // Both fixtures, with the unrelated one first: with a single report on screen, a positional check
+    // (`storeProblems[0].field === 'githubRepos'`) satisfies every other test in this file, and the
+    // mixed state is the one it gets wrong — which is the state issue #68 makes reachable.
+    const { user } = await renderApp([], [UNUSABLE_PROVIDERS, UNUSABLE_REPO_LIST])
+
+    // Matched by field, because both fixture messages say "is an object, not a JSON array".
+    expect(await screen.findByText(/"aiProviders" in/)).toBeInTheDocument()
+    expect(screen.getByText(/"githubRepos" in/)).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Reset stored list' }))
+
+    expect(screen.getByRole('button', { name: 'Confirm reset' })).toBeInTheDocument()
+  })
+
+  it('clears a failed reset when the operator backs out', async () => {
+    const { stub, user } = await renderApp([], [UNUSABLE_REPO_LIST])
+    await screen.findByText(/is an object, not a JSON array/)
+    stub.setRepos.mockRejectedValueOnce(new Error('disk is full'))
+
+    await user.click(screen.getByRole('button', { name: 'Reset stored list' }))
+    await user.click(screen.getByRole('button', { name: 'Confirm reset' }))
+    expect(await screen.findByText('disk is full')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Cancel' }))
+
+    // A failure message left under an un-pressed button misreports the state of an action the operator
+    // explicitly backed out of.
+    expect(screen.queryByText('disk is full')).toBeNull()
+  })
+
+  it('does not pretend a queued reset can be called back', async () => {
+    // The write is already queued behind `updateRepos`' serialization by the time this renders, and
+    // nothing can recall it — a Cancel that looked live would say otherwise.
+    let release = () => {}
+    const inFlight = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const { stub, user } = await renderApp([], [UNUSABLE_REPO_LIST])
+    await screen.findByText(/is an object, not a JSON array/)
+    stub.setRepos.mockImplementationOnce(async (next: RepoRef[]) => {
+      await inFlight
+      stub.applyRepos(next)
+      return []
+    })
+
+    await user.click(screen.getByRole('button', { name: 'Reset stored list' }))
+    await user.click(screen.getByRole('button', { name: 'Confirm reset' }))
+
+    expect(await screen.findByRole('button', { name: 'Resetting…' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Cancel' })).toBeDisabled()
+    release()
+    await waitFor(() => expect(stub.storedRepos()).toEqual([]))
+  })
+
+  it('takes the report down once an add has healed the store', async () => {
+    // The other way out, and the one the reviewer's "Add overwrote it before the operator was ever
+    // told" case turns on: any list write replaces the unusable value, so the card has to be re-read
+    // after every write — not only after the reset that this card owns.
+    const { stub, user } = await renderApp([], [UNUSABLE_REPO_LIST])
+    await screen.findByText(/is an object, not a JSON array/)
+
+    await submitAdd(user, ONE)
+    await addSettled()
+
+    await waitFor(() => expect(screen.queryByText(/is an object, not a JSON array/)).toBeNull())
+    expect(stub.setRepos).toHaveBeenCalledWith([ONE])
+  })
+
+  it('reports the write failure even when the diagnostic read throws', async () => {
+    // `refreshStoreProblems` runs in `persistRepos`' `finally`, and a synchronous throw there *replaces*
+    // the rejection already on its way to the caller — the operator would be told the bridge was missing
+    // instead of why their write failed. A diagnostic must not be able to hide the thing it annotates.
+    const { stub, user } = await renderApp([], [UNUSABLE_REPO_LIST])
+    await screen.findByText(/is an object, not a JSON array/)
+    stub.setRepos.mockRejectedValueOnce(new Error('acme/one cannot host the MAO workflow'))
+    stub.storeProblems.mockImplementation(() => {
+      throw new Error('preload bridge did not load')
+    })
+
+    await submitAdd(user, ONE)
+
+    expect(await screen.findByText('acme/one cannot host the MAO workflow')).toBeInTheDocument()
+    expect(screen.queryByText('preload bridge did not load')).toBeNull()
+  })
+
+  it('leaves the operator where they were when the reset lands', async () => {
+    // The sidebar is visible from Global settings too, so a reset can be started there — and it
+    // finishes two awaits later. Navigating on completion is the race `navigationGeneration` exists to
+    // stop, and after a reset there is nothing to navigate to anyway.
+    const { stub, user } = await renderApp([], [UNUSABLE_REPO_LIST])
+    await screen.findByText(/is an object, not a JSON array/)
+    await user.click(globalSettingsNav())
+    expect(tokenField()).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Reset stored list' }))
+    await user.click(screen.getByRole('button', { name: 'Confirm reset' }))
+
+    await waitFor(() => expect(stub.setRepos).toHaveBeenCalledWith([]))
+    expect(tokenField()).toBeInTheDocument()
+  })
+
+  it('notices a store that became unusable while the window was open', async () => {
+    // The file is not this window's to own: the report sends the operator to `config.json`, and a
+    // hand-edit made there is invisible until the next repository-list write — which is the thing that
+    // destroys the value. Reading it only after a write cannot warn anyone in time.
+    //
+    // Fake timers here and no `userEvent`: the two deadlock (SKILL.md), so this drives the interval
+    // directly and asserts on what the operator sees.
+    vi.useFakeTimers()
+    try {
+      const stub = createElectronApiStub([ONE])
+      const { unmount } = render(
+        <StrictMode>
+          <App />
+        </StrictMode>,
+      )
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(screen.queryByText(/could not be read/)).toBeNull()
+
+      stub.storeProblems.mockResolvedValue([UNUSABLE_REPO_LIST])
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+
+      expect(screen.getByText(/is an object, not a JSON array/)).toBeInTheDocument()
+
+      // AGENTS.md requires a polling effect to clear its interval; a leaked one is otherwise invisible
+      // here, because `refreshStoreProblems` swallows the error an unbound bridge would throw.
+      const readsBeforeUnmount = stub.storeProblems.mock.calls.length
+      unmount()
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(60_000)
+      })
+      expect(stub.storeProblems.mock.calls.length).toBe(readsBeforeUnmount)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('adopts a repository list something else repaired while the window was open', async () => {
+    // The renderer read the list once, at mount, while the store could not answer — so healing the file
+    // from a terminal took the card away and left the sidebar insisting there were no projects. The
+    // diagnostic going green while the UI stays broken is worse than either alone.
+    vi.useFakeTimers()
+    try {
+      const stub = createElectronApiStub([], [UNUSABLE_REPO_LIST])
+      render(
+        <StrictMode>
+          <App />
+        </StrictMode>,
+      )
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(screen.getByText(/"githubRepos" in/)).toBeInTheDocument()
+
+      // `mao repos add acme one` in another terminal: the store now holds a real list and reports nothing.
+      stub.applyRepos([ONE])
+      stub.storeProblems.mockResolvedValue([])
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+
+      expect(screen.queryByText(/"githubRepos" in/)).toBeNull()
+      expect(screen.getByRole('button', { name: 'acme/one' })).toBeInTheDocument()
+      expect(screen.queryByText(/No projects yet/)).toBeNull()
+      // Selection reconciles too, by identity: the repaired list has an entry and nothing was selected,
+      // so the project opens rather than leaving the operator on an empty welcome pane.
+      expect(screen.getByRole('heading', { name: 'acme/one' })).toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('retries the repaired list on the next poll when the first read fails', async () => {
+    // The repair transition is observable exactly once, so consuming it before the list is actually in
+    // hand spends it: one transient rejection and the sidebar is stuck on "No projects yet" until the
+    // window is restarted, with the diagnostic gone and nothing left to say why.
+    vi.useFakeTimers()
+    try {
+      const stub = createElectronApiStub([], [UNUSABLE_REPO_LIST])
+      render(
+        <StrictMode>
+          <App />
+        </StrictMode>,
+      )
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(screen.getByText(/"githubRepos" in/)).toBeInTheDocument()
+
+      stub.applyRepos([ONE])
+      stub.storeProblems.mockResolvedValue([])
+      stub.getRepos.mockRejectedValueOnce(new Error('main process is busy'))
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+      expect(screen.queryByRole('button', { name: 'acme/one' })).toBeNull()
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+
+      expect(screen.getByRole('button', { name: 'acme/one' })).toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('discards a repaired list a newer observation has already superseded', async () => {
+    // Repairs are observed on a 30s poll but adopted through a read that takes its own time, so the two
+    // can interleave: a read started for one repair can land after the store has broken and been
+    // repaired again. Applying it then would both show the list from before the second repair and spend
+    // the latch, so nothing would ever read the current one — and a later list write would persist that
+    // stale mirror.
+    vi.useFakeTimers()
+    try {
+      const stub = createElectronApiStub([], [UNUSABLE_REPO_LIST])
+      render(
+        <StrictMode>
+          <App />
+        </StrictMode>,
+      )
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(screen.getByText(/"githubRepos" in/)).toBeInTheDocument()
+
+      // The first repair is seen, and its read is held open.
+      let releaseStale: (repos: RepoRef[]) => void = () => {}
+      const stale = new Promise<RepoRef[]>((resolve) => {
+        releaseStale = resolve
+      })
+      stub.storeProblems.mockResolvedValue([])
+      stub.getRepos.mockImplementationOnce(() => stale)
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+
+      // While it is still in flight the store breaks again, and is then repaired to a different list.
+      stub.storeProblems.mockResolvedValue([UNUSABLE_REPO_LIST])
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+      stub.applyRepos([TWO])
+      stub.storeProblems.mockResolvedValue([])
+
+      // The held read answers at last, with the list from before the second repair.
+      await act(async () => {
+        releaseStale([ONE])
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(screen.queryByRole('button', { name: 'acme/one' })).toBeNull()
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+
+      expect(screen.getByRole('button', { name: 'acme/two' })).toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("discards a repaired list this window's own write has superseded", async () => {
+    // The other half of the same race: the newer information is not a report but a write from here.
+    // `fireEvent` rather than `userEvent` because fake timers are needed to drive the poll and the two
+    // deadlock (SKILL.md).
+    vi.useFakeTimers()
+    try {
+      const stub = createElectronApiStub([], [UNUSABLE_REPO_LIST])
+      render(
+        <StrictMode>
+          <App />
+        </StrictMode>,
+      )
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(screen.getByText(/"githubRepos" in/)).toBeInTheDocument()
+
+      let releaseStale: (repos: RepoRef[]) => void = () => {}
+      const stale = new Promise<RepoRef[]>((resolve) => {
+        releaseStale = resolve
+      })
+      stub.storeProblems.mockResolvedValue([])
+      stub.getRepos.mockImplementationOnce(() => stale)
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+
+      // The operator registers a repository while that read is still in flight.
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: '+ Add' }))
+      })
+      await act(async () => {
+        fireEvent.change(screen.getByPlaceholderText('owner'), { target: { value: ONE.owner } })
+        fireEvent.change(screen.getByPlaceholderText('repo'), { target: { value: ONE.repo } })
+        fireEvent.click(screen.getByRole('button', { name: 'Add' }))
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(stub.setRepos).toHaveBeenCalledWith([ONE])
+
+      // The held read answers with the list from before that write.
+      await act(async () => {
+        releaseStale([])
+        await vi.advanceTimersByTimeAsync(0)
+      })
+
+      expect(screen.getByRole('button', { name: 'acme/one' })).toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('ignores a repair read that a later one has already answered', async () => {
+    // Two reads started while the report said the same thing share a generation, so ordering them needs
+    // more than that check: whichever *finishes* last would otherwise win, and an older answer landing
+    // late rolls the sidebar back to a list that is no longer what the store holds.
+    vi.useFakeTimers()
+    try {
+      const stub = createElectronApiStub([], [UNUSABLE_REPO_LIST])
+      render(
+        <StrictMode>
+          <App />
+        </StrictMode>,
+      )
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(screen.getByText(/"githubRepos" in/)).toBeInTheDocument()
+
+      let releaseFirst: (repos: RepoRef[]) => void = () => {}
+      let releaseSecond: (repos: RepoRef[]) => void = () => {}
+      const first = new Promise<RepoRef[]>((resolve) => {
+        releaseFirst = resolve
+      })
+      const second = new Promise<RepoRef[]>((resolve) => {
+        releaseSecond = resolve
+      })
+      stub.storeProblems.mockResolvedValue([])
+      stub.getRepos.mockImplementationOnce(() => first).mockImplementationOnce(() => second)
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+
+      // The newer answer lands first; the older one arrives after it.
+      await act(async () => {
+        releaseSecond([TWO])
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      await act(async () => {
+        releaseFirst([ONE])
+        await vi.advanceTimersByTimeAsync(0)
+      })
+
+      expect(screen.getByRole('button', { name: 'acme/two' })).toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'acme/one' })).toBeNull()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('holds a repair read back while this window is writing the list', async () => {
+    // A settings edit's success path deliberately does not re-read the list, so a repair read that slips
+    // in *during* that write and answers with the pre-write list has the last word — the store keeps the
+    // new interval while the pane shows the old one, and the next full list write puts the old one back.
+    vi.useFakeTimers()
+    try {
+      const stub = createElectronApiStub([ONE])
+      render(
+        <StrictMode>
+          <App />
+        </StrictMode>,
+      )
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+      })
+      expect(screen.getByRole('spinbutton')).toHaveValue(30)
+
+      // The store breaks, is repaired, and the first repair read fails — leaving a retry pending.
+      stub.storeProblems.mockResolvedValue([UNUSABLE_REPO_LIST])
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+      stub.storeProblems.mockResolvedValue([])
+      stub.getRepos.mockRejectedValueOnce(new Error('main process is busy'))
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+
+      // A slow settings write, with a poll landing in the middle of it.
+      let releaseWrite: () => void = () => {}
+      const written = new Promise<void>((resolve) => {
+        releaseWrite = resolve
+      })
+      stub.setRepos.mockImplementationOnce(async (next: RepoRef[]) => {
+        await written
+        stub.applyRepos(next)
+        return []
+      })
+      await act(async () => {
+        fireEvent.change(screen.getByRole('spinbutton'), { target: { value: '60' } })
+      })
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+      await act(async () => {
+        releaseWrite()
+        await vi.advanceTimersByTimeAsync(0)
+      })
+
+      expect(stub.storedRepos()).toEqual([{ ...ONE, pollIntervalMs: 60_000 }])
+      expect(screen.getByRole('spinbutton')).toHaveValue(60)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('still adopts a repair after an earlier write has finished', async () => {
+    // The other side of holding adoption back during a write: the hold has to be released. Leak it and
+    // the window never adopts another repair for the rest of its life, which is a worse failure than the
+    // race it exists to prevent — and an invisible one, since nothing else re-reads the list.
+    vi.useFakeTimers()
+    try {
+      const stub = createElectronApiStub([ONE])
+      render(
+        <StrictMode>
+          <App />
+        </StrictMode>,
+      )
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+      })
+
+      // An ordinary settings write, start to finish.
+      await act(async () => {
+        fireEvent.change(screen.getByRole('spinbutton'), { target: { value: '45' } })
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(stub.setRepos).toHaveBeenCalledWith([{ ...ONE, pollIntervalMs: 45_000 }])
+
+      // Only afterwards does the store break, and then get repaired to a different list.
+      stub.storeProblems.mockResolvedValue([UNUSABLE_REPO_LIST])
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+      expect(screen.getByText(/"githubRepos" in/)).toBeInTheDocument()
+
+      stub.applyRepos([TWO])
+      stub.storeProblems.mockResolvedValue([])
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+
+      expect(screen.getByRole('button', { name: 'acme/two' })).toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('says nothing when the store is healthy', async () => {
+    await renderApp([ONE])
+
+    expect(screen.queryByText(/could not be read/)).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Reset stored list' })).toBeNull()
+  })
+})
 
 describe('App project selection', () => {
   it('opens the project the operator picks in the sidebar', async () => {

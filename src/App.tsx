@@ -9,8 +9,11 @@ import { electronApi } from './electron-api'
 import type { RepoRef } from '../core/workflow-engine'
 import type { RepoWorkflowCapability } from '../core/repo-capabilities'
 import { sameRepoRef } from '../core/repo-registry'
-import type { ThemePreference } from '../core/store'
+import type { StoredValueProblem, ThemePreference } from '../core/store'
 import type { AppUpdateCheck } from './electron'
+
+/** Matches the board's own listing poll: this is a background diagnostic, not something to spin on. */
+const STORE_PROBLEM_POLL_MS = 30_000
 
 type ProjectTab = 'board' | 'queue' | 'settings'
 type View = 'project' | 'global-settings'
@@ -34,6 +37,40 @@ export default function App() {
   const [dismissedUpdateSha, setDismissedUpdateSha] = useState<string | null>(null)
   /** Surfaces a failed settings edit or removal, which are otherwise silent (no preflight, no form). */
   const [repoError, setRepoError] = useState('')
+  /**
+   * Stored values the main process could not use. Polled rather than pushed (AGENTS.md rule 6), and
+   * kept separate from `repos` on purpose: a `githubRepos` the schema cannot use arrives here as `[]`,
+   * exactly like an empty list, so the list itself can never carry the fact that something was
+   * discarded — and the guard's own report goes to a console a packaged-app operator never sees.
+   */
+  const [storeProblems, setStoreProblems] = useState<StoredValueProblem[]>([])
+  /**
+   * What the poll has to remember between reports about the repository list. A ref, not state: it is
+   * read to decide what to do with the value being stored, and a render is not what has to happen in
+   * between.
+   *
+   * - `lastUnusable` — what the previous report said, so the next one can be recognised as a repair
+   *   rather than merely a quiet answer.
+   * - `repairOwed` — a repair has been seen but its list has not been adopted yet. Survives a failed
+   *   read so the next poll tries again.
+   * - `generation` — bumped whenever something invalidates a list read already in flight: the observed
+   *   state changing, or this window starting a write. Repairs are observed on a 30s poll
+   *   but adopted through a read that takes its own time, so the two interleave; without this, a read
+   *   started for one repair could land after the store had broken and been repaired again, show the
+   *   list from before that second repair, and spend `repairOwed` so nothing ever read the current one.
+   * - `writesInFlight` — writes from this window that have not settled. A read taken across one answers
+   *   with a list the write is about to replace, and a generation captured *after* the write began looks
+   *   current, so the read is not started at all; the write's own completion re-enters and retries.
+   * - `adoption` — the most recently started adoption. Reads sharing a generation can still finish out
+   *   of order, and only the newest may apply, or a late older answer rolls the sidebar back.
+   */
+  const repoListWatch = useRef({
+    lastUnusable: false,
+    repairOwed: false,
+    generation: 0,
+    writesInFlight: 0,
+    adoption: 0,
+  })
   /**
    * Counts every navigation choice, so an async add can ask whether the operator moved elsewhere
    * while its permission preflight was running.
@@ -72,6 +109,98 @@ export default function App() {
   const matchingSelectedIndex = selectedRepo === null ? null : selectedRepoIndex(repos, selectedRepo)
   const selectedIndex = matchingSelectedIndex === -1 ? null : matchingSelectedIndex
   const selected = selectedIndex === null ? undefined : repos[selectedIndex]
+
+  /**
+   * Best-effort: a diagnostic that cannot be read must not take the app down with it, so a rejection
+   * leaves the notice as it was rather than propagating. Re-read after every list write instead of
+   * assumed cleared — a write heals the store, but a *failed* write leaves the unusable value in
+   * place, which is precisely when the notice has to stay up.
+   */
+  /**
+   * Stores a report and answers whether the repository list still has to be re-read because it was
+   * repaired since the last one.
+   *
+   * That transition is the only thing worth acting on. While the list is unusable the renderer holds
+   * `[]` — the guard's answer, not a list — so it is not stale, it is correct; and once a repair has
+   * been adopted there is nothing further to take. Re-reading on *every* poll instead would reintroduce
+   * the hazard `persistRepos`' success path avoids: a round trip landing mid-typing stomps newer
+   * keystrokes in the settings pane.
+   *
+   * Deliberately does **not** clear the flag when it answers `true`: the transition is observable once,
+   * and clearing it here would spend it on a read that has not happened yet. `adoptRepairedRepoList()`
+   * clears it, and only once the list is in hand — so a transient failure leaves the repair pending and
+   * the next poll tries again, instead of stranding the sidebar on "No projects yet" until a restart.
+   */
+  function applyStoreProblems(next: StoredValueProblem[]): boolean {
+    const watch = repoListWatch.current
+    const unusable = next.some((problem) => problem.field === 'githubRepos')
+    if (unusable !== watch.lastUnusable) {
+      watch.lastUnusable = unusable
+      watch.generation += 1
+    }
+    const healed = watch.repairOwed && !unusable
+    if (!healed) watch.repairOwed = unusable
+    setStoreProblems(next)
+    return healed
+  }
+
+  /**
+   * Takes the repaired list, and only then treats the repair as done.
+   *
+   * Throws if the read fails, which every caller swallows — on purpose. The renderer's current list is
+   * left exactly as it was rather than replaced with an empty one, and because the flag is still set the
+   * next poll re-enters here. Adopting `[]` on failure would look identical to "there really are no
+   * projects", which is the one thing this whole path exists to stop the operator being told.
+   */
+  async function adoptRepairedRepoList(): Promise<void> {
+    const watch = repoListWatch.current
+    // Not while this window is writing: the store is about to hold whatever the write is sending, so a
+    // read now can only produce a list to be discarded — and its generation, captured after the write
+    // began, would still look current when it answered. `persistRepos` re-enters here once it settles.
+    if (watch.writesInFlight > 0) return
+    const startedAt = watch.generation
+    const request = (watch.adoption += 1)
+    const repaired = await electronApi().github.getRepos()
+    // Superseded while this read was in flight — by a newer report, by a write from this window, or by a
+    // later adoption that has already answered. The list is dropped rather than applied, and
+    // `repairOwed` is left standing so the next report reads whatever exists then.
+    if (watch.generation !== startedAt || watch.adoption !== request) return
+    watch.repairOwed = false
+    setRepos(repaired)
+  }
+
+  function refreshStoreProblems(): Promise<void> {
+    // The bridge lookup is deferred into the chain rather than called here, because this runs inside
+    // `persistRepos`' `finally`: `electronApi()` throws synchronously when nothing is bound, and a
+    // synchronous throw in a `finally` *replaces* the rejection already on its way to the caller — the
+    // operator would be told the bridge was missing instead of why their write failed.
+    return Promise.resolve()
+      .then(() => electronApi().app.storeProblems())
+      .then(async (next) => {
+        // A repair from outside this window — `mao repos add` in a terminal, or the hand-edit the report
+        // itself asks for — heals the store without the renderer writing anything, so nothing else would
+        // ever re-read the list. Taking only the diagnostic down would leave the card gone and the
+        // sidebar still insisting there are no projects, which is worse than either alone. Selection
+        // reconciles itself: the identity effect above adopts the first entry once one exists.
+        if (applyStoreProblems(next)) await adoptRepairedRepoList()
+      })
+      .catch(() => {})
+  }
+
+  /**
+   * Polled, not only read at mount, because the file is not this window's to own: an operator who
+   * hand-edits `config.json` while the app is open — which the report itself sends them to do — would
+   * otherwise see nothing until their next repository-list write, and that write is what destroys the
+   * value. Reading it *after* a write cannot warn anyone in time; only reading it on a clock can.
+   *
+   * Cleared on unmount, and safe under StrictMode's double invocation: the read is idempotent and both
+   * mounts install and clear their own interval.
+   */
+  useEffect(() => {
+    void refreshStoreProblems()
+    const handle = setInterval(() => void refreshStoreProblems(), STORE_PROBLEM_POLL_MS)
+    return () => clearInterval(handle)
+  }, [])
 
   useEffect(() => {
     electronApi().github.getRepos().then((savedRepos) => {
@@ -185,6 +314,10 @@ export default function App() {
    */
   async function persistRepos(next: RepoRef[]): Promise<RepoWorkflowCapability[]> {
     const previous = repos
+    // This window is now the newest thing to have touched the list, so any repair read already in flight
+    // is describing a store that predates it — and until this settles, no new one should start.
+    repoListWatch.current.generation += 1
+    repoListWatch.current.writesInFlight += 1
     setRepos(next)
     try {
       return await electronApi().github.setRepos(next)
@@ -193,6 +326,14 @@ export default function App() {
       // built from a write we know was refused.
       setRepos(await electronApi().github.getRepos().catch(() => previous))
       throw err
+    } finally {
+      // No second generation bump on the way out: the one taken on entry already invalidates every read
+      // that spans this write, whichever order they settle in.
+      repoListWatch.current.writesInFlight -= 1
+      // Every list write replaces an unusable stored value, and a refused one does not — so this is
+      // read back on both paths rather than cleared optimistically on the success path. It is also what
+      // retries an adoption this write held back.
+      void refreshStoreProblems()
     }
   }
 
@@ -298,6 +439,36 @@ export default function App() {
     }
   }
 
+  /**
+   * The in-app way out of a stored repository list the schema cannot use.
+   *
+   * Reachable when nothing else is: with no usable list there is no sidebar row, so no project is
+   * selected and the Settings tab's Remove button — the guard's own suggested recovery — never
+   * renders. Writing an empty list registers nothing, so unlike Add it is never refused by the
+   * write-permission preflight, which is what an operator with a missing or revoked token is left
+   * with. Sidebar confirms first, and shows the report naming the file to salvage from.
+   */
+  async function resetRepoList() {
+    setRepoError('')
+    // Re-read before destroying anything. This store is not this window's alone: the report itself tells
+    // the operator to go to `config.json`, and `mao repos add` in a terminal heals it — while this card,
+    // read at mount and after writes, keeps offering a button that writes an empty list. Blind, that
+    // deletes the healthy list they just built. Fail closed: a read that throws aborts the reset.
+    const current = await electronApi().app.storeProblems()
+    applyStoreProblems(current)
+    if (!current.some((problem) => problem.field === 'githubRepos')) {
+      await adoptRepairedRepoList().catch(() => {})
+      return
+    }
+    await persistRepos([])
+    // Adopt what the store now holds, for the same reason removal does: the write is the authority.
+    // Deliberately nothing else. Selection reconciles itself — the effect above clears `selectedRepo`
+    // when the list empties — and forcing a view/tab here would be a navigation decision made after
+    // two awaits, which is exactly what `navigationGeneration` exists to stop: the sidebar is visible
+    // from Global settings too, so a reset started there would otherwise yank the operator away from it.
+    await adoptRepairedRepoList().catch(() => {})
+  }
+
   async function removeSelectedRepo() {
     if (selectedIndex === null) return
     const target = repos[selectedIndex]
@@ -348,6 +519,8 @@ export default function App() {
         selectedIndex={selectedIndex}
         onSelect={selectProject}
         onAddRepo={addRepo}
+        storeProblems={storeProblems}
+        onResetRepoList={resetRepoList}
         view={view}
         onViewChange={selectView}
       />

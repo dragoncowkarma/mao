@@ -133,6 +133,19 @@ export function registerIpcHandlers() {
 
   ipcMain.handle('workflow:clearCompleted', () => workflowEngine.clearCompleted())
 
+  // The GUI's only way to learn that unattended work is halted, and its only way out. Pulled like
+  // `app:storeProblems` (AGENTS.md rule 6) and driven by the ENGINE rather than by `storeProblems`,
+  // because the latch is monotone: after an out-of-band repair the store reads clean while this process
+  // stays halted, and the card has to stay up and keep working in exactly that window.
+  ipcMain.handle('workflow:recoveryRequired', () => ({
+    required: workflowEngine.isQueueRecoveryLatched(),
+    reason: workflowEngine.getQueueRecoveryReason(),
+  }))
+
+  // Returns core's typed outcome rather than a boolean, so the renderer and `mao workflow
+  // confirm-queue-recovery` cannot disagree about whether confirmation succeeded.
+  ipcMain.handle('workflow:confirmQueueRecovery', () => workflowEngine.confirmQueueRecovery())
+
   ipcMain.handle('ui:getTheme', () => store.get('theme'))
 
   ipcMain.handle('ui:setTheme', (_event, theme: ThemePreference) => {

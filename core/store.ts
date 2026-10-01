@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import type { AiProviderConfig } from './ai/types.ts'
+import { WORKFLOW_ACTIVE_LABEL } from './workflow-engine.ts'
 import type { QueuedTask, RepoRef } from './workflow-engine.ts'
 
 /**
@@ -79,6 +80,69 @@ export function describeUnusableRepoList(value: unknown, source: string): string
   )
 }
 
+/**
+ * The actionable report for a stored `aiProviders` that is not a list — or `null` when it is one.
+ *
+ * Worded as an ignored-configuration report, deliberately unlike the queue's below: an empty provider
+ * list costs nothing but the ability to route a stage, and every stage then fails at `selectAgent()`
+ * with the pre-existing retryable "No AI providers registered" *before* any GitHub write. So this field
+ * is reported and coerced, and it does **not** halt automation — latching for it would be a larger
+ * outage than the fault it describes.
+ *
+ * The recovery it names needs no GitHub token, which is the point: a missing or revoked token is one of
+ * the likelier reasons an operator was editing `config.json` by hand in the first place, and `mao config
+ * import-providers` and the GUI's Global settings pane are both reachable without one.
+ */
+export function describeUnusableProviderList(value: unknown, source: string): string | null {
+  if (Array.isArray(value)) return null
+  return (
+    `[store] "aiProviders" in ${source} is ${describeStoredType(value)}, not a JSON array of AI ` +
+    'provider configs — ignoring it, so no AI providers are registered and every workflow stage fails ' +
+    'for want of an agent to route to. The unusable value is still in the file; any provider-list write ' +
+    "overwrites it. `mao config import-providers <file>`, or the GUI's Global settings pane, replaces " +
+    'it — neither needs a GitHub token. Copy any provider configs you still need out of ' +
+    `${source} first, including their apiKey values, which exist nowhere else.`
+  )
+}
+
+/**
+ * The actionable report for a stored `workflowTasks` that is not a list — or `null` when it is one.
+ *
+ * This one is not just a report: it is the text the queue-recovery latch carries verbatim (see
+ * `findStoredQueueProblem()` and `WorkflowEngine.requireQueueRecovery()`), so the stderr line, every
+ * refused mutation's error, `mao run`'s refusal and the GUI's card all say the same thing. That is why
+ * it describes a *halt* rather than only a discard.
+ *
+ * Halting is the correction review of PR #69 forced, and the reasoning is worth keeping next to the
+ * words. Coercing the queue to `[]` looked safe because resuming an empty queue is a no-op — but both
+ * long-lived hosts call `startAutoTrigger()` immediately after `createMaoApp()`, and that ticks at once
+ * rather than after its first interval. The first poll's `enqueueFromIssue()` would `notify()`, the
+ * `'change'` listener would `store.set('workflowTasks', …)`, and that single write both destroys the
+ * only salvageable copy of the unreadable value **and** starts an unattended pipeline on a host that
+ * cannot know what was already in flight. The `workflow-active` label is best-effort, so a task lost
+ * with the queue may carry no label to stop its issue being picked up and run a second time.
+ *
+ * It names `mao workflow confirm-queue-recovery` rather than `mao workflow clear-completed`, and that is
+ * load-bearing: `clear-completed` also emits `'change'`, so it is *gated* too. Leaving it open would let
+ * a GUI "Clear completed" click replace the unreadable value with no confirmation at all — exactly the
+ * destruction this latch exists to prevent.
+ */
+export function describeUnusableTaskQueue(value: unknown, source: string): string | null {
+  if (Array.isArray(value)) return null
+  return (
+    `[store] "workflowTasks" in ${source} is ${describeStoredType(value)}, not a JSON array of queued ` +
+    'workflow tasks — ignoring it, so the queue is empty and MAO will not start unattended work: ' +
+    'auto-resume, auto-trigger polling and every queue write are refused until this is resolved. That ' +
+    'is deliberate — the record of what was already in flight is unreadable, so enqueueing anything ' +
+    'would overwrite the only salvageable copy of it and risk re-running GitHub work that already ' +
+    'happened. The unusable value is still in the file. Copy anything you still need out of ' +
+    `${source} first, then check the target repo for an issue still labelled "${WORKFLOW_ACTIVE_LABEL}" ` +
+    'whose branch or PR is half-finished and finish or clean it up by hand. `mao workflow ' +
+    'confirm-queue-recovery` (or the sidebar\'s Discard unreadable queue) then discards the unreadable ' +
+    'value and releases the engine.'
+  )
+}
+
 type StoredShapeRule<K extends keyof MaoStoreSchema> = (raw: MaoStoreSchema[K], source: string) => string | null
 
 /**
@@ -89,10 +153,16 @@ type StoredShapeRule<K extends keyof MaoStoreSchema> = (raw: MaoStoreSchema[K], 
  * A table rather than a predicate over every schema key, because `describeStoredProblems()` iterates it
  * to decide what to *read*: electron-store re-reads and re-parses the whole config file on every `get`,
  * so walking all six fields to have five of them answer `null` cost six full file reads per call, on the
- * main process, in the `finally` of every repository-list write.
+ * main process, in the `finally` of every repository-list write. It is **three** fields now, not one, so
+ * each `problems()` call is three of those reads — which is why the queue latch is derived once at boot
+ * (`core/app.ts`) and never re-probed from the `'change'` path: routing it through there would have put
+ * three whole-config reads and three `JSON.parse`s on every queue change, and `config.json` carries up
+ * to `MAX_FINISHED_TASKS` finished tasks with their full prompts and AI output.
  */
 const STORED_SHAPE_RULES: { [K in keyof MaoStoreSchema]?: StoredShapeRule<K> } = {
   githubRepos: (raw, source) => describeUnusableRepoList(raw, source),
+  aiProviders: (raw, source) => describeUnusableProviderList(raw, source),
+  workflowTasks: (raw, source) => describeUnusableTaskQueue(raw, source),
 }
 
 function unusableStoredValue<K extends keyof MaoStoreSchema>(
@@ -139,6 +209,21 @@ export function describeStoredProblems(
   return problems
 }
 
+/**
+ * The one field whose unusable value halts unattended automation, and the single lookup for it.
+ *
+ * Exported so `core/app.ts`'s boot-time latch, `WorkflowEngine.confirmQueueRecovery()`'s postcondition
+ * and both shells' reporting cannot disagree about what counts as "the queue is unreadable". The other
+ * two guarded fields are reported and coerced but never halt anything — see
+ * `describeUnusableProviderList()` for why an unusable `aiProviders` must not.
+ */
+export const QUEUE_GATING_FIELD = 'workflowTasks' as const
+
+/** The unusable-queue problem among a backend's problems, or `undefined` when the queue reads normally. */
+export function findStoredQueueProblem(problems: StoredValueProblem[]): StoredValueProblem | undefined {
+  return problems.find((problem) => problem.field === QUEUE_GATING_FIELD)
+}
+
 /** A backend's read, corrected to the shape `MaoStoreSchema` declares. See `createStoredReadGuard`. */
 export type StoredReadGuard = <K extends keyof MaoStoreSchema>(key: K, raw: MaoStoreSchema[K]) => MaoStoreSchema[K]
 
@@ -173,12 +258,19 @@ export type StoredReadGuard = <K extends keyof MaoStoreSchema>(key: K, raw: MaoS
  * too: that is the point of the rule living here rather than at the read sites, which are scattered
  * across `core/`, `cli/` and `electron/` and would each have to remember it.
  *
- * `githubRepos` is the only field guarded, and the other two array-typed fields are left out
- * deliberately rather than overlooked. `aiProviders` would be the same one-line coercion. `workflowTasks`
- * would not: a queue MAO cannot read is a question about unattended-pipeline safety, which this repo
- * already answers with a whole mechanism (`core/persistence-guard.ts`, the persistence-broken marker and
- * `resume`), and substituting `[]` for it without deciding how that interacts with auto-resume would be
- * the wrong half of the fix. Adding a field here means answering that question for it first.
+ * All three array-typed fields are guarded, and the question `workflowTasks` raised is answered rather
+ * than deferred: a queue MAO cannot read halts unattended automation (see `describeUnusableTaskQueue()`
+ * and `WorkflowEngine.requireQueueRecovery()`), because coercing it to `[]` and carrying on let the
+ * immediate first auto-trigger poll overwrite the unreadable value and start a pipeline. `aiProviders`
+ * is coerced and reported but deliberately halts nothing. Adding a field here means answering the same
+ * question for it: what does the empty value cost, which write heals it, and does losing it let
+ * unattended work start against state MAO can no longer account for?
+ *
+ * What this guard does **not** cover, so the halt is not read as more than it is: a `config.json` that
+ * is not valid JSON at all is invisible here — `FileStore.load()` catches the parse error and answers
+ * `{}`, so every field reads as its schema default and nothing is reported (issue #67). Element-level
+ * validity is also out of scope, exactly as it is for `githubRepos`: `workflowTasks: [null]` passes
+ * `Array.isArray` and then throws inside `restore()` (issue #75).
  */
 export function createStoredReadGuard(
   source: string,

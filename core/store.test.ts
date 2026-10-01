@@ -8,12 +8,16 @@ import {
   createStoredReadGuard,
   describeStoredProblems,
   describeUnusableRepoList,
+  describeUnusableProviderList,
+  describeUnusableTaskQueue,
+  findStoredQueueProblem,
   createGuardedStore,
   type MaoStoreSchema,
   type StoredValueBackend,
 } from './store.ts'
 import { canonicalRepoList } from './repo-registry.ts'
-import type { RepoRef } from './workflow-engine.ts'
+import type { AiProviderConfig } from './ai/types.ts'
+import type { QueuedTask, RepoRef } from './workflow-engine.ts'
 
 const tmpDirs: string[] = []
 
@@ -24,6 +28,33 @@ afterEach(() => {
 
 const widgets: RepoRef = { owner: 'acme', repo: 'widgets' }
 const gadgets: RepoRef = { owner: 'acme', repo: 'gadgets' }
+
+const claude: AiProviderConfig = { id: 'claude', name: 'Claude', kind: 'cli', command: 'claude' }
+
+const pendingTask: QueuedTask = {
+  id: 'task-1',
+  title: 'Pending task',
+  repo: widgets,
+  stage: 'issue',
+  history: [],
+  status: 'pending',
+  autoAdvance: false,
+  github: {},
+}
+
+/**
+ * The shapes a hand-edit can leave behind, and the phrase each must produce.
+ *
+ * Shared by all three fields' tables so none can end up covered for fewer shapes than its neighbours.
+ * The object is issue #60's own repro; the rest are what `typeof` collapses or an editor produces.
+ */
+const DISCARDED_SHAPES: Array<[unknown, string]> = [
+  [{ 'acme/widgets': { owner: 'acme', repo: 'widgets' } }, 'is an object'],
+  ['acme/widgets', 'is a string'],
+  [42, 'is a number'],
+  [true, 'is a boolean'],
+  [null, 'is null'],
+]
 
 /**
  * A real `config.json` holding exactly `contents`, opened through a real `FileStore`.
@@ -212,6 +243,152 @@ describe('FileStore githubRepos read guard', () => {
   })
 })
 
+describe('FileStore aiProviders read guard', () => {
+  it('reads a stored list back unchanged, and says nothing about it', () => {
+    const warn = captureWarnings()
+    const { store } = storeHolding({ aiProviders: [claude] })
+
+    expect(store.get('aiProviders')).toEqual([claude])
+    expect(warn).not.toHaveBeenCalled()
+  })
+
+  it('reports every shape it discards, not only the keyed object', () => {
+    // A shared spy would see only the first report (the guard dedups per field), so a regression that
+    // made null, strings, numbers or booleans discard *silently* would pass a loop checking only the
+    // returned value.
+    for (const [aiProviders, expectedPhrase] of DISCARDED_SHAPES) {
+      const warn = captureWarnings()
+      const { store, filePath } = storeHolding({ aiProviders })
+
+      expect(store.get('aiProviders')).toEqual([])
+      expect(warn).toHaveBeenCalledTimes(1)
+      const message = warn.mock.calls[0]![0] as string
+      expect(message).toContain('"aiProviders"')
+      expect(message).toContain(expectedPhrase)
+      expect(message).toContain(filePath)
+
+      warn.mockRestore()
+    }
+  })
+
+  it('returns a value the expression `mao config show` runs can consume', () => {
+    // Copies cli/index.ts's redaction expression rather than driving commander. Before the rule this
+    // threw `store.get(...).map is not a function`, so the one command an operator runs to find out what
+    // state they are in was the command the broken state killed.
+    captureWarnings()
+    const { store } = storeHolding({ aiProviders: { claude } })
+
+    const providers = store.get('aiProviders')
+
+    expect(() =>
+      providers.map((provider) => ({ ...provider, apiKey: provider.apiKey ? '[set]' : undefined })),
+    ).not.toThrow()
+    expect(providers).toEqual([])
+  })
+
+  it('names a recovery that needs no GitHub token, and does not claim automation is halted', () => {
+    // The wording distinction from the queue's report, and it is a safety claim rather than style: an
+    // empty provider list stops stages at selectAgent() before any GitHub write, so this field must not
+    // tell the operator that unattended work has been halted — nothing halts for it.
+    const message = describeUnusableProviderList({}, '/tmp/config.json')!
+
+    expect(message).toContain('mao config import-providers')
+    expect(message).toContain('apiKey')
+    expect(message).not.toContain('halt')
+    expect(message).not.toContain('confirm-queue-recovery')
+  })
+})
+
+describe('FileStore workflowTasks read guard', () => {
+  it('reads a stored queue back unchanged, and says nothing about it', () => {
+    const warn = captureWarnings()
+    const { store } = storeHolding({ workflowTasks: [pendingTask] })
+
+    expect(store.get('workflowTasks')).toEqual([pendingTask])
+    expect(warn).not.toHaveBeenCalled()
+  })
+
+  it('reports every shape it discards, not only the keyed object', () => {
+    for (const [workflowTasks, expectedPhrase] of DISCARDED_SHAPES) {
+      const warn = captureWarnings()
+      const { store, filePath } = storeHolding({ workflowTasks })
+
+      expect(store.get('workflowTasks')).toEqual([])
+      expect(warn).toHaveBeenCalledTimes(1)
+      const message = warn.mock.calls[0]![0] as string
+      expect(message).toContain('"workflowTasks"')
+      expect(message).toContain(expectedPhrase)
+      expect(message).toContain(filePath)
+
+      warn.mockRestore()
+    }
+  })
+
+  it('says automation is halted and names the confirm command, not clear-completed', () => {
+    // `mao workflow clear-completed` also emits `'change'`, so it is gated too — naming it would send
+    // the operator at a command that now refuses. And it must point at the workflow-active label,
+    // because the queue that recorded what was in flight is the thing that is gone.
+    const message = describeUnusableTaskQueue('task-1', '/tmp/config.json')!
+
+    expect(message).toContain('mao workflow confirm-queue-recovery')
+    expect(message).toContain('workflow-active')
+    expect(message).toContain('refused')
+    expect(message).not.toContain('clear-completed')
+  })
+
+  it('prints no stored value, whatever the value was', () => {
+    // config.json is one blob that also holds githubToken in plaintext, and a malformed field is exactly
+    // the hand-edit that can leave a fragment of a neighbouring key inside it.
+    const secretish = { token: 'ghp_liveSecretValue', nested: ['ghp_anotherSecret'] }
+
+    for (const describe_ of [describeUnusableTaskQueue, describeUnusableProviderList, describeUnusableRepoList]) {
+      const message = describe_(secretish, '/tmp/config.json')!
+      expect(message).toContain('is an object')
+      expect(message).not.toContain('ghp_liveSecretValue')
+      expect(message).not.toContain('ghp_anotherSecret')
+    }
+  })
+
+  it('survives a write to an unrelated field, which is what lets the next boot latch again', () => {
+    // The whole no-new-persisted-state premise: FileStore.persist() rewrites this.data, whose
+    // workflowTasks the guard never repaired, so only a write to *this* field heals it.
+    captureWarnings()
+    const corrupt = { 'task-1': pendingTask }
+    const { store, filePath } = storeHolding({ workflowTasks: corrupt })
+
+    store.get('workflowTasks')
+    store.set('theme', 'dark')
+
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).workflowTasks).toEqual(corrupt)
+    expect(new FileStore(filePath).problems().map((p) => p.field)).toContain('workflowTasks')
+  })
+
+  it('hands back a fresh array rather than the shared default', () => {
+    captureWarnings()
+    const { store } = storeHolding({ workflowTasks: 7 })
+
+    store.get('workflowTasks').push(pendingTask)
+
+    expect(store.get('workflowTasks')).toEqual([])
+    expect(MAO_STORE_DEFAULTS.workflowTasks).toEqual([])
+  })
+})
+
+describe('findStoredQueueProblem', () => {
+  it('picks out the queue problem and ignores the other guarded fields', () => {
+    // The single lookup core/app.ts's latch and confirmQueueRecovery's postcondition both use, so they
+    // cannot disagree about what counts as "the queue is unreadable".
+    captureWarnings()
+    const { store } = storeHolding({ githubRepos: 'x', aiProviders: 'y', workflowTasks: 'z' })
+
+    const problems = store.problems()
+
+    expect(problems.map((p) => p.field).sort()).toEqual(['aiProviders', 'githubRepos', 'workflowTasks'])
+    expect(findStoredQueueProblem(problems)?.field).toBe('workflowTasks')
+    expect(findStoredQueueProblem(problems.filter((p) => p.field !== 'workflowTasks'))).toBeUndefined()
+  })
+})
+
 describe('MaoStore.problems', () => {
   it('reports nothing for a healthy store', () => {
     const { store } = storeHolding({ githubRepos: [widgets] })
@@ -355,7 +532,7 @@ describe('createStoredReadGuard', () => {
     expect(reports[0]).toContain('/tmp/config.json')
   })
 
-  it('touches no field but githubRepos', () => {
+  it('touches no field without a rule', () => {
     const reports: string[] = []
     const guard = createStoredReadGuard('/tmp/config.json', (message) => reports.push(message))
 

@@ -48,8 +48,15 @@ function makeGithub(overrides: Record<string, unknown> = {}) {
   } as unknown as GithubService
 }
 
-function makeEngine() {
-  return { enqueueFromIssue: vi.fn() } as unknown as WorkflowEngine
+/**
+ * `queueRecoveryReason` models a latched host (issue #68): the scheduler consults the engine before it
+ * polls, so the fake has to answer. `undefined` is the healthy case every pre-existing test here uses.
+ */
+function makeEngine(queueRecoveryReason?: string) {
+  return {
+    enqueueFromIssue: vi.fn(),
+    getQueueRecoveryReason: vi.fn(() => queueRecoveryReason),
+  } as unknown as WorkflowEngine
 }
 
 /**
@@ -182,5 +189,61 @@ describe('auto-trigger duplicate repositories', () => {
 
     expect(github.fetchTasks).not.toHaveBeenCalled()
     expect(engine.enqueueFromIssue).not.toHaveBeenCalled()
+  })
+})
+
+/**
+ * The scheduler half of issue #68's fail-closed latch.
+ *
+ * `startAutoTrigger` ticks immediately rather than after its first interval, and that tick is how an
+ * unreadable queue got overwritten and a pipeline started. The engine would refuse the enqueue anyway;
+ * stopping here is what makes the poll cost zero GitHub calls and write no best-effort label.
+ */
+describe('startAutoTrigger with a latched queue', () => {
+  const REASON = '[store] "workflowTasks" in /tmp/config.json is an object, not a JSON array…'
+
+  it('spends no GitHub call and advances no poll timestamp', async () => {
+    const github = makeGithub()
+    const engine = makeEngine(REASON)
+
+    const trigger = startAutoTrigger(github, engine, () => [repo])
+    handles.push(trigger.handle)
+    await new Promise((r) => setTimeout(r, 20))
+
+    expect(github.assertRepoWorkflowWritable).not.toHaveBeenCalled()
+    expect(github.fetchTasks).not.toHaveBeenCalled()
+    expect(github.addLabel).not.toHaveBeenCalled()
+    expect(engine.enqueueFromIssue).not.toHaveBeenCalled()
+    // Skipping the whole scheduler rather than each poll is what keeps this null: `lastPolledAt` is set
+    // in pollRepo's `finally`, so a per-poll gate would leave the GUI's "last synced" claiming syncs
+    // that never happened.
+    expect(trigger.getStatus('acme', 'widgets').lastPolledAt).toBeNull()
+  })
+
+  it('pollNow rejects rather than reporting a clean sync', async () => {
+    // `pollNow` must be a wrapper, not `pollRepo` itself: pollRepo swallows every throw into `lastError`,
+    // which nothing in the renderer reads — so a latch check inside it would let the board's Refresh
+    // report success on a halted host, the exact failure github:refreshRepo rejects its own preflight
+    // to avoid.
+    const github = makeGithub()
+    const trigger = startAutoTrigger(github, makeEngine(REASON), () => [repo])
+    handles.push(trigger.handle)
+
+    await expect(trigger.pollNow(repo)).rejects.toThrow(REASON)
+    expect(github.fetchTasks).not.toHaveBeenCalled()
+  })
+
+  it('a healthy host polls, enqueues and labels exactly as before', async () => {
+    const github = makeGithub()
+    const engine = makeEngine()
+
+    const trigger = startAutoTrigger(github, engine, () => [repo])
+    handles.push(trigger.handle)
+    await new Promise((r) => setTimeout(r, 20))
+
+    expect(github.assertRepoWorkflowWritable).toHaveBeenCalled()
+    expect(engine.enqueueFromIssue).toHaveBeenCalled()
+    expect(trigger.getStatus('acme', 'widgets').lastPolledAt).not.toBeNull()
+    await expect(trigger.pollNow(repo)).resolves.toBeUndefined()
   })
 })

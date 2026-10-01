@@ -1192,3 +1192,163 @@ describe('WorkflowEngine repository permission preflight', () => {
     expect(github.assertRepoWorkflowWritable).toHaveBeenCalledTimes(4)
   })
 })
+
+/**
+ * The queue-recovery latch: issue #68's fail-closed half, and the corrections adversarial review of this
+ * design forced. Every test here is about what must NOT happen while the stored queue is unreadable.
+ */
+describe('WorkflowEngine queue-recovery latch', () => {
+  const REASON = '[store] "workflowTasks" in /tmp/config.json is an object, not a JSON array…'
+
+  function latchedEngine(probe?: () => string | undefined) {
+    const github = makeFakeGithub()
+    const engine = new WorkflowEngine(github)
+    engine.setProviders([makeProvider('agent-a'), makeProvider('agent-b')])
+    if (probe) engine.setStoredQueueProbe(probe)
+    engine.requireQueueRecovery(REASON)
+    return { engine, github }
+  }
+
+  it('refuses every queue mutation and emits no change', () => {
+    // The property that matters more than the throw: zero `'change'` emissions, because that listener is
+    // the only writer of `workflowTasks` and its write is what destroys the operator's last copy.
+    const mutations: Array<[string, (e: WorkflowEngine) => unknown]> = [
+      ['enqueue', (e) => e.enqueue('t', repo)],
+      ['enqueueFromIssue', (e) => e.enqueueFromIssue(1, 'https://x/1', 't', repo)],
+      ['retry', (e) => e.retry('nope')],
+      ['advance', (e) => e.advance('nope')],
+      ['setAutoAdvance', (e) => e.setAutoAdvance('nope', false)],
+      ['clearCompleted', (e) => e.clearCompleted()],
+    ]
+
+    for (const [name, mutate] of mutations) {
+      const { engine } = latchedEngine()
+      const changes = vi.fn()
+      engine.on('change', changes)
+
+      expect(() => mutate(engine), name).toThrow(REASON)
+      expect(changes, name).not.toHaveBeenCalled()
+    }
+  })
+
+  it('runs no stage when resumeProcessing is called, which is what `mao run` does unconditionally', async () => {
+    const { engine, github } = latchedEngine()
+    engine.restore([{ ...makePendingQueueTask('leftover') }])
+
+    engine.resumeProcessing()
+    await new Promise((r) => setTimeout(r, 30))
+
+    expect(github.assertRepoWorkflowWritable).not.toHaveBeenCalled()
+    expect(ai.createAiProvider).not.toHaveBeenCalled()
+    expect(engine.getTasks().find((t) => t.id === 'leftover')!.status).toBe('pending')
+  })
+
+  it('never downgrades, and a clean probe does not unlatch it', () => {
+    // Monotone on purpose: this process's in-memory queue is the coerced empty one, so un-latching after
+    // an out-of-band repair would run the wrong queue and then persist it over the real one.
+    const { engine } = latchedEngine(() => undefined)
+
+    engine.requireQueueRecovery('a different, softer reason')
+
+    expect(engine.getQueueRecoveryReason()).toBe(REASON)
+    expect(engine.isQueueRecoveryLatched()).toBe(true)
+  })
+
+  it('a refused mutation does not become a persistence failure', () => {
+    // Why notify() itself is deliberately NOT a gate point: notifyAfterStage reads a throwing `'change'`
+    // listener as a write failure, so gating there would escalate this read-shape halt into a bogus
+    // persistenceBroken — the very misdiagnosis the latch is kept separate from the marker to avoid.
+    const { engine } = latchedEngine()
+
+    expect(() => engine.enqueue('t', repo)).toThrow()
+
+    expect(engine.isPersistenceBroken()).toBe(false)
+    expect(engine.getPersistenceError()).toBeUndefined()
+  })
+
+  it('confirmQueueRecovery is not blocked by the latch it clears, and emits exactly one change', () => {
+    // The hard constraint that the way out cannot be gated. Also pins the ordering: the field is cleared
+    // BEFORE notify(), so the field-only backstop in core/app.ts lets this one write through — a reader
+    // that re-probed here would re-latch inside the healing emit and deadlock both recovery routes.
+    let stored: string | undefined = REASON
+    const { engine } = latchedEngine(() => stored)
+    const changes = vi.fn(() => {
+      stored = undefined
+    })
+    engine.on('change', changes)
+
+    const outcome = engine.confirmQueueRecovery()
+
+    expect(outcome).toEqual({ kind: 'replaced' })
+    expect(changes).toHaveBeenCalledTimes(1)
+    expect(engine.isQueueRecoveryLatched()).toBe(false)
+  })
+
+  it('re-latches when the stored value is still unreadable after the write', () => {
+    // A write that threw, or one a backend silently dropped, must leave the halt exactly as it found it
+    // — and say so, rather than reporting success.
+    const { engine } = latchedEngine(() => REASON)
+    engine.on('change', () => {})
+
+    const outcome = engine.confirmQueueRecovery()
+
+    expect(outcome.kind).toBe('still-unreadable')
+    expect(engine.isQueueRecoveryLatched()).toBe(true)
+  })
+
+  it('re-latches and reports the write error when the change listener throws', () => {
+    const { engine } = latchedEngine(() => REASON)
+    engine.on('change', () => {
+      throw new Error('ENOSPC: no space left on device')
+    })
+
+    const outcome = engine.confirmQueueRecovery()
+
+    expect(outcome.kind).toBe('still-unreadable')
+    expect(outcome.kind === 'still-unreadable' && outcome.reason).toContain('ENOSPC')
+    expect(engine.isQueueRecoveryLatched()).toBe(true)
+    // Still a read-shape halt, not a persistence failure: the caller is told the write failed, but the
+    // engine must not flip the marker's flag for it.
+    expect(engine.isPersistenceBroken()).toBe(false)
+  })
+
+  it('writes nothing when the stored queue reads normally again', () => {
+    // The latch is monotone, so the card stays up after an out-of-band repair — and a blind confirm then
+    // would overwrite that repair with this process's coerced empty queue, inflicting the exact loss the
+    // latch exists to prevent. Probe before clearing.
+    const { engine } = latchedEngine(() => undefined)
+    const changes = vi.fn()
+    engine.on('change', changes)
+
+    const outcome = engine.confirmQueueRecovery()
+
+    expect(outcome).toEqual({ kind: 'already-readable' })
+    expect(changes).not.toHaveBeenCalled()
+    expect(engine.isQueueRecoveryLatched()).toBe(true)
+  })
+
+  it('leaves a healthy engine completely alone', () => {
+    const github = makeFakeGithub()
+    const engine = new WorkflowEngine(github)
+    engine.setProviders([makeProvider('agent-a')])
+
+    expect(engine.isQueueRecoveryLatched()).toBe(false)
+    expect(engine.getQueueRecoveryReason()).toBeUndefined()
+    expect(engine.confirmQueueRecovery()).toEqual({ kind: 'already-readable' })
+    expect(() => engine.enqueue('t', repo)).not.toThrow()
+  })
+})
+
+/** A restorable task, shaped like the queue's own entries. */
+function makePendingQueueTask(id: string): QueuedTask {
+  return {
+    id,
+    title: 'Leftover task',
+    repo,
+    stage: 'issue',
+    history: [],
+    status: 'pending',
+    autoAdvance: false,
+    github: {},
+  }
+}

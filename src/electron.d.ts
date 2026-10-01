@@ -1,7 +1,7 @@
 import type { AiProviderConfig } from '../core/ai/types'
 import type { GithubTask, GithubTaskDetail } from '../core/github-service'
 import type { RepoWorkflowCapability } from '../core/repo-capabilities'
-import type { QueuedTask, RepoRef, RunOverride } from '../core/workflow-engine'
+import type { QueueRecoveryOutcome, QueueRecoveryState, QueuedTask, RepoRef, RunOverride } from '../core/workflow-engine'
 import type { AutoTriggerStatus } from '../core/auto-trigger'
 import type { StoredValueProblem, ThemePreference } from '../core/store'
 import type { SelfUpdateCheck } from '../core/self-update'
@@ -52,6 +52,10 @@ declare global {
         advance: (taskId: string, runOverride?: RunOverride) => Promise<QueuedTask>
         setAutoAdvance: (taskId: string, autoAdvance: boolean) => Promise<QueuedTask>
         clearCompleted: () => Promise<void>
+        /** Whether unattended work is halted because the stored queue is unreadable, and why. */
+        recoveryRequired: () => Promise<QueueRecoveryState>
+        /** Discards an unreadable stored queue and releases the engine. Core decides the outcome. */
+        confirmQueueRecovery: () => Promise<QueueRecoveryOutcome>
       }
       ui: {
         getTheme: () => Promise<ThemePreference>

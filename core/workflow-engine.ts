@@ -137,6 +137,32 @@ function slugify(text: string): string {
  * MaoStore, the other to stream stage transitions to stdout — without either needing to know the
  * other exists.
  */
+/**
+ * What `WorkflowEngine.confirmQueueRecovery()` actually did, decided in `core/` so both shells render one
+ * answer instead of each re-deriving "did that work?" for themselves.
+ *
+ * `'already-readable'` is the case worth naming: the latch is monotone, so something healed the stored
+ * value out of band (an operator hand-edit, or another process's recovery) while this process stayed
+ * halted. Confirming then writes **nothing** — this process's in-memory queue is the coerced empty one,
+ * so persisting it would overwrite the repair with the very loss the latch exists to prevent. The
+ * operator has to restart to load it.
+ */
+/**
+ * Whether unattended work is halted, and the store's report saying why — what the GUI polls.
+ *
+ * Carries the reason rather than only a flag so the card shows the same text the CLI prints; `reason` is
+ * `undefined` exactly when `required` is false.
+ */
+export interface QueueRecoveryState {
+  required: boolean
+  reason: string | undefined
+}
+
+export type QueueRecoveryOutcome =
+  | { kind: 'replaced' }
+  | { kind: 'already-readable' }
+  | { kind: 'still-unreadable'; reason: string }
+
 export class WorkflowEngine extends EventEmitter {
   private queue: QueuedTask[] = []
   private providers: AiProviderConfig[] = []
@@ -155,6 +181,29 @@ export class WorkflowEngine extends EventEmitter {
    * an operator rather than silently retrying.
    */
   private persistenceBroken: Error | undefined
+  /**
+   * The store's own operator-facing report for an unreadable `workflowTasks`, held verbatim — not a
+   * boolean, so every refused mutation, `mao run`'s refusal and the GUI's card say the same words.
+   *
+   * Set once by `createMaoApp()` (the only boot path) before it subscribes the `'change'` →
+   * `store.set('workflowTasks', …)` listener and before `restore()`, so nothing can write over the
+   * unreadable value in between. **Monotone**: it never downgrades and no later check clears it, because
+   * this process's in-memory queue is the coerced `[]` rather than whatever the file holds — un-latching
+   * would run the wrong queue and then persist it over the real one.
+   *
+   * Deliberately *not* re-derived from the store at gate time. Review of PR #69 showed the boot case is
+   * the dangerous one (both hosts tick auto-trigger immediately after boot), while a corruption appearing
+   * after a *clean* boot is harmless — the engine is holding the true queue, so its next write restores
+   * the file faithfully. Probing per gate would instead have put three whole-config reads on the
+   * `'change'` path and, worse, let a transient read failure latch a healthy host forever.
+   */
+  private queueRecoveryReason: string | undefined
+  /**
+   * Re-reads the store's queue problem, injected by `createMaoApp` so the engine keeps no store
+   * reference (architecture rule 3). Used **only** by `confirmQueueRecovery()` — once before it writes,
+   * to notice an out-of-band repair it must not overwrite, and once after, to verify the write landed.
+   */
+  private storedQueueProbe: (() => string | undefined) | undefined
 
   constructor(github: GithubService) {
     super()
@@ -193,8 +242,98 @@ export class WorkflowEngine extends EventEmitter {
     return this.persistenceBroken
   }
 
+  /** Injects the store re-read `confirmQueueRecovery()` uses. See `storedQueueProbe`. */
+  setStoredQueueProbe(probe: () => string | undefined) {
+    this.storedQueueProbe = probe
+  }
+
+  /**
+   * Latches the queue as unreadable. Idempotent and one-way — the first reason wins, so a second call
+   * cannot soften or replace what the operator was already told.
+   */
+  requireQueueRecovery(reason: string) {
+    if (this.queueRecoveryReason === undefined) this.queueRecoveryReason = reason
+  }
+
+  /**
+   * Whether unattended work is halted, read from the field alone and **never** by probing the store.
+   *
+   * The field-only contract is load-bearing, not a micro-optimisation: `confirmQueueRecovery()` clears
+   * the field and *then* notifies, because that one `'change'` is the write that replaces the unreadable
+   * value. A reader that re-probed at that moment would see the still-dirty store, re-latch inside the
+   * healing emit, and refuse the only write that could ever clear the latch — deadlocking both recovery
+   * routes permanently. `core/app.ts`'s `'change'` backstop must use this and nothing else.
+   */
+  isQueueRecoveryLatched(): boolean {
+    return this.queueRecoveryReason !== undefined
+  }
+
+  /** The operator-facing reason unattended work is halted, or `undefined` when it is not. */
+  getQueueRecoveryReason(): string | undefined {
+    return this.queueRecoveryReason
+  }
+
+  /**
+   * Refuses a queue mutation while the stored queue is unreadable.
+   *
+   * Called at the top of every public mutator — before any queue change and before `notify()` — rather
+   * than inside `notify()` itself. Gating `notify()` would be the tidier chokepoint and is wrong:
+   * `notifyAfterStage()` reads a throwing `'change'` listener as a *persistence* failure and would
+   * escalate this read-shape halt into a bogus `persistenceBroken`, which is precisely the
+   * misdiagnosis this latch is kept separate from the persistence-broken marker to avoid.
+   */
+  private assertQueueWritable() {
+    if (this.queueRecoveryReason !== undefined) throw new Error(this.queueRecoveryReason)
+  }
+
+  /**
+   * The one way out of the latch, and deliberately the one queue path that does not consult it.
+   *
+   * Discards the unreadable stored value by letting exactly one `'change'` through, so the write still
+   * goes via the engine's listener and `core/app.ts:createMaoApp` stays the single writer of
+   * `workflowTasks` (architecture rule 3). Confirmation and replacement are therefore one action: a latch
+   * cleared without replacing the value would simply return on the next boot.
+   *
+   * Three guards, each for a failure the adversarial review of this design actually found:
+   * - probe **before** clearing, so an out-of-band repair is reported rather than overwritten;
+   * - clear before `notify()`, so the field-only backstop lets this emit through;
+   * - re-probe afterwards and re-latch if the value is still there, so a write that threw or that a
+   *   backend silently dropped leaves the halt exactly as it found it instead of reporting success.
+   */
+  confirmQueueRecovery(): QueueRecoveryOutcome {
+    if (this.queueRecoveryReason === undefined) return { kind: 'already-readable' }
+    if (this.probeStoredQueue() === undefined) return { kind: 'already-readable' }
+
+    const latched = this.queueRecoveryReason
+    this.queueRecoveryReason = undefined
+    let writeError: string | undefined
+    try {
+      this.notify()
+    } catch (err) {
+      writeError = err instanceof Error ? err.message : String(err)
+    }
+
+    const remaining = this.probeStoredQueue() ?? (writeError === undefined ? undefined : latched)
+    if (remaining === undefined) return { kind: 'replaced' }
+    this.queueRecoveryReason = remaining
+    return { kind: 'still-unreadable', reason: writeError === undefined ? remaining : `${remaining} (${writeError})` }
+  }
+
+  /** The probe, failing closed: an inspection that throws counts as still-unreadable, never as healed. */
+  private probeStoredQueue(): string | undefined {
+    if (this.storedQueueProbe === undefined) return undefined
+    try {
+      return this.storedQueueProbe()
+    } catch {
+      return this.queueRecoveryReason ?? 'MAO could not re-inspect its stored settings.'
+    }
+  }
+
   /** Removes all finished (done/error) tasks immediately. */
   clearCompleted() {
+    // Gated even though the in-memory queue is harmless: it emits `'change'`, so leaving it open would
+    // let a GUI "Clear completed" click replace the unreadable stored value with no confirmation at all.
+    this.assertQueueWritable()
     this.queue = this.queue.filter((t) => t.status !== 'done' && t.status !== 'error')
     this.notify()
   }
@@ -264,6 +403,7 @@ export class WorkflowEngine extends EventEmitter {
    * override applied to that single execution and nothing after it (see `RunOverride`).
    */
   retry(taskId: string, runOverride?: RunOverride): QueuedTask {
+    this.assertQueueWritable()
     const task = this.queue.find((t) => t.id === taskId)
     if (!task) throw new Error(`Unknown task: ${taskId}`)
     if (task.status !== 'error') throw new Error(`Task is not in an error state: ${task.status}`)
@@ -281,6 +421,7 @@ export class WorkflowEngine extends EventEmitter {
    * optionally with a one-shot tool/model/effort override for that single execution.
    */
   advance(taskId: string, runOverride?: RunOverride): QueuedTask {
+    this.assertQueueWritable()
     const task = this.queue.find((t) => t.id === taskId)
     if (!task) throw new Error(`Unknown task: ${taskId}`)
     if (task.status !== 'paused') throw new Error(`Task is not paused: ${task.status}`)
@@ -294,6 +435,7 @@ export class WorkflowEngine extends EventEmitter {
 
   /** Toggles whether a task auto-continues to the next stage on its own, or waits for a manual advance(). */
   setAutoAdvance(taskId: string, autoAdvance: boolean): QueuedTask {
+    this.assertQueueWritable()
     const task = this.queue.find((t) => t.id === taskId)
     if (!task) throw new Error(`Unknown task: ${taskId}`)
     task.autoAdvance = autoAdvance
@@ -302,6 +444,7 @@ export class WorkflowEngine extends EventEmitter {
   }
 
   enqueue(title: string, repo: RepoRef, autoAdvance = true, providerOverride?: ProviderOverride): QueuedTask {
+    this.assertQueueWritable()
     const task: QueuedTask = {
       id: randomUUID(),
       title,
@@ -333,6 +476,9 @@ export class WorkflowEngine extends EventEmitter {
     autoAdvance = true,
     providerOverride?: ProviderOverride,
   ): QueuedTask {
+    // The exact call review of PR #69 reproduced: auto-trigger ticks immediately after boot, and without
+    // this the first poll's notify() would overwrite the unreadable queue AND start a real pipeline.
+    this.assertQueueWritable()
     const task: QueuedTask = {
       id: randomUUID(),
       title,
@@ -374,6 +520,10 @@ export class WorkflowEngine extends EventEmitter {
     // the process restarts. Continuing would only produce more in-memory state the store can't
     // durably reflect.
     if (this.persistenceBroken) return
+    // The stored queue is unreadable, so this process cannot tell what was already in flight. Refuse to
+    // run any stage — this is the chokepoint `mao run` reaches through its unconditional
+    // resumeProcessing(), and every GitHub write in the repo is reachable only from here.
+    if (this.queueRecoveryReason !== undefined) return
     this.processing = true
     try {
       let advanced = true
@@ -381,6 +531,7 @@ export class WorkflowEngine extends EventEmitter {
         advanced = false
         for (const task of this.queue) {
           if (this.persistenceBroken) return
+          if (this.queueRecoveryReason !== undefined) return
           if (task.status !== 'pending') continue
           await this.runStage(task)
           advanced = true

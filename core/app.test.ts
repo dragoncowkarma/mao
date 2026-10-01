@@ -16,12 +16,43 @@ function makeRealDataDir(): { dataDir: string; store: FileStore } {
   return { dataDir, store: new FileStore(path.join(dataDir, 'config.json')) }
 }
 
+/**
+ * A data directory whose `config.json` already holds exactly `contents`, opened through a real
+ * `FileStore`.
+ *
+ * Written as raw JSON rather than through `store.set`, which cannot produce a value the schema forbids —
+ * a hand-edited file can, and that is the whole subject of the boot regressions below.
+ */
+function makeRealDataDirHolding(contents: unknown): { dataDir: string; store: FileStore; filePath: string } {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mao-app-test-'))
+  tmpDirs.push(dataDir)
+  const filePath = path.join(dataDir, 'config.json')
+  fs.writeFileSync(filePath, JSON.stringify(contents, null, 2))
+  return { dataDir, store: new FileStore(filePath), filePath }
+}
+
+/** Keeps the read guard's report out of the test output without hiding whether it happened. */
+function captureWarnings() {
+  return vi.spyOn(console, 'warn').mockImplementation(() => {})
+}
+
 afterEach(() => {
   vi.restoreAllMocks()
   while (tmpDirs.length) {
     fs.rmSync(tmpDirs.pop()!, { recursive: true, force: true })
   }
 })
+
+/** The repository root, anchored to this file rather than to whatever directory vitest started in. */
+const REPO_ROOT = path.join(
+  (import.meta as unknown as { dirname?: string }).dirname ?? path.join(process.cwd(), 'core'),
+  '..',
+)
+
+/** Comments may legitimately name a symbol; only executable text should satisfy a source assertion. */
+function withoutComments(source: string): string {
+  return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+}
 
 function makePendingTask(id: string): QueuedTask {
   return {
@@ -107,5 +138,248 @@ describe('createMaoApp', () => {
     expect(task.error).toMatch(/no GitHub token is configured/)
     // Still stalled at its own stage, so restoring the token and retrying re-runs it unchanged.
     expect(task.stage).toBe('issue')
+  })
+})
+
+/**
+ * Issue #68's fail-closed half, at the only boot path both shells call.
+ *
+ * Review of PR #69 reproduced the hole these pin: that PR coerced an unreadable `workflowTasks` to `[]`
+ * and argued it was safe because resuming an empty queue is a no-op. But Electron's
+ * `registerIpcHandlers` and `mao run` both call `startAutoTrigger()` straight after `createMaoApp()`, and
+ * it ticks *immediately* rather than after its first interval — so the first poll's `enqueueFromIssue()`
+ * would `notify()`, the `'change'` listener would `store.set('workflowTasks', …)`, and that single write
+ * would destroy the only salvageable copy of the unreadable value **and** start an unattended pipeline on
+ * a host that cannot know what was already in flight.
+ */
+describe('createMaoApp with an unreadable stored queue', () => {
+  const corruptQueue = { 'task-1': { id: 'task-1' } }
+
+  it('latches the engine, refuses to auto-resume, and does not claim persistence is broken', () => {
+    const warn = captureWarnings()
+    const { dataDir, store } = makeRealDataDirHolding({ workflowTasks: corruptQueue })
+
+    const { workflowEngine } = createMaoApp({
+      store,
+      workspaceRoot: path.join(dataDir, 'workspaces'),
+      dataDir,
+      resume: true,
+    })
+
+    expect(workflowEngine.isQueueRecoveryLatched()).toBe(true)
+    expect(workflowEngine.getQueueRecoveryReason()).toContain('"workflowTasks"')
+    expect(workflowEngine.getTasks()).toEqual([])
+    // A read-shape halt must never be reported through the *write* marker: `mao config show` would then
+    // answer workflowPersistenceBroken: true and send the operator to a command that cannot fix this.
+    expect(hasPersistenceBrokenMarker(dataDir)).toBe(false)
+    expect(workflowEngine.isPersistenceBroken()).toBe(false)
+    expect(warn).toHaveBeenCalledTimes(1)
+  })
+
+  it('the reproduced path: an immediate auto-trigger enqueue cannot overwrite the unreadable value', () => {
+    // The end-to-end regression, driven through the engine the way auto-trigger's first tick does.
+    captureWarnings()
+    const { dataDir, store, filePath } = makeRealDataDirHolding({ workflowTasks: corruptQueue })
+
+    const { workflowEngine } = createMaoApp({
+      store,
+      workspaceRoot: path.join(dataDir, 'workspaces'),
+      dataDir,
+      resume: true,
+    })
+
+    expect(() =>
+      workflowEngine.enqueueFromIssue(7, 'https://github.com/acme/widgets/issues/7', 'Fix it', {
+        owner: 'acme',
+        repo: 'widgets',
+      }),
+    ).toThrow(/workflowTasks/)
+
+    // The operator's only salvageable copy is still exactly where it was.
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).workflowTasks).toEqual(corruptQueue)
+    expect(workflowEngine.getTasks()).toEqual([])
+  })
+
+  it('latches before the change listener is subscribed, so nothing can write in between', () => {
+    // Ordering inside createMaoApp. If the latch were set after the subscription (or after restore()),
+    // any emission in that window would persist an array over the unreadable value.
+    captureWarnings()
+    const { dataDir, store, filePath } = makeRealDataDirHolding({
+      workflowTasks: corruptQueue,
+      githubToken: 'ghp_x',
+    })
+
+    const { workflowEngine } = createMaoApp({
+      store,
+      workspaceRoot: path.join(dataDir, 'workspaces'),
+      dataDir,
+      resume: true,
+    })
+    // Force the listener directly — this is what a future ungated emitter would do. The backstop must
+    // swallow it silently rather than persist, and must not escalate to a persistence failure.
+    workflowEngine.emit('change', [makePendingTask('sneaky')])
+
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).workflowTasks).toEqual(corruptQueue)
+    expect(workflowEngine.isPersistenceBroken()).toBe(false)
+  })
+
+  it('recovers through confirmQueueRecovery, and the next boot resumes normally', async () => {
+    // The end-to-end way out, and non-stickiness: the latch is derived from the stored value, so once the
+    // value is replaced nothing survives to block a later legitimate queue.
+    // One spy for the whole test: vi.spyOn on an already-spied method hands back the SAME mock, so a
+    // second captureWarnings() would still be carrying the first boot's report.
+    const warn = captureWarnings()
+    const { dataDir, store, filePath } = makeRealDataDirHolding({ workflowTasks: corruptQueue })
+
+    const first = createMaoApp({ store, workspaceRoot: path.join(dataDir, 'workspaces'), dataDir, resume: false })
+    expect(first.workflowEngine.confirmQueueRecovery()).toEqual({ kind: 'replaced' })
+
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).workflowTasks).toEqual([])
+
+    const reopened = new FileStore(filePath)
+    reopened.set('workflowTasks', [makePendingTask('after-recovery')])
+
+    warn.mockClear()
+    const second = createMaoApp({
+      store: new FileStore(filePath),
+      workspaceRoot: path.join(dataDir, 'workspaces'),
+      dataDir,
+      resume: true,
+    })
+    await new Promise((r) => setTimeout(r, 30))
+
+    expect(second.workflowEngine.isQueueRecoveryLatched()).toBe(false)
+    const task = second.workflowEngine.getTasks().find((t) => t.id === 'after-recovery')!
+    // No GitHub token configured, so the stage preflight rejects — which is what proves processing
+    // actually started rather than the task sitting untouched at 'pending'.
+    expect(task.status).toBe('error')
+    expect(task.error).toMatch(/no GitHub token is configured/)
+    expect(warn).not.toHaveBeenCalled()
+  })
+
+  it('fails closed on a store it cannot inspect at all, without a value in the message', () => {
+    const { dataDir, store } = makeRealDataDir()
+    vi.spyOn(store, 'problems').mockImplementation(() => {
+      throw new Error('EACCES: permission denied, open \'/tmp/ghp_secretish/config.json\'')
+    })
+
+    const { workflowEngine } = createMaoApp({
+      store,
+      workspaceRoot: path.join(dataDir, 'workspaces'),
+      dataDir,
+      resume: true,
+    })
+
+    expect(workflowEngine.isQueueRecoveryLatched()).toBe(true)
+    // A parse or I/O error is free to quote the file's own text, and config.json holds githubToken in
+    // plaintext — so the fabricated reason interpolates nothing from the error.
+    expect(workflowEngine.getQueueRecoveryReason()).not.toContain('ghp_secretish')
+    expect(workflowEngine.getQueueRecoveryReason()).not.toContain('EACCES')
+  })
+
+  it('an unreadable aiProviders is reported but halts nothing', () => {
+    // The deliberate asymmetry: an empty provider list stops every stage at selectAgent() before any
+    // GitHub write, so latching for it would be a larger outage than the fault.
+    const warn = captureWarnings()
+    const { dataDir, store } = makeRealDataDirHolding({ aiProviders: { claude: { id: 'claude' } } })
+
+    const { workflowEngine } = createMaoApp({
+      store,
+      workspaceRoot: path.join(dataDir, 'workspaces'),
+      dataDir,
+      resume: true,
+    })
+
+    expect(workflowEngine.isQueueRecoveryLatched()).toBe(false)
+    expect(() => workflowEngine.enqueue('t', { owner: 'acme', repo: 'widgets' })).not.toThrow()
+    expect(warn).toHaveBeenCalledTimes(1)
+    expect(warn.mock.calls[0]![0] as string).toContain('"aiProviders"')
+  })
+
+  it('leaves a healthy store entirely unlatched', () => {
+    const { dataDir, store } = makeRealDataDirHolding({ workflowTasks: [makePendingTask('ok')] })
+
+    const { workflowEngine } = createMaoApp({
+      store,
+      workspaceRoot: path.join(dataDir, 'workspaces'),
+      dataDir,
+      resume: false,
+    })
+
+    expect(workflowEngine.isQueueRecoveryLatched()).toBe(false)
+    expect(workflowEngine.getTasks().map((t) => t.id)).toEqual(['ok'])
+  })
+})
+
+/**
+ * Two rules the other gates make *unobservable* at runtime, pinned as source order instead.
+ *
+ * Verified by mutation: moving `requireQueueRecovery` below the `'change'` subscription, and moving the
+ * gate into `notify()`, both leave the whole suite green — because nothing emits between the
+ * subscription and the latch (`restore()` emits nothing), and because every public mutator already
+ * throws before `notify()` is reached. They are defence against a later refactor rather than behaviour
+ * with a witness, and the repo's own answer to a hand-maintained coupling with no type to enforce it is
+ * to read the source (see `core/store.test.ts` on `electron/store.ts`, `core/node-environment.test.ts`
+ * on the vitest config).
+ */
+describe('core/app.ts and the engine, as source order', () => {
+  const appSource = withoutComments(fs.readFileSync(path.join(REPO_ROOT, 'core', 'app.ts'), 'utf-8'))
+  const engineSource = withoutComments(
+    fs.readFileSync(path.join(REPO_ROOT, 'core', 'workflow-engine.ts'), 'utf-8'),
+  )
+
+  it('latches before it subscribes the change listener and before restore', () => {
+    const latch = appSource.indexOf('requireQueueRecovery(')
+    const subscribe = appSource.indexOf("workflowEngine.on('change'")
+    const restore = appSource.indexOf('workflowEngine.restore(')
+
+    expect(latch).toBeGreaterThan(-1)
+    expect(subscribe).toBeGreaterThan(-1)
+    expect(restore).toBeGreaterThan(-1)
+    expect(latch).toBeLessThan(subscribe)
+    expect(latch).toBeLessThan(restore)
+  })
+
+  it('reads the field, not the store, in the change backstop', () => {
+    // The deadlock: confirmQueueRecovery() clears the field and then notifies, because that emit IS the
+    // healing write — a backstop that re-inspected the store there would re-latch inside it.
+    const listener = appSource.slice(appSource.indexOf("workflowEngine.on('change'"))
+    const body = listener.slice(0, listener.indexOf('})') + 2)
+
+    expect(body).toContain('isQueueRecoveryLatched()')
+    expect(body).not.toContain('describeUnreadableQueue(')
+    expect(body).not.toContain('problems()')
+  })
+
+  it('ands the latch into safeToResume', () => {
+    // Also unobservable on its own — restore(resume: true) reaches processQueue, which is gated anyway —
+    // so this is the second line of defence, not the first. Pinned so a refactor cannot quietly make the
+    // boot path depend on processQueue's check alone.
+    const safeToResume = appSource.slice(appSource.indexOf('const safeToResume ='))
+    const line = safeToResume.slice(0, safeToResume.indexOf('\n'))
+
+    expect(line).toContain('isQueueRecoveryLatched()')
+    expect(line).toContain('hasPersistenceBrokenMarker(dataDir)')
+  })
+
+  it('keeps both of processQueue\'s latch checks', () => {
+    // Removing either one alone changes nothing observable (the entry check short-circuits what the
+    // in-loop check would catch anyway), so neither is independently load-bearing — but removing BOTH
+    // lets a latched engine run stages. Mirrors how persistenceBroken is checked in the same two places.
+    const processQueue = engineSource.slice(engineSource.indexOf('  private async processQueue() {'))
+    const body = processQueue.slice(0, processQueue.indexOf('\n  private '))
+    const checks = [...body.matchAll(/this\.queueRecoveryReason !== undefined\) return/g)]
+
+    expect(checks).toHaveLength(2)
+  })
+
+  it('does not gate notify() itself', () => {
+    // notifyAfterStage reads a throwing `'change'` listener as a persistence failure, so a gate here
+    // would escalate this read-shape halt into a bogus persistenceBroken.
+    const notify = engineSource.slice(engineSource.indexOf('  private notify() {'))
+    const body = notify.slice(0, notify.indexOf('\n  }') + 4)
+
+    expect(body).toContain("this.emit('change'")
+    expect(body).not.toContain('assertQueueWritable')
   })
 })

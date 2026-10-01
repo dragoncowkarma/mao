@@ -5,7 +5,12 @@ import type { AiProviderConfig } from '../../core/ai/types'
 import type { GithubTask } from '../../core/github-service'
 import type { RepoWorkflowCapability } from '../../core/repo-capabilities'
 import type { StoredValueProblem, ThemePreference } from '../../core/store'
-import type { QueuedTask, RepoRef } from '../../core/workflow-engine'
+import type {
+  QueuedTask,
+  QueueRecoveryOutcome,
+  QueueRecoveryState,
+  RepoRef,
+} from '../../core/workflow-engine'
 
 /**
  * A method the renderer should not reach in this test. Failing loudly beats returning an empty value:
@@ -61,6 +66,21 @@ export function createElectronApiStub(initialRepos: RepoRef[] = [], initialProbl
   const listProviders = vi.fn(async (): Promise<AiProviderConfig[]> => [])
   const listWorkflowTasks = vi.fn(async (): Promise<QueuedTask[]> => [])
 
+  // Modelled on the real latch rather than taken as a separate input: the engine derives it at boot from
+  // the store's `workflowTasks` problem, so a test that seeds that problem gets a halted host for free —
+  // and, because the latch is monotone, healing the store does NOT clear it. Only the confirm call does.
+  let queueLatched = initialProblems.find((problem) => problem.field === 'workflowTasks')?.message
+  const recoveryRequired = vi.fn(
+    async (): Promise<QueueRecoveryState> => ({ required: queueLatched !== undefined, reason: queueLatched }),
+  )
+  const confirmQueueRecovery = vi.fn(async (): Promise<QueueRecoveryOutcome> => {
+    if (queueLatched === undefined) return { kind: 'already-readable' }
+    if (!problems.some((problem) => problem.field === 'workflowTasks')) return { kind: 'already-readable' }
+    queueLatched = undefined
+    problems = problems.filter((problem) => problem.field !== 'workflowTasks')
+    return { kind: 'replaced' }
+  })
+
   const api = {
     platform: 'test',
     app: {
@@ -90,6 +110,8 @@ export function createElectronApiStub(initialRepos: RepoRef[] = [], initialProbl
       advance: notStubbed('workflow.advance'),
       setAutoAdvance: notStubbed('workflow.setAutoAdvance'),
       clearCompleted: notStubbed('workflow.clearCompleted'),
+      recoveryRequired,
+      confirmQueueRecovery,
     },
     ui: {
       getTheme,
@@ -114,5 +136,7 @@ export function createElectronApiStub(initialRepos: RepoRef[] = [], initialProbl
     applyRepos: (next: RepoRef[]) => {
       stored = next.map((repo) => ({ ...repo }))
     },
+    recoveryRequired,
+    confirmQueueRecovery,
   }
 }

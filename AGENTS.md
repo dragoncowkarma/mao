@@ -443,27 +443,57 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   records a confirmed *write* failure, so `mao config show` would answer `workflowPersistenceBroken: true`
   while persistence is fine, and it is sticky and operator-gated where this heals itself. The two are
   reported as separate fields.
-- **Two readers, and only one of them may probe the store.** `isQueueRecoveryLatched()` reads the field
-  and nothing else; the probing accessors are for the pre-mutation gates and `confirmQueueRecovery()`.
-  `core/app.ts`'s `'change'` backstop must use the field-only one. This is not style: `confirmQueueRecovery()`
+- **Only `confirmQueueRecovery()` observes the store; every gate reads the field.** `assertQueueWritable()`,
+  `processQueue`'s two checks, `safeToResume` and `core/app.ts`'s `'change'` backstop all read
+  `queueRecoveryReason` / `isQueueRecoveryLatched()` and nothing else. `confirmQueueRecovery()` is the one
+  reader that takes a fresh observation, immediately before its write. Do **not** add a per-gate probe:
+  each observation is a whole-config read and parse on conf, the gates sit on operator actions and the
+  queue-write path, and a transient read failure there would latch a healthy host. This is not style:
+  `confirmQueueRecovery()`
   clears the field and *then* notifies, because that one emit **is** the write that replaces the
   unreadable value — a backstop that re-inspected the store at that moment would see the still-dirty file,
   re-latch inside the healing emit, and refuse the only write that can ever clear the latch, deadlocking
   both recovery routes permanently. The backstop is also a **silent return, never a throw**: `notifyAfterStage`
   reads a throwing `'change'` listener as a persistence failure and would escalate this read-shape halt
   into a bogus `persistenceBroken`. For the same reason `notify()` itself is deliberately not a gate —
-  gate its callers. And the latch is derived **once at boot**, never re-probed per gate: a corruption
-  appearing after a *clean* boot is harmless (the engine holds the true queue, so its next write restores
-  the file faithfully), while probing per gate would put three whole-config reads on the `'change'` path
-  and let a transient read failure latch a healthy host.
-- **`confirmQueueRecovery()` owns its own postcondition, and probes before it writes.** It returns a
-  typed `QueueRecoveryOutcome` (`'replaced'` / `'already-readable'` / `'still-unreadable'`) so the CLI
-  command and the GUI button cannot disagree about whether confirmation worked — a bare boolean had the
-  CLI re-deriving success while the GUI reported it. `'already-readable'` is the case that must write
-  **nothing**: the latch is monotone, so after a repair made outside this process the store reads clean
-  while this process still holds the coerced empty queue, and persisting it would overwrite the repair
-  with exactly the loss the latch exists to prevent — the operator has to restart. A write that threw or
-  that a backend silently dropped re-latches rather than reporting success.
+  gate its callers. And the latch is decided **once at boot**: a corruption appearing after a *clean* boot
+  is harmless for that session, because the engine holds the true queue and its next write restores the
+  file faithfully. The GUI still has to *say* so — `src/components/Sidebar.tsx` renders a late-discovered
+  `workflowTasks` problem with its own wording, because the store's report asserts a halt that has not
+  happened in that state, and filtering the report out while the halted card did not render hid it
+  entirely.
+- **One observation decides the latch and feeds `restore()`.** `createMaoApp` calls
+  `store.inspect(QUEUE_GATING_FIELD)` once (through one guarded helper) and uses that single result for
+  both. `get()` and `problems()` are two reads and conf re-reads and re-parses the whole file on every
+  `get`, so deciding from one and restoring from the other left a window: a value turning non-array in
+  between read as *healthy* — no latch — and was then restored as the guard's coerced `[]`, so the host
+  ran unlatched holding an empty queue and the immediate auto-trigger tick overwrote the unreadable
+  original. `inspect()` also answers a third state, `readable: false` (the store could not be read at
+  all), which is **not** a flavour of "unusable": a caller about to write must refuse on it rather than
+  assume the value is the corrupt one it last saw.
+- **`confirmQueueRecovery()` owns its own postcondition, and observes before it writes.** It returns a
+  typed `QueueRecoveryOutcome` so the CLI command and the GUI button cannot disagree about whether
+  confirmation worked — a bare boolean had the CLI re-deriving success while the GUI reported it. Four
+  kinds, each saying only what was established: `'replaced'` (still unusable immediately before the
+  write, and the write did not throw), `'already-readable'` (readable again, so **nothing is written** —
+  the latch is monotone, so after a repair made outside this process the store reads clean while this
+  process still holds the coerced empty queue, and persisting it would overwrite that repair with exactly
+  the loss the latch exists to prevent; the operator has to restart), `'unverified'` (the store could not
+  be read, so nothing is written rather than written on a guess) and `'write-failed'` (the attempt threw,
+  so what reached the file is unknown and the halt stands). None interpolates the backend's error text:
+  an I/O or parse failure can quote the file's own bytes and that file holds `githubToken` in plaintext,
+  so the reasons come from a closed set.
+- **That pre-write observation narrows a window; it is not a cross-process postcondition, and must not be
+  described as one.** What it closes is the interleaving that destroys data: another process or a
+  hand-edit making the queue *readable* between the latch and the confirm, which now answers
+  `'already-readable'` and writes nothing. Replacing one unusable value with another loses nothing,
+  because neither could be restored. What it does **not** close is a write that lands *after* this one and
+  clobbers it — the ordinary multi-process lost update every field in this single-blob file shares (issue
+  #73). A real postcondition needs a primitive neither backend has (an advisory lock, or `O_EXCL` +
+  rename keyed on a stored version with a retry loop), and a `version` token on `MaoStore` would not be
+  one either, since read-compare-write still leaves a window before the write lands. Keep the word
+  *atomic* out of the comments, the operator-facing text and the member names — `inspect`/`observe` say
+  what they do.
 - **What the halt does *not* cover, so it is not read as more than it is.** A `config.json` that is not
   valid JSON at all is invisible: `FileStore.load()` catches the parse error and answers `{}`, so every
   field reads as its schema default, nothing is reported and no latch arms (issue #67). Element-level

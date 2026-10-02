@@ -231,11 +231,29 @@ To recover:
 
 That command is the only queue path that is not gated, and it is deliberately **not**
 `clear-completed` — `clear-completed` also writes the queue, so it is refused too; leaving it open would
-let a GUI click replace the unreadable value with no confirmation at all. It reports its own
-postcondition rather than assuming success: if the write did not land, the halt stands and the command
-fails. If something else repaired the file first (a hand-edit, or the same command in another terminal)
-it writes **nothing** and tells you to restart — this process is still holding an empty queue, so only a
-fresh boot loads the real one.
+let a GUI click replace the unreadable value with no confirmation at all. It takes a fresh observation of
+the file immediately before it writes, and reports only what that established:
+
+| It says | What happened |
+| --- | --- |
+| discarded the unreadable queue | the value was still unusable right before the write, and the write did not throw |
+| reads normally — nothing written | something else repaired the file first (a hand-edit, or the same command in another terminal). **Nothing is written**, because this process is still holding an empty queue and writing it would destroy that repair. Restart to load the real one |
+| nothing was written (could not read) | the config file could not be read at all, so whether the unusable value is still there is unknown. Refusing beats writing on a guess — fix the file or its permissions and retry |
+| the replacement write failed | the attempt threw, so what reached the file is unknown. Inspect it before salvaging, then retry |
+
+None of those messages quotes the underlying error, because an I/O or parse failure can echo the file's
+own bytes and that file holds your GitHub token in plaintext.
+
+That pre-write check closes the interleaving that destroys data — another process making the queue
+readable between the halt and your confirmation. It is **not** a cross-process lock: a write that lands
+*after* yours can still clobber it, which is the ordinary multi-process lost update every field in this
+single-blob config shares (issue #73). Do not run two recoveries at once and expect one to win cleanly.
+
+**A problem found after a clean start does not halt that session.** The latch is decided at boot, so if
+the file is corrupted while MAO is already running, the engine is still holding the queue it loaded and
+its next queue write rewrites the file from it. The sidebar says exactly that, in its own words rather
+than repeating the store's "automation is halted" report, which would be false there. Restarting before
+that write happens *will* refuse to start unattended work until the value is replaced.
 
 What the halt does **not** cover, so do not read it as more: a `config.json` that is not valid JSON at
 all is invisible to it (`FileStore.load()` catches the parse error and answers with schema defaults, so
@@ -639,7 +657,8 @@ Per AGENTS.md, the reviewer should be a different agent than the implementer.
 Check, in order: architecture rules (core Electron-free? logic in shells? does the
 `core` vitest project still run with no plugins and no DOM?),
 lockstep files all updated (IPC 3-file chain, store pair, STAGE_LABELS × 2),
-a new store-shape rule — does the field latch, and is the pre-mutation gate the only probing reader?,
+a new store-shape rule — does the field latch, and is `confirmQueueRecovery()` still the only reader
+that observes the store (every gate reads the field)?,
 domain invariants (maker-checker, CI gate, timeouts, error-not-crash), secrets
 hygiene, then style (match surrounding code — there is no autoformatter).
 

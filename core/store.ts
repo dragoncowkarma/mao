@@ -224,6 +224,44 @@ export function findStoredQueueProblem(problems: StoredValueProblem[]): StoredVa
   return problems.find((problem) => problem.field === QUEUE_GATING_FIELD)
 }
 
+/**
+ * The report for a backend that could not be read at all, rather than one holding the wrong shape.
+ *
+ * Value-free by construction: an I/O or parse failure is free to quote the file's own bytes, and
+ * `config.json` holds `githubToken` in plaintext — so nothing from the underlying error is interpolated,
+ * only the field and the file. It is phrased as a halt because that is what it causes: a state MAO
+ * cannot establish is treated as unusable, never as healthy.
+ */
+export function describeUninspectableStore(field: keyof MaoStoreSchema, source: string): string {
+  return (
+    `[store] MAO could not read "${field}" from ${source} at all, so it cannot establish whether the ` +
+    'value is usable — treating it as unusable. Check the file and the permissions on it, then retry.'
+  )
+}
+
+/**
+ * One read of a stored value, carrying both what a caller may use and what the guard had to do.
+ *
+ * Exists because `get()` and `problems()` are two separate reads, and electron-store re-reads and
+ * re-parses the config file on **every** `get`. `createMaoApp` decided the queue latch from one of those
+ * reads and then restored from the other, so a hand-edit landing between them left the host *unlatched*
+ * holding a coerced empty queue — auto-trigger then started immediately and overwrote the unreadable
+ * original, which is the exact failure the latch exists to prevent. One observation removes the window:
+ * the latch and `restore()` cannot disagree because there is no second read to disagree with.
+ */
+export interface StoredObservation<K extends keyof MaoStoreSchema> {
+  /** The value corrected to the shape the schema declares — what a caller may use. */
+  value: MaoStoreSchema[K]
+  /** The operator-facing report when the guard had to replace the stored value, else `undefined`. */
+  problem: string | undefined
+  /**
+   * False when the backend read itself failed, so nothing about the stored value was established.
+   * `value` is then the schema default and `problem` is `describeUninspectableStore()`'s report.
+   * Callers that are about to **write** must treat this as "unknown" and refuse, not as "corrupt".
+   */
+  readable: boolean
+}
+
 /** A backend's read, corrected to the shape `MaoStoreSchema` declares. See `createStoredReadGuard`. */
 export type StoredReadGuard = <K extends keyof MaoStoreSchema>(key: K, raw: MaoStoreSchema[K]) => MaoStoreSchema[K]
 
@@ -319,6 +357,14 @@ export interface MaoStore {
    * since the guard's own report goes to a main-process console a packaged-app operator never sees.
    */
   problems(): StoredValueProblem[]
+  /**
+   * One read answering both the usable value and whether the stored one had to be replaced.
+   *
+   * Part of the contract rather than a convenience: `get()` and `problems()` are two reads of a file
+   * another process can change between them (see `StoredObservation`). Any decision that pairs "is this
+   * value usable?" with "what do I do with it?" must come from a single `inspect()`.
+   */
+  inspect<K extends keyof MaoStoreSchema>(key: K): StoredObservation<K>
 }
 
 /**
@@ -372,6 +418,29 @@ export function createGuardedStore(
     },
     problems(): StoredValueProblem[] {
       return describeStoredProblems(readRaw, source)
+    },
+    inspect<K extends keyof MaoStoreSchema>(key: K): StoredObservation<K> {
+      let raw: MaoStoreSchema[K]
+      try {
+        raw = readRaw(key)
+      } catch {
+        // Fail closed, and say nothing about the value: a read that threw established nothing, so a
+        // caller about to write must refuse rather than assume the stored value is the corrupt one it
+        // last saw. `readable: false` is what carries that distinction.
+        return {
+          value: structuredClone(MAO_STORE_DEFAULTS[key]),
+          problem: describeUninspectableStore(key, source),
+          readable: false,
+        }
+      }
+      // Guarded through the same `guardRead` as `get()`, deliberately — including its once-per-field
+      // warning — so an observation and a plain read cannot disagree about the value or about whether
+      // the operator was told. `unusableStoredValue` is read from the SAME `raw`, not from a second read.
+      return {
+        value: guardRead(key, raw),
+        problem: unusableStoredValue(key, raw, source) ?? undefined,
+        readable: true,
+      }
     },
   }
 }
@@ -431,5 +500,9 @@ export class FileStore implements MaoStore {
 
   problems(): StoredValueProblem[] {
     return this.guarded.problems()
+  }
+
+  inspect<K extends keyof MaoStoreSchema>(key: K): StoredObservation<K> {
+    return this.guarded.inspect(key)
   }
 }

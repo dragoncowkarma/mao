@@ -1,7 +1,12 @@
 import { GithubService } from './github-service.ts'
 import { createRepoRegistrar } from './repo-registry.ts'
 import { WorkflowEngine, type QueuedTask } from './workflow-engine.ts'
-import { findStoredQueueProblem, type MaoStore } from './store.ts'
+import {
+  QUEUE_GATING_FIELD,
+  describeUninspectableStore,
+  type MaoStore,
+  type StoredObservation,
+} from './store.ts'
 import { hasPersistenceBrokenMarker, writePersistenceBrokenMarker } from './persistence-guard.ts'
 
 export interface MaoAppOptions {
@@ -52,22 +57,25 @@ export interface MaoApp {
  * polling (the Electron main process, or `mao run`) start it themselves.
  */
 /**
- * The store's report for an unreadable `workflowTasks`, or `undefined` when the queue reads normally.
+ * One guarded observation of the stored queue — the value, whether the guard replaced it, and whether
+ * the store could be read at all.
  *
- * Fails closed on a store it cannot inspect at all, and fabricates that reason without interpolating the
- * error: a parse failure is free to quote the file's own text, and `config.json` holds `githubToken` in
- * plaintext. Because the latch is derived once at boot, a transient inspection failure halts only this
- * process — the next start re-inspects rather than inheriting a permanent halt.
+ * The single helper for both uses, so the boot decision and the engine's pre-write check cannot differ
+ * in how they treat a store that cannot be read. Fails closed, and says so without interpolating the
+ * error: a parse or I/O failure is free to quote the file's own text, and `config.json` holds
+ * `githubToken` in plaintext. `readable: false` is a third answer, not a flavour of "unusable" —
+ * `confirmQueueRecovery()` refuses to write on it and replaces on the other, which is the distinction
+ * the previous string-valued probe collapsed.
  */
-function describeUnreadableQueue(store: MaoStore): string | undefined {
+function observeStoredQueue(store: MaoStore): StoredObservation<typeof QUEUE_GATING_FIELD> {
   try {
-    return findStoredQueueProblem(store.problems())?.message
+    return store.inspect(QUEUE_GATING_FIELD)
   } catch {
-    return (
-      '[store] MAO could not inspect its own stored settings, so it cannot tell whether the workflow ' +
-      'queue is readable — refusing to start unattended work. Check the config file reported by `mao ' +
-      'config show` and restart.'
-    )
+    return {
+      value: [],
+      problem: describeUninspectableStore(QUEUE_GATING_FIELD, 'the config file'),
+      readable: false,
+    }
   }
 }
 
@@ -90,9 +98,20 @@ export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOp
   // notify(), the listener below would store.set('workflowTasks', …), and that single write would destroy
   // the only salvageable copy of the unreadable value *and* start an unattended pipeline on a host that
   // cannot know what was already in flight. Latching here makes every queue path refuse instead.
-  workflowEngine.setStoredQueueProbe(() => describeUnreadableQueue(store))
-  const queueProblem = describeUnreadableQueue(store)
-  if (queueProblem !== undefined) workflowEngine.requireQueueRecovery(queueProblem)
+  workflowEngine.setStoredQueueObserver(() => {
+    const { readable, problem } = observeStoredQueue(store)
+    return { readable, problem }
+  })
+  // ONE observation, used for BOTH the latch below and `restore()` further down, and that is the fix for
+  // the second window review found. `problems()` and `get()` are two separate reads, and electron-store
+  // re-reads and re-parses the config file on every `get` — so a hand-edit (or another CLI) turning
+  // `workflowTasks` from an array into a non-array BETWEEN them left the first read saying "healthy", so
+  // no latch, while the second was coerced to `[]` and restored. The host then ran UNLATCHED with an
+  // empty queue, auto-trigger ticked immediately, and the unreadable original was overwritten while
+  // unattended work began — exactly what the latch exists to prevent. There is now no second read to
+  // disagree with.
+  const observedQueue = observeStoredQueue(store)
+  if (observedQueue.problem !== undefined) workflowEngine.requireQueueRecovery(observedQueue.problem)
 
   workflowEngine.on('change', (tasks: QueuedTask[]) => {
     // Last-resort backstop, and a SILENT return rather than a throw: notifyAfterStage() reads a throwing
@@ -129,7 +148,8 @@ export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOp
   // *write*, the latch means this process cannot *read* the queue. `mao config show` reports them
   // separately so neither is diagnosed as the other.
   const safeToResume = resume && !hasPersistenceBrokenMarker(dataDir) && !workflowEngine.isQueueRecoveryLatched()
-  workflowEngine.restore(store.get('workflowTasks'), { resume: safeToResume })
+  // The value from the same observation the latch was decided on — never a second `store.get`.
+  workflowEngine.restore(observedQueue.value, { resume: safeToResume })
 
   return { githubService, workflowEngine, store, updateRepos: createRepoRegistrar(githubService, store) }
 }

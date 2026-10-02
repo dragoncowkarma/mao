@@ -386,8 +386,13 @@ workflow
       log('The stored workflow queue reads normally — nothing was written. Restart MAO to load it.')
       return
     }
-    if (outcome.kind === 'still-unreadable') {
-      throw new Error(`The unreadable value is still in the config file; the engine remains halted. ${outcome.reason}`)
+    // Both failures say only what was established, and neither carries the backend's error text: an I/O
+    // or parse failure can quote the file, which holds the GitHub token in plaintext.
+    if (outcome.kind === 'unverified') {
+      throw new Error(`Nothing was written. ${outcome.reason}`)
+    }
+    if (outcome.kind === 'write-failed') {
+      throw new Error(outcome.reason)
     }
     log('Discarded the unreadable stored workflow queue. Auto-resume, polling and queue writes are released.')
   })

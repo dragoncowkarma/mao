@@ -10,6 +10,7 @@ import {
   describeUnusableRepoList,
   describeUnusableProviderList,
   describeUnusableTaskQueue,
+  describeUninspectableStore,
   findStoredQueueProblem,
   createGuardedStore,
   type MaoStoreSchema,
@@ -589,5 +590,107 @@ describe("electron/store.ts, the other MaoStore backend", () => {
 
     expect(exported).toEqual(['store'])
     expect(source).toMatch(/export const store: MaoStore\b/)
+  })
+})
+
+/**
+ * `MaoStore.inspect()` — one read answering both "what may I use" and "did the guard replace it".
+ *
+ * It exists because `get()` and `problems()` are two reads, and conf re-reads and re-parses the whole
+ * config file on every `get`. `createMaoApp` decided the queue latch from one and restored from the
+ * other, so a value changed between them left the host unlatched holding a coerced empty queue.
+ */
+describe('MaoStore.inspect', () => {
+  it('answers value and problem from the same read, and says the read succeeded', () => {
+    captureWarnings()
+    const { store } = storeHolding({ workflowTasks: { 'task-1': pendingTask } })
+
+    const observed = store.inspect('workflowTasks')
+
+    expect(observed.readable).toBe(true)
+    expect(observed.value).toEqual([])
+    expect(observed.problem).toContain('"workflowTasks"')
+  })
+
+  it('reports no problem for a healthy value, and hands back what is stored', () => {
+    const warn = captureWarnings()
+    const { store } = storeHolding({ workflowTasks: [pendingTask] })
+
+    const observed = store.inspect('workflowTasks')
+
+    expect(observed).toEqual({ value: [pendingTask], problem: undefined, readable: true })
+    expect(warn).not.toHaveBeenCalled()
+  })
+
+  it('cannot disagree with itself when the backend changes between two reads', () => {
+    // The regression for the second window review found. This backend flips from a healthy array to a
+    // non-array on its SECOND read, which models conf re-reading the file while another process edits
+    // it. Two reads (problems() then get()) would see "healthy" and then a coerced `[]`; one inspect()
+    // cannot, because there is no second read to disagree with.
+    captureWarnings()
+    let reads = 0
+    const flipping = fakeBackend({ workflowTasks: [pendingTask] })
+    const store = createGuardedStore(
+      {
+        get: <K extends keyof MaoStoreSchema>(key: K) => {
+          if (key !== 'workflowTasks') return flipping.backend.get(key)
+          reads += 1
+          return (reads === 1 ? [pendingTask] : { 'task-1': pendingTask }) as unknown as MaoStoreSchema[K]
+        },
+        set: flipping.backend.set,
+      },
+      '/tmp/config.json',
+    )
+
+    const observed = store.inspect('workflowTasks')
+
+    // Whichever read it got, the verdict and the value describe the SAME one: either a healthy array
+    // with no problem, or a coerced empty list WITH a problem. Never healthy-verdict + coerced value.
+    expect(reads).toBe(1)
+    if (observed.problem === undefined) expect(observed.value).toEqual([pendingTask])
+    else expect(observed.value).toEqual([])
+  })
+
+  it('fails closed when the backend read throws, without quoting the error', () => {
+    // `readable: false` is a third answer, not a flavour of "unusable": a caller about to WRITE must
+    // refuse rather than assume the value is still the corrupt one it last saw.
+    const store = createGuardedStore(
+      {
+        get: () => {
+          throw new Error("EACCES: permission denied, open '/tmp/ghp_secretish/config.json'")
+        },
+        set: () => {},
+      },
+      '/tmp/config.json',
+    )
+
+    const observed = store.inspect('workflowTasks')
+
+    expect(observed.readable).toBe(false)
+    expect(observed.value).toEqual([])
+    expect(observed.problem).toContain('could not read')
+    expect(observed.problem).not.toContain('EACCES')
+    expect(observed.problem).not.toContain('ghp_secretish')
+  })
+
+  it('warns once, exactly as get() does, so an observation and a read cannot differ', () => {
+    const warn = captureWarnings()
+    const { store } = storeHolding({ workflowTasks: 'task-1' })
+
+    store.inspect('workflowTasks')
+    store.get('workflowTasks')
+    store.inspect('workflowTasks')
+
+    expect(warn).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('describeUninspectableStore', () => {
+  it('names the field and the file and nothing else', () => {
+    const message = describeUninspectableStore('workflowTasks', '/tmp/config.json')
+
+    expect(message).toContain('"workflowTasks"')
+    expect(message).toContain('/tmp/config.json')
+    expect(message).toContain('unusable')
   })
 })

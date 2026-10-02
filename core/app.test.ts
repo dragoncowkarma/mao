@@ -3,7 +3,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createMaoApp } from './app.ts'
-import { FileStore } from './store.ts'
+import { FileStore, createGuardedStore, type MaoStoreSchema } from './store.ts'
 import { hasPersistenceBrokenMarker, writePersistenceBrokenMarker } from './persistence-guard.ts'
 import type { QueuedTask } from './workflow-engine.ts'
 
@@ -259,7 +259,9 @@ describe('createMaoApp with an unreadable stored queue', () => {
 
   it('fails closed on a store it cannot inspect at all, without a value in the message', () => {
     const { dataDir, store } = makeRealDataDir()
-    vi.spyOn(store, 'problems').mockImplementation(() => {
+    // `inspect`, not `problems`: the boot takes ONE observation now, which is the point of finding 2's
+    // fix. A store that cannot be read at all must halt rather than crash boot or read as healthy.
+    vi.spyOn(store, 'inspect').mockImplementation(() => {
       throw new Error('EACCES: permission denied, open \'/tmp/ghp_secretish/config.json\'')
     })
 
@@ -322,6 +324,84 @@ describe('createMaoApp with an unreadable stored queue', () => {
  * to read the source (see `core/store.test.ts` on `electron/store.ts`, `core/node-environment.test.ts`
  * on the vitest config).
  */
+/**
+ * Finding 2 from the re-review, end to end at the boot path.
+ *
+ * `createMaoApp` used to decide the latch from `store.problems()` and then restore from a SEPARATE
+ * `store.get('workflowTasks')`. conf re-reads and re-parses the config file on every `get`, so a
+ * hand-edit (or another CLI) turning the queue from an array into a non-array between those two reads
+ * left the first read saying "healthy" — no latch — while the second was coerced to `[]` and restored.
+ * The host then ran UNLATCHED holding an empty queue, auto-trigger ticked immediately, and the
+ * unreadable original was overwritten while unattended work began.
+ */
+describe('createMaoApp when the stored queue changes between reads', () => {
+  /** A store whose `workflowTasks` turns unusable on its Nth raw read, like conf re-reading the file. */
+  function flippingStore(healthyReads: number) {
+    let reads = 0
+    const data: Record<string, unknown> = { workflowTasks: [makePendingTask('real')] }
+    return createGuardedStore(
+      {
+        get: <K extends keyof MaoStoreSchema>(key: K) => {
+          if (key !== 'workflowTasks') return data[key] as MaoStoreSchema[K] | undefined
+          reads += 1
+          return (reads <= healthyReads
+            ? [makePendingTask('real')]
+            : { real: makePendingTask('real') }) as unknown as MaoStoreSchema[K]
+        },
+        set: <K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]) => {
+          data[key] = value
+        },
+      },
+      '/tmp/config.json',
+    )
+  }
+
+  it('never ends up unlatched while holding a queue the guard had to replace', () => {
+    // The invariant, stated so it holds whichever read the boot happens to get: an empty restored queue
+    // and no latch is the one combination that let the reproduced failure through.
+    captureWarnings()
+    const { dataDir } = makeRealDataDir()
+
+    for (const healthyReads of [0, 1, 2]) {
+      const store = flippingStore(healthyReads)
+      const { workflowEngine } = createMaoApp({
+        store,
+        workspaceRoot: path.join(dataDir, 'workspaces'),
+        dataDir,
+        resume: false,
+      })
+
+      const restoredIds = workflowEngine.getTasks().map((t) => t.id)
+      const latched = workflowEngine.isQueueRecoveryLatched()
+      expect(latched || restoredIds.length > 0, `healthyReads=${healthyReads}`).toBe(true)
+      if (!latched) expect(restoredIds).toEqual(['real'])
+    }
+  })
+
+  it('takes exactly one raw read of the queue at boot', () => {
+    // Two reads is the bug, not an inefficiency: a second read is a second chance to disagree. Also the
+    // reason the boot does not re-derive the latch per gate — on conf each raw read is a whole-config
+    // read and parse.
+    captureWarnings()
+    const { dataDir } = makeRealDataDir()
+    let reads = 0
+    const store = createGuardedStore(
+      {
+        get: <K extends keyof MaoStoreSchema>(key: K) => {
+          if (key === 'workflowTasks') reads += 1
+          return undefined
+        },
+        set: () => {},
+      },
+      '/tmp/config.json',
+    )
+
+    createMaoApp({ store, workspaceRoot: path.join(dataDir, 'workspaces'), dataDir, resume: false })
+
+    expect(reads).toBe(1)
+  })
+})
+
 describe('core/app.ts and the engine, as source order', () => {
   const appSource = withoutComments(fs.readFileSync(path.join(REPO_ROOT, 'core', 'app.ts'), 'utf-8'))
   const engineSource = withoutComments(

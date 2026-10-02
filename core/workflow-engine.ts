@@ -141,11 +141,25 @@ function slugify(text: string): string {
  * What `WorkflowEngine.confirmQueueRecovery()` actually did, decided in `core/` so both shells render one
  * answer instead of each re-deriving "did that work?" for themselves.
  *
- * `'already-readable'` is the case worth naming: the latch is monotone, so something healed the stored
- * value out of band (an operator hand-edit, or another process's recovery) while this process stayed
- * halted. Confirming then writes **nothing** — this process's in-memory queue is the coerced empty one,
- * so persisting it would overwrite the repair with the very loss the latch exists to prevent. The
- * operator has to restart to load it.
+ * Four kinds, because each says something different about what was actually established:
+ *
+ * - `'replaced'` — the stored value was still unusable immediately before the write, and the write did
+ *   not throw.
+ * - `'already-readable'` — the stored queue reads normally again, so **nothing was written**. The latch
+ *   is monotone, so something healed the value out of band (a hand-edit, or another process's recovery)
+ *   while this process stayed halted; this process's in-memory queue is the coerced empty one, so
+ *   persisting it would overwrite that repair with the very loss the latch exists to prevent. The
+ *   operator has to restart to load it. This is also the answer when a concurrent repair lands between
+ *   the pre-write observation and the write attempt — see `confirmQueueRecovery()`.
+ * - `'unverified'` — the store could not be read at all, so whether the value is still the unusable one
+ *   is **unknown**. Nothing is written: a transient read failure, or a repair this process cannot see,
+ *   would otherwise be overwritten on a guess.
+ * - `'write-failed'` — the write was attempted and threw, so what reached the file is unknown. The halt
+ *   stands and the operator is told to inspect the file before salvaging.
+ *
+ * No kind asserts a file state the code did not establish, and none interpolates the backend's error
+ * text: an I/O or parse error is free to quote the file's own bytes and `config.json` holds
+ * `githubToken` in plaintext, so the reason is picked from a closed set of sentences.
  */
 /**
  * Whether unattended work is halted, and the store's report saying why — what the GUI polls.
@@ -158,10 +172,28 @@ export interface QueueRecoveryState {
   reason: string | undefined
 }
 
+/** What one observation of the stored queue established. See `WorkflowEngine.storedQueueObserver`. */
+export interface StoredQueueObservation {
+  /** False when the store could not be read at all, so nothing about the stored value was established. */
+  readable: boolean
+  /** The operator-facing report when the value is unusable (or unreadable), else `undefined`. */
+  problem: string | undefined
+}
+
+/** Closed-set reasons. Never built from a backend error: those can quote a file holding the token. */
+const UNOBSERVABLE_QUEUE =
+  '[store] MAO could not read the stored workflow queue, so it cannot tell whether the unusable value ' +
+  'is still there — nothing was written and automation stays halted. Check the config file reported by ' +
+  '`mao config show` and retry.'
+const QUEUE_WRITE_FAILED =
+  '[store] The replacement write failed, so what reached the config file is unknown and automation ' +
+  'stays halted. Inspect the file before salvaging anything from it, then retry.'
+
 export type QueueRecoveryOutcome =
   | { kind: 'replaced' }
   | { kind: 'already-readable' }
-  | { kind: 'still-unreadable'; reason: string }
+  | { kind: 'unverified'; reason: string }
+  | { kind: 'write-failed'; reason: string }
 
 export class WorkflowEngine extends EventEmitter {
   private queue: QueuedTask[] = []
@@ -199,11 +231,16 @@ export class WorkflowEngine extends EventEmitter {
    */
   private queueRecoveryReason: string | undefined
   /**
-   * Re-reads the store's queue problem, injected by `createMaoApp` so the engine keeps no store
-   * reference (architecture rule 3). Used **only** by `confirmQueueRecovery()` — once before it writes,
-   * to notice an out-of-band repair it must not overwrite, and once after, to verify the write landed.
+   * One tri-state observation of the stored queue, injected by `createMaoApp` so the engine keeps no
+   * store reference (architecture rule 3). Used **only** by `confirmQueueRecovery()`, immediately before
+   * it writes.
+   *
+   * Tri-state rather than the `string | undefined` it replaced, and that is the whole point: the old
+   * shape turned a *throwing* inspection into a non-`undefined` reason, which `confirmQueueRecovery()`
+   * then read as "the corrupt value is still there" and wrote on. A state MAO cannot establish must
+   * refuse, not guess — `readable: false` is what carries that.
    */
-  private storedQueueProbe: (() => string | undefined) | undefined
+  private storedQueueObserver: (() => StoredQueueObservation) | undefined
 
   constructor(github: GithubService) {
     super()
@@ -242,9 +279,9 @@ export class WorkflowEngine extends EventEmitter {
     return this.persistenceBroken
   }
 
-  /** Injects the store re-read `confirmQueueRecovery()` uses. See `storedQueueProbe`. */
-  setStoredQueueProbe(probe: () => string | undefined) {
-    this.storedQueueProbe = probe
+  /** Injects the one store observation `confirmQueueRecovery()` uses. See `storedQueueObserver`. */
+  setStoredQueueObserver(observe: () => StoredQueueObservation) {
+    this.storedQueueObserver = observe
   }
 
   /**
@@ -302,30 +339,45 @@ export class WorkflowEngine extends EventEmitter {
    */
   confirmQueueRecovery(): QueueRecoveryOutcome {
     if (this.queueRecoveryReason === undefined) return { kind: 'already-readable' }
-    if (this.probeStoredQueue() === undefined) return { kind: 'already-readable' }
+
+    // Observed immediately before the write, inside this one synchronous function with no awaits, so the
+    // only remaining window is the notify() -> store.set -> writeFileSync path itself. What this closes
+    // is the interleaving that destroys data: another process (or a hand-edit) making the queue READABLE
+    // between the latch and this click. Nothing is lost when it merely replaces one unusable value with
+    // another, because neither could be restored. A write landing AFTER this one and clobbering it is the
+    // ordinary multi-process lost update that every field in this single-blob file shares (issue #73);
+    // this is not, and does not claim to be, a cross-process atomic postcondition.
+    const observed = this.observeStoredQueue()
+    if (observed === undefined || !observed.readable) {
+      return { kind: 'unverified', reason: observed?.problem ?? UNOBSERVABLE_QUEUE }
+    }
+    if (observed.problem === undefined) return { kind: 'already-readable' }
 
     const latched = this.queueRecoveryReason
+    // Cleared BEFORE notify(), because the field-only backstop in core/app.ts is what lets this one emit
+    // through — and that emit IS the write that replaces the unusable value, so routing it through the
+    // listener keeps core/app.ts the single writer of `workflowTasks` (architecture rule 3).
     this.queueRecoveryReason = undefined
-    let writeError: string | undefined
     try {
       this.notify()
-    } catch (err) {
-      writeError = err instanceof Error ? err.message : String(err)
+    } catch {
+      // Re-latched because the write did not complete, so the unusable value is presumed still there —
+      // but the outcome says only that the attempt failed, since what reached the file is unknown. The
+      // backend's own error text is deliberately not carried: it can quote the file, which holds the
+      // GitHub token in plaintext.
+      this.queueRecoveryReason = latched
+      return { kind: 'write-failed', reason: QUEUE_WRITE_FAILED }
     }
-
-    const remaining = this.probeStoredQueue() ?? (writeError === undefined ? undefined : latched)
-    if (remaining === undefined) return { kind: 'replaced' }
-    this.queueRecoveryReason = remaining
-    return { kind: 'still-unreadable', reason: writeError === undefined ? remaining : `${remaining} (${writeError})` }
+    return { kind: 'replaced' }
   }
 
-  /** The probe, failing closed: an inspection that throws counts as still-unreadable, never as healed. */
-  private probeStoredQueue(): string | undefined {
-    if (this.storedQueueProbe === undefined) return undefined
+  /** The observation, failing closed: anything it cannot establish reads as unknown, never as healed. */
+  private observeStoredQueue(): StoredQueueObservation | undefined {
+    if (this.storedQueueObserver === undefined) return undefined
     try {
-      return this.storedQueueProbe()
+      return this.storedQueueObserver()
     } catch {
-      return this.queueRecoveryReason ?? 'MAO could not re-inspect its stored settings.'
+      return { readable: false, problem: UNOBSERVABLE_QUEUE }
     }
   }
 

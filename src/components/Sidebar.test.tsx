@@ -111,6 +111,47 @@ describe('Sidebar queue recovery', () => {
     expect(screen.queryByRole('button', { name: 'Reset stored list' })).toBeNull()
   })
 
+  it('shows a late-discovered queue problem even though this session is not halted', () => {
+    // Finding 3 from the re-review. The latch is decided at boot, so a file corrupted after a clean boot
+    // leaves `required: false` while the 30s storeProblems poll finds it. The old code filtered every
+    // workflowTasks report out of the generic list unconditionally while the dedicated card rendered
+    // only for a boot-time latch — so in exactly this state NEITHER appeared and the operator saw
+    // nothing at all.
+    renderSidebar({
+      queueRecovery: { required: false, reason: undefined },
+      queueStoredStillUnreadable: true,
+      storeProblems: [UNUSABLE_QUEUE],
+    })
+
+    expect(screen.getByText(UNUSABLE_QUEUE.message)).toBeInTheDocument()
+    // And it must NOT claim a halt that has not happened: this session is still running the queue it
+    // loaded at startup. Saying "halted" would send the operator looking for a stoppage.
+    expect(screen.queryByText('Workflow automation is halted')).toBeNull()
+    expect(screen.getByText('The stored workflow queue is unreadable')).toBeInTheDocument()
+    expect(screen.getByText(/This session is not halted/)).toBeInTheDocument()
+  })
+
+  it('offers no discard for a late-discovered problem, because nothing is latched to clear', () => {
+    renderSidebar({
+      queueRecovery: { required: false, reason: undefined },
+      queueStoredStillUnreadable: true,
+      storeProblems: [UNUSABLE_QUEUE],
+    })
+
+    expect(screen.queryByRole('button', { name: 'Discard unreadable queue' })).toBeNull()
+    expect(screen.queryByText(/Restart MAO to load it/)).toBeNull()
+  })
+
+  it('prints the queue report once in the late case too', () => {
+    renderSidebar({
+      queueRecovery: { required: false, reason: undefined },
+      queueStoredStillUnreadable: true,
+      storeProblems: [UNUSABLE_QUEUE],
+    })
+
+    expect(screen.getAllByText(UNUSABLE_QUEUE.message)).toHaveLength(1)
+  })
+
   it('says nothing about the queue when nothing is halted', () => {
     renderSidebar()
 

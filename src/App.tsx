@@ -483,15 +483,18 @@ export default function App() {
    * The outcome is decided in `core/` (see `QueueRecoveryOutcome`) rather than inferred here, so this
    * button and `mao workflow confirm-queue-recovery` cannot disagree about whether it worked. Both
    * non-success outcomes are surfaced by throwing, because Sidebar's own catch is what puts a message on
-   * screen: `'still-unreadable'` means the write did not land and the halt stands, and
+   * screen: `'unverified'` means the store could not be read so nothing was written, `'write-failed'`
+   * means the attempt threw and what reached the file is unknown, and
    * `'already-readable'` means something else repaired the file first and writing would have destroyed
    * that repair. Both reads are refreshed afterwards either way.
    */
   async function discardUnreadableQueue() {
     try {
       const outcome = await electronApi().workflow.confirmQueueRecovery()
-      if (outcome.kind === 'still-unreadable') {
-        throw new Error(`The unreadable value is still in the config file; automation stays halted. ${outcome.reason}`)
+      // Every non-success outcome is surfaced by throwing, because Sidebar's own catch is what puts a
+      // message on screen. None of them carries the backend's error text — see QueueRecoveryOutcome.
+      if (outcome.kind === 'unverified' || outcome.kind === 'write-failed') {
+        throw new Error(outcome.reason)
       }
       if (outcome.kind === 'already-readable') {
         throw new Error('The stored queue reads normally again — nothing was written. Restart MAO to load it.')

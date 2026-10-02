@@ -107,11 +107,21 @@ export default function Sidebar({
   const repoListUnusable = storeProblems.some((problem) => problem.field === 'githubRepos')
 
   /**
-   * The queue's report is rendered by its own card below, which carries the discard action, so it is
-   * filtered out of the generic list — the latch holds the store's message verbatim, and showing both
-   * would print the same paragraph twice in a narrow column.
+   * Whether the stored queue is unusable *right now*, which is not the same as this session being halted.
+   *
+   * The latch is decided once at boot, so a file corrupted after a clean boot leaves `queueRecovery`
+   * false while the 30s `app:storeProblems` poll finds the problem. Both facts have to reach the
+   * operator, and they say different things — see the card below.
    */
-  const otherProblems = storeProblems.filter((problem) => problem.field !== 'workflowTasks')
+  const queueStoredProblem = storeProblems.find((problem) => problem.field === 'workflowTasks')
+  const showQueueCard = queueRecovery.required || queueStoredProblem !== undefined
+
+  /**
+   * The queue's report is filtered out of the generic list only when the dedicated card below actually
+   * renders it — filtering unconditionally hid it completely in exactly the case the card does not cover
+   * (a clean boot, then corruption), so neither the card nor the generic report appeared at all.
+   */
+  const otherProblems = storeProblems.filter((problem) => problem.field !== 'workflowTasks' || !showQueueCard)
 
   async function submitDiscard() {
     if (discarding) return
@@ -196,13 +206,30 @@ export default function Sidebar({
           </button>
         </div>
 
-        {queueRecovery.required && (
+        {showQueueCard && (
           <div className="card mb-2 gap-1.5 p-2">
-            <p className="card-title text-[13px]">Workflow automation is halted</p>
-            {/* The store's own report, verbatim — the same words `mao run` prints and every refused
-                queue action throws, so an operator reading one has read them all. */}
-            <p className="text-muted text-[11px] leading-snug">{queueRecovery.reason}</p>
-            {queueStoredStillUnreadable ? (
+            <p className="card-title text-[13px]">
+              {queueRecovery.required ? 'Workflow automation is halted' : 'The stored workflow queue is unreadable'}
+            </p>
+            {/* When this session is halted, the store's own report verbatim — the same words `mao run`
+                prints and every refused queue action throws, so an operator reading one has read them
+                all. When it is NOT halted, that report would be false: the latch is decided at boot, so
+                a file corrupted afterwards leaves this session running the real queue it already loaded.
+                Saying "halted" there would send the operator looking for a stoppage that has not
+                happened, so the late case gets its own wording. */}
+            {queueRecovery.required ? (
+              <p className="text-muted text-[11px] leading-snug">{queueRecovery.reason}</p>
+            ) : (
+              <>
+                <p className="text-muted text-[11px] leading-snug">{queueStoredProblem?.message}</p>
+                <p className="text-muted text-[11px] leading-snug">
+                  This session is not halted — it is still holding the queue it loaded at startup, and its
+                  next queue write will rewrite the file from that. Restarting before then will refuse to
+                  start unattended work until the value is replaced.
+                </p>
+              </>
+            )}
+            {queueRecovery.required && queueStoredStillUnreadable ? (
               confirmingDiscard ? (
                 <div className="flex gap-2">
                   <button onClick={submitDiscard} className="btn btn-primary text-xs" disabled={discarding}>
@@ -229,7 +256,7 @@ export default function Sidebar({
                   Discard unreadable queue
                 </button>
               )
-            ) : (
+            ) : queueRecovery.required ? (
               /* Something outside this window already repaired the file. Offering the discard here
                  would overwrite that repair with this process's coerced empty queue, so the way out is
                  a restart instead — the real queue has to be loaded, and only a fresh boot does that. */
@@ -237,7 +264,7 @@ export default function Sidebar({
                 The stored queue reads normally again. Restart MAO to load it — this session is still
                 halted because it is holding an empty queue.
               </p>
-            )}
+            ) : null}
             {queueError && (
               <p className="text-xs" style={{ color: 'var(--color-accent-700)' }}>
                 {queueError}

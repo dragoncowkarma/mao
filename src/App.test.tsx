@@ -1027,14 +1027,14 @@ describe('App halted workflow queue', () => {
   it('keeps the card up and says why when the discard itself fails', async () => {
     const { user, stub } = await renderApp([], [UNUSABLE_QUEUE])
     stub.confirmQueueRecovery.mockResolvedValue({
-      kind: 'still-unreadable',
-      reason: 'EACCES: permission denied',
+      kind: 'write-failed',
+      reason: 'The replacement write failed, so what reached the config file is unknown.',
     })
 
     await user.click(await screen.findByRole('button', { name: 'Discard unreadable queue' }))
     await user.click(screen.getByRole('button', { name: 'Confirm discard' }))
 
-    expect(await screen.findByText(/EACCES: permission denied/)).toBeInTheDocument()
+    expect(await screen.findByText(/what reached the config file is unknown/)).toBeInTheDocument()
     expect(screen.getByText('Workflow automation is halted')).toBeInTheDocument()
   })
 

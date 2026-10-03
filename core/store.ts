@@ -240,6 +240,29 @@ export function describeUninspectableStore(field: keyof MaoStoreSchema, source: 
 }
 
 /**
+ * An opaque proof of *which* raw value an observation saw, for `MaoStore.setIfUnchanged()`.
+ *
+ * A serialization rather than a hash, because hashing buys nothing here and `JSON.stringify` already
+ * tells us what we need. It is computed inside a `try`, so a value the serializer cannot handle (circular,
+ * a `BigInt`, nesting deep enough to blow the stack) yields `undefined` instead of adding a throw site to
+ * the read path — and `undefined` makes every conditional write refuse rather than guess.
+ *
+ * **Never log or render it.** It is stored content verbatim, and `config.json` holds `githubToken` in
+ * plaintext.
+ */
+function witnessOf(raw: unknown): string | undefined {
+  try {
+    // `undefined` has no JSON form, so distinguish "absent" from a failure rather than conflating them.
+    return raw === undefined ? '\u0000absent' : JSON.stringify(raw)
+  } catch {
+    return undefined
+  }
+}
+
+/** What a conditional write did. See `MaoStore.setIfUnchanged()`. */
+export type ConditionalWriteResult = 'written' | 'superseded' | 'unverifiable'
+
+/**
  * One read of a stored value, carrying both what a caller may use and what the guard had to do.
  *
  * Exists because `get()` and `problems()` are two separate reads, and electron-store re-reads and
@@ -260,6 +283,12 @@ export interface StoredObservation<K extends keyof MaoStoreSchema> {
    * Callers that are about to **write** must treat this as "unknown" and refuse, not as "corrupt".
    */
   readable: boolean
+  /**
+   * Proof of which raw value this observation saw, to be handed back to `setIfUnchanged()` so a write
+   * can refuse if the stored value has moved since. `undefined` when the value could not be serialized,
+   * which makes the conditional write refuse. Never render it — see `witnessOf`.
+   */
+  witness: string | undefined
 }
 
 /** A backend's read, corrected to the shape `MaoStoreSchema` declares. See `createStoredReadGuard`. */
@@ -365,6 +394,27 @@ export interface MaoStore {
    * value usable?" with "what do I do with it?" must come from a single `inspect()`.
    */
   inspect<K extends keyof MaoStoreSchema>(key: K): StoredObservation<K>
+  /**
+   * Writes only if the stored raw value is still the one `witness` came from.
+   *
+   * The reason a plain `set` is not enough for recovery: the queue-recovery write replaces an unusable
+   * value with this process's (empty) queue, so if another process repaired the queue between the
+   * observation and the write, an unconditional `set` destroys that repair and reports success. Observing
+   * "immediately before" writing does not close that — only refusing the write does.
+   *
+   * `'superseded'` means the raw value moved and **nothing was written**. `'unverifiable'` means the
+   * current value could not be read or serialized, so whether it moved is unknown — also nothing written.
+   * Throws only if the underlying write throws.
+   *
+   * This is **not** a cross-process lock. It closes the read-then-clobber window; a write that lands
+   * after it can still overwrite, which is the ordinary multi-process lost update every field in this
+   * single-blob file shares (issue #73).
+   */
+  setIfUnchanged<K extends keyof MaoStoreSchema>(
+    key: K,
+    witness: string | undefined,
+    value: MaoStoreSchema[K],
+  ): ConditionalWriteResult
 }
 
 /**
@@ -377,6 +427,17 @@ export interface MaoStore {
 export interface StoredValueBackend {
   get<K extends keyof MaoStoreSchema>(key: K): MaoStoreSchema[K] | undefined
   set<K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]): void
+  /**
+   * A read that is guaranteed to reflect what is on disk *now*, for `inspect()` and the conditional
+   * write — both of which exist to notice another process's change.
+   *
+   * Optional, and the fallback to `get` is correct rather than a guess: conf re-reads and re-parses the
+   * whole config file on every `get`, so for `electron/store.ts` the two are the same call. `FileStore`
+   * answers `get` from the snapshot taken in its constructor, so it *must* supply this — without it, a
+   * CLI recovery would compare against a value that may be minutes stale. May throw when the file exists
+   * but cannot be read; callers turn that into "unknown", never into "healthy".
+   */
+  getFresh?<K extends keyof MaoStoreSchema>(key: K): MaoStoreSchema[K] | undefined
 }
 
 /**
@@ -402,6 +463,16 @@ export function createGuardedStore(
 ): MaoStore {
   const guardRead = createStoredReadGuard(source, warn)
 
+  /**
+   * The freshest read the backend can give, for the two members that exist to notice another process's
+   * change. Falls back to `get` only where that is already a disk read — see `StoredValueBackend.getFresh`.
+   */
+  function readRawFresh<K extends keyof MaoStoreSchema>(key: K): MaoStoreSchema[K] {
+    const read = backend.getFresh?.bind(backend) ?? backend.get.bind(backend)
+    const value = read(key)
+    return value === undefined ? structuredClone(MAO_STORE_DEFAULTS[key]) : value
+  }
+
   function readRaw<K extends keyof MaoStoreSchema>(key: K): MaoStoreSchema[K] {
     const value = backend.get(key)
     // Cloned, never the shared `MAO_STORE_DEFAULTS` instance — one caller pushing into what it read
@@ -422,7 +493,9 @@ export function createGuardedStore(
     inspect<K extends keyof MaoStoreSchema>(key: K): StoredObservation<K> {
       let raw: MaoStoreSchema[K]
       try {
-        raw = readRaw(key)
+        // The FRESH read deliberately, not `get`'s: an observation exists to be acted on, and on
+        // `FileStore` a snapshot read would compare a recovery against a value taken at construction.
+        raw = readRawFresh(key)
       } catch {
         // Fail closed, and say nothing about the value: a read that threw established nothing, so a
         // caller about to write must refuse rather than assume the stored value is the corrupt one it
@@ -431,6 +504,7 @@ export function createGuardedStore(
           value: structuredClone(MAO_STORE_DEFAULTS[key]),
           problem: describeUninspectableStore(key, source),
           readable: false,
+          witness: undefined,
         }
       }
       // Guarded through the same `guardRead` as `get()`, deliberately — including its once-per-field
@@ -440,7 +514,28 @@ export function createGuardedStore(
         value: guardRead(key, raw),
         problem: unusableStoredValue(key, raw, source) ?? undefined,
         readable: true,
+        witness: witnessOf(raw),
       }
+    },
+    setIfUnchanged<K extends keyof MaoStoreSchema>(
+      key: K,
+      witness: string | undefined,
+      value: MaoStoreSchema[K],
+    ): ConditionalWriteResult {
+      if (witness === undefined) return 'unverifiable'
+      let current: string | undefined
+      try {
+        current = witnessOf(readRawFresh(key))
+      } catch {
+        return 'unverifiable'
+      }
+      if (current === undefined) return 'unverifiable'
+      if (current !== witness) return 'superseded'
+      // No read-back afterwards: a post-write comparison of two post-write reads cannot tell "written"
+      // from "written then immediately superseded", so it would assert more than it establishes. The
+      // write either throws or it does not, and the caller is told which.
+      backend.set(key, value)
+      return 'written'
     },
   }
 }
@@ -472,6 +567,12 @@ export class FileStore implements MaoStore {
           this.data[key] = value
           this.persist()
         },
+        // Re-read from disk, because `get` above answers from the constructor snapshot and the two
+        // members that use this exist to notice another process's change. Deliberately NOT written back
+        // into `this.data`: mutating the snapshot mid-process would make `get()` answer differently
+        // depending on whether a recovery happened to have run.
+        getFresh: <K extends keyof MaoStoreSchema>(key: K) =>
+          ({ ...structuredClone(MAO_STORE_DEFAULTS), ...this.loadStrict() })[key],
       },
       filePath,
     )
@@ -482,6 +583,24 @@ export class FileStore implements MaoStore {
       return JSON.parse(fs.readFileSync(this.filePath, 'utf-8'))
     } catch {
       return {}
+    }
+  }
+
+  /**
+   * `load()`, but a file that exists and cannot be read **throws** instead of reading as `{}`.
+   *
+   * Only for `getFresh`. The constructor keeps the swallowing `load()` on purpose: answering schema
+   * defaults for an unparseable file is the pre-existing behaviour (and the known blind spot tracked as
+   * issue #67), and changing it here would quietly change what every boot does. What a *conditional
+   * write* needs is the opposite — an unreadable file must become "unknown", never "unchanged".
+   */
+  private loadStrict(): Partial<MaoStoreSchema> {
+    try {
+      return JSON.parse(fs.readFileSync(this.filePath, 'utf-8'))
+    } catch (err) {
+      // A missing file is the normal first run, and reads as "nothing stored" rather than a failure.
+      if ((err as { code?: string }).code === 'ENOENT') return {}
+      throw err
     }
   }
 
@@ -504,5 +623,13 @@ export class FileStore implements MaoStore {
 
   inspect<K extends keyof MaoStoreSchema>(key: K): StoredObservation<K> {
     return this.guarded.inspect(key)
+  }
+
+  setIfUnchanged<K extends keyof MaoStoreSchema>(
+    key: K,
+    witness: string | undefined,
+    value: MaoStoreSchema[K],
+  ): ConditionalWriteResult {
+    return this.guarded.setIfUnchanged(key, witness, value)
   }
 }

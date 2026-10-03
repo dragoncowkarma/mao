@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { WorkflowEngine, type QueuedTask, type RepoRef, type StoredQueueObservation } from './workflow-engine.ts'
+import { WorkflowEngine, type QueuedTask, type RepoRef } from './workflow-engine.ts'
 import { RepoCapabilityError, evaluateRepoCapability } from './repo-capabilities.ts'
 import type { AgentStage, AiProviderConfig } from './ai/types.ts'
 import type { GithubService } from './github-service.ts'
@@ -1200,18 +1200,10 @@ describe('WorkflowEngine repository permission preflight', () => {
 describe('WorkflowEngine queue-recovery latch', () => {
   const REASON = '[store] "workflowTasks" in /tmp/config.json is an object, not a JSON array…'
 
-  /** Still unusable — what the file holds until something replaces it. */
-  const STILL_UNUSABLE = { readable: true, problem: REASON }
-  /** Repaired out of band, by a hand-edit or another process's recovery. */
-  const NOW_READABLE = { readable: true, problem: undefined }
-  /** The store could not be read at all, so nothing about the stored value was established. */
-  const UNINSPECTABLE = { readable: false, problem: 'could not read the config file' }
-
-  function latchedEngine(observe?: () => StoredQueueObservation) {
+  function latchedEngine() {
     const github = makeFakeGithub()
     const engine = new WorkflowEngine(github)
     engine.setProviders([makeProvider('agent-a'), makeProvider('agent-b')])
-    if (observe) engine.setStoredQueueObserver(observe)
     engine.requireQueueRecovery(REASON)
     return { engine, github }
   }
@@ -1250,15 +1242,18 @@ describe('WorkflowEngine queue-recovery latch', () => {
     expect(engine.getTasks().find((t) => t.id === 'leftover')!.status).toBe('pending')
   })
 
-  it('never downgrades, and a clean probe does not unlatch it', () => {
+  it('never downgrades, and only clearQueueRecovery() releases it', () => {
     // Monotone on purpose: this process's in-memory queue is the coerced empty one, so un-latching after
     // an out-of-band repair would run the wrong queue and then persist it over the real one.
-    const { engine } = latchedEngine(() => NOW_READABLE)
+    const { engine } = latchedEngine()
 
     engine.requireQueueRecovery('a different, softer reason')
 
     expect(engine.getQueueRecoveryReason()).toBe(REASON)
     expect(engine.isQueueRecoveryLatched()).toBe(true)
+
+    engine.clearQueueRecovery()
+    expect(engine.isQueueRecoveryLatched()).toBe(false)
   })
 
   it('a refused mutation does not become a persistence failure', () => {
@@ -1273,113 +1268,10 @@ describe('WorkflowEngine queue-recovery latch', () => {
     expect(engine.getPersistenceError()).toBeUndefined()
   })
 
-  it('confirmQueueRecovery is not blocked by the latch it clears, and emits exactly one change', () => {
-    // The hard constraint that the way out cannot be gated. Also pins the ordering: the field is cleared
-    // BEFORE notify(), so the field-only backstop in core/app.ts lets this one write through — a reader
-    // that re-probed here would re-latch inside the healing emit and deadlock both recovery routes.
-    let stored: StoredQueueObservation = STILL_UNUSABLE
-    const { engine } = latchedEngine(() => stored)
-    const changes = vi.fn(() => {
-      stored = NOW_READABLE
-    })
-    engine.on('change', changes)
-
-    const outcome = engine.confirmQueueRecovery()
-
-    expect(outcome).toEqual({ kind: 'replaced' })
-    expect(changes).toHaveBeenCalledTimes(1)
-    expect(engine.isQueueRecoveryLatched()).toBe(false)
-  })
-
-  it('re-latches when the stored value is still unreadable after the write', () => {
-    // A write that threw, or one a backend silently dropped, must leave the halt exactly as it found it
-    // — and say so, rather than reporting success.
-    const { engine } = latchedEngine(() => STILL_UNUSABLE)
-    const changes = vi.fn()
-    engine.on('change', changes)
-
-    const outcome = engine.confirmQueueRecovery()
-
-    // The write is attempted exactly once and, having not thrown, is reported as what it is.
-    expect(outcome).toEqual({ kind: 'replaced' })
-    expect(changes).toHaveBeenCalledTimes(1)
-    expect(engine.isQueueRecoveryLatched()).toBe(false)
-  })
-
-  it('writes nothing, and says so, when the stored queue cannot be read at all', () => {
-    // The finding this replaces: the old probe turned a THROWING inspection into a non-undefined reason,
-    // which confirmQueueRecovery read as "the corrupt value is still there" and wrote on. A transient
-    // read failure — or a repair this process cannot see — would then be overwritten on a guess.
-    const { engine } = latchedEngine(() => UNINSPECTABLE)
-    const changes = vi.fn()
-    engine.on('change', changes)
-
-    const outcome = engine.confirmQueueRecovery()
-
-    expect(outcome.kind).toBe('unverified')
-    expect(changes).not.toHaveBeenCalled()
-    expect(engine.isQueueRecoveryLatched()).toBe(true)
-  })
-
-  it('writes nothing when the observation itself throws', () => {
-    const { engine } = latchedEngine(() => {
-      throw new Error('EACCES: permission denied')
-    })
-    const changes = vi.fn()
-    engine.on('change', changes)
-
-    const outcome = engine.confirmQueueRecovery()
-
-    expect(outcome.kind).toBe('unverified')
-    expect(changes).not.toHaveBeenCalled()
-    // And it carries none of the backend's text: an I/O or parse error can quote the file, which holds
-    // githubToken in plaintext.
-    expect(outcome.kind === 'unverified' && outcome.reason).not.toContain('EACCES')
-  })
-
-  it('writes nothing when no observer is injected at all', () => {
-    // Fail closed: with nothing able to establish the stored state, a write would be a guess.
-    const { engine } = latchedEngine()
-    const changes = vi.fn()
-    engine.on('change', changes)
-
-    expect(engine.confirmQueueRecovery().kind).toBe('unverified')
-    expect(changes).not.toHaveBeenCalled()
-    expect(engine.isQueueRecoveryLatched()).toBe(true)
-  })
-
-  it('re-latches and reports the write error when the change listener throws', () => {
-    const { engine } = latchedEngine(() => STILL_UNUSABLE)
-    engine.on('change', () => {
-      throw new Error('ENOSPC: no space left on device')
-    })
-
-    const outcome = engine.confirmQueueRecovery()
-
-    expect(outcome.kind).toBe('write-failed')
-    // The reason says the attempt failed and the result is unknown — it does NOT quote the backend's
-    // error, which can carry the contents of a file holding the GitHub token.
-    expect(outcome.kind === 'write-failed' && outcome.reason).not.toContain('ENOSPC')
-    expect(engine.isQueueRecoveryLatched()).toBe(true)
-    // Still a read-shape halt, not a persistence failure: the caller is told the write failed, but the
-    // engine must not flip the marker's flag for it.
-    expect(engine.isPersistenceBroken()).toBe(false)
-  })
-
-  it('writes nothing when the stored queue reads normally again', () => {
-    // The latch is monotone, so the card stays up after an out-of-band repair — and a blind confirm then
-    // would overwrite that repair with this process's coerced empty queue, inflicting the exact loss the
-    // latch exists to prevent. Probe before clearing.
-    const { engine } = latchedEngine(() => NOW_READABLE)
-    const changes = vi.fn()
-    engine.on('change', changes)
-
-    const outcome = engine.confirmQueueRecovery()
-
-    expect(outcome).toEqual({ kind: 'already-readable' })
-    expect(changes).not.toHaveBeenCalled()
-    expect(engine.isQueueRecoveryLatched()).toBe(true)
-  })
+  // The `confirmQueueRecovery()` sequence moved to `createMaoApp` when its write became conditional on
+  // the stored value not having moved — that needs the store, which the engine deliberately does not
+  // hold (architecture rule 3). Its tests live in core/app.test.ts beside the boot path; what stays here
+  // is the latch itself and the gates.
 
   it('leaves a healthy engine completely alone', () => {
     const github = makeFakeGithub()
@@ -1388,7 +1280,6 @@ describe('WorkflowEngine queue-recovery latch', () => {
 
     expect(engine.isQueueRecoveryLatched()).toBe(false)
     expect(engine.getQueueRecoveryReason()).toBeUndefined()
-    expect(engine.confirmQueueRecovery()).toEqual({ kind: 'already-readable' })
     expect(() => engine.enqueue('t', repo)).not.toThrow()
   })
 })

@@ -232,7 +232,7 @@ describe('createMaoApp with an unreadable stored queue', () => {
     const { dataDir, store, filePath } = makeRealDataDirHolding({ workflowTasks: corruptQueue })
 
     const first = createMaoApp({ store, workspaceRoot: path.join(dataDir, 'workspaces'), dataDir, resume: false })
-    expect(first.workflowEngine.confirmQueueRecovery()).toEqual({ kind: 'replaced' })
+    expect(first.confirmQueueRecovery()).toEqual({ kind: 'replaced' })
 
     expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).workflowTasks).toEqual([])
 
@@ -461,5 +461,147 @@ describe('core/app.ts and the engine, as source order', () => {
 
     expect(body).toContain("this.emit('change'")
     expect(body).not.toContain('assertQueueWritable')
+  })
+})
+
+/**
+ * `confirmQueueRecovery()` — the one way out of the halt, and the sequence review had to correct twice.
+ *
+ * It lives on `MaoApp` rather than the engine because its write has to be **conditional** on the stored
+ * value not having moved since it was observed, and that needs the store the engine deliberately does not
+ * hold. Observing immediately before an unconditional write is not enough: a repair landing in between is
+ * destroyed and reported as success, which is exactly what review reproduced at the previous head.
+ */
+describe('MaoApp.confirmQueueRecovery', () => {
+  const corrupt = { 'task-1': { id: 'task-1' } }
+
+  /**
+   * A store whose queue can be repaired by a hook that runs at a chosen moment, so a concurrent repair
+   * can be placed either side of the observation.
+   */
+  function racingStore() {
+    const data: Record<string, unknown> = { workflowTasks: corrupt }
+    const writes: unknown[] = []
+    // Armed explicitly rather than by a read counter, because the boot observation already consumes one
+    // read — counting from zero would place the repair before the confirm even looked.
+    let repairOnNextRead = false
+    const store = createGuardedStore(
+      {
+        get: <K extends keyof MaoStoreSchema>(key: K) => data[key] as MaoStoreSchema[K] | undefined,
+        getFresh: <K extends keyof MaoStoreSchema>(key: K) => {
+          const value = data[key] as MaoStoreSchema[K] | undefined
+          if (key === 'workflowTasks' && repairOnNextRead) {
+            // Another process repairs the queue *after* this read answers — i.e. between the observation
+            // and the conditional write's compare.
+            repairOnNextRead = false
+            data.workflowTasks = [makePendingTask('repaired')]
+          }
+          return value
+        },
+        set: <K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]) => {
+          data[key] = value
+          if (key === 'workflowTasks') writes.push(value)
+        },
+      },
+      '/tmp/config.json',
+    )
+    return {
+      store,
+      data,
+      writes,
+      armRepairAfterNextRead: () => {
+        repairOnNextRead = true
+      },
+    }
+  }
+
+  function bootWith(store: ReturnType<typeof racingStore>['store']) {
+    const { dataDir } = makeRealDataDir()
+    return createMaoApp({ store, workspaceRoot: path.join(dataDir, 'workspaces'), dataDir, resume: false })
+  }
+
+  it('refuses to write when the queue was repaired between the observation and the write', () => {
+    // The finding. An unconditional write here returned 'replaced' and left the repaired queue replaced
+    // by this process's empty one.
+    captureWarnings()
+    const racing = racingStore()
+    const app = bootWith(racing.store)
+    racing.armRepairAfterNextRead()
+
+    const outcome = app.confirmQueueRecovery()
+
+    expect(outcome).toEqual({ kind: 'superseded' })
+    expect(racing.writes).toEqual([])
+    expect(racing.data.workflowTasks).toEqual([makePendingTask('repaired')])
+    // Still halted: nothing was replaced, so releasing would leave the engine running the wrong queue.
+    expect(app.workflowEngine.isQueueRecoveryLatched()).toBe(true)
+  })
+
+  it('replaces and releases when nothing moved', () => {
+    captureWarnings()
+    const racing = racingStore()
+    const app = bootWith(racing.store)
+
+    const outcome = app.confirmQueueRecovery()
+
+    expect(outcome).toEqual({ kind: 'replaced' })
+    expect(racing.writes).toEqual([[]])
+    expect(app.workflowEngine.isQueueRecoveryLatched()).toBe(false)
+  })
+
+  it('writes nothing when the store cannot be read, and quotes no error', () => {
+    captureWarnings()
+    const { dataDir, store } = makeRealDataDirHolding({ workflowTasks: corrupt })
+    const app = createMaoApp({ store, workspaceRoot: path.join(dataDir, 'workspaces'), dataDir, resume: false })
+    vi.spyOn(store, 'inspect').mockImplementation(() => {
+      throw new Error("EACCES: permission denied, open '/tmp/ghp_secretish/config.json'")
+    })
+    const set = vi.spyOn(store, 'set')
+
+    const outcome = app.confirmQueueRecovery()
+
+    expect(outcome.kind).toBe('unverified')
+    expect(set).not.toHaveBeenCalled()
+    expect(outcome.kind === 'unverified' && outcome.reason).not.toContain('EACCES')
+    expect(outcome.kind === 'unverified' && outcome.reason).not.toContain('ghp_secretish')
+    expect(app.workflowEngine.isQueueRecoveryLatched()).toBe(true)
+  })
+
+  it('writes nothing, and stays halted, when the write throws', () => {
+    captureWarnings()
+    const racing = racingStore()
+    const app = bootWith(racing.store)
+    vi.spyOn(racing.store, 'setIfUnchanged').mockImplementation(() => {
+      throw new Error('ENOSPC: no space left on device')
+    })
+
+    const outcome = app.confirmQueueRecovery()
+
+    // No `reason` field at all, so there is nowhere for the backend's text to be carried.
+    expect(outcome).toEqual({ kind: 'write-failed' })
+    expect(app.workflowEngine.isQueueRecoveryLatched()).toBe(true)
+  })
+
+  it('writes nothing when the queue was already repaired before the observation', () => {
+    captureWarnings()
+    const racing = racingStore()
+    const app = bootWith(racing.store)
+    racing.data.workflowTasks = [makePendingTask('repaired')]
+
+    const outcome = app.confirmQueueRecovery()
+
+    expect(outcome).toEqual({ kind: 'already-readable' })
+    expect(racing.writes).toEqual([])
+    // Monotone: this process is still holding the coerced empty queue, so it must not release.
+    expect(app.workflowEngine.isQueueRecoveryLatched()).toBe(true)
+  })
+
+  it('is a no-op on a host that was never halted', () => {
+    const racing = racingStore()
+    racing.data.workflowTasks = [makePendingTask('fine')]
+    const app = bootWith(racing.store)
+
+    expect(app.confirmQueueRecovery()).toEqual({ kind: 'already-readable' })
+    expect(racing.writes).toEqual([])
   })
 })

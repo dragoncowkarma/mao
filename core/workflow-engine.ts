@@ -138,22 +138,25 @@ function slugify(text: string): string {
  * other exists.
  */
 /**
- * What `WorkflowEngine.confirmQueueRecovery()` actually did, decided in `core/` so both shells render one
+ * What `createMaoApp`'s `confirmQueueRecovery()` actually did, decided in `core/` so both shells render one
  * answer instead of each re-deriving "did that work?" for themselves.
  *
- * Four kinds, because each says something different about what was actually established:
+ * Five kinds, because each says something different about what was actually established:
  *
- * - `'replaced'` — the stored value was still unusable immediately before the write, and the write did
- *   not throw.
+ * - `'replaced'` — the stored value was still unusable, the conditional write confirmed it had not moved
+ *   since it was observed, and the write did not throw.
  * - `'already-readable'` — the stored queue reads normally again, so **nothing was written**. The latch
  *   is monotone, so something healed the value out of band (a hand-edit, or another process's recovery)
  *   while this process stayed halted; this process's in-memory queue is the coerced empty one, so
  *   persisting it would overwrite that repair with the very loss the latch exists to prevent. The
- *   operator has to restart to load it. This is also the answer when a concurrent repair lands between
- *   the pre-write observation and the write attempt — see `confirmQueueRecovery()`.
- * - `'unverified'` — the store could not be read at all, so whether the value is still the unusable one
- *   is **unknown**. Nothing is written: a transient read failure, or a repair this process cannot see,
- *   would otherwise be overwritten on a guess.
+ *   operator has to restart to load it.
+ * - `'superseded'` — the stored value changed between the observation and the write, so the conditional
+ *   write refused and **nothing was written**. This is the kind that makes the previous one mean anything:
+ *   observing immediately before an *unconditional* write still destroys a repair landing in between,
+ *   which is what review of this design found.
+ * - `'unverified'` — the store could not be read, or its value could not be serialized to compare, so
+ *   whether it is still the unusable one is **unknown**. Nothing is written rather than written on a
+ *   guess: a transient read failure, or a repair this process cannot see, would otherwise be overwritten.
  * - `'write-failed'` — the write was attempted and threw, so what reached the file is unknown. The halt
  *   stands and the operator is told to inspect the file before salvaging.
  *
@@ -172,28 +175,12 @@ export interface QueueRecoveryState {
   reason: string | undefined
 }
 
-/** What one observation of the stored queue established. See `WorkflowEngine.storedQueueObserver`. */
-export interface StoredQueueObservation {
-  /** False when the store could not be read at all, so nothing about the stored value was established. */
-  readable: boolean
-  /** The operator-facing report when the value is unusable (or unreadable), else `undefined`. */
-  problem: string | undefined
-}
-
-/** Closed-set reasons. Never built from a backend error: those can quote a file holding the token. */
-const UNOBSERVABLE_QUEUE =
-  '[store] MAO could not read the stored workflow queue, so it cannot tell whether the unusable value ' +
-  'is still there — nothing was written and automation stays halted. Check the config file reported by ' +
-  '`mao config show` and retry.'
-const QUEUE_WRITE_FAILED =
-  '[store] The replacement write failed, so what reached the config file is unknown and automation ' +
-  'stays halted. Inspect the file before salvaging anything from it, then retry.'
-
 export type QueueRecoveryOutcome =
   | { kind: 'replaced' }
   | { kind: 'already-readable' }
+  | { kind: 'superseded' }
   | { kind: 'unverified'; reason: string }
-  | { kind: 'write-failed'; reason: string }
+  | { kind: 'write-failed' }
 
 export class WorkflowEngine extends EventEmitter {
   private queue: QueuedTask[] = []
@@ -219,7 +206,8 @@ export class WorkflowEngine extends EventEmitter {
    *
    * Set once by `createMaoApp()` (the only boot path) before it subscribes the `'change'` →
    * `store.set('workflowTasks', …)` listener and before `restore()`, so nothing can write over the
-   * unreadable value in between. **Monotone**: it never downgrades and no later check clears it, because
+   * unreadable value in between. Released only by `clearQueueRecovery()`, which `createMaoApp`'s
+   * `confirmQueueRecovery()` calls *after* its conditional write has been confirmed. **Monotone**: it never downgrades and no later check clears it, because
    * this process's in-memory queue is the coerced `[]` rather than whatever the file holds — un-latching
    * would run the wrong queue and then persist it over the real one.
    *
@@ -230,17 +218,6 @@ export class WorkflowEngine extends EventEmitter {
    * `'change'` path and, worse, let a transient read failure latch a healthy host forever.
    */
   private queueRecoveryReason: string | undefined
-  /**
-   * One tri-state observation of the stored queue, injected by `createMaoApp` so the engine keeps no
-   * store reference (architecture rule 3). Used **only** by `confirmQueueRecovery()`, immediately before
-   * it writes.
-   *
-   * Tri-state rather than the `string | undefined` it replaced, and that is the whole point: the old
-   * shape turned a *throwing* inspection into a non-`undefined` reason, which `confirmQueueRecovery()`
-   * then read as "the corrupt value is still there" and wrote on. A state MAO cannot establish must
-   * refuse, not guess — `readable: false` is what carries that.
-   */
-  private storedQueueObserver: (() => StoredQueueObservation) | undefined
 
   constructor(github: GithubService) {
     super()
@@ -279,11 +256,6 @@ export class WorkflowEngine extends EventEmitter {
     return this.persistenceBroken
   }
 
-  /** Injects the one store observation `confirmQueueRecovery()` uses. See `storedQueueObserver`. */
-  setStoredQueueObserver(observe: () => StoredQueueObservation) {
-    this.storedQueueObserver = observe
-  }
-
   /**
    * Latches the queue as unreadable. Idempotent and one-way — the first reason wins, so a second call
    * cannot soften or replace what the operator was already told.
@@ -295,11 +267,11 @@ export class WorkflowEngine extends EventEmitter {
   /**
    * Whether unattended work is halted, read from the field alone and **never** by probing the store.
    *
-   * The field-only contract is load-bearing, not a micro-optimisation: `confirmQueueRecovery()` clears
-   * the field and *then* notifies, because that one `'change'` is the write that replaces the unreadable
-   * value. A reader that re-probed at that moment would see the still-dirty store, re-latch inside the
-   * healing emit, and refuse the only write that could ever clear the latch — deadlocking both recovery
-   * routes permanently. `core/app.ts`'s `'change'` backstop must use this and nothing else.
+   * The field-only contract is load-bearing, not a micro-optimisation. Two independent reasons: each
+   * store observation is a whole-config read and parse on conf, and this is read on the queue-write path;
+   * and a transient read failure there would latch a healthy host for the rest of its life. It also keeps
+   * the recovery possible — the replacing write goes through `createMaoApp`, and a backstop that
+   * re-inspected the store while that write was in flight would refuse it.
    */
   isQueueRecoveryLatched(): boolean {
     return this.queueRecoveryReason !== undefined
@@ -324,61 +296,16 @@ export class WorkflowEngine extends EventEmitter {
   }
 
   /**
-   * The one way out of the latch, and deliberately the one queue path that does not consult it.
+   * Releases the halt. Called by `createMaoApp`'s `confirmQueueRecovery()` and **only** after it has
+   * confirmed the replacing write actually landed.
    *
-   * Discards the unreadable stored value by letting exactly one `'change'` through, so the write still
-   * goes via the engine's listener and `core/app.ts:createMaoApp` stays the single writer of
-   * `workflowTasks` (architecture rule 3). Confirmation and replacement are therefore one action: a latch
-   * cleared without replacing the value would simply return on the next boot.
-   *
-   * Three guards, each for a failure the adversarial review of this design actually found:
-   * - probe **before** clearing, so an out-of-band repair is reported rather than overwritten;
-   * - clear before `notify()`, so the field-only backstop lets this emit through;
-   * - re-probe afterwards and re-latch if the value is still there, so a write that threw or that a
-   *   backend silently dropped leaves the halt exactly as it found it instead of reporting success.
+   * Deliberately not a method that writes: the write must be conditional on the stored value not having
+   * moved since it was observed, which needs the store, and the engine holds none (architecture rule 3).
+   * Clearing is therefore the *last* step of that sequence — clearing first and writing after would leave
+   * a released engine over a queue that was never replaced.
    */
-  confirmQueueRecovery(): QueueRecoveryOutcome {
-    if (this.queueRecoveryReason === undefined) return { kind: 'already-readable' }
-
-    // Observed immediately before the write, inside this one synchronous function with no awaits, so the
-    // only remaining window is the notify() -> store.set -> writeFileSync path itself. What this closes
-    // is the interleaving that destroys data: another process (or a hand-edit) making the queue READABLE
-    // between the latch and this click. Nothing is lost when it merely replaces one unusable value with
-    // another, because neither could be restored. A write landing AFTER this one and clobbering it is the
-    // ordinary multi-process lost update that every field in this single-blob file shares (issue #73);
-    // this is not, and does not claim to be, a cross-process atomic postcondition.
-    const observed = this.observeStoredQueue()
-    if (observed === undefined || !observed.readable) {
-      return { kind: 'unverified', reason: observed?.problem ?? UNOBSERVABLE_QUEUE }
-    }
-    if (observed.problem === undefined) return { kind: 'already-readable' }
-
-    const latched = this.queueRecoveryReason
-    // Cleared BEFORE notify(), because the field-only backstop in core/app.ts is what lets this one emit
-    // through — and that emit IS the write that replaces the unusable value, so routing it through the
-    // listener keeps core/app.ts the single writer of `workflowTasks` (architecture rule 3).
+  clearQueueRecovery() {
     this.queueRecoveryReason = undefined
-    try {
-      this.notify()
-    } catch {
-      // Re-latched because the write did not complete, so the unusable value is presumed still there —
-      // but the outcome says only that the attempt failed, since what reached the file is unknown. The
-      // backend's own error text is deliberately not carried: it can quote the file, which holds the
-      // GitHub token in plaintext.
-      this.queueRecoveryReason = latched
-      return { kind: 'write-failed', reason: QUEUE_WRITE_FAILED }
-    }
-    return { kind: 'replaced' }
-  }
-
-  /** The observation, failing closed: anything it cannot establish reads as unknown, never as healed. */
-  private observeStoredQueue(): StoredQueueObservation | undefined {
-    if (this.storedQueueObserver === undefined) return undefined
-    try {
-      return this.storedQueueObserver()
-    } catch {
-      return { readable: false, problem: UNOBSERVABLE_QUEUE }
-    }
   }
 
   /** Removes all finished (done/error) tasks immediately. */

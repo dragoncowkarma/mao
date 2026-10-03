@@ -618,7 +618,11 @@ describe('MaoStore.inspect', () => {
 
     const observed = store.inspect('workflowTasks')
 
-    expect(observed).toEqual({ value: [pendingTask], problem: undefined, readable: true })
+    expect(observed.value).toEqual([pendingTask])
+    expect(observed.problem).toBeUndefined()
+    expect(observed.readable).toBe(true)
+    // A witness is produced for a healthy value too — that is what makes a conditional write possible.
+    expect(observed.witness).toBeTypeOf('string')
     expect(warn).not.toHaveBeenCalled()
   })
 
@@ -692,5 +696,88 @@ describe('describeUninspectableStore', () => {
     expect(message).toContain('"workflowTasks"')
     expect(message).toContain('/tmp/config.json')
     expect(message).toContain('unusable')
+  })
+})
+
+/**
+ * `setIfUnchanged()` — the conditional write the recovery rests on, and `FileStore`'s freshness.
+ *
+ * Observing before writing is not the same as writing conditionally: a repair landing between the two is
+ * destroyed by an unconditional `set` and reported as success. These pin the three parts that make the
+ * difference — the comparison itself, refusing when it cannot be made, and reading what is on disk *now*
+ * rather than what was there when the store was constructed.
+ */
+describe('MaoStore.setIfUnchanged', () => {
+  it('writes when the stored value still matches the witness', () => {
+    captureWarnings()
+    const { store, filePath } = storeHolding({ workflowTasks: { 'task-1': pendingTask } })
+
+    const observed = store.inspect('workflowTasks')
+    expect(store.setIfUnchanged('workflowTasks', observed.witness, [])).toBe('written')
+
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).workflowTasks).toEqual([])
+  })
+
+  it('refuses, and writes nothing, when the stored value moved since the observation', () => {
+    captureWarnings()
+    const { store, filePath } = storeHolding({ workflowTasks: { 'task-1': pendingTask } })
+    const observed = store.inspect('workflowTasks')
+
+    // Another process repairs the queue after the observation and before the write.
+    fs.writeFileSync(filePath, JSON.stringify({ workflowTasks: [pendingTask] }, null, 2))
+
+    expect(store.setIfUnchanged('workflowTasks', observed.witness, [])).toBe('superseded')
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).workflowTasks).toEqual([pendingTask])
+  })
+
+  it('refuses when there is no witness to compare against', () => {
+    // `witnessOf` answers undefined for a value it cannot serialize. Writing then would be a guess about
+    // a value nobody established, which is the whole failure this member exists to prevent.
+    captureWarnings()
+    const { store, filePath } = storeHolding({ workflowTasks: { 'task-1': pendingTask } })
+
+    expect(store.setIfUnchanged('workflowTasks', undefined, [])).toBe('unverifiable')
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).workflowTasks).toEqual({ 'task-1': pendingTask })
+  })
+
+  it('refuses when the file cannot be read, rather than treating it as unchanged', () => {
+    captureWarnings()
+    const { store, filePath } = storeHolding({ workflowTasks: { 'task-1': pendingTask } })
+    const observed = store.inspect('workflowTasks')
+
+    // Present but unparseable. `loadStrict` must throw for this, so the compare answers "unknown" — the
+    // swallowing `load()` the constructor uses would read it as `{}` and could compare equal by accident.
+    fs.writeFileSync(filePath, '{ "workflowTasks": [')
+
+    expect(store.setIfUnchanged('workflowTasks', observed.witness, [])).toBe('unverifiable')
+  })
+
+  it('FileStore observes what is on disk now, not its constructor snapshot', () => {
+    // The gap review named: `get` answers from the snapshot, so an `inspect` built on it would compare a
+    // CLI recovery against a value taken at construction and miss a repair that had already landed.
+    const warn = captureWarnings()
+    const { store, filePath } = storeHolding({ workflowTasks: [pendingTask] })
+    expect(store.inspect('workflowTasks').problem).toBeUndefined()
+
+    fs.writeFileSync(filePath, JSON.stringify({ workflowTasks: { 'task-1': pendingTask } }, null, 2))
+
+    // Fresh: the observation sees the corruption that landed after construction.
+    expect(store.inspect('workflowTasks').problem).toContain('"workflowTasks"')
+    // And `get` deliberately still answers from the snapshot — the fresh read is NOT written back, so a
+    // recovery cannot change what every other reader in the process sees.
+    expect(store.get('workflowTasks')).toEqual([pendingTask])
+    expect(warn).toHaveBeenCalledTimes(1)
+  })
+
+  it('FileStore reports an unreadable file as unobservable, not as empty', () => {
+    captureWarnings()
+    const { store, filePath } = storeHolding({ workflowTasks: [pendingTask] })
+
+    fs.writeFileSync(filePath, 'not json at all')
+
+    const observed = store.inspect('workflowTasks')
+    expect(observed.readable).toBe(false)
+    expect(observed.witness).toBeUndefined()
+    expect(observed.problem).toContain('could not read')
   })
 })

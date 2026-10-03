@@ -85,9 +85,14 @@ describe('electron/ipc.ts exposes the latch and its way out', () => {
   })
 
   it('delegates the outcome to core rather than deciding success itself', () => {
-    // Rule 2, and the reason the two shells cannot disagree about whether confirmation worked.
+    // Rule 2, and the reason the two shells cannot disagree about whether confirmation worked. The target
+    // is `createMaoApp`'s `confirmQueueRecovery`, not the engine's: the recovery write has to be
+    // conditional on the stored value, which needs the store the engine does not hold.
     expect(source).toMatch(
-      /ipcMain\.handle\('workflow:confirmQueueRecovery',\s*\(\)\s*=>\s*workflowEngine\.confirmQueueRecovery\(\)\)/,
+      /ipcMain\.handle\('workflow:confirmQueueRecovery',\s*\(\)\s*=>\s*confirmQueueRecovery\(\)\)/,
     )
+    // And it comes off the app, so no shell re-derives it.
+    expect(source).toMatch(/confirmQueueRecovery\s*\}\s*=\s*createMaoApp\(/)
+    expect(source).not.toContain('workflowEngine.confirmQueueRecovery')
   })
 })

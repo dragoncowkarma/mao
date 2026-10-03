@@ -13,7 +13,7 @@ export function registerIpcHandlers() {
   const buildSha = process.env.MAO_BUILD_SHA ?? ''
   if (buildSha) store.set('buildSha', buildSha)
 
-  const { githubService, workflowEngine, updateRepos } = createMaoApp({
+  const { githubService, workflowEngine, updateRepos, confirmQueueRecovery } = createMaoApp({
     store,
     workspaceRoot: path.join(app.getPath('userData'), 'workspaces'),
     dataDir: app.getPath('userData'),
@@ -144,7 +144,7 @@ export function registerIpcHandlers() {
 
   // Returns core's typed outcome rather than a boolean, so the renderer and `mao workflow
   // confirm-queue-recovery` cannot disagree about whether confirmation succeeded.
-  ipcMain.handle('workflow:confirmQueueRecovery', () => workflowEngine.confirmQueueRecovery())
+  ipcMain.handle('workflow:confirmQueueRecovery', () => confirmQueueRecovery())
 
   ipcMain.handle('ui:getTheme', () => store.get('theme'))
 

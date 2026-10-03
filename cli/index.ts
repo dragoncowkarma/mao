@@ -378,10 +378,10 @@ workflow
   )
   .action(() => {
     // resume: false, so booting this command cannot start the pipeline it is about to release.
-    const { workflowEngine } = loadApp(false)
+    const { confirmQueueRecovery } = loadApp(false)
     // The outcome is decided in core (see QueueRecoveryOutcome) rather than re-derived here, so this
     // command and the GUI button cannot disagree about whether confirmation succeeded.
-    const outcome = workflowEngine.confirmQueueRecovery()
+    const outcome = confirmQueueRecovery()
     if (outcome.kind === 'already-readable') {
       log('The stored workflow queue reads normally — nothing was written. Restart MAO to load it.')
       return
@@ -391,8 +391,17 @@ workflow
     if (outcome.kind === 'unverified') {
       throw new Error(`Nothing was written. ${outcome.reason}`)
     }
+    if (outcome.kind === 'superseded') {
+      throw new Error(
+        'The stored queue changed while confirming, so nothing was written and automation stays halted. ' +
+          'Re-check the config file — something else is writing it — and retry.',
+      )
+    }
     if (outcome.kind === 'write-failed') {
-      throw new Error(outcome.reason)
+      throw new Error(
+        'The replacement write failed, so what reached the config file is unknown and automation stays ' +
+          'halted. Inspect the file before salvaging anything from it, then retry.',
+      )
     }
     log('Discarded the unreadable stored workflow queue. Auto-resume, polling and queue writes are released.')
   })

@@ -493,8 +493,18 @@ export default function App() {
       const outcome = await electronApi().workflow.confirmQueueRecovery()
       // Every non-success outcome is surfaced by throwing, because Sidebar's own catch is what puts a
       // message on screen. None of them carries the backend's error text — see QueueRecoveryOutcome.
-      if (outcome.kind === 'unverified' || outcome.kind === 'write-failed') {
-        throw new Error(outcome.reason)
+      if (outcome.kind === 'unverified') throw new Error(outcome.reason)
+      if (outcome.kind === 'superseded') {
+        throw new Error(
+          'The stored queue changed while confirming, so nothing was written. Something else is writing ' +
+            'the config file — re-check it and try again.',
+        )
+      }
+      if (outcome.kind === 'write-failed') {
+        throw new Error(
+          'The replacement write failed, so what reached the config file is unknown and automation stays ' +
+            'halted. Inspect the file before salvaging anything from it, then try again.',
+        )
       }
       if (outcome.kind === 'already-readable') {
         throw new Error('The stored queue reads normally again — nothing was written. Restart MAO to load it.')

@@ -220,14 +220,16 @@ export default function Sidebar({
             {queueRecovery.required ? (
               <p className="text-muted text-[11px] leading-snug">{queueRecovery.reason}</p>
             ) : (
-              <>
-                <p className="text-muted text-[11px] leading-snug">{queueStoredProblem?.message}</p>
-                <p className="text-muted text-[11px] leading-snug">
-                  This session is not halted — it is still holding the queue it loaded at startup, and its
-                  next queue write will rewrite the file from that. Restarting before then will refuse to
-                  start unattended work until the value is replaced.
-                </p>
-              </>
+              /* Deliberately NOT the store's report. That text is written for the halted case and says the
+                 queue is empty, that MAO will not start unattended work, and that every queue write is
+                 refused — all three false here. Rendering it beside "this session is not halted" gave the
+                 operator two opposite instructions at once. The field and the file are what they need. */
+              <p className="text-muted text-[11px] leading-snug">
+                MAO cannot read the stored workflow queue in {queueStoredProblem?.source}. This session is
+                not halted — it is still holding the queue it loaded at startup, and its next queue write
+                will rewrite the file from that. Restarting before then will refuse to start unattended
+                work until the value is replaced, and `mao workflow confirm-queue-recovery` will discard it.
+              </p>
             )}
             {queueRecovery.required && queueStoredStillUnreadable ? (
               confirmingDiscard ? (

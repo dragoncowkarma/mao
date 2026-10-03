@@ -2,7 +2,7 @@ import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 import Sidebar from './Sidebar'
-import type { StoredValueProblem } from '../../core/store'
+import { describeUnusableTaskQueue, type StoredValueProblem } from '../../core/store'
 import type { QueueRecoveryState } from '../../core/workflow-engine'
 
 /**
@@ -14,10 +14,18 @@ import type { QueueRecoveryState } from '../../core/workflow-engine'
  * with user-event, per SKILL.md) or clicking something to force a re-read. Rendering the component
  * directly states the rule precisely.
  */
+/**
+ * The **real** report, from core's own describer rather than a one-line stand-in.
+ *
+ * A short fixture hid the defect this pins: the actual text asserts that the queue is empty, that MAO
+ * will not start unattended work and that every queue write is refused. All three are false for a problem
+ * found after a clean start, so rendering it there contradicted the card's own next sentence. Importing
+ * the describer means the test keeps checking the words that actually ship.
+ */
 const UNUSABLE_QUEUE: StoredValueProblem = {
   field: 'workflowTasks',
   source: '/data/config.json',
-  message: '[store] "workflowTasks" in /data/config.json is an object, not a JSON array of queued tasks.',
+  message: describeUnusableTaskQueue({ 'task-1': {} }, '/data/config.json')!,
 }
 
 const HALTED: QueueRecoveryState = { required: true, reason: UNUSABLE_QUEUE.message }
@@ -123,12 +131,16 @@ describe('Sidebar queue recovery', () => {
       storeProblems: [UNUSABLE_QUEUE],
     })
 
-    expect(screen.getByText(UNUSABLE_QUEUE.message)).toBeInTheDocument()
-    // And it must NOT claim a halt that has not happened: this session is still running the queue it
-    // loaded at startup. Saying "halted" would send the operator looking for a stoppage.
-    expect(screen.queryByText('Workflow automation is halted')).toBeNull()
     expect(screen.getByText('The stored workflow queue is unreadable')).toBeInTheDocument()
     expect(screen.getByText(/This session is not halted/)).toBeInTheDocument()
+    expect(screen.getByText(/\/data\/config.json/)).toBeInTheDocument()
+    // And it must not claim a halt, an empty queue, or refused writes — none of which is true here. The
+    // store's report asserts all three, so it must NOT be rendered verbatim in this state.
+    expect(screen.queryByText('Workflow automation is halted')).toBeNull()
+    expect(screen.queryByText(UNUSABLE_QUEUE.message)).toBeNull()
+    for (const claim of [/will not start unattended work/, /queue is empty/, /are refused/]) {
+      expect(screen.queryByText(claim)).toBeNull()
+    }
   })
 
   it('offers no discard for a late-discovered problem, because nothing is latched to clear', () => {
@@ -142,14 +154,15 @@ describe('Sidebar queue recovery', () => {
     expect(screen.queryByText(/Restart MAO to load it/)).toBeNull()
   })
 
-  it('prints the queue report once in the late case too', () => {
+  it('prints the late-case explanation once, and the halted report not at all', () => {
     renderSidebar({
       queueRecovery: { required: false, reason: undefined },
       queueStoredStillUnreadable: true,
       storeProblems: [UNUSABLE_QUEUE],
     })
 
-    expect(screen.getAllByText(UNUSABLE_QUEUE.message)).toHaveLength(1)
+    expect(screen.getAllByText(/This session is not halted/)).toHaveLength(1)
+    expect(screen.queryByText(UNUSABLE_QUEUE.message)).toBeNull()
   })
 
   it('says nothing about the queue when nothing is halted', () => {

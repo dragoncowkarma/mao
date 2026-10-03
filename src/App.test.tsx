@@ -1026,10 +1026,7 @@ describe('App halted workflow queue', () => {
 
   it('keeps the card up and says why when the discard itself fails', async () => {
     const { user, stub } = await renderApp([], [UNUSABLE_QUEUE])
-    stub.confirmQueueRecovery.mockResolvedValue({
-      kind: 'write-failed',
-      reason: 'The replacement write failed, so what reached the config file is unknown.',
-    })
+    stub.confirmQueueRecovery.mockResolvedValue({ kind: 'write-failed' })
 
     await user.click(await screen.findByRole('button', { name: 'Discard unreadable queue' }))
     await user.click(screen.getByRole('button', { name: 'Confirm discard' }))

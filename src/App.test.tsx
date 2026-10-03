@@ -49,6 +49,21 @@ const UNUSABLE_PROVIDERS: StoredValueProblem = {
 }
 
 /**
+ * What the main process answers for a `config.json` whose `workflowTasks` the schema cannot use.
+ *
+ * Spelled out rather than imported from core for the same reason as the fixtures above, and it carries
+ * the halt wording because that is what the engine's latch holds verbatim — the operator reads the same
+ * paragraph here, in `mao run`'s refusal, and in every refused queue action.
+ */
+const UNUSABLE_QUEUE: StoredValueProblem = {
+  field: 'workflowTasks',
+  source: '/data/config.json',
+  message:
+    '[store] "workflowTasks" in /data/config.json is an object, not a JSON array of queued workflow ' +
+    'tasks — ignoring it, so the queue is empty and MAO will not start unattended work.',
+}
+
+/**
  * Mounts the real App against a fake bridge, inside StrictMode because that is what `src/main.tsx`
  * does. The doubled mount/unmount is a development-and-test check — the packaged build runs effects
  * once — but it is the check AGENTS.md requires polling effects to survive, so running tests under it
@@ -968,5 +983,99 @@ describe('App repository add and unsaved global settings', () => {
     expect(screen.queryByRole('heading', { name: 'acme/two' })).toBeNull()
     expect(stub.setRepos).not.toHaveBeenCalled()
     expect(screen.queryByRole('button', { name: 'ACME/TWO' })).toBeNull()
+  })
+})
+
+/**
+ * The GUI half of issue #68: a halted host has to say so, and has to offer a way out that is reachable.
+ *
+ * Reachable matters literally — an unusable `githubRepos` can sit in the same file, leaving no sidebar
+ * row, no selected project and therefore no Settings tab. So the card renders above the project list,
+ * exactly where the repo-list reset does.
+ */
+describe('App halted workflow queue', () => {
+  it('shows the store report and offers a two-step discard', async () => {
+    const { user, stub } = await renderApp([], [UNUSABLE_QUEUE])
+
+    expect(await screen.findByText(/MAO will not start unattended work/)).toBeInTheDocument()
+    // Two-step, like the repo-list reset: this write discards whatever the file held for the queue.
+    await user.click(await screen.findByRole('button', { name: 'Discard unreadable queue' }))
+    expect(stub.confirmQueueRecovery).not.toHaveBeenCalled()
+
+    await user.click(screen.getByRole('button', { name: 'Confirm discard' }))
+
+    await waitFor(() => expect(stub.confirmQueueRecovery).toHaveBeenCalled())
+    await waitFor(() => expect(screen.queryByText(/MAO will not start unattended work/)).toBeNull())
+  })
+
+  it('refuses to overwrite a queue something else already repaired, and says to restart', async () => {
+    // The latch is monotone, so after a repair made outside this window the store reads clean while this
+    // session still holds the coerced empty queue. Core answers `already-readable` and writes nothing;
+    // the operator has to be told that a restart — not another click — is what loads the real queue.
+    // (That the button is not even *offered* in that state is a prop-level rule, pinned in
+    // src/components/Sidebar.test.tsx where it can be asserted without waiting on a 30s poll.)
+    const { user, stub } = await renderApp([], [UNUSABLE_QUEUE])
+    stub.confirmQueueRecovery.mockResolvedValue({ kind: 'already-readable' })
+
+    await user.click(await screen.findByRole('button', { name: 'Discard unreadable queue' }))
+    await user.click(screen.getByRole('button', { name: 'Confirm discard' }))
+
+    expect(await screen.findByText(/Restart MAO to load it/)).toBeInTheDocument()
+    expect(screen.getByText('Workflow automation is halted')).toBeInTheDocument()
+  })
+
+  it('keeps the card up and says why when the discard itself fails', async () => {
+    const { user, stub } = await renderApp([], [UNUSABLE_QUEUE])
+    stub.confirmQueueRecovery.mockResolvedValue({ kind: 'write-failed' })
+
+    await user.click(await screen.findByRole('button', { name: 'Discard unreadable queue' }))
+    await user.click(screen.getByRole('button', { name: 'Confirm discard' }))
+
+    expect(await screen.findByText(/what reached the config file is unknown/)).toBeInTheDocument()
+    expect(screen.getByText('Workflow automation is halted')).toBeInTheDocument()
+  })
+
+  it('does not print the same report twice', async () => {
+    // The latch carries the store's message verbatim, so rendering both the queue card and the generic
+    // problems list would show the same paragraph twice in a narrow column.
+    await renderApp([], [UNUSABLE_QUEUE])
+
+    expect(await screen.findAllByText(/MAO will not start unattended work/)).toHaveLength(1)
+  })
+
+  it('still shows another field report alongside the queue card', async () => {
+    await renderApp([], [UNUSABLE_QUEUE, UNUSABLE_PROVIDERS])
+
+    expect(await screen.findByText(/MAO will not start unattended work/)).toBeInTheDocument()
+    expect(screen.getByText(/"aiProviders" in \/data\/config.json/)).toBeInTheDocument()
+  })
+
+  it('a repo-list read that fails from the very first poll does not suppress the queue card', async () => {
+    // The two reads sit on separate chains on purpose: `refreshStoreProblems` ends in one trailing catch
+    // covering both halves, so folding the queue read into it would let a throw there hide the one answer
+    // that says unattended work is halted. Built by hand rather than through `renderApp` so the failure
+    // is already in place at mount — that is what makes this a proof of the separation rather than of
+    // state left over from a successful first read.
+    const stub = createElectronApiStub([], [UNUSABLE_QUEUE])
+    stub.storeProblems.mockRejectedValue(new Error('EACCES: permission denied'))
+    render(
+      <StrictMode>
+        <App />
+      </StrictMode>,
+    )
+
+    expect(await screen.findByText('Workflow automation is halted')).toBeInTheDocument()
+    // And it fails SAFE: with nobody able to say whether the file still holds the unreadable value, the
+    // discard stays on offer rather than the renderer claiming a repair it cannot see. Clicking it is
+    // harmless either way — `confirmQueueRecovery()` re-probes and writes nothing if the value is gone.
+    expect(await screen.findByRole('button', { name: 'Discard unreadable queue' })).toBeInTheDocument()
+    expect(screen.queryByText(/Restart MAO to load it/)).toBeNull()
+  })
+
+  it('says nothing about the queue when the store is healthy', async () => {
+    await renderApp([ONE])
+
+    expect(screen.queryByText('Workflow automation is halted')).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Discard unreadable queue' })).toBeNull()
   })
 })

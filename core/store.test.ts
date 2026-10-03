@@ -8,12 +8,17 @@ import {
   createStoredReadGuard,
   describeStoredProblems,
   describeUnusableRepoList,
+  describeUnusableProviderList,
+  describeUnusableTaskQueue,
+  describeUninspectableStore,
+  findStoredQueueProblem,
   createGuardedStore,
   type MaoStoreSchema,
   type StoredValueBackend,
 } from './store.ts'
 import { canonicalRepoList } from './repo-registry.ts'
-import type { RepoRef } from './workflow-engine.ts'
+import type { AiProviderConfig } from './ai/types.ts'
+import type { QueuedTask, RepoRef } from './workflow-engine.ts'
 
 const tmpDirs: string[] = []
 
@@ -24,6 +29,33 @@ afterEach(() => {
 
 const widgets: RepoRef = { owner: 'acme', repo: 'widgets' }
 const gadgets: RepoRef = { owner: 'acme', repo: 'gadgets' }
+
+const claude: AiProviderConfig = { id: 'claude', name: 'Claude', kind: 'cli', command: 'claude' }
+
+const pendingTask: QueuedTask = {
+  id: 'task-1',
+  title: 'Pending task',
+  repo: widgets,
+  stage: 'issue',
+  history: [],
+  status: 'pending',
+  autoAdvance: false,
+  github: {},
+}
+
+/**
+ * The shapes a hand-edit can leave behind, and the phrase each must produce.
+ *
+ * Shared by all three fields' tables so none can end up covered for fewer shapes than its neighbours.
+ * The object is issue #60's own repro; the rest are what `typeof` collapses or an editor produces.
+ */
+const DISCARDED_SHAPES: Array<[unknown, string]> = [
+  [{ 'acme/widgets': { owner: 'acme', repo: 'widgets' } }, 'is an object'],
+  ['acme/widgets', 'is a string'],
+  [42, 'is a number'],
+  [true, 'is a boolean'],
+  [null, 'is null'],
+]
 
 /**
  * A real `config.json` holding exactly `contents`, opened through a real `FileStore`.
@@ -212,6 +244,152 @@ describe('FileStore githubRepos read guard', () => {
   })
 })
 
+describe('FileStore aiProviders read guard', () => {
+  it('reads a stored list back unchanged, and says nothing about it', () => {
+    const warn = captureWarnings()
+    const { store } = storeHolding({ aiProviders: [claude] })
+
+    expect(store.get('aiProviders')).toEqual([claude])
+    expect(warn).not.toHaveBeenCalled()
+  })
+
+  it('reports every shape it discards, not only the keyed object', () => {
+    // A shared spy would see only the first report (the guard dedups per field), so a regression that
+    // made null, strings, numbers or booleans discard *silently* would pass a loop checking only the
+    // returned value.
+    for (const [aiProviders, expectedPhrase] of DISCARDED_SHAPES) {
+      const warn = captureWarnings()
+      const { store, filePath } = storeHolding({ aiProviders })
+
+      expect(store.get('aiProviders')).toEqual([])
+      expect(warn).toHaveBeenCalledTimes(1)
+      const message = warn.mock.calls[0]![0] as string
+      expect(message).toContain('"aiProviders"')
+      expect(message).toContain(expectedPhrase)
+      expect(message).toContain(filePath)
+
+      warn.mockRestore()
+    }
+  })
+
+  it('returns a value the expression `mao config show` runs can consume', () => {
+    // Copies cli/index.ts's redaction expression rather than driving commander. Before the rule this
+    // threw `store.get(...).map is not a function`, so the one command an operator runs to find out what
+    // state they are in was the command the broken state killed.
+    captureWarnings()
+    const { store } = storeHolding({ aiProviders: { claude } })
+
+    const providers = store.get('aiProviders')
+
+    expect(() =>
+      providers.map((provider) => ({ ...provider, apiKey: provider.apiKey ? '[set]' : undefined })),
+    ).not.toThrow()
+    expect(providers).toEqual([])
+  })
+
+  it('names a recovery that needs no GitHub token, and does not claim automation is halted', () => {
+    // The wording distinction from the queue's report, and it is a safety claim rather than style: an
+    // empty provider list stops stages at selectAgent() before any GitHub write, so this field must not
+    // tell the operator that unattended work has been halted — nothing halts for it.
+    const message = describeUnusableProviderList({}, '/tmp/config.json')!
+
+    expect(message).toContain('mao config import-providers')
+    expect(message).toContain('apiKey')
+    expect(message).not.toContain('halt')
+    expect(message).not.toContain('confirm-queue-recovery')
+  })
+})
+
+describe('FileStore workflowTasks read guard', () => {
+  it('reads a stored queue back unchanged, and says nothing about it', () => {
+    const warn = captureWarnings()
+    const { store } = storeHolding({ workflowTasks: [pendingTask] })
+
+    expect(store.get('workflowTasks')).toEqual([pendingTask])
+    expect(warn).not.toHaveBeenCalled()
+  })
+
+  it('reports every shape it discards, not only the keyed object', () => {
+    for (const [workflowTasks, expectedPhrase] of DISCARDED_SHAPES) {
+      const warn = captureWarnings()
+      const { store, filePath } = storeHolding({ workflowTasks })
+
+      expect(store.get('workflowTasks')).toEqual([])
+      expect(warn).toHaveBeenCalledTimes(1)
+      const message = warn.mock.calls[0]![0] as string
+      expect(message).toContain('"workflowTasks"')
+      expect(message).toContain(expectedPhrase)
+      expect(message).toContain(filePath)
+
+      warn.mockRestore()
+    }
+  })
+
+  it('says automation is halted and names the confirm command, not clear-completed', () => {
+    // `mao workflow clear-completed` also emits `'change'`, so it is gated too — naming it would send
+    // the operator at a command that now refuses. And it must point at the workflow-active label,
+    // because the queue that recorded what was in flight is the thing that is gone.
+    const message = describeUnusableTaskQueue('task-1', '/tmp/config.json')!
+
+    expect(message).toContain('mao workflow confirm-queue-recovery')
+    expect(message).toContain('workflow-active')
+    expect(message).toContain('refused')
+    expect(message).not.toContain('clear-completed')
+  })
+
+  it('prints no stored value, whatever the value was', () => {
+    // config.json is one blob that also holds githubToken in plaintext, and a malformed field is exactly
+    // the hand-edit that can leave a fragment of a neighbouring key inside it.
+    const secretish = { token: 'ghp_liveSecretValue', nested: ['ghp_anotherSecret'] }
+
+    for (const describe_ of [describeUnusableTaskQueue, describeUnusableProviderList, describeUnusableRepoList]) {
+      const message = describe_(secretish, '/tmp/config.json')!
+      expect(message).toContain('is an object')
+      expect(message).not.toContain('ghp_liveSecretValue')
+      expect(message).not.toContain('ghp_anotherSecret')
+    }
+  })
+
+  it('survives a write to an unrelated field, which is what lets the next boot latch again', () => {
+    // The whole no-new-persisted-state premise: FileStore.persist() rewrites this.data, whose
+    // workflowTasks the guard never repaired, so only a write to *this* field heals it.
+    captureWarnings()
+    const corrupt = { 'task-1': pendingTask }
+    const { store, filePath } = storeHolding({ workflowTasks: corrupt })
+
+    store.get('workflowTasks')
+    store.set('theme', 'dark')
+
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).workflowTasks).toEqual(corrupt)
+    expect(new FileStore(filePath).problems().map((p) => p.field)).toContain('workflowTasks')
+  })
+
+  it('hands back a fresh array rather than the shared default', () => {
+    captureWarnings()
+    const { store } = storeHolding({ workflowTasks: 7 })
+
+    store.get('workflowTasks').push(pendingTask)
+
+    expect(store.get('workflowTasks')).toEqual([])
+    expect(MAO_STORE_DEFAULTS.workflowTasks).toEqual([])
+  })
+})
+
+describe('findStoredQueueProblem', () => {
+  it('picks out the queue problem and ignores the other guarded fields', () => {
+    // The single lookup core/app.ts's latch and confirmQueueRecovery's postcondition both use, so they
+    // cannot disagree about what counts as "the queue is unreadable".
+    captureWarnings()
+    const { store } = storeHolding({ githubRepos: 'x', aiProviders: 'y', workflowTasks: 'z' })
+
+    const problems = store.problems()
+
+    expect(problems.map((p) => p.field).sort()).toEqual(['aiProviders', 'githubRepos', 'workflowTasks'])
+    expect(findStoredQueueProblem(problems)?.field).toBe('workflowTasks')
+    expect(findStoredQueueProblem(problems.filter((p) => p.field !== 'workflowTasks'))).toBeUndefined()
+  })
+})
+
 describe('MaoStore.problems', () => {
   it('reports nothing for a healthy store', () => {
     const { store } = storeHolding({ githubRepos: [widgets] })
@@ -355,7 +533,7 @@ describe('createStoredReadGuard', () => {
     expect(reports[0]).toContain('/tmp/config.json')
   })
 
-  it('touches no field but githubRepos', () => {
+  it('touches no field without a rule', () => {
     const reports: string[] = []
     const guard = createStoredReadGuard('/tmp/config.json', (message) => reports.push(message))
 
@@ -412,5 +590,194 @@ describe("electron/store.ts, the other MaoStore backend", () => {
 
     expect(exported).toEqual(['store'])
     expect(source).toMatch(/export const store: MaoStore\b/)
+  })
+})
+
+/**
+ * `MaoStore.inspect()` — one read answering both "what may I use" and "did the guard replace it".
+ *
+ * It exists because `get()` and `problems()` are two reads, and conf re-reads and re-parses the whole
+ * config file on every `get`. `createMaoApp` decided the queue latch from one and restored from the
+ * other, so a value changed between them left the host unlatched holding a coerced empty queue.
+ */
+describe('MaoStore.inspect', () => {
+  it('answers value and problem from the same read, and says the read succeeded', () => {
+    captureWarnings()
+    const { store } = storeHolding({ workflowTasks: { 'task-1': pendingTask } })
+
+    const observed = store.inspect('workflowTasks')
+
+    expect(observed.readable).toBe(true)
+    expect(observed.value).toEqual([])
+    expect(observed.problem).toContain('"workflowTasks"')
+  })
+
+  it('reports no problem for a healthy value, and hands back what is stored', () => {
+    const warn = captureWarnings()
+    const { store } = storeHolding({ workflowTasks: [pendingTask] })
+
+    const observed = store.inspect('workflowTasks')
+
+    expect(observed.value).toEqual([pendingTask])
+    expect(observed.problem).toBeUndefined()
+    expect(observed.readable).toBe(true)
+    // A witness is produced for a healthy value too — that is what makes a conditional write possible.
+    expect(observed.witness).toBeTypeOf('string')
+    expect(warn).not.toHaveBeenCalled()
+  })
+
+  it('cannot disagree with itself when the backend changes between two reads', () => {
+    // The regression for the second window review found. This backend flips from a healthy array to a
+    // non-array on its SECOND read, which models conf re-reading the file while another process edits
+    // it. Two reads (problems() then get()) would see "healthy" and then a coerced `[]`; one inspect()
+    // cannot, because there is no second read to disagree with.
+    captureWarnings()
+    let reads = 0
+    const flipping = fakeBackend({ workflowTasks: [pendingTask] })
+    const store = createGuardedStore(
+      {
+        get: <K extends keyof MaoStoreSchema>(key: K) => {
+          if (key !== 'workflowTasks') return flipping.backend.get(key)
+          reads += 1
+          return (reads === 1 ? [pendingTask] : { 'task-1': pendingTask }) as unknown as MaoStoreSchema[K]
+        },
+        set: flipping.backend.set,
+      },
+      '/tmp/config.json',
+    )
+
+    const observed = store.inspect('workflowTasks')
+
+    // Whichever read it got, the verdict and the value describe the SAME one: either a healthy array
+    // with no problem, or a coerced empty list WITH a problem. Never healthy-verdict + coerced value.
+    expect(reads).toBe(1)
+    if (observed.problem === undefined) expect(observed.value).toEqual([pendingTask])
+    else expect(observed.value).toEqual([])
+  })
+
+  it('fails closed when the backend read throws, without quoting the error', () => {
+    // `readable: false` is a third answer, not a flavour of "unusable": a caller about to WRITE must
+    // refuse rather than assume the value is still the corrupt one it last saw.
+    const store = createGuardedStore(
+      {
+        get: () => {
+          throw new Error("EACCES: permission denied, open '/tmp/ghp_secretish/config.json'")
+        },
+        set: () => {},
+      },
+      '/tmp/config.json',
+    )
+
+    const observed = store.inspect('workflowTasks')
+
+    expect(observed.readable).toBe(false)
+    expect(observed.value).toEqual([])
+    expect(observed.problem).toContain('could not read')
+    expect(observed.problem).not.toContain('EACCES')
+    expect(observed.problem).not.toContain('ghp_secretish')
+  })
+
+  it('warns once, exactly as get() does, so an observation and a read cannot differ', () => {
+    const warn = captureWarnings()
+    const { store } = storeHolding({ workflowTasks: 'task-1' })
+
+    store.inspect('workflowTasks')
+    store.get('workflowTasks')
+    store.inspect('workflowTasks')
+
+    expect(warn).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('describeUninspectableStore', () => {
+  it('names the field and the file and nothing else', () => {
+    const message = describeUninspectableStore('workflowTasks', '/tmp/config.json')
+
+    expect(message).toContain('"workflowTasks"')
+    expect(message).toContain('/tmp/config.json')
+    expect(message).toContain('unusable')
+  })
+})
+
+/**
+ * `setIfUnchanged()` — the conditional write the recovery rests on, and `FileStore`'s freshness.
+ *
+ * Observing before writing is not the same as writing conditionally: a repair landing between the two is
+ * destroyed by an unconditional `set` and reported as success. These pin the three parts that make the
+ * difference — the comparison itself, refusing when it cannot be made, and reading what is on disk *now*
+ * rather than what was there when the store was constructed.
+ */
+describe('MaoStore.setIfUnchanged', () => {
+  it('writes when the stored value still matches the witness', () => {
+    captureWarnings()
+    const { store, filePath } = storeHolding({ workflowTasks: { 'task-1': pendingTask } })
+
+    const observed = store.inspect('workflowTasks')
+    expect(store.setIfUnchanged('workflowTasks', observed.witness, [])).toBe('written')
+
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).workflowTasks).toEqual([])
+  })
+
+  it('refuses, and writes nothing, when the stored value moved since the observation', () => {
+    captureWarnings()
+    const { store, filePath } = storeHolding({ workflowTasks: { 'task-1': pendingTask } })
+    const observed = store.inspect('workflowTasks')
+
+    // Another process repairs the queue after the observation and before the write.
+    fs.writeFileSync(filePath, JSON.stringify({ workflowTasks: [pendingTask] }, null, 2))
+
+    expect(store.setIfUnchanged('workflowTasks', observed.witness, [])).toBe('superseded')
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).workflowTasks).toEqual([pendingTask])
+  })
+
+  it('refuses when there is no witness to compare against', () => {
+    // `witnessOf` answers undefined for a value it cannot serialize. Writing then would be a guess about
+    // a value nobody established, which is the whole failure this member exists to prevent.
+    captureWarnings()
+    const { store, filePath } = storeHolding({ workflowTasks: { 'task-1': pendingTask } })
+
+    expect(store.setIfUnchanged('workflowTasks', undefined, [])).toBe('unverifiable')
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).workflowTasks).toEqual({ 'task-1': pendingTask })
+  })
+
+  it('refuses when the file cannot be read, rather than treating it as unchanged', () => {
+    captureWarnings()
+    const { store, filePath } = storeHolding({ workflowTasks: { 'task-1': pendingTask } })
+    const observed = store.inspect('workflowTasks')
+
+    // Present but unparseable. `loadStrict` must throw for this, so the compare answers "unknown" — the
+    // swallowing `load()` the constructor uses would read it as `{}` and could compare equal by accident.
+    fs.writeFileSync(filePath, '{ "workflowTasks": [')
+
+    expect(store.setIfUnchanged('workflowTasks', observed.witness, [])).toBe('unverifiable')
+  })
+
+  it('FileStore observes what is on disk now, not its constructor snapshot', () => {
+    // The gap review named: `get` answers from the snapshot, so an `inspect` built on it would compare a
+    // CLI recovery against a value taken at construction and miss a repair that had already landed.
+    const warn = captureWarnings()
+    const { store, filePath } = storeHolding({ workflowTasks: [pendingTask] })
+    expect(store.inspect('workflowTasks').problem).toBeUndefined()
+
+    fs.writeFileSync(filePath, JSON.stringify({ workflowTasks: { 'task-1': pendingTask } }, null, 2))
+
+    // Fresh: the observation sees the corruption that landed after construction.
+    expect(store.inspect('workflowTasks').problem).toContain('"workflowTasks"')
+    // And `get` deliberately still answers from the snapshot — the fresh read is NOT written back, so a
+    // recovery cannot change what every other reader in the process sees.
+    expect(store.get('workflowTasks')).toEqual([pendingTask])
+    expect(warn).toHaveBeenCalledTimes(1)
+  })
+
+  it('FileStore reports an unreadable file as unobservable, not as empty', () => {
+    captureWarnings()
+    const { store, filePath } = storeHolding({ workflowTasks: [pendingTask] })
+
+    fs.writeFileSync(filePath, 'not json at all')
+
+    const observed = store.inspect('workflowTasks')
+    expect(observed.readable).toBe(false)
+    expect(observed.witness).toBeUndefined()
+    expect(observed.problem).toContain('could not read')
   })
 })

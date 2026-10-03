@@ -431,7 +431,7 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   only salvageable copy of the unreadable value **and** starts an unattended pipeline on a host that
   cannot know what was already in flight (the `workflow-active` label is best-effort, so a task lost with
   the queue may carry no label to stop its issue running twice). `createMaoApp` therefore reads
-  `findStoredQueueProblem(store.problems())` and calls `workflowEngine.requireQueueRecovery(message)`
+  `store.inspect(QUEUE_GATING_FIELD)` once and calls `workflowEngine.requireQueueRecovery(problem)`
   **before** it subscribes the `'change'` listener and before `restore()`, and the engine then refuses
   `enqueue`, `enqueueFromIssue`, `retry`, `advance`, `setAutoAdvance` and `clearCompleted` (each before
   any mutation and before `notify()`) plus `processQueue` at entry and in its per-task loop. `clearCompleted`
@@ -462,6 +462,14 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   `workflowTasks` problem with its own wording, because the store's report asserts a halt that has not
   happened in that state, and filtering the report out while the halted card did not render hid it
   entirely.
+- **`inspect()` and `setIfUnchanged()` read fresh; `get()` may not.** conf re-reads and re-parses the whole
+  config file on every `get`, so for Electron the two are the same call. `FileStore` answers `get` from the
+  snapshot taken in its constructor, so it supplies `StoredValueBackend.getFresh` — without it a CLI
+  recovery would compare against a value taken at construction and miss a repair that had already landed.
+  That fresh read uses a *strict* loader: a file that exists and cannot be read throws, so an unreadable
+  file becomes "unknown" rather than "unchanged". The constructor keeps the swallowing `load()`, because
+  answering schema defaults for an unparseable file is pre-existing behaviour and its own tracked gap
+  (#67) — do not quietly change what every boot does while fixing a write path.
 - **One observation decides the latch and feeds `restore()`.** `createMaoApp` calls
   `store.inspect(QUEUE_GATING_FIELD)` once (through one guarded helper) and uses that single result for
   both. `get()` and `problems()` are two reads and conf re-reads and re-parses the whole file on every
@@ -471,8 +479,13 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   original. `inspect()` also answers a third state, `readable: false` (the store could not be read at
   all), which is **not** a flavour of "unusable": a caller about to write must refuse on it rather than
   assume the value is the corrupt one it last saw.
-- **`confirmQueueRecovery()` owns its own postcondition, and observes before it writes.** It returns a
-  typed `QueueRecoveryOutcome` so the CLI command and the GUI button cannot disagree about whether
+- **`workflowTasks` has two writers, both in `core/app.ts`.** The engine's `'change'` listener, and
+  `confirmQueueRecovery()`'s conditional replacement. The recovery write cannot go through the listener,
+  because it must be refused when the stored value has moved and `emit()` cannot report that back — and it
+  must not go through the engine, which holds no store reference (rule 3). Two call sites in the
+  composition root, and still nothing outside it: no shell, and no other `core/` module, writes the field.
+- **`confirmQueueRecovery()` lives on `MaoApp`, owns its own postcondition, and writes conditionally.** It
+  returns a typed `QueueRecoveryOutcome` so the CLI command and the GUI button cannot disagree about whether
   confirmation worked — a bare boolean had the CLI re-deriving success while the GUI reported it. Four
   kinds, each saying only what was established: `'replaced'` (still unusable immediately before the
   write, and the write did not throw), `'already-readable'` (readable again, so **nothing is written** —
@@ -483,17 +496,20 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   so what reached the file is unknown and the halt stands). None interpolates the backend's error text:
   an I/O or parse failure can quote the file's own bytes and that file holds `githubToken` in plaintext,
   so the reasons come from a closed set.
-- **That pre-write observation narrows a window; it is not a cross-process postcondition, and must not be
-  described as one.** What it closes is the interleaving that destroys data: another process or a
-  hand-edit making the queue *readable* between the latch and the confirm, which now answers
-  `'already-readable'` and writes nothing. Replacing one unusable value with another loses nothing,
-  because neither could be restored. What it does **not** close is a write that lands *after* this one and
-  clobbers it — the ordinary multi-process lost update every field in this single-blob file shares (issue
-  #73). A real postcondition needs a primitive neither backend has (an advisory lock, or `O_EXCL` +
-  rename keyed on a stored version with a retry loop), and a `version` token on `MaoStore` would not be
-  one either, since read-compare-write still leaves a window before the write lands. Keep the word
-  *atomic* out of the comments, the operator-facing text and the member names — `inspect`/`observe` say
-  what they do.
+- **Observing before writing is not the same as writing conditionally, and only the second is safe.** An
+  earlier revision observed the queue "immediately before" an unconditional `store.set` and claimed that
+  closed the destructive interleaving. It did not: `'already-readable'` only catches a repair that finished
+  *before* the observation, so a repair landing between the observation and the write was still destroyed
+  and still reported as success. `MaoStore.setIfUnchanged()` is what closes it — the write is keyed on the
+  raw value the observation saw, and answers `'superseded'` without writing if it moved. Replacing one
+  unusable value with another loses nothing, because neither could be restored.
+  What that still does **not** close is a write landing *after* this one and clobbering it — the ordinary
+  multi-process lost update every field in this single-blob file shares (issue #73). A real cross-process
+  postcondition needs a primitive neither backend has (an advisory lock, or `O_EXCL` + rename keyed on a
+  stored version with a retry loop); a `version` token on `MaoStore` would not be one either, since
+  read-compare-write still leaves a window before the write lands. So keep the word *atomic* out of the
+  comments, the operator-facing text and the member names — `inspect` and `setIfUnchanged` say exactly
+  what they do, and `MaoStore.setIfUnchanged`'s doc states the limit where a reader will meet it.
 - **What the halt does *not* cover, so it is not read as more than it is.** A `config.json` that is not
   valid JSON at all is invisible: `FileStore.load()` catches the parse error and answers `{}`, so every
   field reads as its schema default, nothing is reported and no latch arms (issue #67). Element-level

@@ -781,3 +781,79 @@ describe('MaoStore.setIfUnchanged', () => {
     expect(observed.problem).toContain('could not read')
   })
 })
+
+/**
+ * The limit of `setIfUnchanged()`, pinned so it lives in the suite rather than only in a comment.
+ *
+ * Two revisions of this PR claimed the read-then-clobber window was closed. It is not: the comparison
+ * narrows it to the compare -> write interval, and a repair landing *inside* that interval is still
+ * overwritten. Asserting the real behaviour is what stops the claim drifting back — if someone later adds
+ * a lock and genuinely closes it, this test fails and has to be rewritten deliberately.
+ */
+describe('setIfUnchanged — what it does not close', () => {
+  it('is atomic against other callers in this process', () => {
+    // The half that IS guaranteed, and the reason: nothing may be inserted between the compare and the
+    // write, so no other JavaScript here can interleave. A backend that counts reads proves the pair runs
+    // back to back with no second observation in between.
+    const reads: string[] = []
+    const data: Record<string, unknown> = { workflowTasks: { 'task-1': pendingTask } }
+    const store = createGuardedStore(
+      {
+        get: <K extends keyof MaoStoreSchema>(key: K) => data[key] as MaoStoreSchema[K] | undefined,
+        getFresh: <K extends keyof MaoStoreSchema>(key: K) => {
+          reads.push(String(key))
+          return data[key] as MaoStoreSchema[K] | undefined
+        },
+        set: <K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]) => {
+          data[key] = value
+        },
+      },
+      '/tmp/config.json',
+    )
+    captureWarnings()
+
+    const observed = store.inspect('workflowTasks')
+    reads.length = 0
+    expect(store.setIfUnchanged('workflowTasks', observed.witness, [])).toBe('written')
+
+    // Exactly one read — the compare — and then the write. No window for a same-process caller.
+    expect(reads).toEqual(['workflowTasks'])
+  })
+
+  it('does NOT close the window against another OS process, and must not claim to', () => {
+    // The honest residue. This backend repairs the value *after* the compare read has answered, which is
+    // what another process doing it between our compare and our writeFileSync looks like from here. The
+    // repair is overwritten and the result is still 'written'.
+    //
+    // Keeping this as an executable assertion rather than prose is the point: it is the exact scenario
+    // review reproduced, and recording it stops the "window closed" wording coming back.
+    const data: Record<string, unknown> = { workflowTasks: { 'task-1': pendingTask } }
+    let repairAfterNextRead = false
+    const store = createGuardedStore(
+      {
+        get: <K extends keyof MaoStoreSchema>(key: K) => data[key] as MaoStoreSchema[K] | undefined,
+        getFresh: <K extends keyof MaoStoreSchema>(key: K) => {
+          const value = data[key] as MaoStoreSchema[K] | undefined
+          if (key === 'workflowTasks' && repairAfterNextRead) {
+            repairAfterNextRead = false
+            data.workflowTasks = [pendingTask]
+          }
+          return value
+        },
+        set: <K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]) => {
+          data[key] = value
+        },
+      },
+      '/tmp/config.json',
+    )
+    captureWarnings()
+
+    const observed = store.inspect('workflowTasks')
+    repairAfterNextRead = true
+
+    expect(store.setIfUnchanged('workflowTasks', observed.witness, [])).toBe('written')
+    // The repair is gone. Closing this needs an advisory lock both writers take, or O_EXCL + rename
+    // keyed on a stored version — a primitive neither backend has. Tracked as issue #73.
+    expect(data.workflowTasks).toEqual([])
+  })
+})

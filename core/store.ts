@@ -406,9 +406,16 @@ export interface MaoStore {
    * current value could not be read or serialized, so whether it moved is unknown — also nothing written.
    * Throws only if the underlying write throws.
    *
-   * This is **not** a cross-process lock. It closes the read-then-clobber window; a write that lands
-   * after it can still overwrite, which is the ordinary multi-process lost update every field in this
-   * single-blob file shares (issue #73).
+   * **What `'written'` actually establishes, stated narrowly because an earlier revision of this comment
+   * promised more.** The compare and the write are one synchronous run of JavaScript with no `await`
+   * between them, so no other code *in this process* can interleave: against another caller here, the
+   * pair is atomic and `'written'` means "nothing had moved". Against another OS process it is not. The
+   * comparison narrows the window — from the whole confirm sequence down to the compare →
+   * `writeFileSync` interval — but a repair landing inside that interval is still overwritten and still
+   * reported `'written'`. Closing that needs a primitive neither backend has: an advisory lock both
+   * writers take, or `O_EXCL` + rename keyed on a stored version with a retry loop. Cross-process
+   * serialization of same-key writes is issue #73 and is deliberately **not** attempted here; do not
+   * describe this member as closing it.
    */
   setIfUnchanged<K extends keyof MaoStoreSchema>(
     key: K,
@@ -531,9 +538,14 @@ export function createGuardedStore(
       }
       if (current === undefined) return 'unverifiable'
       if (current !== witness) return 'superseded'
-      // No read-back afterwards: a post-write comparison of two post-write reads cannot tell "written"
-      // from "written then immediately superseded", so it would assert more than it establishes. The
-      // write either throws or it does not, and the caller is told which.
+      // Nothing may be inserted between the compare above and the write below — not an `await`, not a
+      // callback, not a second read. That adjacency is the entire guarantee: it makes the pair atomic
+      // with respect to other callers in this process. It does NOT make it atomic against another OS
+      // process, which can still repair the value in this interval and have it overwritten (#73).
+      //
+      // No read-back afterwards either: comparing two post-write reads cannot tell "written" from
+      // "written then immediately superseded", so it would assert more than it establishes. The write
+      // either throws or it does not, and the caller is told which.
       backend.set(key, value)
       return 'written'
     },

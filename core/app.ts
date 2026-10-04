@@ -170,10 +170,14 @@ export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOp
    * 3. Write **conditionally**, keyed on the value just observed. This is the step that makes step 2
    *    mean something: observing immediately before an unconditional write still loses a repair that
    *    lands in between, which is exactly what review found here. `'superseded'` writes nothing.
+   *    Its limit is stated where it is implemented (`MaoStore.setIfUnchanged`) and is real: the compare
+   *    and the write are atomic against other callers *in this process*, not against another OS process,
+   *    which can still repair the value between them. That residue is issue #73.
    * 4. Release the halt only after a confirmed write. Clearing first and writing after would leave a
    *    released engine over a queue that was never replaced.
    *
-   * Not a cross-process lock: a write landing after this one can still overwrite it (issue #73).
+   * Not a cross-process lock, and not described as one: see `MaoStore.setIfUnchanged` for exactly what
+   * `'written'` does and does not establish (issue #73).
    */
   function confirmQueueRecovery(): QueueRecoveryOutcome {
     if (!workflowEngine.isQueueRecoveryLatched()) return { kind: 'already-readable' }

@@ -308,6 +308,21 @@ export class WorkflowEngine extends EventEmitter {
     this.queueRecoveryReason = undefined
   }
 
+  /**
+   * Persists the queue this process is holding, without changing it.
+   *
+   * For the case where the stored value went unusable *after* a clean start: this process still has the
+   * real queue in memory, so one `'change'` rewrites the file faithfully. That is the only safe way out
+   * of that state — a *separate* process running the discard would replace the file with its own empty
+   * queue, and this process's real one would then be lost the next time it restarted without having
+   * written. Gated like every other emitter, so it refuses when this process is the latched one (its
+   * queue is the coerced empty list and saving it would destroy the file's contents).
+   */
+  persistQueue() {
+    this.assertQueueWritable()
+    this.notify()
+  }
+
   /** Removes all finished (done/error) tasks immediately. */
   clearCompleted() {
     // Gated even though the in-memory queue is harmless: it emits `'change'`, so leaving it open would

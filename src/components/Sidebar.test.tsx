@@ -32,6 +32,7 @@ const HALTED: QueueRecoveryState = { required: true, reason: UNUSABLE_QUEUE.mess
 
 function renderSidebar(overrides: Partial<Parameters<typeof Sidebar>[0]> = {}) {
   const onDiscardQueue = vi.fn(async () => {})
+  const onResaveQueue = vi.fn(async () => {})
   const props = {
     repos: [],
     selectedIndex: 0,
@@ -42,12 +43,13 @@ function renderSidebar(overrides: Partial<Parameters<typeof Sidebar>[0]> = {}) {
     queueRecovery: { required: false, reason: undefined } as QueueRecoveryState,
     queueStoredStillUnreadable: false,
     onDiscardQueue,
+    onResaveQueue,
     view: 'project' as const,
     onViewChange: vi.fn(),
     ...overrides,
   }
   render(<Sidebar {...props} />)
-  return { onDiscardQueue, user: userEvent.setup() }
+  return { onDiscardQueue, onResaveQueue, user: userEvent.setup() }
 }
 
 describe('Sidebar queue recovery', () => {
@@ -143,8 +145,12 @@ describe('Sidebar queue recovery', () => {
     }
   })
 
-  it('offers no discard for a late-discovered problem, because nothing is latched to clear', () => {
-    renderSidebar({
+  it('offers a save of this session\'s queue for a late problem, never a discard', async () => {
+    // Review's finding: recommending `mao workflow confirm-queue-recovery` here is actively unsafe. That
+    // command discards, and run in a separate process it writes ITS empty queue over the file — so this
+    // session's real queue is lost the moment it restarts without having written. The safe action is for
+    // THIS session to save the queue it is holding.
+    const { user, onResaveQueue, onDiscardQueue } = renderSidebar({
       queueRecovery: { required: false, reason: undefined },
       queueStoredStillUnreadable: true,
       storeProblems: [UNUSABLE_QUEUE],
@@ -152,6 +158,26 @@ describe('Sidebar queue recovery', () => {
 
     expect(screen.queryByRole('button', { name: 'Discard unreadable queue' })).toBeNull()
     expect(screen.queryByText(/Restart MAO to load it/)).toBeNull()
+    // And the destructive CLI command must not be named in this state.
+    expect(screen.queryByText(/confirm-queue-recovery/)).toBeNull()
+
+    await user.click(screen.getByRole('button', { name: /Save this session/ }))
+
+    expect(onResaveQueue).toHaveBeenCalledTimes(1)
+    expect(onDiscardQueue).not.toHaveBeenCalled()
+  })
+
+  it('shows why a late save failed instead of failing silently', async () => {
+    const { user, onResaveQueue } = renderSidebar({
+      queueRecovery: { required: false, reason: undefined },
+      queueStoredStillUnreadable: true,
+      storeProblems: [UNUSABLE_QUEUE],
+    })
+    onResaveQueue.mockRejectedValue(new Error('ENOSPC: no space left on device'))
+
+    await user.click(screen.getByRole('button', { name: /Save this session/ }))
+
+    expect(await screen.findByText(/ENOSPC/)).toBeInTheDocument()
   })
 
   it('prints the late-case explanation once, and the halted report not at all', () => {

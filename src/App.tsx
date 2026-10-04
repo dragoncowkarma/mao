@@ -515,6 +515,20 @@ export default function App() {
     }
   }
 
+  /**
+   * Rewrites the stored queue from the one this session holds, for a value that went unusable after a
+   * clean start. Safe precisely because it is *this* process doing it: the queue it writes is the real
+   * one. Refreshes both reads afterwards so the card clears.
+   */
+  async function resaveStoredQueue() {
+    try {
+      await electronApi().workflow.resaveQueue()
+    } finally {
+      await refreshStoreProblems()
+      await refreshQueueRecovery()
+    }
+  }
+
   async function resetRepoList() {
     setRepoError('')
     // Re-read before destroying anything. This store is not this window's alone: the report itself tells
@@ -591,6 +605,7 @@ export default function App() {
         queueRecovery={queueRecovery}
         queueStoredStillUnreadable={!storeProblemsRead || storeProblems.some((problem) => problem.field === 'workflowTasks')}
         onDiscardQueue={discardUnreadableQueue}
+        onResaveQueue={resaveStoredQueue}
         view={view}
         onViewChange={selectView}
       />

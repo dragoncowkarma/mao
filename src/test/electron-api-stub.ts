@@ -73,6 +73,11 @@ export function createElectronApiStub(initialRepos: RepoRef[] = [], initialProbl
   const recoveryRequired = vi.fn(
     async (): Promise<QueueRecoveryState> => ({ required: queueLatched !== undefined, reason: queueLatched }),
   )
+  // Models WorkflowEngine.persistQueue: rewrites the stored value from the queue this process holds, so
+  // the problem clears without the destructive discard.
+  const resaveQueue = vi.fn(async (): Promise<void> => {
+    problems = problems.filter((problem) => problem.field !== 'workflowTasks')
+  })
   const confirmQueueRecovery = vi.fn(async (): Promise<QueueRecoveryOutcome> => {
     if (queueLatched === undefined) return { kind: 'already-readable' }
     if (!problems.some((problem) => problem.field === 'workflowTasks')) return { kind: 'already-readable' }
@@ -112,6 +117,7 @@ export function createElectronApiStub(initialRepos: RepoRef[] = [], initialProbl
       clearCompleted: notStubbed('workflow.clearCompleted'),
       recoveryRequired,
       confirmQueueRecovery,
+      resaveQueue,
     },
     ui: {
       getTheme,
@@ -138,5 +144,6 @@ export function createElectronApiStub(initialRepos: RepoRef[] = [], initialProbl
     },
     recoveryRequired,
     confirmQueueRecovery,
+    resaveQueue,
   }
 }

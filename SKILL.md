@@ -220,7 +220,8 @@ show` reports `workflowQueueRecoveryRequired: true` — a **separate** field fro
 `workflowPersistenceBroken`, which still means only "a prior process could not *write*". Do not run
 `mao config clear-persistence-broken` for this; it cannot describe or fix it.
 
-To recover:
+To recover (this is the **halted** case — see the late-corruption note below if the session is still
+running its real queue):
 
 1. Copy anything you still need out of the config file — confirming **discards** whatever it holds for
    the queue, and nothing reconstructs it.
@@ -249,11 +250,21 @@ readable between the halt and your confirmation. It is **not** a cross-process l
 *after* yours can still clobber it, which is the ordinary multi-process lost update every field in this
 single-blob config shares (issue #73). Do not run two recoveries at once and expect one to win cleanly.
 
-**A problem found after a clean start does not halt that session.** The latch is decided at boot, so if
-the file is corrupted while MAO is already running, the engine is still holding the queue it loaded and
-its next queue write rewrites the file from it. The sidebar says exactly that, in its own words rather
-than repeating the store's "automation is halted" report, which would be false there. Restarting before
-that write happens *will* refuse to start unattended work until the value is replaced.
+**A problem found after a clean start does not halt that session — and `confirm-queue-recovery` is the
+wrong tool for it.** The latch is decided at boot, so if the file is corrupted while MAO is already
+running, the engine is still holding the queue it loaded and its next queue write rewrites the file from
+it. The sidebar says exactly that, in its own words rather than repeating the store's "automation is
+halted" report, which would be false there.
+
+Do **not** reach for `mao workflow confirm-queue-recovery` in that state. It *discards*, and run in a
+separate process it writes **that** process's empty queue over the file — so the running session's real
+queue is lost the moment it restarts without having written. The sidebar instead offers **Save this
+session's queue now**, which persists the queue the running process is holding (`WorkflowEngine.persistQueue()`,
+gated like every other emitter so a *latched* process cannot use it to save its coerced empty list).
+With no GUI open, the safe equivalent is to let the running `mao run` reach its next queue write, or to
+stop it and then recover — not to discard from a second terminal while it is live.
+
+Restarting before any of that *will* refuse to start unattended work until the value is replaced.
 
 What the halt does **not** cover, so do not read it as more: a `config.json` that is not valid JSON at
 all is invisible to it (`FileStore.load()` catches the parse error and answers with schema defaults, so

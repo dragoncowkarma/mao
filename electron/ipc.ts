@@ -146,6 +146,11 @@ export function registerIpcHandlers() {
   // confirm-queue-recovery` cannot disagree about whether confirmation succeeded.
   ipcMain.handle('workflow:confirmQueueRecovery', () => confirmQueueRecovery())
 
+  // For a value that went unusable after a clean start: this process still holds the real queue, so one
+  // persist rewrites the file from it. Offered instead of the discard there, because a discard run in
+  // another process would replace the file with ITS empty queue and lose this one.
+  ipcMain.handle('workflow:resaveQueue', () => workflowEngine.persistQueue())
+
   ipcMain.handle('ui:getTheme', () => store.get('theme'))
 
   ipcMain.handle('ui:setTheme', (_event, theme: ThemePreference) => {

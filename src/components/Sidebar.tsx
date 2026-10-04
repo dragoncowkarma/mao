@@ -66,6 +66,14 @@ interface SidebarProps {
   queueStoredStillUnreadable: boolean
   /** Discards the unreadable stored queue and releases the engine. Rejects if the write fails. */
   onDiscardQueue: () => Promise<void>
+  /**
+   * Rewrites the stored queue from the one this session is holding.
+   *
+   * Offered only in the late case — the value went unusable after a clean start, so this session still
+   * has the real queue. A *discard* there would be wrong twice over: there is no latch to release, and
+   * run in another process it would put that process's empty queue in the file.
+   */
+  onResaveQueue: () => Promise<void>
   view: 'project' | 'global-settings'
   onViewChange: (view: 'project' | 'global-settings') => void
 }
@@ -80,6 +88,7 @@ export default function Sidebar({
   queueRecovery,
   queueStoredStillUnreadable,
   onDiscardQueue,
+  onResaveQueue,
   view,
   onViewChange,
 }: SidebarProps) {
@@ -94,6 +103,7 @@ export default function Sidebar({
   const [resetError, setResetError] = useState('')
   const [confirmingDiscard, setConfirmingDiscard] = useState(false)
   const [discarding, setDiscarding] = useState(false)
+  const [resaving, setResaving] = useState(false)
   const [queueError, setQueueError] = useState('')
 
   /**
@@ -122,6 +132,19 @@ export default function Sidebar({
    * (a clean boot, then corruption), so neither the card nor the generic report appeared at all.
    */
   const otherProblems = storeProblems.filter((problem) => problem.field !== 'workflowTasks' || !showQueueCard)
+
+  async function submitResave() {
+    if (resaving) return
+    setResaving(true)
+    setQueueError('')
+    try {
+      await onResaveQueue()
+    } catch (err) {
+      setQueueError(readableIpcError(err))
+    } finally {
+      setResaving(false)
+    }
+  }
 
   async function submitDiscard() {
     if (discarding) return
@@ -224,12 +247,21 @@ export default function Sidebar({
                  queue is empty, that MAO will not start unattended work, and that every queue write is
                  refused — all three false here. Rendering it beside "this session is not halted" gave the
                  operator two opposite instructions at once. The field and the file are what they need. */
-              <p className="text-muted text-[11px] leading-snug">
-                MAO cannot read the stored workflow queue in {queueStoredProblem?.source}. This session is
-                not halted — it is still holding the queue it loaded at startup, and its next queue write
-                will rewrite the file from that. Restarting before then will refuse to start unattended
-                work until the value is replaced, and `mao workflow confirm-queue-recovery` will discard it.
-              </p>
+              <>
+                <p className="text-muted text-[11px] leading-snug">
+                  MAO cannot read the stored workflow queue in {queueStoredProblem?.source}. This session
+                  is not halted — it is still holding the queue it loaded at startup, and its next queue
+                  write will rewrite the file from that. Restarting before that happens will refuse to
+                  start unattended work until the value is replaced.
+                </p>
+                {/* Deliberately NOT `mao workflow confirm-queue-recovery` here. That command discards, and
+                    run in a *separate* process it would write ITS empty queue over the file — so this
+                    session's real queue would be lost the moment it restarted without having written.
+                    Saving from this session writes the queue it is actually holding. */}
+                <button onClick={submitResave} className="btn btn-secondary self-start text-xs" disabled={resaving}>
+                  {resaving ? 'Saving…' : 'Save this session’s queue now'}
+                </button>
+              </>
             )}
             {queueRecovery.required && queueStoredStillUnreadable ? (
               confirmingDiscard ? (

@@ -240,15 +240,18 @@ the file immediately before it writes, and reports only what that established:
 | discarded the unreadable queue | the value was still unusable right before the write, and the write did not throw |
 | reads normally — nothing written | something else repaired the file first (a hand-edit, or the same command in another terminal). **Nothing is written**, because this process is still holding an empty queue and writing it would destroy that repair. Restart to load the real one |
 | nothing was written (could not read) | the config file could not be read at all, so whether the unusable value is still there is unknown. Refusing beats writing on a guess — fix the file or its permissions and retry |
+| the stored queue changed while confirming | the value moved between the check and the write, so the write refused and **nothing was written**. Something else is writing the file — re-check it and retry |
 | the replacement write failed | the attempt threw, so what reached the file is unknown. Inspect it before salvaging, then retry |
 
 None of those messages quotes the underlying error, because an I/O or parse failure can echo the file's
 own bytes and that file holds your GitHub token in plaintext.
 
-That pre-write check closes the interleaving that destroys data — another process making the queue
-readable between the halt and your confirmation. It is **not** a cross-process lock: a write that lands
-*after* yours can still clobber it, which is the ordinary multi-process lost update every field in this
-single-blob config shares (issue #73). Do not run two recoveries at once and expect one to win cleanly.
+That check **narrows** the window; it does not close it. The comparison and the write are one
+synchronous step, so against anything else in the same process they are atomic — but another OS process
+repairing the file inside that step, or writing *after* it, still wins or still loses depending on
+timing, and the command will say `discarded` either way. That is the ordinary multi-process lost update
+every field in this single-blob config shares (issue #73). So: do not run two recoveries at once, and do
+not hand-edit the file while a recovery is running, and expect a clean winner.
 
 **A problem found after a clean start does not halt that session — and `confirm-queue-recovery` is the
 wrong tool for it.** The latch is decided at boot, so if the file is corrupted while MAO is already
@@ -267,8 +270,10 @@ stop it and then recover — not to discard from a second terminal while it is l
 Restarting before any of that *will* refuse to start unattended work until the value is replaced.
 
 What the halt does **not** cover, so do not read it as more: a `config.json` that is not valid JSON at
-all is invisible to it (`FileStore.load()` catches the parse error and answers with schema defaults, so
-nothing is reported and nothing latches — issue #67); element-level garbage such as
+all **does** now latch the queue, because the boot observation goes through `inspect()` → `getFresh()` →
+`loadStrict()`, which throws on a file that exists and cannot be parsed — so it arrives as unreadable and
+halts. Every *other* field still reads as its schema default, because the constructor keeps the
+swallowing `load()`, so issue #67 is narrower than it was rather than closed; element-level garbage such as
 `{"workflowTasks": [null]}` passes the container check and then throws inside `restore()` (issue #75);
 and `mao swarm` reads none of this, so "the queue is latched" never means "this host performs no
 unattended GitHub writes".

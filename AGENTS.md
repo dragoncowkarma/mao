@@ -504,11 +504,14 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   earlier revision observed the queue "immediately before" an unconditional `store.set` and claimed that
   closed the destructive interleaving. It did not: `'already-readable'` only catches a repair that finished
   *before* the observation, so a repair landing between the observation and the write was still destroyed
-  and still reported as success. `MaoStore.setIfUnchanged()` is what closes it — the write is keyed on the
-  raw value the observation saw, and answers `'superseded'` without writing if it moved. Replacing one
+  and still reported as success. `MaoStore.setIfUnchanged()` is what *narrows* it — the write is keyed on
+  the raw value the observation saw, and answers `'superseded'` without writing if it moved. Replacing one
   unusable value with another loses nothing, because neither could be restored.
-  What that still does **not** close is a write landing *after* this one and clobbering it — the ordinary
-  multi-process lost update every field in this single-blob file shares (issue #73). A real cross-process
+  It does **not** close the race, and must not be described as doing so. Two residues remain, both real
+  and both pinned as tests: a repair landing inside the compare → `writeFileSync` interval is still
+  overwritten and still reported `'written'` (the pair is atomic only against callers *in this process*),
+  and so is a write landing *after* this one. Both are the multi-process lost update every field in this
+  single-blob file shares (issue #73). A real cross-process
   postcondition needs a primitive neither backend has (an advisory lock, or `O_EXCL` + rename keyed on a
   stored version with a retry loop); a `version` token on `MaoStore` would not be one either, since
   read-compare-write still leaves a window before the write lands. So keep the word *atomic* out of the

@@ -448,12 +448,13 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   `queueRecoveryReason` / `isQueueRecoveryLatched()` and nothing else. `confirmQueueRecovery()` is the one
   reader that takes a fresh observation, immediately before its write. Do **not** add a per-gate probe:
   each observation is a whole-config read and parse on conf, the gates sit on operator actions and the
-  queue-write path, and a transient read failure there would latch a healthy host. This is not style:
-  `confirmQueueRecovery()`
-  clears the field and *then* notifies, because that one emit **is** the write that replaces the
-  unreadable value — a backstop that re-inspected the store at that moment would see the still-dirty file,
-  re-latch inside the healing emit, and refuse the only write that can ever clear the latch, deadlocking
-  both recovery routes permanently. The backstop is also a **silent return, never a throw**: `notifyAfterStage`
+  queue-write path, and a transient read failure there would latch a healthy host. (An earlier revision
+  justified the field-only rule by a *healing emit* — `confirmQueueRecovery()` clearing the field and then
+  notifying, so the write went through the listener. That is no longer how it works: the recovery writes
+  conditionally through `store.setIfUnchanged` and clears the latch afterwards, so there is no emit to
+  re-latch inside. The two reasons above are the ones that survive, and a deadlock of that shape is now
+  impossible by construction rather than merely ordered around.)
+  The backstop is also a **silent return, never a throw**: `notifyAfterStage`
   reads a throwing `'change'` listener as a persistence failure and would escalate this read-shape halt
   into a bogus `persistenceBroken`. For the same reason `notify()` itself is deliberately not a gate —
   gate its callers. And the latch is decided **once at boot**: a corruption appearing after a *clean* boot
@@ -486,14 +487,17 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   composition root, and still nothing outside it: no shell, and no other `core/` module, writes the field.
 - **`confirmQueueRecovery()` lives on `MaoApp`, owns its own postcondition, and writes conditionally.** It
   returns a typed `QueueRecoveryOutcome` so the CLI command and the GUI button cannot disagree about whether
-  confirmation worked — a bare boolean had the CLI re-deriving success while the GUI reported it. Four
-  kinds, each saying only what was established: `'replaced'` (still unusable immediately before the
-  write, and the write did not throw), `'already-readable'` (readable again, so **nothing is written** —
+  confirmation worked — a bare boolean had the CLI re-deriving success while the GUI reported it. **Five**
+  kinds, each saying only what was established: `'replaced'` (still unusable at the conditional write's
+  compare, and the write did not throw), `'already-readable'` (readable again, so **nothing is written** —
   the latch is monotone, so after a repair made outside this process the store reads clean while this
   process still holds the coerced empty queue, and persisting it would overwrite that repair with exactly
-  the loss the latch exists to prevent; the operator has to restart), `'unverified'` (the store could not
-  be read, so nothing is written rather than written on a guess) and `'write-failed'` (the attempt threw,
-  so what reached the file is unknown and the halt stands). None interpolates the backend's error text:
+  the loss the latch exists to prevent; the operator has to restart), `'superseded'` (the value moved
+  between the observation and the compare, so the write refused and nothing was written),
+  `'unverified'` (the store could not be read or compared, so nothing is written rather than written on a
+  guess) and `'write-failed'` (the attempt threw, so what reached the file is unknown and the halt
+  stands). The write itself goes through `store.setIfUnchanged`, and the latch is cleared **after** it is
+  confirmed — not before, and not through an emit. None interpolates the backend's error text:
   an I/O or parse failure can quote the file's own bytes and that file holds `githubToken` in plaintext,
   so the reasons come from a closed set.
 - **Observing before writing is not the same as writing conditionally, and only the second is safe.** An
@@ -511,8 +515,12 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   comments, the operator-facing text and the member names — `inspect` and `setIfUnchanged` say exactly
   what they do, and `MaoStore.setIfUnchanged`'s doc states the limit where a reader will meet it.
 - **What the halt does *not* cover, so it is not read as more than it is.** A `config.json` that is not
-  valid JSON at all is invisible: `FileStore.load()` catches the parse error and answers `{}`, so every
-  field reads as its schema default, nothing is reported and no latch arms (issue #67). Element-level
+  valid JSON at all no longer slips past the *queue* latch, and that changed with the fresh read: the boot
+  observation goes through `inspect()` → `getFresh()` → `loadStrict()`, which throws on a file that exists
+  and cannot be parsed, so it arrives as `readable: false` and latches. Every **other** field still reads
+  as its schema default, because the constructor keeps the swallowing `load()` — issue #67 is therefore
+  narrower than it was, not closed, and it is still the tracking issue for the rest of the schema.
+  Element-level
   validity is out of scope exactly as for `githubRepos` — `workflowTasks: [null]` passes `Array.isArray`
   and then throws inside `restore()` (issue #75). And `mao swarm` reads none of this: it is a separate
   Python engine with a separate credential, so "the queue is latched" must never be read as "this host

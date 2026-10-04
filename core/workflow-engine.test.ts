@@ -1273,32 +1273,9 @@ describe('WorkflowEngine queue-recovery latch', () => {
   // hold (architecture rule 3). Its tests live in core/app.test.ts beside the boot path; what stays here
   // is the latch itself and the gates.
 
-  it('refuses persistQueue, because a latched queue is the coerced empty one', () => {
-    // persistQueue() exists for the opposite case — a process holding the REAL queue rewriting a file that
-    // went unusable after a clean start. A *latched* process holds the guard's empty list instead, so
-    // letting it persist would put `[]` over the file's contents: the exact loss the latch prevents. The
-    // gate is what keeps the safe recovery from doubling as a destructive one.
-    const { engine } = latchedEngine()
-    const changes = vi.fn()
-    engine.on('change', changes)
-
-    expect(() => engine.persistQueue()).toThrow(REASON)
-    expect(changes).not.toHaveBeenCalled()
-  })
-
-  it('persistQueue rewrites the file from an unlatched engine, emitting exactly one change', () => {
-    const github = makeFakeGithub()
-    const engine = new WorkflowEngine(github)
-    engine.restore([makePendingQueueTask('real')])
-    const changes = vi.fn()
-    engine.on('change', changes)
-
-    engine.persistQueue()
-
-    expect(changes).toHaveBeenCalledTimes(1)
-    // The queue itself is untouched — this persists what the process already holds.
-    expect(engine.getTasks().map((t) => t.id)).toEqual(['real'])
-  })
+  // `persistQueue()` is gone: the re-save it existed for now goes through `createMaoApp`'s
+  // `resaveStoredQueue()`, because that write has to be conditional on the stored value and `emit()`
+  // cannot report a refusal back. Its tests moved to core/app.test.ts with it.
 
   it('leaves a healthy engine completely alone', () => {
     const github = makeFakeGithub()

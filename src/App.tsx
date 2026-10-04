@@ -517,12 +517,32 @@ export default function App() {
 
   /**
    * Rewrites the stored queue from the one this session holds, for a value that went unusable after a
-   * clean start. Safe precisely because it is *this* process doing it: the queue it writes is the real
-   * one. Refreshes both reads afterwards so the card clears.
+   * clean start.
+   *
+   * The card it is clicked from is up to one poll interval stale, so the decision cannot be made here:
+   * core observes the store fresh and writes conditionally. Every non-success outcome is surfaced by
+   * throwing, because Sidebar's catch is what puts a message on screen — `already-readable` in
+   * particular means something else repaired the file first and **nothing was written**, which the
+   * operator has to be told rather than left assuming their click saved anything.
    */
   async function resaveStoredQueue() {
     try {
-      await electronApi().workflow.resaveQueue()
+      const outcome = await electronApi().workflow.resaveQueue()
+      if (outcome.kind === 'already-readable') {
+        throw new Error('The stored queue reads normally again — nothing was written.')
+      }
+      if (outcome.kind === 'superseded') {
+        throw new Error(
+          'The stored queue changed while saving, so nothing was written. Something else is writing the ' +
+            'config file — re-check it and try again.',
+        )
+      }
+      if (outcome.kind === 'unverified') throw new Error(outcome.reason)
+      if (outcome.kind === 'write-failed') {
+        throw new Error(
+          'The save failed, so what reached the config file is unknown. Inspect it, then try again.',
+        )
+      }
     } finally {
       await refreshStoreProblems()
       await refreshQueueRecovery()

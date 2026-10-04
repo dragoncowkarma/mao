@@ -56,8 +56,8 @@ declare global {
         recoveryRequired: () => Promise<QueueRecoveryState>
         /** Discards an unreadable stored queue and releases the engine. Core decides the outcome. */
         confirmQueueRecovery: () => Promise<QueueRecoveryOutcome>
-        /** Rewrites the stored queue from the one this process is holding. See WorkflowEngine.persistQueue. */
-        resaveQueue: () => Promise<void>
+        /** Rewrites the stored queue from the one this process holds, conditionally. See MaoApp.resaveStoredQueue. */
+        resaveQueue: () => Promise<QueueRecoveryOutcome>
       }
       ui: {
         getTheme: () => Promise<ThemePreference>

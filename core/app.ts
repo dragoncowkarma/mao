@@ -47,6 +47,12 @@ export interface MaoApp {
    */
   confirmQueueRecovery: () => QueueRecoveryOutcome
   /**
+   * Rewrites an unusable stored queue from the one this session holds, for a value that went unusable
+   * after a clean start. Same conditional write as `confirmQueueRecovery()`, and refuses while halted —
+   * see the implementation for why sharing that sequence is the point.
+   */
+  resaveStoredQueue: () => QueueRecoveryOutcome
+  /**
    * The only supported way to change the tracked-repository list. Reads, preflights and writes as one
    * serialized unit (see core/repo-registry.ts) — writing `githubRepos` through `store` directly
    * reopens the late-write race that lets a slow registration resurrect a removed repository.
@@ -122,9 +128,11 @@ export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOp
   workflowEngine.on('change', (tasks: QueuedTask[]) => {
     // Last-resort backstop, and a SILENT return rather than a throw: notifyAfterStage() reads a throwing
     // `'change'` listener as a persistence failure and would escalate this read-shape halt into a bogus
-    // persistenceBroken. Reads the field only — never the store — because confirmQueueRecovery() clears
-    // the field and then notifies, and that one emit IS the write that replaces the unreadable value; a
-    // backstop that re-inspected the store here would re-latch inside it and deadlock the only way out.
+    // persistenceBroken. Reads the field only — never the store — for the two reasons that survive: each
+    // observation is a whole-config read and parse on conf, and this sits on the queue-write path; and a
+    // transient read failure here would latch a healthy host. (It is NOT justified by a healing emit any
+    // more: the recovery writes conditionally through `store.setIfUnchanged` and clears the latch
+    // afterwards, so there is no emit for a store-reading backstop to deadlock inside.)
     // Every public mutator already asserts the latch, so reaching this is a bug in a future emitter; it
     // exists so such a bug costs a missing persist instead of the operator's last copy.
     if (workflowEngine.isQueueRecoveryLatched()) return
@@ -158,30 +166,33 @@ export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOp
   workflowEngine.restore(observedQueue.value, { resume: safeToResume })
 
   /**
-   * Observe, then write **only if nothing moved**, then release the halt.
+   * Replace an unusable stored queue with the one this process is holding — observed fresh, written only
+   * if nothing moved, and never on a state that could not be established.
    *
-   * Every step is ordered for a failure that was actually reproduced:
+   * The single implementation behind both operator actions, because they are the same write with
+   * different preconditions: a halted session's queue is the guard's empty list (so this is a *discard*,
+   * and needs explicit confirmation), while a session that booted clean still holds the real queue (so
+   * this is a *repair*, and is safe to offer directly). Sharing the sequence is what stops one of them
+   * drifting into an unconditional write — which is exactly what happened to the re-save when it was
+   * built separately on `WorkflowEngine.persistQueue()`: it emitted the in-memory queue with no fresh
+   * observation at all, so an external repair landing after the 30s poll and before the click was
+   * overwritten by a stale queue.
    *
-   * 1. Observe once. A store that cannot be read answers `'unverified'` and writes nothing — a transient
-   *    failure, or a repair this process cannot see, must not be overwritten on a guess.
-   * 2. Already readable? Write nothing. Something healed the file while this process stayed halted (the
-   *    latch is monotone), and this process is still holding the coerced empty queue, so writing it would
-   *    destroy that repair. The operator restarts to load the real one.
-   * 3. Write **conditionally**, keyed on the value just observed. This is the step that makes step 2
-   *    mean something: observing immediately before an unconditional write still loses a repair that
-   *    lands in between, which is exactly what review found here. `'superseded'` writes nothing.
-   *    Its limit is stated where it is implemented (`MaoStore.setIfUnchanged`) and is real: the compare
-   *    and the write are atomic against other callers *in this process*, not against another OS process,
-   *    which can still repair the value between them. That residue is issue #73.
-   * 4. Release the halt only after a confirmed write. Clearing first and writing after would leave a
-   *    released engine over a queue that was never replaced.
+   * Step order, each step for a failure that was reproduced:
    *
-   * Not a cross-process lock, and not described as one: see `MaoStore.setIfUnchanged` for exactly what
-   * `'written'` does and does not establish (issue #73).
+   * 1. Observe once, fresh. A store that cannot be read answers `'unverified'` and writes nothing — a
+   *    transient failure, or a repair this process cannot see, must not be overwritten on a guess.
+   * 2. Already readable? Write nothing. Something healed the file; writing would replace it with this
+   *    process's queue, which for a halted session is the empty list and for a clean one may be stale.
+   * 3. Write **conditionally**, keyed on the value just observed. Observing before an unconditional
+   *    write still loses a repair landing in between. `'superseded'` writes nothing.
+   * 4. Release the halt only after a confirmed write, and only if it was held.
+   *
+   * Its limit is stated where it is implemented (`MaoStore.setIfUnchanged`) and is real: the compare and
+   * the write are atomic against other callers *in this process*, not against another OS process, which
+   * can still repair the value between them. That residue is issue #73.
    */
-  function confirmQueueRecovery(): QueueRecoveryOutcome {
-    if (!workflowEngine.isQueueRecoveryLatched()) return { kind: 'already-readable' }
-
+  function healStoredQueue(): QueueRecoveryOutcome {
     const observed = observeStoredQueue(store)
     if (!observed.readable) {
       return { kind: 'unverified', reason: observed.problem ?? describeUninspectableStore(QUEUE_GATING_FIELD, 'the config file') }
@@ -190,11 +201,9 @@ export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOp
 
     let written
     try {
-      // The engine's own queue — at a latched boot the coerced empty one, i.e. exactly what every reader
-      // in this process has been operating on.
       written = store.setIfUnchanged(QUEUE_GATING_FIELD, observed.witness, workflowEngine.getTasks())
     } catch {
-      // What reached the file is unknown, so the halt stands. The backend's error text is deliberately
+      // What reached the file is unknown, so any halt stands. The backend's error text is deliberately
       // not carried: it can quote a file that holds the GitHub token in plaintext.
       return { kind: 'write-failed' }
     }
@@ -203,8 +212,32 @@ export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOp
       return { kind: 'unverified', reason: describeUninspectableStore(QUEUE_GATING_FIELD, 'the config file') }
     }
 
-    workflowEngine.clearQueueRecovery()
+    if (workflowEngine.isQueueRecoveryLatched()) workflowEngine.clearQueueRecovery()
     return { kind: 'replaced' }
+  }
+
+  /**
+   * Discards an unreadable stored queue and releases the halt. Only meaningful while halted — the queue
+   * it writes is then the guard's empty list, which is why this needs the operator's confirmation.
+   */
+  function confirmQueueRecovery(): QueueRecoveryOutcome {
+    if (!workflowEngine.isQueueRecoveryLatched()) return { kind: 'already-readable' }
+    return healStoredQueue()
+  }
+
+  /**
+   * Rewrites an unusable stored queue from the real one this session is holding, for a value that went
+   * unusable *after* a clean start.
+   *
+   * Refuses while halted, and that refusal is load-bearing rather than defensive: a halted session's
+   * queue is the coerced empty list, so letting this run would make it a silent discard with none of the
+   * confirmation `confirmQueueRecovery()` requires.
+   */
+  function resaveStoredQueue(): QueueRecoveryOutcome {
+    if (workflowEngine.isQueueRecoveryLatched()) {
+      return { kind: 'unverified', reason: describeUninspectableStore(QUEUE_GATING_FIELD, 'the config file') }
+    }
+    return healStoredQueue()
   }
 
   return {
@@ -213,5 +246,6 @@ export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOp
     store,
     updateRepos: createRepoRegistrar(githubService, store),
     confirmQueueRecovery,
+    resaveStoredQueue,
   }
 }

@@ -6,6 +6,7 @@ import App from './App'
 import { createElectronApiStub } from './test/electron-api-stub'
 import type { RepoRef } from '../core/workflow-engine'
 import type { StoredValueProblem } from '../core/store'
+import type { QueueRecoveryOutcome } from '../core/workflow-engine'
 
 const ONE: RepoRef = { owner: 'acme', repo: 'one' }
 const TWO: RepoRef = { owner: 'acme', repo: 'two' }
@@ -55,6 +56,19 @@ const UNUSABLE_PROVIDERS: StoredValueProblem = {
  * the halt wording because that is what the engine's latch holds verbatim — the operator reads the same
  * paragraph here, in `mao run`'s refusal, and in every refused queue action.
  */
+/**
+ * The same problem, used for the *late* case — a clean start followed by corruption.
+ *
+ * The stub derives the latch from whether a `workflowTasks` problem was seeded at construction, so a
+ * late-case test cannot use `UNUSABLE_QUEUE` directly: it would arrive latched. This one is injected
+ * after mount through `storeProblems`, which is exactly how the 30s poll surfaces it in production.
+ */
+const UNUSABLE_QUEUE_LATE: StoredValueProblem = {
+  field: 'workflowTasks',
+  source: '/data/config.json',
+  message: '[store] "workflowTasks" in /data/config.json is an object, not a JSON array.',
+}
+
 const UNUSABLE_QUEUE: StoredValueProblem = {
   field: 'workflowTasks',
   source: '/data/config.json',
@@ -1070,6 +1084,43 @@ describe('App halted workflow queue', () => {
     // harmless either way — `confirmQueueRecovery()` re-probes and writes nothing if the value is gone.
     expect(await screen.findByRole('button', { name: 'Discard unreadable queue' })).toBeInTheDocument()
     expect(screen.queryByText(/Restart MAO to load it/)).toBeNull()
+  })
+
+  /**
+   * Mounts the late case: a `workflowTasks` problem on disk while the engine is **not** latched.
+   *
+   * Built by hand because the stub derives the latch from the problems it is constructed with, so
+   * seeding the problem through `renderApp` would boot halted and render the other branch. Overriding
+   * `recoveryRequired` is what production looks like after a clean start — the latch is a boot decision,
+   * the problem arrives later on the poll.
+   */
+  async function renderLateCorruption(outcome: QueueRecoveryOutcome) {
+    const user = userEvent.setup()
+    const stub = createElectronApiStub([], [UNUSABLE_QUEUE_LATE])
+    stub.recoveryRequired.mockResolvedValue({ required: false, reason: undefined })
+    stub.resaveQueue.mockResolvedValue(outcome)
+    render(
+      <StrictMode>
+        <App />
+      </StrictMode>,
+    )
+    await user.click(await screen.findByRole('button', { name: /Save this session/ }))
+    return { stub }
+  }
+
+  it('says so when a late re-save wrote nothing because something else repaired the file', async () => {
+    // The click comes from a card up to one poll interval stale, so "nothing was written" is a real and
+    // likely outcome — core refuses rather than overwriting a repair it can see. Swallowing that here
+    // would leave the operator believing their save landed.
+    await renderLateCorruption({ kind: 'already-readable' })
+
+    expect(await screen.findByText(/nothing was written/)).toBeInTheDocument()
+  })
+
+  it('says so when a late re-save was refused because the value moved', async () => {
+    await renderLateCorruption({ kind: 'superseded' })
+
+    expect(await screen.findByText(/changed while saving/)).toBeInTheDocument()
   })
 
   it('says nothing about the queue when the store is healthy', async () => {

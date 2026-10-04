@@ -216,7 +216,9 @@ describe('createMaoApp with an unreadable stored queue', () => {
       resume: true,
     })
     // Force the listener directly — this is what a future ungated emitter would do. The backstop must
-    // swallow it silently rather than persist, and must not escalate to a persistence failure.
+    // swallow it silently rather than persist, and must not escalate to a persistence failure. (It is no
+    // longer the recovery's own write path: that goes through `store.setIfUnchanged`, so there is no
+    // healing emit here to protect.)
     workflowEngine.emit('change', [makePendingTask('sneaky')])
 
     expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).workflowTasks).toEqual(corruptQueue)
@@ -603,5 +605,114 @@ describe('MaoApp.confirmQueueRecovery', () => {
 
     expect(app.confirmQueueRecovery()).toEqual({ kind: 'already-readable' })
     expect(racing.writes).toEqual([])
+  })
+})
+
+/**
+ * `MaoApp.resaveStoredQueue()` — the late-corruption repair, and the stale-observation bug it had.
+ *
+ * Built separately on `WorkflowEngine.persistQueue()`, it emitted the in-memory queue with no fresh
+ * observation at all. So: boot clean holding Q, the file goes unusable, the 30s poll shows the card, an
+ * external repair writes a good queue Q2, the operator clicks — and Q overwrote Q2. That window is wider
+ * than the compare→write residue, because it opens even when the repair finishes entirely before the
+ * handler starts. It now shares `confirmQueueRecovery()`'s conditional sequence.
+ */
+describe('MaoApp.resaveStoredQueue', () => {
+  const corrupt = { 'task-1': { id: 'task-1' } }
+
+  /** A store that boots with a readable queue and can then be changed from "outside". */
+  function externalStore(initial: unknown) {
+    const data: Record<string, unknown> = { workflowTasks: initial }
+    const writes: unknown[] = []
+    const store = createGuardedStore(
+      {
+        get: <K extends keyof MaoStoreSchema>(key: K) => data[key] as MaoStoreSchema[K] | undefined,
+        getFresh: <K extends keyof MaoStoreSchema>(key: K) => data[key] as MaoStoreSchema[K] | undefined,
+        set: <K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]) => {
+          data[key] = value
+          if (key === 'workflowTasks') writes.push(value)
+        },
+      },
+      '/tmp/config.json',
+    )
+    return { store, data, writes }
+  }
+
+  function bootClean() {
+    const external = externalStore([makePendingTask('real')])
+    const { dataDir } = makeRealDataDir()
+    const app = createMaoApp({
+      store: external.store,
+      workspaceRoot: path.join(dataDir, 'workspaces'),
+      dataDir,
+      resume: false,
+    })
+    return { ...external, app }
+  }
+
+  it('writes nothing when something else repaired the file before the click', () => {
+    // The finding. The session is holding Q, the card was raised by a stale poll, and the file now holds
+    // a different, perfectly good queue. Writing Q over it is the loss this whole feature exists to stop.
+    captureWarnings()
+    const booted = bootClean()
+    expect(booted.app.workflowEngine.getTasks().map((t) => t.id)).toEqual(['real'])
+
+    // The file goes unusable, then an external repair lands before the operator clicks.
+    booted.data.workflowTasks = corrupt
+    booted.data.workflowTasks = [makePendingTask('repaired-elsewhere')]
+
+    const outcome = booted.app.resaveStoredQueue()
+
+    expect(outcome).toEqual({ kind: 'already-readable' })
+    expect(booted.writes).toEqual([])
+    expect(booted.data.workflowTasks).toEqual([makePendingTask('repaired-elsewhere')])
+  })
+
+  it('rewrites the file from this session\'s queue while the value is still unusable', () => {
+    captureWarnings()
+    const booted = bootClean()
+    booted.data.workflowTasks = corrupt
+
+    const outcome = booted.app.resaveStoredQueue()
+
+    expect(outcome).toEqual({ kind: 'replaced' })
+    // The REAL queue, not an empty list — that is the whole difference from the discard.
+    expect(booted.data.workflowTasks).toEqual([makePendingTask('real')])
+    expect(booted.writes).toHaveLength(1)
+  })
+
+  it('refuses while the session is halted, so it cannot become a silent discard', () => {
+    // A halted session's queue is the guard's empty list. Letting the repair path run there would write
+    // `[]` over the file with none of the confirmation the discard requires.
+    captureWarnings()
+    const { dataDir, store } = makeRealDataDirHolding({ workflowTasks: corrupt })
+    const app = createMaoApp({ store, workspaceRoot: path.join(dataDir, 'workspaces'), dataDir, resume: false })
+    const set = vi.spyOn(store, 'setIfUnchanged')
+
+    expect(app.workflowEngine.isQueueRecoveryLatched()).toBe(true)
+    expect(app.resaveStoredQueue().kind).toBe('unverified')
+    expect(set).not.toHaveBeenCalled()
+  })
+
+  it('writes nothing when the store cannot be read', () => {
+    captureWarnings()
+    const booted = bootClean()
+    booted.data.workflowTasks = corrupt
+    vi.spyOn(booted.store, 'inspect').mockImplementation(() => {
+      throw new Error('EACCES: permission denied')
+    })
+
+    const outcome = booted.app.resaveStoredQueue()
+
+    expect(outcome.kind).toBe('unverified')
+    expect(booted.writes).toEqual([])
+    expect(outcome.kind === 'unverified' && outcome.reason).not.toContain('EACCES')
+  })
+
+  it('is a no-op on a healthy store', () => {
+    const booted = bootClean()
+
+    expect(booted.app.resaveStoredQueue()).toEqual({ kind: 'already-readable' })
+    expect(booted.writes).toEqual([])
   })
 })

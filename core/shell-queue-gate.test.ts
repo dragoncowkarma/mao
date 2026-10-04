@@ -91,8 +91,18 @@ describe('electron/ipc.ts exposes the latch and its way out', () => {
     expect(source).toMatch(
       /ipcMain\.handle\('workflow:confirmQueueRecovery',\s*\(\)\s*=>\s*confirmQueueRecovery\(\)\)/,
     )
-    // And it comes off the app, so no shell re-derives it.
-    expect(source).toMatch(/confirmQueueRecovery\s*\}\s*=\s*createMaoApp\(/)
+    // And both come off the app, so no shell re-derives them.
+    expect(source).toMatch(/confirmQueueRecovery[\s,]/)
+    expect(source).toMatch(/resaveStoredQueue[\s,]*\}\s*=\s*createMaoApp\(/)
     expect(source).not.toContain('workflowEngine.confirmQueueRecovery')
+  })
+
+  it('delegates the late-corruption re-save to core too, not to the engine', () => {
+    // The renderer's card is up to one poll interval stale, so the decision cannot be made in a shell:
+    // core observes the store fresh and writes conditionally. An earlier revision called
+    // `workflowEngine.persistQueue()` straight from here, which emitted the in-memory queue with no
+    // observation at all and overwrote a repair that had landed after the last poll.
+    expect(source).toMatch(/ipcMain\.handle\('workflow:resaveQueue',\s*\(\)\s*=>\s*resaveStoredQueue\(\)\)/)
+    expect(source).not.toContain('persistQueue')
   })
 })

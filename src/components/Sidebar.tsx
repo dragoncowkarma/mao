@@ -299,11 +299,25 @@ export default function Sidebar({
                 halted because it is holding an empty queue.
               </p>
             ) : null}
-            {queueError && (
-              <p className="text-xs" style={{ color: 'var(--color-accent-700)' }}>
-                {queueError}
-              </p>
-            )}
+          </div>
+        )}
+
+        {/* The result of a queue action lives OUTSIDE the card above, and that placement is the fix for a
+            bug rather than a layout preference. These messages are about an action that has finished,
+            while the card is about a condition that currently holds — and the two most important
+            messages say the condition is *gone*. `already-readable` means the fresh observation found the
+            file repaired, so the refresh that follows removes the problem, the card unmounts, and an error
+            rendered inside it vanished with the thing it was reporting on. The operator saw a click that
+            did nothing. Dismissed explicitly so it cannot be missed either. */}
+        {queueError && (
+          <div className="card mb-2 gap-1.5 p-2">
+            <p className="card-title text-[13px]">Workflow queue</p>
+            <p className="text-xs" style={{ color: 'var(--color-accent-700)' }}>
+              {queueError}
+            </p>
+            <button onClick={() => setQueueError('')} className="btn btn-secondary self-start text-xs">
+              Dismiss
+            </button>
           </div>
         )}
 

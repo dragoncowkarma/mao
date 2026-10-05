@@ -1,5 +1,5 @@
 import { StrictMode } from 'react'
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 import App from './App'
@@ -1094,7 +1094,7 @@ describe('App halted workflow queue', () => {
    * `recoveryRequired` is what production looks like after a clean start — the latch is a boot decision,
    * the problem arrives later on the poll.
    */
-  async function renderLateCorruption(outcome: QueueRecoveryOutcome) {
+  async function renderLateCorruption(outcome: QueueRecoveryOutcome, { healsAfter = false } = {}) {
     const user = userEvent.setup()
     const stub = createElectronApiStub([], [UNUSABLE_QUEUE_LATE])
     stub.recoveryRequired.mockResolvedValue({ required: false, reason: undefined })
@@ -1104,24 +1104,56 @@ describe('App halted workflow queue', () => {
         <App />
       </StrictMode>,
     )
-    await user.click(await screen.findByRole('button', { name: /Save this session/ }))
+    const button = await screen.findByRole('button', { name: /Save this session/ })
+    // `healsAfter` models what actually happens for `already-readable`: the outcome says the fresh
+    // observation found the file repaired, so the refresh that follows the action REMOVES the problem.
+    // Without this the stub keeps answering a stale problem and the card never unmounts — which is how
+    // the first version of these tests passed against a renderer that lost the message.
+    if (healsAfter) stub.storeProblems.mockResolvedValue([])
+    await user.click(button)
     return { stub }
   }
 
-  it('says so when a late re-save wrote nothing because something else repaired the file', async () => {
-    // The click comes from a card up to one poll interval stale, so "nothing was written" is a real and
-    // likely outcome — core refuses rather than overwriting a repair it can see. Swallowing that here
-    // would leave the operator believing their save landed.
-    await renderLateCorruption({ kind: 'already-readable' })
+  it('keeps the “nothing was written” message after the problem it reported on disappears', async () => {
+    // The ordering bug, and the reason the message cannot live inside the queue card. `already-readable`
+    // means the file is genuinely repaired, so the refresh in the action's `finally` empties the problem
+    // list, the card unmounts, and a message rendered inside it goes with it — leaving a click that
+    // appears to have done nothing. The message has to outlive the condition it is reporting on.
+    await renderLateCorruption({ kind: 'already-readable' }, { healsAfter: true })
 
     expect(await screen.findByText(/nothing was written/)).toBeInTheDocument()
+    // The card really is gone — this is not passing because the problem lingered.
+    await waitFor(() => expect(screen.queryByRole('button', { name: /Save this session/ })).toBeNull())
+    expect(screen.getByText(/nothing was written/)).toBeInTheDocument()
   })
 
-  it('says so when a late re-save was refused because the value moved', async () => {
-    await renderLateCorruption({ kind: 'superseded' })
+  it('keeps every other non-success result too, with the problem list emptied', async () => {
+    // Same ordering for the rest: a store that heals (or is read as healed) between the action and the
+    // refresh must not take the explanation down with it.
+    const cases: Array<[QueueRecoveryOutcome, RegExp]> = [
+      [{ kind: 'superseded' }, /changed while saving/],
+      [{ kind: 'unverified', reason: 'could not read the config file' }, /could not read the config file/],
+      [{ kind: 'write-failed' }, /what reached the config file is unknown/],
+    ]
 
-    expect(await screen.findByText(/changed while saving/)).toBeInTheDocument()
+    for (const [outcome, expected] of cases) {
+      cleanup()
+      await renderLateCorruption(outcome, { healsAfter: true })
+      expect(await screen.findByText(expected), String(expected)).toBeInTheDocument()
+    }
   })
+
+  it('lets the operator dismiss the result', async () => {
+    const user = userEvent.setup()
+    await renderLateCorruption({ kind: 'already-readable' }, { healsAfter: true })
+    await screen.findByText(/nothing was written/)
+
+    await user.click(screen.getByRole('button', { name: 'Dismiss' }))
+
+    expect(screen.queryByText(/nothing was written/)).toBeNull()
+  })
+
+
 
   it('says nothing about the queue when the store is healthy', async () => {
     await renderApp([ONE])

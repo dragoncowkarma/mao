@@ -423,8 +423,10 @@ describe('core/app.ts and the engine, as source order', () => {
   })
 
   it('reads the field, not the store, in the change backstop', () => {
-    // The deadlock: confirmQueueRecovery() clears the field and then notifies, because that emit IS the
-    // healing write — a backstop that re-inspected the store there would re-latch inside it.
+    // Two reasons, neither of them a healing emit — there is no longer one, because `healStoredQueue()`
+    // writes through `store.setIfUnchanged` and clears the latch afterwards. What survives: each
+    // observation is a whole-config read and parse on conf, and this sits on the queue-write path; and a
+    // transient read failure here would latch a healthy host for the rest of its life.
     const listener = appSource.slice(appSource.indexOf("workflowEngine.on('change'"))
     const body = listener.slice(0, listener.indexOf('})') + 2)
 

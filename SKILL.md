@@ -262,8 +262,12 @@ halted" report, which would be false there.
 Do **not** reach for `mao workflow confirm-queue-recovery` in that state. It *discards*, and run in a
 separate process it writes **that** process's empty queue over the file — so the running session's real
 queue is lost the moment it restarts without having written. The sidebar instead offers **Save this
-session's queue now**, which persists the queue the running process is holding (`WorkflowEngine.persistQueue()`,
-gated like every other emitter so a *latched* process cannot use it to save its coerced empty list).
+session's queue now**, which rewrites the file from the queue the running process is holding
+(`MaoApp.resaveStoredQueue()`). It is the *same* conditional write the discard uses — observe the store
+fresh, write only if the value has not moved, report what was established — and it refuses while that
+session is halted, because a halted session's queue is the coerced empty list and saving it would make
+this a silent discard. So it can also answer "nothing was written": if something repaired the file first,
+you are told rather than left assuming the click saved anything.
 With no GUI open, the safe equivalent is to let the running `mao run` reach its next queue write, or to
 stop it and then recover — not to discard from a second terminal while it is live.
 

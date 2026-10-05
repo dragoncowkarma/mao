@@ -443,10 +443,11 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   records a confirmed *write* failure, so `mao config show` would answer `workflowPersistenceBroken: true`
   while persistence is fine, and it is sticky and operator-gated where this heals itself. The two are
   reported as separate fields.
-- **Only `confirmQueueRecovery()` observes the store; every gate reads the field.** `assertQueueWritable()`,
+- **Only the recovery writes observe the store; every gate reads the field.** `assertQueueWritable()`,
   `processQueue`'s two checks, `safeToResume` and `core/app.ts`'s `'change'` backstop all read
-  `queueRecoveryReason` / `isQueueRecoveryLatched()` and nothing else. `confirmQueueRecovery()` is the one
-  reader that takes a fresh observation, immediately before its write. Do **not** add a per-gate probe:
+  `queueRecoveryReason` / `isQueueRecoveryLatched()` and nothing else. The fresh observation belongs to
+  `healStoredQueue()`, which **both** operator actions go through — `confirmQueueRecovery()` (discard
+  while halted) and `resaveStoredQueue()` (rewrite from the live queue after a clean start). Do **not** add a per-gate probe:
   each observation is a whole-config read and parse on conf, the gates sit on operator actions and the
   queue-write path, and a transient read failure there would latch a healthy host. (An earlier revision
   justified the field-only rule by a *healing emit* — `confirmQueueRecovery()` clearing the field and then
@@ -481,10 +482,23 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   all), which is **not** a flavour of "unusable": a caller about to write must refuse on it rather than
   assume the value is the corrupt one it last saw.
 - **`workflowTasks` has two writers, both in `core/app.ts`.** The engine's `'change'` listener, and
-  `confirmQueueRecovery()`'s conditional replacement. The recovery write cannot go through the listener,
-  because it must be refused when the stored value has moved and `emit()` cannot report that back — and it
-  must not go through the engine, which holds no store reference (rule 3). Two call sites in the
-  composition root, and still nothing outside it: no shell, and no other `core/` module, writes the field.
+  `healStoredQueue()`'s conditional replacement — the single write behind *both* operator actions. It
+  cannot go through the listener, because it must be refused when the stored value has moved and `emit()`
+  cannot report that back; and it must not go through the engine, which holds no store reference (rule 3).
+  Two call sites in the composition root, and still nothing outside it: no shell, and no other `core/`
+  module, writes the field.
+- **The discard and the late re-save share one implementation, deliberately.** They are the same write
+  with different preconditions: replace an unusable stored value with the queue this process holds — the
+  guard's empty list when halted (so it needs explicit confirmation) or the real queue after a clean boot
+  (so it is safe to offer directly). They were built separately once, and the second one promptly drifted
+  into an unconditional write that overwrote a repair with a stale queue. Keep them on `healStoredQueue()`
+  so that cannot recur, and keep `resaveStoredQueue()`'s refusal-while-halted — without it the repair path
+  is a silent discard.
+- **An action's result must outlive the condition it reports on.** `src/components/Sidebar.tsx` renders
+  queue-action messages *outside* the problem card. `already-readable` means the file is genuinely
+  repaired, so the refresh that follows empties the problem list and unmounts the card — a message
+  rendered inside it disappeared along with the thing it was explaining, leaving a click that looked like
+  it did nothing. Pinned by a renderer test that empties the list after the action.
 - **`confirmQueueRecovery()` lives on `MaoApp`, owns its own postcondition, and writes conditionally.** It
   returns a typed `QueueRecoveryOutcome` so the CLI command and the GUI button cannot disagree about whether
   confirmation worked — a bare boolean had the CLI re-deriving success while the GUI reported it. **Five**

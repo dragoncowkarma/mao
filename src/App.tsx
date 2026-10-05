@@ -6,7 +6,7 @@ import ProjectSettings from './components/ProjectSettings'
 import GlobalSettings from './components/GlobalSettings'
 import UpdateBanner from './components/UpdateBanner'
 import { electronApi } from './electron-api'
-import type { RepoRef } from '../core/workflow-engine'
+import type { QueueRecoveryState, RepoRef } from '../core/workflow-engine'
 import type { RepoWorkflowCapability } from '../core/repo-capabilities'
 import { sameRepoRef } from '../core/repo-registry'
 import type { StoredValueProblem, ThemePreference } from '../core/store'
@@ -44,6 +44,15 @@ export default function App() {
    * discarded — and the guard's own report goes to a console a packaged-app operator never sees.
    */
   const [storeProblems, setStoreProblems] = useState<StoredValueProblem[]>([])
+  const [queueRecovery, setQueueRecovery] = useState<QueueRecoveryState>({ required: false, reason: undefined })
+  /**
+   * Whether `app:storeProblems` has ever answered. Until it has, the renderer does not know whether the
+   * config file still holds the unreadable queue — and the two unknowns are not symmetric: telling a
+   * halted operator "already repaired, just restart" when nobody has read the file is a dead end, while
+   * offering the discard is safe because `confirmQueueRecovery()` re-probes and writes nothing if the
+   * value is gone. So an unread store counts as still-unreadable.
+   */
+  const [storeProblemsRead, setStoreProblemsRead] = useState(false)
   /**
    * What the poll has to remember between reports about the repository list. A ref, not state: it is
    * read to decide what to do with the value being stored, and a render is not what has to happen in
@@ -141,6 +150,7 @@ export default function App() {
     const healed = watch.repairOwed && !unusable
     if (!healed) watch.repairOwed = unusable
     setStoreProblems(next)
+    setStoreProblemsRead(true)
     return healed
   }
 
@@ -188,6 +198,21 @@ export default function App() {
   }
 
   /**
+   * Read on its own chain, deliberately not folded into `refreshStoreProblems` above.
+   *
+   * That function ends in one trailing `.catch(() => {})` covering both halves, so a throw while reading
+   * the repository problems would swallow the queue answer with it — and the queue answer is the one that
+   * says unattended work is halted. Two reads, two catches, so neither can hide the other. It is also a
+   * different authority: the engine's latch is monotone, so it stays up after the store reads clean.
+   */
+  function refreshQueueRecovery(): Promise<void> {
+    return Promise.resolve()
+      .then(() => electronApi().workflow.recoveryRequired())
+      .then((next) => setQueueRecovery(next))
+      .catch(() => {})
+  }
+
+  /**
    * Polled, not only read at mount, because the file is not this window's to own: an operator who
    * hand-edits `config.json` while the app is open — which the report itself sends them to do — would
    * otherwise see nothing until their next repository-list write, and that write is what destroys the
@@ -198,7 +223,11 @@ export default function App() {
    */
   useEffect(() => {
     void refreshStoreProblems()
-    const handle = setInterval(() => void refreshStoreProblems(), STORE_PROBLEM_POLL_MS)
+    void refreshQueueRecovery()
+    const handle = setInterval(() => {
+      void refreshStoreProblems()
+      void refreshQueueRecovery()
+    }, STORE_PROBLEM_POLL_MS)
     return () => clearInterval(handle)
   }, [])
 
@@ -440,6 +469,78 @@ export default function App() {
   }
 
   /**
+   * Discards an unreadable stored workflow queue and releases the engine.
+   *
+   * The outcome is decided in `core/` (see `QueueRecoveryOutcome`) rather than inferred here, so this
+   * button and `mao workflow confirm-queue-recovery` cannot disagree about whether it worked. Both
+   * non-success outcomes are surfaced by throwing, because Sidebar's own catch is what puts a message on
+   * screen: `'unverified'` means the store could not be read so nothing was written, `'write-failed'`
+   * means the attempt threw and what reached the file is unknown, and
+   * `'already-readable'` means something else repaired the file first and writing would have destroyed
+   * that repair. Both reads are refreshed afterwards either way.
+   */
+  async function discardUnreadableQueue() {
+    try {
+      const outcome = await electronApi().workflow.confirmQueueRecovery()
+      // Every non-success outcome is surfaced by throwing, because Sidebar's own catch is what puts a
+      // message on screen. None of them carries the backend's error text — see QueueRecoveryOutcome.
+      if (outcome.kind === 'unverified') throw new Error(outcome.reason)
+      if (outcome.kind === 'superseded') {
+        throw new Error(
+          'The stored queue changed while confirming, so nothing was written. Something else is writing ' +
+            'the config file — re-check it and try again.',
+        )
+      }
+      if (outcome.kind === 'write-failed') {
+        throw new Error(
+          'The replacement write failed, so what reached the config file is unknown and automation stays ' +
+            'halted. Inspect the file before salvaging anything from it, then try again.',
+        )
+      }
+      if (outcome.kind === 'already-readable') {
+        throw new Error('The stored queue reads normally again — nothing was written. Restart MAO to load it.')
+      }
+    } finally {
+      await refreshQueueRecovery()
+      await refreshStoreProblems()
+    }
+  }
+
+  /**
+   * Rewrites the stored queue from the one this session holds, for a value that went unusable after a
+   * clean start.
+   *
+   * The card it is clicked from is up to one poll interval stale, so the decision cannot be made here:
+   * core observes the store fresh and writes conditionally. Every non-success outcome is surfaced by
+   * throwing, because Sidebar's catch is what puts a message on screen — `already-readable` in
+   * particular means something else repaired the file first and **nothing was written**, which the
+   * operator has to be told rather than left assuming their click saved anything.
+   */
+  async function resaveStoredQueue() {
+    try {
+      const outcome = await electronApi().workflow.resaveQueue()
+      if (outcome.kind === 'already-readable') {
+        throw new Error('The stored queue reads normally again — nothing was written.')
+      }
+      if (outcome.kind === 'superseded') {
+        throw new Error(
+          'The stored queue changed while saving, so nothing was written. Something else is writing the ' +
+            'config file — re-check it and try again.',
+        )
+      }
+      if (outcome.kind === 'unverified') throw new Error(outcome.reason)
+      if (outcome.kind === 'write-failed') {
+        throw new Error(
+          'The save failed, so what reached the config file is unknown. Inspect it, then try again.',
+        )
+      }
+    } finally {
+      await refreshStoreProblems()
+      await refreshQueueRecovery()
+    }
+  }
+
+  /**
    * The in-app way out of a stored repository list the schema cannot use.
    *
    * Reachable when nothing else is: with no usable list there is no sidebar row, so no project is
@@ -521,6 +622,10 @@ export default function App() {
         onAddRepo={addRepo}
         storeProblems={storeProblems}
         onResetRepoList={resetRepoList}
+        queueRecovery={queueRecovery}
+        queueStoredStillUnreadable={!storeProblemsRead || storeProblems.some((problem) => problem.field === 'workflowTasks')}
+        onDiscardQueue={discardUnreadableQueue}
+        onResaveQueue={resaveStoredQueue}
         view={view}
         onViewChange={selectView}
       />

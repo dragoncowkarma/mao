@@ -2,7 +2,13 @@ import { contextBridge, ipcRenderer } from 'electron'
 import type { AiProviderConfig } from '../core/ai/types.ts'
 import type { GithubTask, GithubTaskDetail } from '../core/github-service.ts'
 import type { RepoWorkflowCapability } from '../core/repo-capabilities.ts'
-import type { QueuedTask, RepoRef, RunOverride } from '../core/workflow-engine.ts'
+import type {
+  QueuedTask,
+  QueueRecoveryOutcome,
+  QueueRecoveryState,
+  RepoRef,
+  RunOverride,
+} from '../core/workflow-engine.ts'
 import type { AutoTriggerStatus } from '../core/auto-trigger.ts'
 import type { StoredValueProblem, ThemePreference } from '../core/store.ts'
 import type { SelfUpdateCheck } from '../core/self-update.ts'
@@ -62,6 +68,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
     setAutoAdvance: (taskId: string, autoAdvance: boolean): Promise<QueuedTask> =>
       ipcRenderer.invoke('workflow:setAutoAdvance', taskId, autoAdvance),
     clearCompleted: (): Promise<void> => ipcRenderer.invoke('workflow:clearCompleted'),
+    recoveryRequired: (): Promise<QueueRecoveryState> => ipcRenderer.invoke('workflow:recoveryRequired'),
+    confirmQueueRecovery: (): Promise<QueueRecoveryOutcome> =>
+      ipcRenderer.invoke('workflow:confirmQueueRecovery'),
+    resaveQueue: (): Promise<QueueRecoveryOutcome> => ipcRenderer.invoke('workflow:resaveQueue'),
   },
   ui: {
     getTheme: (): Promise<ThemePreference> => ipcRenderer.invoke('ui:getTheme'),

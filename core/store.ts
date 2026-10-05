@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import type { AiProviderConfig } from './ai/types.ts'
+import { WORKFLOW_ACTIVE_LABEL } from './workflow-engine.ts'
 import type { QueuedTask, RepoRef } from './workflow-engine.ts'
 
 /**
@@ -79,6 +80,69 @@ export function describeUnusableRepoList(value: unknown, source: string): string
   )
 }
 
+/**
+ * The actionable report for a stored `aiProviders` that is not a list — or `null` when it is one.
+ *
+ * Worded as an ignored-configuration report, deliberately unlike the queue's below: an empty provider
+ * list costs nothing but the ability to route a stage, and every stage then fails at `selectAgent()`
+ * with the pre-existing retryable "No AI providers registered" *before* any GitHub write. So this field
+ * is reported and coerced, and it does **not** halt automation — latching for it would be a larger
+ * outage than the fault it describes.
+ *
+ * The recovery it names needs no GitHub token, which is the point: a missing or revoked token is one of
+ * the likelier reasons an operator was editing `config.json` by hand in the first place, and `mao config
+ * import-providers` and the GUI's Global settings pane are both reachable without one.
+ */
+export function describeUnusableProviderList(value: unknown, source: string): string | null {
+  if (Array.isArray(value)) return null
+  return (
+    `[store] "aiProviders" in ${source} is ${describeStoredType(value)}, not a JSON array of AI ` +
+    'provider configs — ignoring it, so no AI providers are registered and every workflow stage fails ' +
+    'for want of an agent to route to. The unusable value is still in the file; any provider-list write ' +
+    "overwrites it. `mao config import-providers <file>`, or the GUI's Global settings pane, replaces " +
+    'it — neither needs a GitHub token. Copy any provider configs you still need out of ' +
+    `${source} first, including their apiKey values, which exist nowhere else.`
+  )
+}
+
+/**
+ * The actionable report for a stored `workflowTasks` that is not a list — or `null` when it is one.
+ *
+ * This one is not just a report: it is the text the queue-recovery latch carries verbatim (see
+ * `findStoredQueueProblem()` and `WorkflowEngine.requireQueueRecovery()`), so the stderr line, every
+ * refused mutation's error, `mao run`'s refusal and the GUI's card all say the same thing. That is why
+ * it describes a *halt* rather than only a discard.
+ *
+ * Halting is the correction review of PR #69 forced, and the reasoning is worth keeping next to the
+ * words. Coercing the queue to `[]` looked safe because resuming an empty queue is a no-op — but both
+ * long-lived hosts call `startAutoTrigger()` immediately after `createMaoApp()`, and that ticks at once
+ * rather than after its first interval. The first poll's `enqueueFromIssue()` would `notify()`, the
+ * `'change'` listener would `store.set('workflowTasks', …)`, and that single write both destroys the
+ * only salvageable copy of the unreadable value **and** starts an unattended pipeline on a host that
+ * cannot know what was already in flight. The `workflow-active` label is best-effort, so a task lost
+ * with the queue may carry no label to stop its issue being picked up and run a second time.
+ *
+ * It names `mao workflow confirm-queue-recovery` rather than `mao workflow clear-completed`, and that is
+ * load-bearing: `clear-completed` also emits `'change'`, so it is *gated* too. Leaving it open would let
+ * a GUI "Clear completed" click replace the unreadable value with no confirmation at all — exactly the
+ * destruction this latch exists to prevent.
+ */
+export function describeUnusableTaskQueue(value: unknown, source: string): string | null {
+  if (Array.isArray(value)) return null
+  return (
+    `[store] "workflowTasks" in ${source} is ${describeStoredType(value)}, not a JSON array of queued ` +
+    'workflow tasks — ignoring it, so the queue is empty and MAO will not start unattended work: ' +
+    'auto-resume, auto-trigger polling and every queue write are refused until this is resolved. That ' +
+    'is deliberate — the record of what was already in flight is unreadable, so enqueueing anything ' +
+    'would overwrite the only salvageable copy of it and risk re-running GitHub work that already ' +
+    'happened. The unusable value is still in the file. Copy anything you still need out of ' +
+    `${source} first, then check the target repo for an issue still labelled "${WORKFLOW_ACTIVE_LABEL}" ` +
+    'whose branch or PR is half-finished and finish or clean it up by hand. `mao workflow ' +
+    'confirm-queue-recovery` (or the sidebar\'s Discard unreadable queue) then discards the unreadable ' +
+    'value and releases the engine.'
+  )
+}
+
 type StoredShapeRule<K extends keyof MaoStoreSchema> = (raw: MaoStoreSchema[K], source: string) => string | null
 
 /**
@@ -89,10 +153,16 @@ type StoredShapeRule<K extends keyof MaoStoreSchema> = (raw: MaoStoreSchema[K], 
  * A table rather than a predicate over every schema key, because `describeStoredProblems()` iterates it
  * to decide what to *read*: electron-store re-reads and re-parses the whole config file on every `get`,
  * so walking all six fields to have five of them answer `null` cost six full file reads per call, on the
- * main process, in the `finally` of every repository-list write.
+ * main process, in the `finally` of every repository-list write. It is **three** fields now, not one, so
+ * each `problems()` call is three of those reads — which is why the queue latch is derived once at boot
+ * (`core/app.ts`) and never re-probed from the `'change'` path: routing it through there would have put
+ * three whole-config reads and three `JSON.parse`s on every queue change, and `config.json` carries up
+ * to `MAX_FINISHED_TASKS` finished tasks with their full prompts and AI output.
  */
 const STORED_SHAPE_RULES: { [K in keyof MaoStoreSchema]?: StoredShapeRule<K> } = {
   githubRepos: (raw, source) => describeUnusableRepoList(raw, source),
+  aiProviders: (raw, source) => describeUnusableProviderList(raw, source),
+  workflowTasks: (raw, source) => describeUnusableTaskQueue(raw, source),
 }
 
 function unusableStoredValue<K extends keyof MaoStoreSchema>(
@@ -139,6 +209,88 @@ export function describeStoredProblems(
   return problems
 }
 
+/**
+ * The one field whose unusable value halts unattended automation, and the single lookup for it.
+ *
+ * Exported so `core/app.ts`'s boot-time latch, `WorkflowEngine.confirmQueueRecovery()`'s postcondition
+ * and both shells' reporting cannot disagree about what counts as "the queue is unreadable". The other
+ * two guarded fields are reported and coerced but never halt anything — see
+ * `describeUnusableProviderList()` for why an unusable `aiProviders` must not.
+ */
+export const QUEUE_GATING_FIELD = 'workflowTasks' as const
+
+/** The unusable-queue problem among a backend's problems, or `undefined` when the queue reads normally. */
+export function findStoredQueueProblem(problems: StoredValueProblem[]): StoredValueProblem | undefined {
+  return problems.find((problem) => problem.field === QUEUE_GATING_FIELD)
+}
+
+/**
+ * The report for a backend that could not be read at all, rather than one holding the wrong shape.
+ *
+ * Value-free by construction: an I/O or parse failure is free to quote the file's own bytes, and
+ * `config.json` holds `githubToken` in plaintext — so nothing from the underlying error is interpolated,
+ * only the field and the file. It is phrased as a halt because that is what it causes: a state MAO
+ * cannot establish is treated as unusable, never as healthy.
+ */
+export function describeUninspectableStore(field: keyof MaoStoreSchema, source: string): string {
+  return (
+    `[store] MAO could not read "${field}" from ${source} at all, so it cannot establish whether the ` +
+    'value is usable — treating it as unusable. Check the file and the permissions on it, then retry.'
+  )
+}
+
+/**
+ * An opaque proof of *which* raw value an observation saw, for `MaoStore.setIfUnchanged()`.
+ *
+ * A serialization rather than a hash, because hashing buys nothing here and `JSON.stringify` already
+ * tells us what we need. It is computed inside a `try`, so a value the serializer cannot handle (circular,
+ * a `BigInt`, nesting deep enough to blow the stack) yields `undefined` instead of adding a throw site to
+ * the read path — and `undefined` makes every conditional write refuse rather than guess.
+ *
+ * **Never log or render it.** It is stored content verbatim, and `config.json` holds `githubToken` in
+ * plaintext.
+ */
+function witnessOf(raw: unknown): string | undefined {
+  try {
+    // `undefined` has no JSON form, so distinguish "absent" from a failure rather than conflating them.
+    return raw === undefined ? '\u0000absent' : JSON.stringify(raw)
+  } catch {
+    return undefined
+  }
+}
+
+/** What a conditional write did. See `MaoStore.setIfUnchanged()`. */
+export type ConditionalWriteResult = 'written' | 'superseded' | 'unverifiable'
+
+/**
+ * One read of a stored value, carrying both what a caller may use and what the guard had to do.
+ *
+ * Exists because `get()` and `problems()` are two separate reads, and electron-store re-reads and
+ * re-parses the config file on **every** `get`. `createMaoApp` decided the queue latch from one of those
+ * reads and then restored from the other, so a hand-edit landing between them left the host *unlatched*
+ * holding a coerced empty queue — auto-trigger then started immediately and overwrote the unreadable
+ * original, which is the exact failure the latch exists to prevent. One observation removes the window:
+ * the latch and `restore()` cannot disagree because there is no second read to disagree with.
+ */
+export interface StoredObservation<K extends keyof MaoStoreSchema> {
+  /** The value corrected to the shape the schema declares — what a caller may use. */
+  value: MaoStoreSchema[K]
+  /** The operator-facing report when the guard had to replace the stored value, else `undefined`. */
+  problem: string | undefined
+  /**
+   * False when the backend read itself failed, so nothing about the stored value was established.
+   * `value` is then the schema default and `problem` is `describeUninspectableStore()`'s report.
+   * Callers that are about to **write** must treat this as "unknown" and refuse, not as "corrupt".
+   */
+  readable: boolean
+  /**
+   * Proof of which raw value this observation saw, to be handed back to `setIfUnchanged()` so a write
+   * can refuse if the stored value has moved since. `undefined` when the value could not be serialized,
+   * which makes the conditional write refuse. Never render it — see `witnessOf`.
+   */
+  witness: string | undefined
+}
+
 /** A backend's read, corrected to the shape `MaoStoreSchema` declares. See `createStoredReadGuard`. */
 export type StoredReadGuard = <K extends keyof MaoStoreSchema>(key: K, raw: MaoStoreSchema[K]) => MaoStoreSchema[K]
 
@@ -173,12 +325,19 @@ export type StoredReadGuard = <K extends keyof MaoStoreSchema>(key: K, raw: MaoS
  * too: that is the point of the rule living here rather than at the read sites, which are scattered
  * across `core/`, `cli/` and `electron/` and would each have to remember it.
  *
- * `githubRepos` is the only field guarded, and the other two array-typed fields are left out
- * deliberately rather than overlooked. `aiProviders` would be the same one-line coercion. `workflowTasks`
- * would not: a queue MAO cannot read is a question about unattended-pipeline safety, which this repo
- * already answers with a whole mechanism (`core/persistence-guard.ts`, the persistence-broken marker and
- * `resume`), and substituting `[]` for it without deciding how that interacts with auto-resume would be
- * the wrong half of the fix. Adding a field here means answering that question for it first.
+ * All three array-typed fields are guarded, and the question `workflowTasks` raised is answered rather
+ * than deferred: a queue MAO cannot read halts unattended automation (see `describeUnusableTaskQueue()`
+ * and `WorkflowEngine.requireQueueRecovery()`), because coercing it to `[]` and carrying on let the
+ * immediate first auto-trigger poll overwrite the unreadable value and start a pipeline. `aiProviders`
+ * is coerced and reported but deliberately halts nothing. Adding a field here means answering the same
+ * question for it: what does the empty value cost, which write heals it, and does losing it let
+ * unattended work start against state MAO can no longer account for?
+ *
+ * What this guard does **not** cover, so the halt is not read as more than it is: a `config.json` that
+ * is not valid JSON at all is invisible here — `FileStore.load()` catches the parse error and answers
+ * `{}`, so every field reads as its schema default and nothing is reported (issue #67). Element-level
+ * validity is also out of scope, exactly as it is for `githubRepos`: `workflowTasks: [null]` passes
+ * `Array.isArray` and then throws inside `restore()` (issue #75).
  */
 export function createStoredReadGuard(
   source: string,
@@ -227,6 +386,42 @@ export interface MaoStore {
    * since the guard's own report goes to a main-process console a packaged-app operator never sees.
    */
   problems(): StoredValueProblem[]
+  /**
+   * One read answering both the usable value and whether the stored one had to be replaced.
+   *
+   * Part of the contract rather than a convenience: `get()` and `problems()` are two reads of a file
+   * another process can change between them (see `StoredObservation`). Any decision that pairs "is this
+   * value usable?" with "what do I do with it?" must come from a single `inspect()`.
+   */
+  inspect<K extends keyof MaoStoreSchema>(key: K): StoredObservation<K>
+  /**
+   * Writes only if the stored raw value is still the one `witness` came from.
+   *
+   * The reason a plain `set` is not enough for recovery: the queue-recovery write replaces an unusable
+   * value with this process's (empty) queue, so if another process repaired the queue between the
+   * observation and the write, an unconditional `set` destroys that repair and reports success. Observing
+   * "immediately before" writing does not close that — only refusing the write does.
+   *
+   * `'superseded'` means the raw value moved and **nothing was written**. `'unverifiable'` means the
+   * current value could not be read or serialized, so whether it moved is unknown — also nothing written.
+   * Throws only if the underlying write throws.
+   *
+   * **What `'written'` actually establishes, stated narrowly because an earlier revision of this comment
+   * promised more.** The compare and the write are one synchronous run of JavaScript with no `await`
+   * between them, so no other code *in this process* can interleave: against another caller here, the
+   * pair is atomic and `'written'` means "nothing had moved". Against another OS process it is not. The
+   * comparison narrows the window — from the whole confirm sequence down to the compare →
+   * `writeFileSync` interval — but a repair landing inside that interval is still overwritten and still
+   * reported `'written'`. Closing that needs a primitive neither backend has: an advisory lock both
+   * writers take, or `O_EXCL` + rename keyed on a stored version with a retry loop. Cross-process
+   * serialization of same-key writes is issue #73 and is deliberately **not** attempted here; do not
+   * describe this member as closing it.
+   */
+  setIfUnchanged<K extends keyof MaoStoreSchema>(
+    key: K,
+    witness: string | undefined,
+    value: MaoStoreSchema[K],
+  ): ConditionalWriteResult
 }
 
 /**
@@ -239,6 +434,17 @@ export interface MaoStore {
 export interface StoredValueBackend {
   get<K extends keyof MaoStoreSchema>(key: K): MaoStoreSchema[K] | undefined
   set<K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]): void
+  /**
+   * A read that is guaranteed to reflect what is on disk *now*, for `inspect()` and the conditional
+   * write — both of which exist to notice another process's change.
+   *
+   * Optional, and the fallback to `get` is correct rather than a guess: conf re-reads and re-parses the
+   * whole config file on every `get`, so for `electron/store.ts` the two are the same call. `FileStore`
+   * answers `get` from the snapshot taken in its constructor, so it *must* supply this — without it, a
+   * CLI recovery would compare against a value that may be minutes stale. May throw when the file exists
+   * but cannot be read; callers turn that into "unknown", never into "healthy".
+   */
+  getFresh?<K extends keyof MaoStoreSchema>(key: K): MaoStoreSchema[K] | undefined
 }
 
 /**
@@ -264,6 +470,16 @@ export function createGuardedStore(
 ): MaoStore {
   const guardRead = createStoredReadGuard(source, warn)
 
+  /**
+   * The freshest read the backend can give, for the two members that exist to notice another process's
+   * change. Falls back to `get` only where that is already a disk read — see `StoredValueBackend.getFresh`.
+   */
+  function readRawFresh<K extends keyof MaoStoreSchema>(key: K): MaoStoreSchema[K] {
+    const read = backend.getFresh?.bind(backend) ?? backend.get.bind(backend)
+    const value = read(key)
+    return value === undefined ? structuredClone(MAO_STORE_DEFAULTS[key]) : value
+  }
+
   function readRaw<K extends keyof MaoStoreSchema>(key: K): MaoStoreSchema[K] {
     const value = backend.get(key)
     // Cloned, never the shared `MAO_STORE_DEFAULTS` instance — one caller pushing into what it read
@@ -280,6 +496,58 @@ export function createGuardedStore(
     },
     problems(): StoredValueProblem[] {
       return describeStoredProblems(readRaw, source)
+    },
+    inspect<K extends keyof MaoStoreSchema>(key: K): StoredObservation<K> {
+      let raw: MaoStoreSchema[K]
+      try {
+        // The FRESH read deliberately, not `get`'s: an observation exists to be acted on, and on
+        // `FileStore` a snapshot read would compare a recovery against a value taken at construction.
+        raw = readRawFresh(key)
+      } catch {
+        // Fail closed, and say nothing about the value: a read that threw established nothing, so a
+        // caller about to write must refuse rather than assume the stored value is the corrupt one it
+        // last saw. `readable: false` is what carries that distinction.
+        return {
+          value: structuredClone(MAO_STORE_DEFAULTS[key]),
+          problem: describeUninspectableStore(key, source),
+          readable: false,
+          witness: undefined,
+        }
+      }
+      // Guarded through the same `guardRead` as `get()`, deliberately — including its once-per-field
+      // warning — so an observation and a plain read cannot disagree about the value or about whether
+      // the operator was told. `unusableStoredValue` is read from the SAME `raw`, not from a second read.
+      return {
+        value: guardRead(key, raw),
+        problem: unusableStoredValue(key, raw, source) ?? undefined,
+        readable: true,
+        witness: witnessOf(raw),
+      }
+    },
+    setIfUnchanged<K extends keyof MaoStoreSchema>(
+      key: K,
+      witness: string | undefined,
+      value: MaoStoreSchema[K],
+    ): ConditionalWriteResult {
+      if (witness === undefined) return 'unverifiable'
+      let current: string | undefined
+      try {
+        current = witnessOf(readRawFresh(key))
+      } catch {
+        return 'unverifiable'
+      }
+      if (current === undefined) return 'unverifiable'
+      if (current !== witness) return 'superseded'
+      // Nothing may be inserted between the compare above and the write below — not an `await`, not a
+      // callback, not a second read. That adjacency is the entire guarantee: it makes the pair atomic
+      // with respect to other callers in this process. It does NOT make it atomic against another OS
+      // process, which can still repair the value in this interval and have it overwritten (#73).
+      //
+      // No read-back afterwards either: comparing two post-write reads cannot tell "written" from
+      // "written then immediately superseded", so it would assert more than it establishes. The write
+      // either throws or it does not, and the caller is told which.
+      backend.set(key, value)
+      return 'written'
     },
   }
 }
@@ -311,6 +579,12 @@ export class FileStore implements MaoStore {
           this.data[key] = value
           this.persist()
         },
+        // Re-read from disk, because `get` above answers from the constructor snapshot and the two
+        // members that use this exist to notice another process's change. Deliberately NOT written back
+        // into `this.data`: mutating the snapshot mid-process would make `get()` answer differently
+        // depending on whether a recovery happened to have run.
+        getFresh: <K extends keyof MaoStoreSchema>(key: K) =>
+          ({ ...structuredClone(MAO_STORE_DEFAULTS), ...this.loadStrict() })[key],
       },
       filePath,
     )
@@ -321,6 +595,24 @@ export class FileStore implements MaoStore {
       return JSON.parse(fs.readFileSync(this.filePath, 'utf-8'))
     } catch {
       return {}
+    }
+  }
+
+  /**
+   * `load()`, but a file that exists and cannot be read **throws** instead of reading as `{}`.
+   *
+   * Only for `getFresh`. The constructor keeps the swallowing `load()` on purpose: answering schema
+   * defaults for an unparseable file is the pre-existing behaviour (and the known blind spot tracked as
+   * issue #67), and changing it here would quietly change what every boot does. What a *conditional
+   * write* needs is the opposite — an unreadable file must become "unknown", never "unchanged".
+   */
+  private loadStrict(): Partial<MaoStoreSchema> {
+    try {
+      return JSON.parse(fs.readFileSync(this.filePath, 'utf-8'))
+    } catch (err) {
+      // A missing file is the normal first run, and reads as "nothing stored" rather than a failure.
+      if ((err as { code?: string }).code === 'ENOENT') return {}
+      throw err
     }
   }
 
@@ -339,5 +631,17 @@ export class FileStore implements MaoStore {
 
   problems(): StoredValueProblem[] {
     return this.guarded.problems()
+  }
+
+  inspect<K extends keyof MaoStoreSchema>(key: K): StoredObservation<K> {
+    return this.guarded.inspect(key)
+  }
+
+  setIfUnchanged<K extends keyof MaoStoreSchema>(
+    key: K,
+    witness: string | undefined,
+    value: MaoStoreSchema[K],
+  ): ConditionalWriteResult {
+    return this.guarded.setIfUnchanged(key, witness, value)
   }
 }

@@ -107,13 +107,18 @@ config
   .command('show')
   .description('Print the current stored config (secrets redacted)')
   .action(() => {
-    const { store } = loadApp()
+    const { store, workflowEngine } = loadApp()
     printJson({
       githubToken: store.get('githubToken') ? '[set]' : '[unset]',
       githubRepos: store.get('githubRepos'),
       aiProviders: store.get('aiProviders').map((p) => ({ ...p, apiKey: p.apiKey ? '[set]' : undefined })),
       theme: store.get('theme'),
       workflowPersistenceBroken: hasPersistenceBrokenMarker(resolveDataDir()),
+      // A separate fact from the line above, never folded into it: that one means a prior process could
+      // no longer *write* the queue, this one that this process cannot *read* it. Reporting a read-shape
+      // problem as a write failure would send the operator to `clear-persistence-broken`, which cannot
+      // describe or fix it.
+      workflowQueueRecoveryRequired: workflowEngine.isQueueRecoveryLatched(),
       // Otherwise this command reports a value that is not in the file: a `githubRepos` the schema
       // cannot use is answered as `[]` above, and the guard's own warning goes to stderr, which
       // `config show 2>/dev/null` discards. Same list the GUI polls over `app:storeProblems`.
@@ -363,6 +368,44 @@ workflow
     log('Cleared completed tasks')
   })
 
+workflow
+  .command('confirm-queue-recovery')
+  .description(
+    'Discard an unreadable stored workflow queue and release the engine. Only run this after copying ' +
+      "anything you still need out of the config file and checking the target repo for an issue still " +
+      'labelled workflow-active whose branch or PR is half-finished — confirming replaces the unreadable ' +
+      'value, so whatever it held is gone.',
+  )
+  .action(() => {
+    // resume: false, so booting this command cannot start the pipeline it is about to release.
+    const { confirmQueueRecovery } = loadApp(false)
+    // The outcome is decided in core (see QueueRecoveryOutcome) rather than re-derived here, so this
+    // command and the GUI button cannot disagree about whether confirmation succeeded.
+    const outcome = confirmQueueRecovery()
+    if (outcome.kind === 'already-readable') {
+      log('The stored workflow queue reads normally — nothing was written. Restart MAO to load it.')
+      return
+    }
+    // Both failures say only what was established, and neither carries the backend's error text: an I/O
+    // or parse failure can quote the file, which holds the GitHub token in plaintext.
+    if (outcome.kind === 'unverified') {
+      throw new Error(`Nothing was written. ${outcome.reason}`)
+    }
+    if (outcome.kind === 'superseded') {
+      throw new Error(
+        'The stored queue changed while confirming, so nothing was written and automation stays halted. ' +
+          'Re-check the config file — something else is writing it — and retry.',
+      )
+    }
+    if (outcome.kind === 'write-failed') {
+      throw new Error(
+        'The replacement write failed, so what reached the config file is unknown and automation stays ' +
+          'halted. Inspect the file before salvaging anything from it, then retry.',
+      )
+    }
+    log('Discarded the unreadable stored workflow queue. Auto-resume, polling and queue writes are released.')
+  })
+
 // --- run ----------------------------------------------------------------------
 
 program
@@ -376,6 +419,19 @@ program
     // resume: false here — the queue is only resumed below, after the stdout log listener is
     // attached, so `mao run` never misses a stage transition that happens synchronously on resume.
     const { store, githubService, workflowEngine } = loadApp(false)
+
+    // Before startAutoTrigger (which ticks immediately) and before resumeProcessing() below, because both
+    // are how an unreadable queue got overwritten and a pipeline started. Non-zero exit rather than
+    // idling: `mao run` is meant for cron, and a caller that sees success while nothing polls is worse
+    // than a failure it can act on.
+    const queueBlocked = workflowEngine.getQueueRecoveryReason()
+    if (queueBlocked !== undefined) {
+      logErr(queueBlocked)
+      logErr('Nothing was started. Run `mao workflow confirm-queue-recovery` once you have salvaged anything you need.')
+      process.exitCode = 1
+      return
+    }
+
     const autoTrigger = startAutoTrigger(githubService, workflowEngine, () => store.get('githubRepos'))
     log('engine started — press Ctrl+C to stop')
 

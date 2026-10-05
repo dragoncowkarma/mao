@@ -13,7 +13,7 @@ export function registerIpcHandlers() {
   const buildSha = process.env.MAO_BUILD_SHA ?? ''
   if (buildSha) store.set('buildSha', buildSha)
 
-  const { githubService, workflowEngine, updateRepos } = createMaoApp({
+  const { githubService, workflowEngine, updateRepos, confirmQueueRecovery, resaveStoredQueue } = createMaoApp({
     store,
     workspaceRoot: path.join(app.getPath('userData'), 'workspaces'),
     dataDir: app.getPath('userData'),
@@ -132,6 +132,26 @@ export function registerIpcHandlers() {
   )
 
   ipcMain.handle('workflow:clearCompleted', () => workflowEngine.clearCompleted())
+
+  // The GUI's only way to learn that unattended work is halted, and its only way out. Pulled like
+  // `app:storeProblems` (AGENTS.md rule 6) and driven by the ENGINE rather than by `storeProblems`,
+  // because the latch is monotone: after an out-of-band repair the store reads clean while this process
+  // stays halted, and the card has to stay up and keep working in exactly that window.
+  ipcMain.handle('workflow:recoveryRequired', () => ({
+    required: workflowEngine.isQueueRecoveryLatched(),
+    reason: workflowEngine.getQueueRecoveryReason(),
+  }))
+
+  // Returns core's typed outcome rather than a boolean, so the renderer and `mao workflow
+  // confirm-queue-recovery` cannot disagree about whether confirmation succeeded.
+  ipcMain.handle('workflow:confirmQueueRecovery', () => confirmQueueRecovery())
+
+  // For a value that went unusable after a clean start: this process still holds the real queue, so this
+  // rewrites the file from it. Offered instead of the discard there, because a discard run in another
+  // process would replace the file with ITS empty queue and lose this one. Delegated to core, which
+  // observes the store fresh and writes conditionally — the renderer's card is up to 30s stale, so an
+  // unconditional write from here would overwrite a repair that landed in between.
+  ipcMain.handle('workflow:resaveQueue', () => resaveStoredQueue())
 
   ipcMain.handle('ui:getTheme', () => store.get('theme'))
 

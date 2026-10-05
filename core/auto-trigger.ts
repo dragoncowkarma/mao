@@ -63,6 +63,13 @@ export function startAutoTrigger(
   }
 
   const tick = async () => {
+    // The stored queue is unreadable, so this host does not know what was already in flight. Skip the
+    // whole scheduler rather than each poll: returning here keeps `lastPolledAt` from advancing, so the
+    // GUI's "last synced" stops claiming syncs that never happened, and nothing is logged once per repo
+    // per interval to a console a packaged-app operator never sees. The engine refuses the enqueue
+    // anyway — this makes the poll cost zero GitHub calls and write no best-effort label.
+    if (workflowEngine.getQueueRecoveryReason() !== undefined) return
+
     const now = Date.now()
     // Canonicalised per tick, not trusted as stored. A store written before repository identity became
     // case-insensitive can hold one repository twice, and iterating it raw is precisely the harm that
@@ -94,7 +101,23 @@ export function startAutoTrigger(
     }
   }
 
+  /**
+   * The operator-initiated poll behind `github:refreshRepo`, and deliberately a *wrapper* rather than
+   * `pollRepo` itself.
+   *
+   * `pollRepo` swallows every failure into `lastError`, which nothing in the renderer reads — so a latch
+   * check inside it would let Refresh report a clean sync on a halted host, the exact failure
+   * `github:refreshRepo` already rejects its own preflight to avoid. Throwing here instead surfaces the
+   * reason in the board's error slot. It cannot live inside `pollRepo` either way: `tick()` awaits it
+   * bare in a loop and is itself called bare, so a throw from there would be an unhandled rejection.
+   */
+  const pollNow = async (repoRef: RepoRef) => {
+    const blocked = workflowEngine.getQueueRecoveryReason()
+    if (blocked !== undefined) throw new Error(blocked)
+    await pollRepo(repoRef)
+  }
+
   tick()
   const handle = setInterval(tick, schedulerTickMs)
-  return { handle, getStatus, pollNow: pollRepo }
+  return { handle, getStatus, pollNow }
 }

@@ -1192,3 +1192,112 @@ describe('WorkflowEngine repository permission preflight', () => {
     expect(github.assertRepoWorkflowWritable).toHaveBeenCalledTimes(4)
   })
 })
+
+/**
+ * The queue-recovery latch: issue #68's fail-closed half, and the corrections adversarial review of this
+ * design forced. Every test here is about what must NOT happen while the stored queue is unreadable.
+ */
+describe('WorkflowEngine queue-recovery latch', () => {
+  const REASON = '[store] "workflowTasks" in /tmp/config.json is an object, not a JSON array…'
+
+  function latchedEngine() {
+    const github = makeFakeGithub()
+    const engine = new WorkflowEngine(github)
+    engine.setProviders([makeProvider('agent-a'), makeProvider('agent-b')])
+    engine.requireQueueRecovery(REASON)
+    return { engine, github }
+  }
+
+  it('refuses every queue mutation and emits no change', () => {
+    // The property that matters more than the throw: zero `'change'` emissions, because that listener is
+    // the only writer of `workflowTasks` and its write is what destroys the operator's last copy.
+    const mutations: Array<[string, (e: WorkflowEngine) => unknown]> = [
+      ['enqueue', (e) => e.enqueue('t', repo)],
+      ['enqueueFromIssue', (e) => e.enqueueFromIssue(1, 'https://x/1', 't', repo)],
+      ['retry', (e) => e.retry('nope')],
+      ['advance', (e) => e.advance('nope')],
+      ['setAutoAdvance', (e) => e.setAutoAdvance('nope', false)],
+      ['clearCompleted', (e) => e.clearCompleted()],
+    ]
+
+    for (const [name, mutate] of mutations) {
+      const { engine } = latchedEngine()
+      const changes = vi.fn()
+      engine.on('change', changes)
+
+      expect(() => mutate(engine), name).toThrow(REASON)
+      expect(changes, name).not.toHaveBeenCalled()
+    }
+  })
+
+  it('runs no stage when resumeProcessing is called, which is what `mao run` does unconditionally', async () => {
+    const { engine, github } = latchedEngine()
+    engine.restore([{ ...makePendingQueueTask('leftover') }])
+
+    engine.resumeProcessing()
+    await new Promise((r) => setTimeout(r, 30))
+
+    expect(github.assertRepoWorkflowWritable).not.toHaveBeenCalled()
+    expect(ai.createAiProvider).not.toHaveBeenCalled()
+    expect(engine.getTasks().find((t) => t.id === 'leftover')!.status).toBe('pending')
+  })
+
+  it('never downgrades, and only clearQueueRecovery() releases it', () => {
+    // Monotone on purpose: this process's in-memory queue is the coerced empty one, so un-latching after
+    // an out-of-band repair would run the wrong queue and then persist it over the real one.
+    const { engine } = latchedEngine()
+
+    engine.requireQueueRecovery('a different, softer reason')
+
+    expect(engine.getQueueRecoveryReason()).toBe(REASON)
+    expect(engine.isQueueRecoveryLatched()).toBe(true)
+
+    engine.clearQueueRecovery()
+    expect(engine.isQueueRecoveryLatched()).toBe(false)
+  })
+
+  it('a refused mutation does not become a persistence failure', () => {
+    // Why notify() itself is deliberately NOT a gate point: notifyAfterStage reads a throwing `'change'`
+    // listener as a write failure, so gating there would escalate this read-shape halt into a bogus
+    // persistenceBroken — the very misdiagnosis the latch is kept separate from the marker to avoid.
+    const { engine } = latchedEngine()
+
+    expect(() => engine.enqueue('t', repo)).toThrow()
+
+    expect(engine.isPersistenceBroken()).toBe(false)
+    expect(engine.getPersistenceError()).toBeUndefined()
+  })
+
+  // The `confirmQueueRecovery()` sequence moved to `createMaoApp` when its write became conditional on
+  // the stored value not having moved — that needs the store, which the engine deliberately does not
+  // hold (architecture rule 3). Its tests live in core/app.test.ts beside the boot path; what stays here
+  // is the latch itself and the gates.
+
+  // `persistQueue()` is gone: the re-save it existed for now goes through `createMaoApp`'s
+  // `resaveStoredQueue()`, because that write has to be conditional on the stored value and `emit()`
+  // cannot report a refusal back. Its tests moved to core/app.test.ts with it.
+
+  it('leaves a healthy engine completely alone', () => {
+    const github = makeFakeGithub()
+    const engine = new WorkflowEngine(github)
+    engine.setProviders([makeProvider('agent-a')])
+
+    expect(engine.isQueueRecoveryLatched()).toBe(false)
+    expect(engine.getQueueRecoveryReason()).toBeUndefined()
+    expect(() => engine.enqueue('t', repo)).not.toThrow()
+  })
+})
+
+/** A restorable task, shaped like the queue's own entries. */
+function makePendingQueueTask(id: string): QueuedTask {
+  return {
+    id,
+    title: 'Leftover task',
+    repo,
+    stage: 'issue',
+    history: [],
+    status: 'pending',
+    autoAdvance: false,
+    github: {},
+  }
+}

@@ -1,11 +1,12 @@
 import { StrictMode } from 'react'
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 import App from './App'
 import { createElectronApiStub } from './test/electron-api-stub'
 import type { RepoRef } from '../core/workflow-engine'
 import type { StoredValueProblem } from '../core/store'
+import type { QueueRecoveryOutcome } from '../core/workflow-engine'
 
 const ONE: RepoRef = { owner: 'acme', repo: 'one' }
 const TWO: RepoRef = { owner: 'acme', repo: 'two' }
@@ -46,6 +47,34 @@ const UNUSABLE_PROVIDERS: StoredValueProblem = {
   field: 'aiProviders',
   source: '/data/config.json',
   message: '[store] "aiProviders" in /data/config.json is an object, not a JSON array of providers.',
+}
+
+/**
+ * What the main process answers for a `config.json` whose `workflowTasks` the schema cannot use.
+ *
+ * Spelled out rather than imported from core for the same reason as the fixtures above, and it carries
+ * the halt wording because that is what the engine's latch holds verbatim — the operator reads the same
+ * paragraph here, in `mao run`'s refusal, and in every refused queue action.
+ */
+/**
+ * The same problem, used for the *late* case — a clean start followed by corruption.
+ *
+ * The stub derives the latch from whether a `workflowTasks` problem was seeded at construction, so a
+ * late-case test cannot use `UNUSABLE_QUEUE` directly: it would arrive latched. This one is injected
+ * after mount through `storeProblems`, which is exactly how the 30s poll surfaces it in production.
+ */
+const UNUSABLE_QUEUE_LATE: StoredValueProblem = {
+  field: 'workflowTasks',
+  source: '/data/config.json',
+  message: '[store] "workflowTasks" in /data/config.json is an object, not a JSON array.',
+}
+
+const UNUSABLE_QUEUE: StoredValueProblem = {
+  field: 'workflowTasks',
+  source: '/data/config.json',
+  message:
+    '[store] "workflowTasks" in /data/config.json is an object, not a JSON array of queued workflow ' +
+    'tasks — ignoring it, so the queue is empty and MAO will not start unattended work.',
 }
 
 /**
@@ -968,5 +997,165 @@ describe('App repository add and unsaved global settings', () => {
     expect(screen.queryByRole('heading', { name: 'acme/two' })).toBeNull()
     expect(stub.setRepos).not.toHaveBeenCalled()
     expect(screen.queryByRole('button', { name: 'ACME/TWO' })).toBeNull()
+  })
+})
+
+/**
+ * The GUI half of issue #68: a halted host has to say so, and has to offer a way out that is reachable.
+ *
+ * Reachable matters literally — an unusable `githubRepos` can sit in the same file, leaving no sidebar
+ * row, no selected project and therefore no Settings tab. So the card renders above the project list,
+ * exactly where the repo-list reset does.
+ */
+describe('App halted workflow queue', () => {
+  it('shows the store report and offers a two-step discard', async () => {
+    const { user, stub } = await renderApp([], [UNUSABLE_QUEUE])
+
+    expect(await screen.findByText(/MAO will not start unattended work/)).toBeInTheDocument()
+    // Two-step, like the repo-list reset: this write discards whatever the file held for the queue.
+    await user.click(await screen.findByRole('button', { name: 'Discard unreadable queue' }))
+    expect(stub.confirmQueueRecovery).not.toHaveBeenCalled()
+
+    await user.click(screen.getByRole('button', { name: 'Confirm discard' }))
+
+    await waitFor(() => expect(stub.confirmQueueRecovery).toHaveBeenCalled())
+    await waitFor(() => expect(screen.queryByText(/MAO will not start unattended work/)).toBeNull())
+  })
+
+  it('refuses to overwrite a queue something else already repaired, and says to restart', async () => {
+    // The latch is monotone, so after a repair made outside this window the store reads clean while this
+    // session still holds the coerced empty queue. Core answers `already-readable` and writes nothing;
+    // the operator has to be told that a restart — not another click — is what loads the real queue.
+    // (That the button is not even *offered* in that state is a prop-level rule, pinned in
+    // src/components/Sidebar.test.tsx where it can be asserted without waiting on a 30s poll.)
+    const { user, stub } = await renderApp([], [UNUSABLE_QUEUE])
+    stub.confirmQueueRecovery.mockResolvedValue({ kind: 'already-readable' })
+
+    await user.click(await screen.findByRole('button', { name: 'Discard unreadable queue' }))
+    await user.click(screen.getByRole('button', { name: 'Confirm discard' }))
+
+    expect(await screen.findByText(/Restart MAO to load it/)).toBeInTheDocument()
+    expect(screen.getByText('Workflow automation is halted')).toBeInTheDocument()
+  })
+
+  it('keeps the card up and says why when the discard itself fails', async () => {
+    const { user, stub } = await renderApp([], [UNUSABLE_QUEUE])
+    stub.confirmQueueRecovery.mockResolvedValue({ kind: 'write-failed' })
+
+    await user.click(await screen.findByRole('button', { name: 'Discard unreadable queue' }))
+    await user.click(screen.getByRole('button', { name: 'Confirm discard' }))
+
+    expect(await screen.findByText(/what reached the config file is unknown/)).toBeInTheDocument()
+    expect(screen.getByText('Workflow automation is halted')).toBeInTheDocument()
+  })
+
+  it('does not print the same report twice', async () => {
+    // The latch carries the store's message verbatim, so rendering both the queue card and the generic
+    // problems list would show the same paragraph twice in a narrow column.
+    await renderApp([], [UNUSABLE_QUEUE])
+
+    expect(await screen.findAllByText(/MAO will not start unattended work/)).toHaveLength(1)
+  })
+
+  it('still shows another field report alongside the queue card', async () => {
+    await renderApp([], [UNUSABLE_QUEUE, UNUSABLE_PROVIDERS])
+
+    expect(await screen.findByText(/MAO will not start unattended work/)).toBeInTheDocument()
+    expect(screen.getByText(/"aiProviders" in \/data\/config.json/)).toBeInTheDocument()
+  })
+
+  it('a repo-list read that fails from the very first poll does not suppress the queue card', async () => {
+    // The two reads sit on separate chains on purpose: `refreshStoreProblems` ends in one trailing catch
+    // covering both halves, so folding the queue read into it would let a throw there hide the one answer
+    // that says unattended work is halted. Built by hand rather than through `renderApp` so the failure
+    // is already in place at mount — that is what makes this a proof of the separation rather than of
+    // state left over from a successful first read.
+    const stub = createElectronApiStub([], [UNUSABLE_QUEUE])
+    stub.storeProblems.mockRejectedValue(new Error('EACCES: permission denied'))
+    render(
+      <StrictMode>
+        <App />
+      </StrictMode>,
+    )
+
+    expect(await screen.findByText('Workflow automation is halted')).toBeInTheDocument()
+    // And it fails SAFE: with nobody able to say whether the file still holds the unreadable value, the
+    // discard stays on offer rather than the renderer claiming a repair it cannot see. Clicking it is
+    // harmless either way — `confirmQueueRecovery()` re-probes and writes nothing if the value is gone.
+    expect(await screen.findByRole('button', { name: 'Discard unreadable queue' })).toBeInTheDocument()
+    expect(screen.queryByText(/Restart MAO to load it/)).toBeNull()
+  })
+
+  /**
+   * Mounts the late case: a `workflowTasks` problem on disk while the engine is **not** latched.
+   *
+   * Built by hand because the stub derives the latch from the problems it is constructed with, so
+   * seeding the problem through `renderApp` would boot halted and render the other branch. Overriding
+   * `recoveryRequired` is what production looks like after a clean start — the latch is a boot decision,
+   * the problem arrives later on the poll.
+   */
+  async function renderLateCorruption(outcome: QueueRecoveryOutcome, { healsAfter = false } = {}) {
+    const user = userEvent.setup()
+    const stub = createElectronApiStub([], [UNUSABLE_QUEUE_LATE])
+    stub.recoveryRequired.mockResolvedValue({ required: false, reason: undefined })
+    stub.resaveQueue.mockResolvedValue(outcome)
+    render(
+      <StrictMode>
+        <App />
+      </StrictMode>,
+    )
+    const button = await screen.findByRole('button', { name: /Save this session/ })
+    // `healsAfter` models what actually happens for `already-readable`: the outcome says the fresh
+    // observation found the file repaired, so the refresh that follows the action REMOVES the problem.
+    // Without this the stub keeps answering a stale problem and the card never unmounts — which is how
+    // the first version of these tests passed against a renderer that lost the message.
+    if (healsAfter) stub.storeProblems.mockResolvedValue([])
+    await user.click(button)
+    return { stub }
+  }
+
+  it('keeps the “nothing was written” message after the problem it reported on disappears', async () => {
+    // The ordering bug, and the reason the message cannot live inside the queue card. `already-readable`
+    // means the file is genuinely repaired, so the refresh in the action's `finally` empties the problem
+    // list, the card unmounts, and a message rendered inside it goes with it — leaving a click that
+    // appears to have done nothing. The message has to outlive the condition it is reporting on.
+    await renderLateCorruption({ kind: 'already-readable' }, { healsAfter: true })
+
+    expect(await screen.findByText(/nothing was written/)).toBeInTheDocument()
+    // The card really is gone — this is not passing because the problem lingered.
+    await waitFor(() => expect(screen.queryByRole('button', { name: /Save this session/ })).toBeNull())
+    expect(screen.getByText(/nothing was written/)).toBeInTheDocument()
+  })
+
+  it('keeps every other non-success result too, with the problem list emptied', async () => {
+    // Same ordering for the rest: a store that heals (or is read as healed) between the action and the
+    // refresh must not take the explanation down with it.
+    const cases: Array<[QueueRecoveryOutcome, RegExp]> = [
+      [{ kind: 'superseded' }, /changed while saving/],
+      [{ kind: 'unverified', reason: 'could not read the config file' }, /could not read the config file/],
+      [{ kind: 'write-failed' }, /what reached the config file is unknown/],
+    ]
+
+    for (const [outcome, expected] of cases) {
+      cleanup()
+      await renderLateCorruption(outcome, { healsAfter: true })
+      expect(await screen.findByText(expected), String(expected)).toBeInTheDocument()
+    }
+  })
+
+  it('lets the operator dismiss the result', async () => {
+    const user = userEvent.setup()
+    await renderLateCorruption({ kind: 'already-readable' }, { healsAfter: true })
+    await screen.findByText(/nothing was written/)
+
+    await user.click(screen.getByRole('button', { name: 'Dismiss' }))
+
+    expect(screen.queryByText(/nothing was written/)).toBeNull()
+  })
+  it('says nothing about the queue when the store is healthy', async () => {
+    await renderApp([ONE])
+
+    expect(screen.queryByText('Workflow automation is halted')).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Discard unreadable queue' })).toBeNull()
   })
 })

@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import type { RepoRef } from '../../core/workflow-engine'
+import type { QueueRecoveryState, RepoRef } from '../../core/workflow-engine'
 import type { RepoWorkflowCapability } from '../../core/repo-capabilities'
 import type { StoredValueProblem } from '../../core/store'
 
@@ -49,6 +49,31 @@ interface SidebarProps {
   storeProblems: StoredValueProblem[]
   /** Discards the unusable stored value by writing an empty list. Rejects if even that write fails. */
   onResetRepoList: () => Promise<void>
+  /**
+   * Whether unattended work is halted because the stored workflow queue is unreadable, and the store's
+   * own report saying why.
+   *
+   * Driven by the engine rather than by `storeProblems`, because the latch is monotone: after a repair
+   * made outside this window the store reads clean while this process stays halted, and the operator
+   * still needs to be told that — and told to restart — rather than shown a healthy-looking sidebar.
+   */
+  queueRecovery: QueueRecoveryState
+  /**
+   * Whether the config file *still* holds the unreadable queue. False while the latch is up means
+   * something else already repaired it, and then the discard must not be offered: it would replace the
+   * repair with this process's coerced empty queue.
+   */
+  queueStoredStillUnreadable: boolean
+  /** Discards the unreadable stored queue and releases the engine. Rejects if the write fails. */
+  onDiscardQueue: () => Promise<void>
+  /**
+   * Rewrites the stored queue from the one this session is holding.
+   *
+   * Offered only in the late case — the value went unusable after a clean start, so this session still
+   * has the real queue. A *discard* there would be wrong twice over: there is no latch to release, and
+   * run in another process it would put that process's empty queue in the file.
+   */
+  onResaveQueue: () => Promise<void>
   view: 'project' | 'global-settings'
   onViewChange: (view: 'project' | 'global-settings') => void
 }
@@ -60,6 +85,10 @@ export default function Sidebar({
   onAddRepo,
   storeProblems,
   onResetRepoList,
+  queueRecovery,
+  queueStoredStillUnreadable,
+  onDiscardQueue,
+  onResaveQueue,
   view,
   onViewChange,
 }: SidebarProps) {
@@ -72,16 +101,64 @@ export default function Sidebar({
   const [confirmingReset, setConfirmingReset] = useState(false)
   const [resetting, setResetting] = useState(false)
   const [resetError, setResetError] = useState('')
+  const [confirmingDiscard, setConfirmingDiscard] = useState(false)
+  const [discarding, setDiscarding] = useState(false)
+  const [resaving, setResaving] = useState(false)
+  const [queueError, setQueueError] = useState('')
 
   /**
    * Whether it is the *repository list* that is unusable, not merely something in the same file.
    *
    * The reset deletes `githubRepos` and nothing else, so offering it for any other field's report would
-   * put a destructive button under a message that is not about repositories. Today the guard only checks
-   * this one field, so the distinction is invisible — which is exactly why it is written down now rather
-   * than discovered when a second field joins it (issue #68).
+   * put a destructive button under a message that is not about repositories. Issue #68 added the second
+   * and third fields this now has to be distinguished from, so the check is load-bearing rather than
+   * merely prospective.
    */
   const repoListUnusable = storeProblems.some((problem) => problem.field === 'githubRepos')
+
+  /**
+   * Whether the stored queue is unusable *right now*, which is not the same as this session being halted.
+   *
+   * The latch is decided once at boot, so a file corrupted after a clean boot leaves `queueRecovery`
+   * false while the 30s `app:storeProblems` poll finds the problem. Both facts have to reach the
+   * operator, and they say different things — see the card below.
+   */
+  const queueStoredProblem = storeProblems.find((problem) => problem.field === 'workflowTasks')
+  const showQueueCard = queueRecovery.required || queueStoredProblem !== undefined
+
+  /**
+   * The queue's report is filtered out of the generic list only when the dedicated card below actually
+   * renders it — filtering unconditionally hid it completely in exactly the case the card does not cover
+   * (a clean boot, then corruption), so neither the card nor the generic report appeared at all.
+   */
+  const otherProblems = storeProblems.filter((problem) => problem.field !== 'workflowTasks' || !showQueueCard)
+
+  async function submitResave() {
+    if (resaving) return
+    setResaving(true)
+    setQueueError('')
+    try {
+      await onResaveQueue()
+    } catch (err) {
+      setQueueError(readableIpcError(err))
+    } finally {
+      setResaving(false)
+    }
+  }
+
+  async function submitDiscard() {
+    if (discarding) return
+    setDiscarding(true)
+    setQueueError('')
+    try {
+      await onDiscardQueue()
+      setConfirmingDiscard(false)
+    } catch (err) {
+      setQueueError(readableIpcError(err))
+    } finally {
+      setDiscarding(false)
+    }
+  }
 
   /**
    * The main process preflights issue/PR write access before it persists anything, so this can fail
@@ -152,10 +229,102 @@ export default function Sidebar({
           </button>
         </div>
 
-        {storeProblems.length > 0 && (
+        {showQueueCard && (
+          <div className="card mb-2 gap-1.5 p-2">
+            <p className="card-title text-[13px]">
+              {queueRecovery.required ? 'Workflow automation is halted' : 'The stored workflow queue is unreadable'}
+            </p>
+            {/* When this session is halted, the store's own report verbatim — the same words `mao run`
+                prints and every refused queue action throws, so an operator reading one has read them
+                all. When it is NOT halted, that report would be false: the latch is decided at boot, so
+                a file corrupted afterwards leaves this session running the real queue it already loaded.
+                Saying "halted" there would send the operator looking for a stoppage that has not
+                happened, so the late case gets its own wording. */}
+            {queueRecovery.required ? (
+              <p className="text-muted text-[11px] leading-snug">{queueRecovery.reason}</p>
+            ) : (
+              /* Deliberately NOT the store's report. That text is written for the halted case and says the
+                 queue is empty, that MAO will not start unattended work, and that every queue write is
+                 refused — all three false here. Rendering it beside "this session is not halted" gave the
+                 operator two opposite instructions at once. The field and the file are what they need. */
+              <>
+                <p className="text-muted text-[11px] leading-snug">
+                  MAO cannot read the stored workflow queue in {queueStoredProblem?.source}. This session
+                  is not halted — it is still holding the queue it loaded at startup, and its next queue
+                  write will rewrite the file from that. Restarting before that happens will refuse to
+                  start unattended work until the value is replaced.
+                </p>
+                {/* Deliberately NOT `mao workflow confirm-queue-recovery` here. That command discards, and
+                    run in a *separate* process it would write ITS empty queue over the file — so this
+                    session's real queue would be lost the moment it restarted without having written.
+                    Saving from this session writes the queue it is actually holding. */}
+                <button onClick={submitResave} className="btn btn-secondary self-start text-xs" disabled={resaving}>
+                  {resaving ? 'Saving…' : 'Save this session’s queue now'}
+                </button>
+              </>
+            )}
+            {queueRecovery.required && queueStoredStillUnreadable ? (
+              confirmingDiscard ? (
+                <div className="flex gap-2">
+                  <button onClick={submitDiscard} className="btn btn-primary text-xs" disabled={discarding}>
+                    {discarding ? 'Discarding…' : 'Confirm discard'}
+                  </button>
+                  {/* Disabled mid-write rather than hidden, like the repo-list reset: the write is
+                      already queued and a Cancel that appeared to work would say otherwise. */}
+                  <button
+                    onClick={() => {
+                      setConfirmingDiscard(false)
+                      setQueueError('')
+                    }}
+                    className="btn btn-secondary text-xs"
+                    disabled={discarding}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              ) : (
+                <button
+                  onClick={() => setConfirmingDiscard(true)}
+                  className="btn btn-secondary self-start text-xs"
+                >
+                  Discard unreadable queue
+                </button>
+              )
+            ) : queueRecovery.required ? (
+              /* Something outside this window already repaired the file. Offering the discard here
+                 would overwrite that repair with this process's coerced empty queue, so the way out is
+                 a restart instead — the real queue has to be loaded, and only a fresh boot does that. */
+              <p className="text-muted text-[11px] leading-snug">
+                The stored queue reads normally again. Restart MAO to load it — this session is still
+                halted because it is holding an empty queue.
+              </p>
+            ) : null}
+          </div>
+        )}
+
+        {/* The result of a queue action lives OUTSIDE the card above, and that placement is the fix for a
+            bug rather than a layout preference. These messages are about an action that has finished,
+            while the card is about a condition that currently holds — and the two most important
+            messages say the condition is *gone*. `already-readable` means the fresh observation found the
+            file repaired, so the refresh that follows removes the problem, the card unmounts, and an error
+            rendered inside it vanished with the thing it was reporting on. The operator saw a click that
+            did nothing. Dismissed explicitly so it cannot be missed either. */}
+        {queueError && (
+          <div className="card mb-2 gap-1.5 p-2">
+            <p className="card-title text-[13px]">Workflow queue</p>
+            <p className="text-xs" style={{ color: 'var(--color-accent-700)' }}>
+              {queueError}
+            </p>
+            <button onClick={() => setQueueError('')} className="btn btn-secondary self-start text-xs">
+              Dismiss
+            </button>
+          </div>
+        )}
+
+        {otherProblems.length > 0 && (
           <div className="card mb-2 gap-1.5 p-2">
             <p className="card-title text-[13px]">Stored settings could not be read</p>
-            {storeProblems.map((problem) => (
+            {otherProblems.map((problem) => (
               <p key={problem.field} className="text-muted text-[11px] leading-snug">
                 {problem.message}
               </p>

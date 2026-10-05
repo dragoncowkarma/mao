@@ -469,15 +469,6 @@ export default function App() {
   }
 
   /**
-   * The in-app way out of a stored repository list the schema cannot use.
-   *
-   * Reachable when nothing else is: with no usable list there is no sidebar row, so no project is
-   * selected and the Settings tab's Remove button — the guard's own suggested recovery — never
-   * renders. Writing an empty list registers nothing, so unlike Add it is never refused by the
-   * write-permission preflight, which is what an operator with a missing or revoked token is left
-   * with. Sidebar confirms first, and shows the report naming the file to salvage from.
-   */
-  /**
    * Discards an unreadable stored workflow queue and releases the engine.
    *
    * The outcome is decided in `core/` (see `QueueRecoveryOutcome`) rather than inferred here, so this
@@ -549,6 +540,15 @@ export default function App() {
     }
   }
 
+  /**
+   * The in-app way out of a stored repository list the schema cannot use.
+   *
+   * Reachable when nothing else is: with no usable list there is no sidebar row, so no project is
+   * selected and the Settings tab's Remove button — the guard's own suggested recovery — never
+   * renders. Writing an empty list registers nothing, so unlike Add it is never refused by the
+   * write-permission preflight, which is what an operator with a missing or revoked token is left
+   * with. Sidebar confirms first, and shows the report naming the file to salvage from.
+   */
   async function resetRepoList() {
     setRepoError('')
     // Re-read before destroying anything. This store is not this window's alone: the report itself tells

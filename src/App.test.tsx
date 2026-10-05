@@ -1152,9 +1152,6 @@ describe('App halted workflow queue', () => {
 
     expect(screen.queryByText(/nothing was written/)).toBeNull()
   })
-
-
-
   it('says nothing about the queue when the store is healthy', async () => {
     await renderApp([ONE])
 

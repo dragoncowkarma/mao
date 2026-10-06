@@ -1012,7 +1012,7 @@ describe('App halted workflow queue', () => {
     const { user, stub } = await renderApp([], [UNUSABLE_QUEUE])
 
     expect(await screen.findByText(/MAO will not start unattended work/)).toBeInTheDocument()
-    // Two-step, like the repo-list reset: this write discards whatever the file held for the queue.
+    // Two-step, like the repo-list reset: this write retains readable tasks but discards invalid entries.
     await user.click(await screen.findByRole('button', { name: 'Discard unreadable queue' }))
     expect(stub.confirmQueueRecovery).not.toHaveBeenCalled()
 
@@ -1024,7 +1024,7 @@ describe('App halted workflow queue', () => {
 
   it('refuses to overwrite a queue something else already repaired, and says to restart', async () => {
     // The latch is monotone, so after a repair made outside this window the store reads clean while this
-    // session still holds the coerced empty queue. Core answers `already-readable` and writes nothing;
+    // session still holds only its filtered startup subset. Core answers `already-readable` and writes nothing;
     // the operator has to be told that a restart — not another click — is what loads the real queue.
     // (That the button is not even *offered* in that state is a prop-level rule, pinned in
     // src/components/Sidebar.test.tsx where it can be asserted without waiting on a 30s poll.)

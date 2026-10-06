@@ -371,10 +371,10 @@ workflow
 workflow
   .command('confirm-queue-recovery')
   .description(
-    'Discard an unreadable stored workflow queue and release the engine. Only run this after copying ' +
-      "anything you still need out of the config file and checking the target repo for an issue still " +
-      'labelled workflow-active whose branch or PR is half-finished — confirming replaces the unreadable ' +
-      'value, so whatever it held is gone.',
+    'Discard invalid entries from an unusable stored workflow queue, retain readable tasks and release ' +
+      'the engine. Only run this after copying anything you still need out of the config file and ' +
+      'checking the target repo for an issue still labelled workflow-active whose branch or PR is ' +
+      'half-finished — confirming permanently removes anything the store could not validate.',
   )
   .action(() => {
     // resume: false, so booting this command cannot start the pipeline it is about to release.
@@ -403,7 +403,10 @@ workflow
           'halted. Inspect the file before salvaging anything from it, then retry.',
       )
     }
-    log('Discarded the unreadable stored workflow queue. Auto-resume, polling and queue writes are released.')
+    log(
+      'Recovered the stored workflow queue: readable tasks were retained and invalid entries were ' +
+        'discarded. Restart MAO or run `mao run` to resume retained tasks; polling and queue writes are released.',
+    )
   })
 
 // --- run ----------------------------------------------------------------------

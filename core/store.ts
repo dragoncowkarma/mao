@@ -1,7 +1,14 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import type { AiProviderConfig } from './ai/types.ts'
-import { WORKFLOW_ACTIVE_LABEL } from './workflow-engine.ts'
+import {
+  AGENT_STAGES,
+  AI_API_FORMATS,
+  AI_EFFORTS,
+  AI_PROVIDER_KINDS,
+  PROVIDER_KIND_IDS,
+  type AiProviderConfig,
+} from './ai/types.ts'
+import { WORKFLOW_ACTIVE_LABEL, WORKFLOW_TASK_STATUSES } from './workflow-engine.ts'
 import type { QueuedTask, RepoRef } from './workflow-engine.ts'
 
 /**
@@ -31,6 +38,205 @@ export const MAO_STORE_DEFAULTS: MaoStoreSchema = {
   workflowTasks: [],
   buildSha: '',
   theme: 'system',
+}
+
+type UnknownRecord = Record<string, unknown>
+type RestorableQueuedTask = Omit<QueuedTask, 'autoAdvance'> & { autoAdvance?: boolean }
+
+function isRecord(value: unknown): value is UnknownRecord {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function isOneOf<T extends string>(value: unknown, choices: readonly T[]): value is T {
+  return typeof value === 'string' && (choices as readonly string[]).includes(value)
+}
+
+function hasOptional(
+  record: UnknownRecord,
+  key: string,
+  predicate: (value: unknown) => boolean,
+): boolean {
+  return record[key] === undefined || predicate(record[key])
+}
+
+/** Like `Array.prototype.every`, but treats a sparse-array hole as an `undefined` entry. */
+function everyArrayEntry(value: unknown[], predicate: (entry: unknown) => boolean): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    if (!predicate(value[index])) return false
+  }
+  return true
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && everyArrayEntry(value, (entry) => typeof entry === 'string')
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value)
+}
+
+function isAiEffort(value: unknown): boolean {
+  return isOneOf(value, AI_EFFORTS)
+}
+
+function isModelEffortPreset(value: unknown): boolean {
+  if (!isRecord(value)) return false
+  return (
+    typeof value.id === 'string' &&
+    typeof value.model === 'string' &&
+    hasOptional(value, 'effort', isAiEffort)
+  )
+}
+
+/**
+ * Runtime counterpart of `AiProviderConfig` at the untyped JSON boundary.
+ *
+ * This is intentionally shape validation, not settings policy: empty strings and a CLI provider with
+ * no command are still structurally representable and the existing settings validation gives those
+ * operator-facing errors. The store boundary's narrower job is to guarantee that every reader may
+ * safely access the declared fields and nested lists without crashing.
+ */
+export function isAiProviderConfig(value: unknown): value is AiProviderConfig {
+  if (!isRecord(value)) return false
+  return (
+    typeof value.id === 'string' &&
+    typeof value.name === 'string' &&
+    isOneOf(value.kind, AI_PROVIDER_KINDS) &&
+    hasOptional(value, 'apiFormat', (entry) => isOneOf(entry, AI_API_FORMATS)) &&
+    hasOptional(value, 'apiKey', (entry) => typeof entry === 'string') &&
+    hasOptional(value, 'baseUrl', (entry) => typeof entry === 'string') &&
+    hasOptional(value, 'model', (entry) => typeof entry === 'string') &&
+    hasOptional(value, 'command', (entry) => typeof entry === 'string') &&
+    hasOptional(value, 'providerKindId', (entry) => isOneOf(entry, PROVIDER_KIND_IDS)) &&
+    hasOptional(value, 'args', isStringArray) &&
+    hasOptional(value, 'effort', isAiEffort) &&
+    hasOptional(
+      value,
+      'allowedStages',
+      (entry) => Array.isArray(entry) && everyArrayEntry(entry, (stage) => isOneOf(stage, AGENT_STAGES)),
+    ) &&
+    hasOptional(
+      value,
+      'presets',
+      (entry) => Array.isArray(entry) && everyArrayEntry(entry, isModelEffortPreset),
+    ) &&
+    hasOptional(value, 'selectedPresetId', (entry) => typeof entry === 'string')
+  )
+}
+
+function isStoredRepoRef(value: unknown): value is RepoRef {
+  if (!isRecord(value)) return false
+  const record = value
+  return (
+    typeof record.owner === 'string' &&
+    typeof record.repo === 'string' &&
+    hasOptional(record, 'autoTrigger', (entry) => typeof entry === 'boolean') &&
+    hasOptional(record, 'pollIntervalMs', isFiniteNumber)
+  )
+}
+
+function isWorkflowStep(value: unknown): boolean {
+  if (!isRecord(value)) return false
+  return (
+    isOneOf(value.stage, AGENT_STAGES) &&
+    typeof value.agentId === 'string' &&
+    typeof value.agentName === 'string' &&
+    hasOptional(value, 'providerKindId', (entry) => isOneOf(entry, PROVIDER_KIND_IDS)) &&
+    hasOptional(value, 'model', (entry) => typeof entry === 'string') &&
+    hasOptional(value, 'effort', isAiEffort) &&
+    typeof value.prompt === 'string' &&
+    typeof value.output === 'string'
+  )
+}
+
+function isRoleAssignment(value: unknown): boolean {
+  if (!isRecord(value)) return false
+  return (
+    hasOptional(value, 'worker', (entry) => typeof entry === 'string') &&
+    hasOptional(value, 'reviewer', (entry) => typeof entry === 'string') &&
+    hasOptional(value, 'maintainer', (entry) => typeof entry === 'string')
+  )
+}
+
+function isProviderOverride(value: unknown): boolean {
+  if (!isRecord(value)) return false
+  return (
+    hasOptional(value, 'providerId', (entry) => typeof entry === 'string') &&
+    hasOptional(value, 'model', (entry) => typeof entry === 'string') &&
+    hasOptional(value, 'effort', isAiEffort) &&
+    hasOptional(value, 'roles', isRoleAssignment)
+  )
+}
+
+function isRunOverride(value: unknown): boolean {
+  if (!isRecord(value)) return false
+  return (
+    hasOptional(value, 'providerId', (entry) => typeof entry === 'string') &&
+    hasOptional(value, 'model', (entry) => typeof entry === 'string') &&
+    hasOptional(value, 'effort', isAiEffort)
+  )
+}
+
+function isActiveWorkflowStep(value: unknown): boolean {
+  if (!isRecord(value)) return false
+  return (
+    typeof value.agentId === 'string' &&
+    typeof value.agentName === 'string' &&
+    hasOptional(value, 'providerKindId', (entry) => isOneOf(entry, PROVIDER_KIND_IDS)) &&
+    hasOptional(value, 'model', (entry) => typeof entry === 'string') &&
+    hasOptional(value, 'effort', isAiEffort) &&
+    typeof value.prompt === 'string'
+  )
+}
+
+function isGithubTaskState(value: unknown): boolean {
+  if (!isRecord(value)) return false
+  return (
+    hasOptional(value, 'issueNumber', isFiniteNumber) &&
+    hasOptional(value, 'issueUrl', (entry) => typeof entry === 'string') &&
+    hasOptional(value, 'prNumber', isFiniteNumber) &&
+    hasOptional(value, 'prUrl', (entry) => typeof entry === 'string') &&
+    hasOptional(value, 'branch', (entry) => typeof entry === 'string')
+  )
+}
+
+/**
+ * Whether an untyped JSON value is a task every restore, engine and renderer path can safely consume.
+ * `autoAdvance` alone may be absent: old queues predate that field, and `restore()` deliberately
+ * migrates the omission to `true`. Every other required member has no safe default and is therefore a
+ * shape failure rather than a guessed migration.
+ */
+function hasQueuedTaskShape(value: unknown, allowMissingAutoAdvance: boolean): value is RestorableQueuedTask {
+  if (!isRecord(value)) return false
+  return (
+    typeof value.id === 'string' &&
+    typeof value.title === 'string' &&
+    isStoredRepoRef(value.repo) &&
+    isOneOf(value.stage, AGENT_STAGES) &&
+    Array.isArray(value.history) &&
+    everyArrayEntry(value.history, isWorkflowStep) &&
+    isOneOf(value.status, WORKFLOW_TASK_STATUSES) &&
+    hasOptional(value, 'error', (entry) => typeof entry === 'string') &&
+    (typeof value.autoAdvance === 'boolean' || (allowMissingAutoAdvance && value.autoAdvance === undefined)) &&
+    hasOptional(value, 'providerOverride', isProviderOverride) &&
+    hasOptional(value, 'nextRunOverride', isRunOverride) &&
+    hasOptional(value, 'active', isActiveWorkflowStep) &&
+    isGithubTaskState(value.github)
+  )
+}
+
+/** Strict current-schema predicate used before persisting a queue. */
+export function isQueuedTask(value: unknown): value is QueuedTask {
+  return hasQueuedTaskShape(value, false)
+}
+
+/** Read-side predicate that accepts the one durable legacy shape `restore()` knows how to migrate. */
+function isRestorableQueuedTask(value: unknown): value is RestorableQueuedTask {
+  return hasQueuedTaskShape(value, true)
+}
+
+function normalizeRestorableTask(task: RestorableQueuedTask): QueuedTask {
+  return { ...task, autoAdvance: task.autoAdvance ?? true }
 }
 
 /**
@@ -80,8 +286,21 @@ export function describeUnusableRepoList(value: unknown, source: string): string
   )
 }
 
+function countInvalidEntries(value: unknown[], predicate: (entry: unknown) => boolean): number {
+  let invalid = 0
+  for (let index = 0; index < value.length; index += 1) {
+    if (!predicate(value[index])) invalid += 1
+  }
+  return invalid
+}
+
+function countPhrase(count: number, singular: string, plural = `${singular}s`): string {
+  return `${count} ${count === 1 ? singular : plural}`
+}
+
 /**
- * The actionable report for a stored `aiProviders` that is not a list — or `null` when it is one.
+ * The actionable report for a stored `aiProviders` that is not a list or contains unusable entries —
+ * or `null` when every entry is safe to hand to callers.
  *
  * Worded as an ignored-configuration report, deliberately unlike the queue's below: an empty provider
  * list costs nothing but the ability to route a stage, and every stage then fails at `selectAgent()`
@@ -94,7 +313,19 @@ export function describeUnusableRepoList(value: unknown, source: string): string
  * import-providers` and the GUI's Global settings pane are both reachable without one.
  */
 export function describeUnusableProviderList(value: unknown, source: string): string | null {
-  if (Array.isArray(value)) return null
+  if (Array.isArray(value)) {
+    const invalid = countInvalidEntries(value, isAiProviderConfig)
+    if (invalid === 0) return null
+    const valid = value.length - invalid
+    return (
+      `[store] "aiProviders" in ${source} contains ${countPhrase(invalid, 'invalid entry', 'invalid entries')} out of ` +
+      `${value.length} — ignoring ${invalid === 1 ? 'it' : 'them'} in memory and keeping ` +
+      `${countPhrase(valid, 'valid provider')}. No stored value, token or API key is shown in this ` +
+      'report. The invalid entries are still in the file; any provider-list write overwrites them. ' +
+      '`mao config import-providers <file>`, or the GUI\'s Global settings pane, replaces the list — ' +
+      `copy anything you still need out of ${source} first.`
+    )
+  }
   return (
     `[store] "aiProviders" in ${source} is ${describeStoredType(value)}, not a JSON array of AI ` +
     'provider configs — ignoring it, so no AI providers are registered and every workflow stage fails ' +
@@ -106,7 +337,8 @@ export function describeUnusableProviderList(value: unknown, source: string): st
 }
 
 /**
- * The actionable report for a stored `workflowTasks` that is not a list — or `null` when it is one.
+ * The actionable report for a stored `workflowTasks` that is not a list or contains unusable entries —
+ * or `null` when every entry is safe to restore.
  *
  * This one is not just a report: it is the text the queue-recovery latch carries verbatim (see
  * `findStoredQueueProblem()` and `WorkflowEngine.requireQueueRecovery()`), so the stderr line, every
@@ -128,7 +360,23 @@ export function describeUnusableProviderList(value: unknown, source: string): st
  * destruction this latch exists to prevent.
  */
 export function describeUnusableTaskQueue(value: unknown, source: string): string | null {
-  if (Array.isArray(value)) return null
+  if (Array.isArray(value)) {
+    const invalid = countInvalidEntries(value, isRestorableQueuedTask)
+    if (invalid === 0) return null
+    const valid = value.length - invalid
+    return (
+      `[store] "workflowTasks" in ${source} contains ${countPhrase(invalid, 'invalid queued task')} ` +
+      `out of ${value.length} — ignoring ${invalid === 1 ? 'it' : 'them'} in memory, preserving ` +
+      `${countPhrase(valid, 'readable task')}, and halting unattended work: auto-resume, auto-trigger ` +
+      'polling and every queue write are refused until this is resolved. No stored task, prompt, token ' +
+      'or API key is shown in this report. A discarded durable task may represent GitHub work MAO can ' +
+      'no longer account for, so running another task could duplicate an issue, branch or PR. The invalid ' +
+      `entries are still in ${source}. Copy anything you need out first, then check the target repos for ` +
+      `issues still labelled "${WORKFLOW_ACTIVE_LABEL}" and half-finished branches or PRs. ` +
+      '`mao workflow confirm-queue-recovery` (or the sidebar\'s Discard unreadable queue) writes back ' +
+      'the readable tasks only and releases the engine.'
+    )
+  }
   return (
     `[store] "workflowTasks" in ${source} is ${describeStoredType(value)}, not a JSON array of queued ` +
     'workflow tasks — ignoring it, so the queue is empty and MAO will not start unattended work: ' +
@@ -174,9 +422,72 @@ function unusableStoredValue<K extends keyof MaoStoreSchema>(
   return rule ? rule(raw, source) : null
 }
 
+/**
+ * The safe in-memory view of a value for which `unusableStoredValue()` returned a problem.
+ *
+ * A wrong container has no readable entries, so it still becomes the cloned schema default. For the
+ * two issue #75 lists, however, a mixed array is not all-or-nothing: keep each entry whose complete
+ * declared shape is safe and leave the invalid entries only on disk until an explicit list write.
+ */
+function usableStoredValue<K extends keyof MaoStoreSchema>(
+  key: K,
+  raw: MaoStoreSchema[K],
+  problem: string | null,
+): MaoStoreSchema[K] {
+  if (key === 'aiProviders' && Array.isArray(raw)) {
+    return Array.from(raw as unknown[]).filter(isAiProviderConfig) as MaoStoreSchema[K]
+  }
+  if (key === 'workflowTasks' && Array.isArray(raw)) {
+    return Array.from(raw as unknown[])
+      .filter(isRestorableQueuedTask)
+      .map(normalizeRestorableTask) as MaoStoreSchema[K]
+  }
+  return problem === null ? raw : structuredClone(MAO_STORE_DEFAULTS[key])
+}
+
+/**
+ * A value a caller tried to persist but which would violate the schema after a JSON round trip.
+ *
+ * Read recovery filters because the bad bytes already exist and callers need a way back. Writes have
+ * no such excuse: rejecting the whole attempted list before `backend.set` preserves the last durable
+ * value and stops `mao config import-providers [null]` from corrupting the file before its success log
+ * touches `p.id`. The message reports only field, destination and count — never an entry or index.
+ */
+function describeInvalidStoredWrite<K extends keyof MaoStoreSchema>(
+  key: K,
+  value: MaoStoreSchema[K],
+  source: string,
+): string | null {
+  const predicate =
+    key === 'aiProviders' ? isAiProviderConfig : key === 'workflowTasks' ? isQueuedTask : undefined
+  if (predicate === undefined) return null
+  if (!Array.isArray(value)) {
+    return (
+      `[store] Refusing to write "${key}" in ${source}: expected a JSON array, received ` +
+      `${describeStoredType(value)}. Nothing was written.`
+    )
+  }
+  const invalid = countInvalidEntries(value, predicate)
+  if (invalid === 0) return null
+  return (
+    `[store] Refusing to write "${key}" in ${source}: ` +
+    `${countPhrase(invalid, 'invalid entry', 'invalid entries')} out of ` +
+    `${value.length}. No entry, prompt, token or API key is shown. Nothing was written.`
+  )
+}
+
+function assertStoredWrite<K extends keyof MaoStoreSchema>(
+  key: K,
+  value: MaoStoreSchema[K],
+  source: string,
+): void {
+  const problem = describeInvalidStoredWrite(key, value, source)
+  if (problem !== null) throw new Error(problem)
+}
+
 /** A stored value the schema cannot use, in the form a shell can show an operator. */
 export interface StoredValueProblem {
-  /** The `MaoStoreSchema` field whose stored value was replaced with the schema default. */
+  /** The `MaoStoreSchema` field whose stored value was replaced or filtered for safe in-memory use. */
   field: keyof MaoStoreSchema
   /** The config file the unusable value is still sitting in. */
   source: string
@@ -268,14 +579,15 @@ export type ConditionalWriteResult = 'written' | 'superseded' | 'unverifiable'
  * Exists because `get()` and `problems()` are two separate reads, and electron-store re-reads and
  * re-parses the config file on **every** `get`. `createMaoApp` decided the queue latch from one of those
  * reads and then restored from the other, so a hand-edit landing between them left the host *unlatched*
- * holding a coerced empty queue — auto-trigger then started immediately and overwrote the unreadable
- * original, which is the exact failure the latch exists to prevent. One observation removes the window:
- * the latch and `restore()` cannot disagree because there is no second read to disagree with.
+ * holding a corrected queue that no longer represented every durable entry — auto-trigger then started
+ * immediately and overwrote the original, which is the exact failure the latch exists to prevent. One
+ * observation removes the window: the latch and `restore()` cannot disagree because there is no second
+ * read to disagree with.
  */
 export interface StoredObservation<K extends keyof MaoStoreSchema> {
-  /** The value corrected to the shape the schema declares — what a caller may use. */
+  /** The value corrected to the shape the schema declares — defaulted or element-filtered for use. */
   value: MaoStoreSchema[K]
-  /** The operator-facing report when the guard had to replace the stored value, else `undefined`. */
+  /** The operator-facing report when the guard had to replace or filter the value, else `undefined`. */
   problem: string | undefined
   /**
    * False when the backend read itself failed, so nothing about the stored value was established.
@@ -326,18 +638,20 @@ export type StoredReadGuard = <K extends keyof MaoStoreSchema>(key: K, raw: MaoS
  * across `core/`, `cli/` and `electron/` and would each have to remember it.
  *
  * All three array-typed fields are guarded, and the question `workflowTasks` raised is answered rather
- * than deferred: a queue MAO cannot read halts unattended automation (see `describeUnusableTaskQueue()`
- * and `WorkflowEngine.requireQueueRecovery()`), because coercing it to `[]` and carrying on let the
- * immediate first auto-trigger poll overwrite the unreadable value and start a pipeline. `aiProviders`
- * is coerced and reported but deliberately halts nothing. Adding a field here means answering the same
- * question for it: what does the empty value cost, which write heals it, and does losing it let
- * unattended work start against state MAO can no longer account for?
+ * than deferred: a queue MAO cannot fully read halts unattended automation (see
+ * `describeUnusableTaskQueue()` and `WorkflowEngine.requireQueueRecovery()`), because carrying on with
+ * a corrected subset lets the immediate first auto-trigger poll overwrite the unusable durable entries
+ * and start a pipeline. `aiProviders` is filtered and reported but deliberately halts nothing. Adding a
+ * field here means answering the same question for it: what does the fallback value cost, which write
+ * heals it, and does losing data let unattended work start against state MAO can no longer account for?
  *
- * What this guard does **not** cover, so the halt is not read as more than it is: a `config.json` that
- * is not valid JSON at all is invisible here — `FileStore.load()` catches the parse error and answers
- * `{}`, so every field reads as its schema default and nothing is reported (issue #67). Element-level
- * validity is also out of scope, exactly as it is for `githubRepos`: `workflowTasks: [null]` passes
- * `Array.isArray` and then throws inside `restore()` (issue #75).
+ * What this guard does **not** cover, so the halt is not read as more than it is: most fields in a
+ * `config.json` that is not valid JSON at all still read as their schema defaults because
+ * `FileStore.load()` swallows the parse error (issue #67; the fresh queue observation itself fails
+ * closed). `githubRepos` entry validity remains `isRepoRef`/`canonicalRepoList`'s policy (#72).
+ * `aiProviders` and `workflowTasks`, by contrast, validate each complete declared entry here (#75):
+ * valid entries survive in order, invalid entries stay on disk until an explicit same-field write, and
+ * any invalid durable task raises the queue-recovery latch before a host can resume.
  */
 export function createStoredReadGuard(
   source: string,
@@ -347,15 +661,15 @@ export function createStoredReadGuard(
 
   return function guardStoredRead<K extends keyof MaoStoreSchema>(key: K, raw: MaoStoreSchema[K]): MaoStoreSchema[K] {
     const problem = unusableStoredValue(key, raw, source)
-    if (problem === null) return raw
+    const usable = usableStoredValue(key, raw, problem)
+    if (problem === null) return usable
     if (!reported.has(key)) {
       reported.add(key)
       warn(problem)
     }
-    // The schema's own default, *cloned*. Returning `MAO_STORE_DEFAULTS[key]` itself would hand every
-    // caller the same shared instance, and one of them pushing into what it read would poison the
-    // default for the rest of the process — the same aliasing `FileStore`'s constructor avoids below.
-    return structuredClone(MAO_STORE_DEFAULTS[key])
+    // A mixed provider/task list keeps its valid entries. A wrong container still gets the schema's
+    // own default, *cloned*: returning the shared instance would let one caller poison every later read.
+    return usable
   }
 }
 
@@ -375,6 +689,7 @@ export function createStoredReadGuard(
  */
 export interface MaoStore {
   get<K extends keyof MaoStoreSchema>(key: K): MaoStoreSchema[K]
+  /** Rejects an invalid provider/task list before the backend can mutate either memory or disk. */
   set<K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]): void
   /**
    * The stored values this backend cannot use, evaluated against what it holds now (see
@@ -398,9 +713,9 @@ export interface MaoStore {
    * Writes only if the stored raw value is still the one `witness` came from.
    *
    * The reason a plain `set` is not enough for recovery: the queue-recovery write replaces an unusable
-   * value with this process's (empty) queue, so if another process repaired the queue between the
-   * observation and the write, an unconditional `set` destroys that repair and reports success. Observing
-   * "immediately before" writing does not close that — only refusing the write does.
+   * value with a validated task subset, so if another process repaired the queue between the observation
+   * and the write, an unconditional `set` destroys that repair and reports success. Observing "immediately
+   * before" writing does not close that — only refusing the write does.
    *
    * `'superseded'` means the raw value moved and **nothing was written**. `'unverifiable'` means the
    * current value could not be read or serialized, so whether it moved is unknown — also nothing written.
@@ -449,7 +764,8 @@ export interface StoredValueBackend {
 
 /**
  * The one composition of a raw backend into a `MaoStore`: absent keys filled from the schema, reads
- * guarded, and `problems()` answered from the **raw** values.
+ * defaulted or element-filtered as required, writes validated, and `problems()` answered from the
+ * **raw** values.
  *
  * Both shipped backends are this function — `FileStore` below over its in-memory snapshot,
  * `electron/store.ts` over electron-store — so "the two shells cannot answer differently for the same
@@ -460,8 +776,7 @@ export interface StoredValueBackend {
  * `problems()` the *guarded* value instead of the raw one passed while making the GUI permanently blind.
  *
  * That distinction is the subtle part and the reason `readRaw` is not the guard: the guard has already
- * replaced an unusable value with the schema default, so asking it what is wrong always answers
- * "nothing".
+ * replaced or filtered an unusable value, so asking it what is wrong always answers "nothing".
  */
 export function createGuardedStore(
   backend: StoredValueBackend,
@@ -492,6 +807,7 @@ export function createGuardedStore(
       return guardRead(key, readRaw(key))
     },
     set<K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]): void {
+      assertStoredWrite(key, value, source)
       backend.set(key, value)
     },
     problems(): StoredValueProblem[] {
@@ -529,6 +845,7 @@ export function createGuardedStore(
       witness: string | undefined,
       value: MaoStoreSchema[K],
     ): ConditionalWriteResult {
+      assertStoredWrite(key, value, source)
       if (witness === undefined) return 'unverifiable'
       let current: string | undefined
       try {

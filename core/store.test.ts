@@ -253,6 +253,74 @@ describe('FileStore aiProviders read guard', () => {
     expect(warn).not.toHaveBeenCalled()
   })
 
+  it('keeps valid providers from a mixed list and reports only the invalid count', () => {
+    const warn = captureWarnings()
+    const leakedId = 'must-not-print-provider-id'
+    const leakedKey = 'provider-key-must-not-print'
+    const { store, filePath } = storeHolding({
+      aiProviders: [
+        claude,
+        null,
+        { id: leakedId, name: 'Broken', apiKey: leakedKey },
+      ],
+    })
+
+    expect(store.get('aiProviders')).toEqual([claude])
+    expect(store.problems().map((problem) => problem.field)).toEqual(['aiProviders'])
+    expect(warn).toHaveBeenCalledTimes(1)
+    const message = warn.mock.calls[0]![0] as string
+    expect(message).toContain('2 invalid entries')
+    expect(message).toContain('out of 3')
+    expect(message).toContain(filePath)
+    expect(message).not.toContain(leakedId)
+    expect(message).not.toContain(leakedKey)
+  })
+
+  it('rejects the invalid list used by `config import-providers` before the durable value changes', () => {
+    const { store, filePath } = storeHolding({ aiProviders: [claude] })
+
+    expect(() => store.set('aiProviders', [null] as unknown as AiProviderConfig[])).toThrow(
+      /1 invalid entry.*out of 1/,
+    )
+
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).aiProviders).toEqual([claude])
+    expect(new FileStore(filePath).get('aiProviders')).toEqual([claude])
+  })
+
+  it('rejects nested shape errors on write without printing provider contents', () => {
+    const leakedModel = 'model-must-not-leak'
+    const invalid = {
+      ...claude,
+      presets: [{ id: 'preset', model: leakedModel, effort: 'impossible' }],
+    }
+    const { store, filePath } = storeHolding({ aiProviders: [claude] })
+
+    let message = ''
+    try {
+      store.set('aiProviders', [invalid] as unknown as AiProviderConfig[])
+    } catch (err) {
+      message = err instanceof Error ? err.message : String(err)
+    }
+
+    expect(message).toContain('1 invalid entry')
+    expect(message).toContain(filePath)
+    expect(message).not.toContain(leakedModel)
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).aiProviders).toEqual([claude])
+  })
+
+  it('rejects sparse top-level and nested arrays before JSON turns their holes into null', () => {
+    const sparseProviders = Array<AiProviderConfig>(1)
+    const sparseArgs = Array<string>(1)
+    const providerWithSparseArgs = { ...claude, args: sparseArgs }
+    const { store, filePath } = storeHolding({ aiProviders: [claude] })
+
+    expect(() => store.set('aiProviders', sparseProviders)).toThrow(/1 invalid entry.*out of 1/)
+    expect(() => store.set('aiProviders', [providerWithSparseArgs])).toThrow(
+      /1 invalid entry.*out of 1/,
+    )
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).aiProviders).toEqual([claude])
+  })
+
   it('reports every shape it discards, not only the keyed object', () => {
     // A shared spy would see only the first report (the guard dedups per field), so a regression that
     // made null, strings, numbers or booleans discard *silently* would pass a loop checking only the
@@ -307,6 +375,66 @@ describe('FileStore workflowTasks read guard', () => {
 
     expect(store.get('workflowTasks')).toEqual([pendingTask])
     expect(warn).not.toHaveBeenCalled()
+  })
+
+  it('keeps valid tasks from a mixed list and reports only the invalid count', () => {
+    const warn = captureWarnings()
+    const leakedPrompt = 'prompt-must-not-print'
+    const { store, filePath } = storeHolding({
+      workflowTasks: [
+        pendingTask,
+        null,
+        { ...pendingTask, id: 'broken', history: [{ prompt: leakedPrompt }] },
+      ],
+    })
+
+    expect(store.get('workflowTasks')).toEqual([pendingTask])
+    expect(store.problems().map((problem) => problem.field)).toEqual(['workflowTasks'])
+    expect(warn).toHaveBeenCalledTimes(1)
+    const message = warn.mock.calls[0]![0] as string
+    expect(message).toContain('2 invalid queued tasks')
+    expect(message).toContain('out of 3')
+    expect(message).toContain(filePath)
+    expect(message).not.toContain(leakedPrompt)
+  })
+
+  it('accepts the legacy missing-autoAdvance shape that restore migrates to true', () => {
+    const warn = captureWarnings()
+    const { autoAdvance: _oldField, ...legacyTask } = pendingTask
+    const { store } = storeHolding({ workflowTasks: [legacyTask] })
+
+    expect(store.get('workflowTasks')).toEqual([{ ...legacyTask, autoAdvance: true }])
+    expect(store.problems()).toEqual([])
+    expect(warn).not.toHaveBeenCalled()
+  })
+
+  it('rejects an invalid task list before a queue write changes the durable value', () => {
+    const { store, filePath } = storeHolding({ workflowTasks: [pendingTask] })
+
+    expect(() => store.set('workflowTasks', [pendingTask, null] as unknown as QueuedTask[])).toThrow(
+      /1 invalid entry.*out of 2/,
+    )
+
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).workflowTasks).toEqual([pendingTask])
+  })
+
+  it('counts a sparse task-list hole as an invalid entry', () => {
+    const sparseTasks = Array<QueuedTask>(1)
+    const { store, filePath } = storeHolding({ workflowTasks: [pendingTask] })
+
+    expect(() => store.set('workflowTasks', sparseTasks)).toThrow(/1 invalid entry.*out of 1/)
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).workflowTasks).toEqual([pendingTask])
+  })
+
+  it('migrates missing autoAdvance on read but requires the current shape on new writes', () => {
+    const { autoAdvance: _oldField, ...legacyTask } = pendingTask
+    const { store, filePath } = storeHolding({ workflowTasks: [legacyTask] })
+
+    expect(store.get('workflowTasks')).toEqual([{ ...legacyTask, autoAdvance: true }])
+    expect(() => store.set('workflowTasks', [legacyTask] as unknown as QueuedTask[])).toThrow(
+      /1 invalid entry.*out of 1/,
+    )
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).workflowTasks).toEqual([legacyTask])
   })
 
   it('reports every shape it discards, not only the keyed object', () => {
@@ -593,6 +721,27 @@ describe("electron/store.ts, the other MaoStore backend", () => {
   })
 })
 
+describe('cli config import-providers', () => {
+  const source = withoutComments(fs.readFileSync(path.join(REPO_ROOT, 'cli', 'index.ts'), 'utf-8'))
+
+  it('passes the whole list through the guarded store before reading provider ids for success output', () => {
+    // The behavioural half lives above: a FileStore rejects `[null]` without changing the durable
+    // provider list. This source coupling pins the CLI half of the reproduced crash — if the success
+    // message touches `p.id` first, the command throws the old TypeError before the shared boundary can
+    // diagnose the field, path and invalid count.
+    const start = source.indexOf(".command('import-providers <file>')")
+    const end = source.indexOf(".command('set-theme <theme>')", start)
+    expect(start).toBeGreaterThanOrEqual(0)
+    expect(end).toBeGreaterThan(start)
+
+    const action = source.slice(start, end)
+    const guardedWrite = action.indexOf("store.set('aiProviders', providers)")
+    const successRead = action.indexOf('providers.map((p) => p.id)')
+    expect(guardedWrite).toBeGreaterThanOrEqual(0)
+    expect(successRead).toBeGreaterThan(guardedWrite)
+  })
+})
+
 /**
  * `MaoStore.inspect()` — one read answering both "what may I use" and "did the guard replace it".
  *
@@ -624,6 +773,22 @@ describe('MaoStore.inspect', () => {
     // A witness is produced for a healthy value too — that is what makes a conditional write possible.
     expect(observed.witness).toBeTypeOf('string')
     expect(warn).not.toHaveBeenCalled()
+  })
+
+  it('filters a mixed queue but witnesses the complete raw value for conditional recovery', () => {
+    captureWarnings()
+    const raw = [pendingTask, null]
+    const { store, filePath } = storeHolding({ workflowTasks: raw })
+
+    const observed = store.inspect('workflowTasks')
+
+    expect(observed.value).toEqual([pendingTask])
+    expect(observed.problem).toContain('1 invalid queued task')
+    // A different invalid entry is still a different raw durable value. If the witness came from the
+    // filtered list, this external change would compare equal and recovery would overwrite it.
+    fs.writeFileSync(filePath, JSON.stringify({ workflowTasks: [pendingTask, {}] }, null, 2))
+    expect(store.setIfUnchanged('workflowTasks', observed.witness, [pendingTask])).toBe('superseded')
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).workflowTasks).toEqual([pendingTask, {}])
   })
 
   it('cannot disagree with itself when the backend changes between two reads', () => {
@@ -716,6 +881,18 @@ describe('MaoStore.setIfUnchanged', () => {
     expect(store.setIfUnchanged('workflowTasks', observed.witness, [])).toBe('written')
 
     expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).workflowTasks).toEqual([])
+  })
+
+  it('rejects an invalid replacement before comparing or writing', () => {
+    captureWarnings()
+    const raw = [pendingTask, null]
+    const { store, filePath } = storeHolding({ workflowTasks: raw })
+    const observed = store.inspect('workflowTasks')
+
+    expect(() =>
+      store.setIfUnchanged('workflowTasks', observed.witness, [null] as unknown as QueuedTask[]),
+    ).toThrow(/1 invalid entry.*out of 1/)
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).workflowTasks).toEqual(raw)
   })
 
   it('refuses, and writes nothing, when the stored value moved since the observation', () => {

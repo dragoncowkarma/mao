@@ -155,6 +155,78 @@ describe('createMaoApp', () => {
 describe('createMaoApp with an unreadable stored queue', () => {
   const corruptQueue = { 'task-1': { id: 'task-1' } }
 
+  it('keeps readable tasks from a mixed queue but latches before any can resume', async () => {
+    const warn = captureWarnings()
+    const running = {
+      ...makePendingTask('kept-task'),
+      status: 'running' as const,
+      active: {
+        agentId: 'agent-a',
+        agentName: 'Agent A',
+        prompt: 'durable prompt must not be reported',
+      },
+    }
+    const rawQueue = [running, null, { ...makePendingTask('broken-task'), github: null }]
+    const { dataDir, store, filePath } = makeRealDataDirHolding({ workflowTasks: rawQueue })
+
+    const { workflowEngine } = createMaoApp({
+      store,
+      workspaceRoot: path.join(dataDir, 'workspaces'),
+      dataDir,
+      resume: true,
+    })
+    await new Promise((resolve) => setTimeout(resolve, 20))
+
+    expect(workflowEngine.isQueueRecoveryLatched()).toBe(true)
+    expect(workflowEngine.getQueueRecoveryReason()).toContain('2 invalid queued tasks')
+    expect(workflowEngine.getQueueRecoveryReason()).not.toContain(running.active.prompt)
+    // The readable task gets the ordinary restart normalization, but the latch prevents processing.
+    expect(workflowEngine.getTasks()).toEqual([
+      expect.objectContaining({ id: 'kept-task', status: 'pending', active: undefined }),
+    ])
+    expect(() =>
+      workflowEngine.enqueueFromIssue(7, 'https://github.com/acme/widgets/issues/7', 'Fix it', {
+        owner: 'acme',
+        repo: 'widgets',
+      }),
+    ).toThrow(/workflowTasks/)
+    // Filtering is a read view, not a silent repair; confirmation is what may discard durable entries.
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).workflowTasks).toEqual(rawQueue)
+    expect(warn).toHaveBeenCalledTimes(1)
+  })
+
+  it('confirmation writes only the readable tasks, and the next boot resumes them normally', async () => {
+    const warn = captureWarnings()
+    const kept = makePendingTask('kept-after-recovery')
+    const rawQueue = [kept, null]
+    const { dataDir, store, filePath } = makeRealDataDirHolding({ workflowTasks: rawQueue })
+
+    const first = createMaoApp({
+      store,
+      workspaceRoot: path.join(dataDir, 'workspaces'),
+      dataDir,
+      resume: true,
+    })
+    expect(first.workflowEngine.getTasks()).toEqual([kept])
+    expect(first.confirmQueueRecovery()).toEqual({ kind: 'replaced' })
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).workflowTasks).toEqual([kept])
+
+    warn.mockClear()
+    const second = createMaoApp({
+      store: new FileStore(filePath),
+      workspaceRoot: path.join(dataDir, 'workspaces'),
+      dataDir,
+      resume: true,
+    })
+    await new Promise((resolve) => setTimeout(resolve, 30))
+
+    expect(second.workflowEngine.isQueueRecoveryLatched()).toBe(false)
+    const resumed = second.workflowEngine.getTasks().find((task) => task.id === kept.id)!
+    expect(resumed.status).toBe('error')
+    expect(resumed.error).toMatch(/no GitHub token is configured/)
+    expect(warn).not.toHaveBeenCalled()
+  })
+
   it('latches the engine, refuses to auto-resume, and does not claim persistence is broken', () => {
     const warn = captureWarnings()
     const { dataDir, store } = makeRealDataDirHolding({ workflowTasks: corruptQueue })
@@ -332,8 +404,8 @@ describe('createMaoApp with an unreadable stored queue', () => {
  * `createMaoApp` used to decide the latch from `store.problems()` and then restore from a SEPARATE
  * `store.get('workflowTasks')`. conf re-reads and re-parses the config file on every `get`, so a
  * hand-edit (or another CLI) turning the queue from an array into a non-array between those two reads
- * left the first read saying "healthy" — no latch — while the second was coerced to `[]` and restored.
- * The host then ran UNLATCHED holding an empty queue, auto-trigger ticked immediately, and the
+ * left the first read saying "healthy" — no latch — while the second was corrected and restored. The
+ * host then ran UNLATCHED holding an incomplete queue, auto-trigger ticked immediately, and the
  * unreadable original was overwritten while unattended work began.
  */
 describe('createMaoApp when the stored queue changes between reads', () => {
@@ -483,8 +555,8 @@ describe('MaoApp.confirmQueueRecovery', () => {
    * A store whose queue can be repaired by a hook that runs at a chosen moment, so a concurrent repair
    * can be placed either side of the observation.
    */
-  function racingStore() {
-    const data: Record<string, unknown> = { workflowTasks: corrupt }
+  function racingStore(initial: unknown = corrupt) {
+    const data: Record<string, unknown> = { workflowTasks: initial }
     const writes: unknown[] = []
     // Armed explicitly rather than by a read counter, because the boot observation already consumes one
     // read — counting from zero would place the repair before the confirm even looked.
@@ -553,6 +625,26 @@ describe('MaoApp.confirmQueueRecovery', () => {
     expect(app.workflowEngine.isQueueRecoveryLatched()).toBe(false)
   })
 
+  it('retains valid tasks added to a still-mixed queue after boot', () => {
+    captureWarnings()
+    const atBoot = makePendingTask('at-boot')
+    const addedLater = makePendingTask('added-later')
+    const racing = racingStore([atBoot, null])
+    const app = bootWith(racing.store)
+    expect(app.workflowEngine.getTasks()).toEqual([atBoot])
+
+    // Another process changes the still-unusable value after this host booted. The raw witness must
+    // protect the compare, while the replacement must come from this fresh observation — reusing the
+    // boot-time engine queue would silently delete `addedLater`.
+    racing.data.workflowTasks = [atBoot, addedLater, null]
+
+    expect(app.confirmQueueRecovery()).toEqual({ kind: 'replaced' })
+    expect(racing.writes).toEqual([[atBoot, addedLater]])
+    expect(racing.data.workflowTasks).toEqual([atBoot, addedLater])
+    expect(app.workflowEngine.getTasks()).toEqual([atBoot, addedLater])
+    expect(app.workflowEngine.isQueueRecoveryLatched()).toBe(false)
+  })
+
   it('writes nothing when the store cannot be read, and quotes no error', () => {
     captureWarnings()
     const { dataDir, store } = makeRealDataDirHolding({ workflowTasks: corrupt })
@@ -596,7 +688,7 @@ describe('MaoApp.confirmQueueRecovery', () => {
 
     expect(outcome).toEqual({ kind: 'already-readable' })
     expect(racing.writes).toEqual([])
-    // Monotone: this process is still holding the coerced empty queue, so it must not release.
+    // Monotone: this process may still hold a filtered startup subset, so it must not release.
     expect(app.workflowEngine.isQueueRecoveryLatched()).toBe(true)
   })
 
@@ -684,8 +776,8 @@ describe('MaoApp.resaveStoredQueue', () => {
   })
 
   it('refuses while the session is halted, so it cannot become a silent discard', () => {
-    // A halted session's queue is the guard's empty list. Letting the repair path run there would write
-    // `[]` over the file with none of the confirmation the discard requires.
+    // A halted session's queue is only the guard's startup subset. Letting the repair path run there
+    // would write it over the file with none of the confirmation the discard requires.
     captureWarnings()
     const { dataDir, store } = makeRealDataDirHolding({ workflowTasks: corrupt })
     const app = createMaoApp({ store, workspaceRoot: path.join(dataDir, 'workspaces'), dataDir, resume: false })

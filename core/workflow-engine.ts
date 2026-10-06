@@ -16,6 +16,10 @@ export type WorkflowStageName = AgentStage
 
 const STAGE_ORDER: WorkflowStageName[] = ['issue', 'pr', 'review', 'merge']
 
+/** Runtime list paired with the persisted task-status union, for untyped store validation. */
+export const WORKFLOW_TASK_STATUSES = ['pending', 'running', 'done', 'error', 'paused'] as const
+export type WorkflowTaskStatus = (typeof WORKFLOW_TASK_STATUSES)[number]
+
 /**
  * Re-exported from core/agent-selection.ts, where the maker-checker rules now live as pure functions
  * the Electron renderer can call too (a card has to show which agent a stage *will* use, and offer
@@ -68,7 +72,7 @@ export interface QueuedTask {
   repo: RepoRef
   stage: WorkflowStageName
   history: WorkflowStepResult[]
-  status: 'pending' | 'running' | 'done' | 'error' | 'paused'
+  status: WorkflowTaskStatus
   error?: string
   /** When false, a finished stage parks the task in 'paused' instead of auto-continuing to the next stage. */
   autoAdvance: boolean
@@ -147,9 +151,9 @@ function slugify(text: string): string {
  *   since it was observed, and the write did not throw.
  * - `'already-readable'` — the stored queue reads normally again, so **nothing was written**. The latch
  *   is monotone, so something healed the value out of band (a hand-edit, or another process's recovery)
- *   while this process stayed halted; this process's in-memory queue is the coerced empty one, so
- *   persisting it would overwrite that repair with the very loss the latch exists to prevent. The
- *   operator has to restart to load it.
+ *   while this process stayed halted; this process's in-memory queue is only the validated,
+ *   restart-normalized subset, so persisting it would overwrite that repair with the very loss the
+ *   latch exists to prevent. The operator has to restart to load it.
  * - `'superseded'` — the stored value changed between the observation and the write, so the conditional
  *   write refused and **nothing was written**. This is the kind that makes the previous one mean anything:
  *   observing immediately before an *unconditional* write still destroys a repair landing in between,
@@ -207,9 +211,10 @@ export class WorkflowEngine extends EventEmitter {
    * Set once by `createMaoApp()` (the only boot path) before it subscribes the `'change'` →
    * `store.set('workflowTasks', …)` listener and before `restore()`, so nothing can write over the
    * unreadable value in between. Released only by `clearQueueRecovery()`, which `createMaoApp`'s
-   * `confirmQueueRecovery()` calls *after* its conditional write has been confirmed. **Monotone**: it never downgrades and no later check clears it, because
-   * this process's in-memory queue is the coerced `[]` rather than whatever the file holds — un-latching
-   * would run the wrong queue and then persist it over the real one.
+   * `confirmQueueRecovery()` calls *after* its conditional write has been confirmed. **Monotone**: it
+   * never downgrades and no later check clears it, because this process's in-memory queue contains only
+   * the validated, restart-normalized subset rather than everything the file holds — un-latching on an
+   * out-of-band repair would run the wrong queue and then persist it over the real one.
    *
    * Deliberately *not* re-derived from the store at gate time. Review of PR #69 showed the boot case is
    * the dangerous one (both hosts tick auto-trigger immediately after boot), while a corruption appearing

@@ -70,13 +70,14 @@ describe('Sidebar queue recovery', () => {
 
   it('does not offer the discard once something else has repaired the file', () => {
     // The rule this file exists for. The latch is monotone, so it stays up after an out-of-band repair —
-    // but the write would then replace that repair with this session's coerced empty queue, which is the
-    // exact loss the latch exists to prevent. A restart is the only correct way out of that state.
+    // but the write would then replace that repair with this session's filtered startup subset, which is
+    // the exact loss the latch exists to prevent. A restart is the only correct way out of that state.
     renderSidebar({ queueRecovery: HALTED, queueStoredStillUnreadable: false, storeProblems: [] })
 
     expect(screen.getByText('Workflow automation is halted')).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Discard unreadable queue' })).toBeNull()
     expect(screen.getByText(/Restart MAO to load it/)).toBeInTheDocument()
+    expect(screen.getByText(/in-memory queue may be incomplete/)).toBeInTheDocument()
   })
 
   it('shows the queue report once, not twice', () => {

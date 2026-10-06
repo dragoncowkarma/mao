@@ -469,7 +469,7 @@ export default function App() {
   }
 
   /**
-   * Discards an unreadable stored workflow queue and releases the engine.
+   * Discards invalid durable queue data, retains readable tasks and releases the engine.
    *
    * The outcome is decided in `core/` (see `QueueRecoveryOutcome`) rather than inferred here, so this
    * button and `mao workflow confirm-queue-recovery` cannot disagree about whether it worked. Both

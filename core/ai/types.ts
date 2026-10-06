@@ -1,7 +1,13 @@
-export type AiProviderKind = 'api' | 'cli'
+export const AI_PROVIDER_KINDS = ['api', 'cli'] as const
+export type AiProviderKind = (typeof AI_PROVIDER_KINDS)[number]
 
 /** Known CLI tool identifiers — used to drive model/effort option sets in the UI. */
-export type ProviderKindId = 'antigravity' | 'claude' | 'codex' | 'custom'
+export const PROVIDER_KIND_IDS = ['antigravity', 'claude', 'codex', 'custom'] as const
+export type ProviderKindId = (typeof PROVIDER_KIND_IDS)[number]
+
+/** HTTP request formats understood by the built-in API provider. */
+export const AI_API_FORMATS = ['anthropic', 'openai'] as const
+export type AiApiFormat = (typeof AI_API_FORMATS)[number]
 
 /**
  * Every accepted reasoning-effort value, as a runtime list so free-form input (e.g. an `[Effort: …]`
@@ -35,14 +41,15 @@ export interface ModelEffortPreset {
  * workflow-engine.ts (which imports from this file). workflow-engine.ts re-exports this as
  * WorkflowStageName for backward compatibility.
  */
-export type AgentStage = 'issue' | 'pr' | 'review' | 'merge'
+export const AGENT_STAGES = ['issue', 'pr', 'review', 'merge'] as const
+export type AgentStage = (typeof AGENT_STAGES)[number]
 
 export interface AiProviderConfig {
   id: string
   name: string
   kind: AiProviderKind
   // api
-  apiFormat?: 'anthropic' | 'openai'
+  apiFormat?: AiApiFormat
   apiKey?: string
   baseUrl?: string
   model?: string

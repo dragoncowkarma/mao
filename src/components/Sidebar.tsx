@@ -39,7 +39,7 @@ interface SidebarProps {
    */
   onAddRepo: (repo: RepoRef) => Promise<RepoWorkflowCapability[]>
   /**
-   * Stored values the main process could not use, answered with a schema default instead.
+   * Stored values the main process could not fully use, answered with a safe default or filtered list.
    *
    * Shown here because this is where their absence is: an unusable `githubRepos` reaches the renderer
    * as `[]`, which is indistinguishable from having no repositories — and with no row to select, the
@@ -61,17 +61,17 @@ interface SidebarProps {
   /**
    * Whether the config file *still* holds the unreadable queue. False while the latch is up means
    * something else already repaired it, and then the discard must not be offered: it would replace the
-   * repair with this process's coerced empty queue.
+   * repair with this process's filtered, restart-normalized queue.
    */
   queueStoredStillUnreadable: boolean
-  /** Discards the unreadable stored queue and releases the engine. Rejects if the write fails. */
+  /** Discards invalid stored queue data, retains readable tasks and releases the engine. */
   onDiscardQueue: () => Promise<void>
   /**
    * Rewrites the stored queue from the one this session is holding.
    *
    * Offered only in the late case — the value went unusable after a clean start, so this session still
    * has the real queue. A *discard* there would be wrong twice over: there is no latch to release, and
-   * run in another process it would put that process's empty queue in the file.
+   * run in another process it would put that process's independently filtered snapshot in the file.
    */
   onResaveQueue: () => Promise<void>
   view: 'project' | 'global-settings'
@@ -243,10 +243,10 @@ export default function Sidebar({
             {queueRecovery.required ? (
               <p className="text-muted text-[11px] leading-snug">{queueRecovery.reason}</p>
             ) : (
-              /* Deliberately NOT the store's report. That text is written for the halted case and says the
-                 queue is empty, that MAO will not start unattended work, and that every queue write is
-                 refused — all three false here. Rendering it beside "this session is not halted" gave the
-                 operator two opposite instructions at once. The field and the file are what they need. */
+              /* Deliberately NOT the store's report. That text is written for the halted case and says
+                 MAO will not start unattended work and every queue write is refused — both false here.
+                 Rendering it beside "this session is not halted" gave the operator two opposite
+                 instructions at once. The field and the file are what they need. */
               <>
                 <p className="text-muted text-[11px] leading-snug">
                   MAO cannot read the stored workflow queue in {queueStoredProblem?.source}. This session
@@ -254,10 +254,10 @@ export default function Sidebar({
                   write will rewrite the file from that. Restarting before that happens will refuse to
                   start unattended work until the value is replaced.
                 </p>
-                {/* Deliberately NOT `mao workflow confirm-queue-recovery` here. That command discards, and
-                    run in a *separate* process it would write ITS empty queue over the file — so this
-                    session's real queue would be lost the moment it restarted without having written.
-                    Saving from this session writes the queue it is actually holding. */}
+                {/* Deliberately NOT `mao workflow confirm-queue-recovery` here. That command discards
+                    anything its separate process cannot validate and writes ITS startup snapshot over
+                    the file — so this session's real queue could be lost when it next restarts. Saving
+                    from this session writes the queue it is actually holding. */}
                 <button onClick={submitResave} className="btn btn-secondary self-start text-xs" disabled={resaving}>
                   {resaving ? 'Saving…' : 'Save this session’s queue now'}
                 </button>
@@ -292,11 +292,11 @@ export default function Sidebar({
               )
             ) : queueRecovery.required ? (
               /* Something outside this window already repaired the file. Offering the discard here
-                 would overwrite that repair with this process's coerced empty queue, so the way out is
-                 a restart instead — the real queue has to be loaded, and only a fresh boot does that. */
+                 would overwrite that repair with this process's filtered, restart-normalized subset,
+                 so the way out is a restart — only a fresh boot can load the complete repaired queue. */
               <p className="text-muted text-[11px] leading-snug">
                 The stored queue reads normally again. Restart MAO to load it — this session is still
-                halted because it is holding an empty queue.
+                halted because its in-memory queue may be incomplete.
               </p>
             ) : null}
           </div>

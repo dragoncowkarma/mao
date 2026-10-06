@@ -1243,8 +1243,8 @@ describe('WorkflowEngine queue-recovery latch', () => {
   })
 
   it('never downgrades, and only clearQueueRecovery() releases it', () => {
-    // Monotone on purpose: this process's in-memory queue is the coerced empty one, so un-latching after
-    // an out-of-band repair would run the wrong queue and then persist it over the real one.
+    // Monotone on purpose: this process's in-memory queue may be only a filtered startup subset, so
+    // un-latching after an out-of-band repair would run the wrong queue and persist it over the real one.
     const { engine } = latchedEngine()
 
     engine.requireQueueRecovery('a different, softer reason')

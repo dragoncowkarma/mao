@@ -175,10 +175,12 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   three-state `permissions.push`, and the unverified pipeline grants must stay aligned, with
   regressions in both TypeScript and Python suites. Credential acquisition and command-failure
   classification deliberately differ because Swarm checks the active `gh` credential.
-- **New pipeline stage** → `STAGE_ORDER` + `buildPromptForStage` + `applyGithubAction`
-  in `core/workflow-engine.ts`, **plus** the `STAGE_LABELS` record that is
-  copy-pasted in both `src/components/KanbanBoard.tsx` and
-  `src/components/WorkflowQueue.tsx`, plus `core/workflow-engine.test.ts`.
+- **New pipeline stage** → `AGENT_STAGES` (the `AgentStage` union is derived from it) in
+  `core/ai/types.ts`, then `STAGE_ORDER` + `buildPromptForStage` + `applyGithubAction` in
+  `core/workflow-engine.ts`, **plus** the `STAGE_LABELS` record in
+  `src/components/KanbanBoard.tsx` and `src/components/WorkflowQueue.tsx`, and both
+  `ALL_STAGES` + `STAGE_LABELS` in `src/components/GlobalSettings.tsx`, plus
+  `core/workflow-engine.test.ts`.
 - **Build outputs** → `electron/main.ts` resolves `preload.js` and
   `../dist/index.html` relative to its own compiled location; the `dist-electron`
   directory name itself lives in `vite.config.ts` (`outDir`) and `package.json`
@@ -187,8 +189,8 @@ There is no codegen — these couplings are maintained by hand and only `npm run
 
 ## Workflow-engine domain invariants
 
-- Stages: `issue → pr → review → merge` (`STAGE_ORDER`). Task statuses:
-  `pending | running | done | error | paused`.
+- Stages: `issue → pr → review → merge` (`STAGE_ORDER`). Task statuses derive from
+  `WORKFLOW_TASK_STATUSES`: `pending | running | done | error | paused`.
 - **Maker-checker**: `selectAgent()` excludes the `agentId` of the last
   `task.history` entry; falls back to the sole provider if only one is registered.
   Preserve this in any routing change.
@@ -336,8 +338,8 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   operator removed while its registration was still checking (the store keeps it, the sidebar does
   not, and auto-trigger keeps polling it). Never write `githubRepos` through `store` directly, and
   never move this sequence into a shell.
-- **A stored field's declared type is an assertion, not a guarantee — `githubRepos` is read through a
-  guard.** Both shipped backends read unvalidated JSON and fill in only the keys that are *missing*
+- **A stored field's declared type is an assertion, not a guarantee — every array field is read through
+  a guard.** Both shipped backends read unvalidated JSON and fill in only the keys that are *missing*
   (`FileStore` spreads the parsed file over `MAO_STORE_DEFAULTS`; electron-store's `defaults` works the
   same way), so a key that is present but the wrong shape survives and is handed to every reader as
   `MaoStoreSchema[K]`. A `githubRepos` that was not an array therefore broke every repository path at
@@ -345,20 +347,24 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   non-iterable `previous` for `mao repos add` and for auto-trigger's per-tick canonicalisation, and `mao
   repos list` printed the malformed value as if it were the list — and because nothing could write the
   list either, the only way out was hand-editing JSON. `createStoredReadGuard()` (`core/store.ts`)
-  answers `[]` instead, reporting once per process through `console.warn` with the field, the value's
-  actual type and the config file path. Coercing rather than throwing is what makes recovery possible —
+  answers `[]` for a wrong container and filters invalid `aiProviders` / `workflowTasks` entries from a
+  mixed array, reporting once per process through `console.warn` with the field, config file path and
+  invalid count — never an entry, prompt, token or API key. Coercing rather than throwing is what makes
+  recovery possible —
   `updateRepos` reads before it writes, so a throwing read takes `repos add`/`repos remove` down with it.
   The read is deliberately **not** a repair: nothing in the guard writes, so a read-only command leaves
-  the file as it found it and the operator can still salvage what the unusable value named. Element-level
-  validity stays `isRepoRef`/`canonicalRepoList`'s job — the guard owns the container only. Do not make
-  the guard silent, and do not add a field to `STORED_SHAPE_RULES` without answering the question that
-  field raises: what does the empty value cost, which write heals it, and **does losing it let unattended
-  work start against state MAO can no longer account for?** All three array-typed fields are guarded now
-  (issue #68). `aiProviders` is reported and coerced but halts nothing — an empty provider list stops
-  every stage at `selectAgent()` before any GitHub write, so latching for it would be a larger outage
-  than the fault. `workflowTasks` halts everything; see the next bullet.
-  The discard is not silent in either shell, and that is a contract, not a log line: `get()` answers the
-  same `[]` for an unusable list as for an empty one, so the fact cannot ride on the value. `MaoStore`
+  the file as it found it and the operator can still salvage what the unusable value named. Entry policy
+  is field-specific: `githubRepos` still belongs to `isRepoRef`/`canonicalRepoList` (#72), while the
+  guard validates the complete declared shapes of `aiProviders` and `workflowTasks` (#75), preserving
+  valid entries in order. Do not make the guard silent, and do not add a field to
+  `STORED_SHAPE_RULES` without answering the question that field raises: what does the fallback cost,
+  which write heals it, and **does losing it let unattended work start against state MAO can no longer
+  account for?** All three array-typed fields are guarded now. `aiProviders` is reported and filtered but
+  halts nothing — an empty provider list stops every stage at `selectAgent()` before any GitHub write,
+  so latching for it would be a larger outage than the fault. Any unusable `workflowTasks` entry halts
+  everything; see the next bullet.
+  The discard is not silent in either shell, and that is a contract, not a log line: `get()` returns only
+  the corrected value (a default or a filtered subset), so the fact cannot ride on the value. `MaoStore`
   therefore carries `problems()` — evaluated on demand against what the backend holds *now*, never
   accumulated as reads happen, because the renderer polls it over a channel of its own and the order of
   two IPC calls must not decide whether the operator is told. `mao config show` prints it; the GUI polls
@@ -412,9 +418,17 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   coverage was a regex over its source — which a mutation feeding `problems()` the **guarded** value
   rather than the raw one passed, while making the GUI permanently blind. `problems()` must read raw:
   the guard has already substituted the default, so asking it what is wrong always answers "nothing".
-  The **write** side is the mirror image and deliberately refuses rather than coerces: `canonicalRepoList`
-  throws when `next` is not an array, because every non-array it can still iterate folds to an empty list
-  (a string yields characters `isRepoRef` rejects; a `Set` yields entries in an unpromised order) and
+  The **write** side is the mirror image and deliberately refuses rather than coerces:
+  `createGuardedStore.set()` and `setIfUnchanged()` reject an `aiProviders` or `workflowTasks` list with
+  any invalid entry before the backend mutates memory or disk. That single boundary protects both shells:
+  notably `mao config import-providers` cannot persist `[null]` and then crash while printing `p.id`, and
+  Electron's `ai:save` cannot swap the engine to a list the store refused. Read filtering recovers bytes
+  that already exist; write rejection preserves the last durable value. Validators walk array indexes
+  rather than using hole-skipping `every`/`reduce` semantics: a sparse hole becomes `null` after JSON
+  serialization and therefore has to be rejected before the write too. For repositories,
+  `canonicalRepoList` throws when `next` is not an array, because every non-array it can still iterate
+  folds to an empty list (a string yields characters `isRepoRef` rejects; a `Set` yields entries in an
+  unpromised order) and
   `createRepoRegistrar` would persist that over every tracked repository with no error. The check runs
   before `previous` is walked so auto-trigger — which passes the stored list as both arguments — reports
   the refusal rather than a bare `previous is not iterable`. Coerce on read so recovery is possible;
@@ -423,12 +437,12 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   into the module-level defaults — a shallow spread let a caller that pushed into the empty list it read
   leak a phantom entry into the default, which the next `FileStore` in that process read back as a
   tracked repository for auto-trigger to poll.
-- **An unreadable `workflowTasks` halts unattended automation, and the latch is derived — no marker, no
-  `clear-` command.** Review of PR #69 established why coercing the queue to `[]` and carrying on is not
-  enough: both long-lived hosts call `startAutoTrigger()` immediately after `createMaoApp()` and it ticks
-  at once rather than after its first interval, so the first poll's `enqueueFromIssue()` would `notify()`,
+- **An unusable `workflowTasks` container or entry halts unattended automation, and the latch is derived —
+  no marker, no `clear-` command.** Review of PR #69 established why correcting the queue and carrying on
+  is not enough: both long-lived hosts call `startAutoTrigger()` immediately after `createMaoApp()` and
+  it ticks at once rather than after its first interval, so the first poll's `enqueueFromIssue()` would `notify()`,
   the `'change'` listener would `store.set('workflowTasks', …)`, and that single write both destroys the
-  only salvageable copy of the unreadable value **and** starts an unattended pipeline on a host that
+  only salvageable copy of the unusable value or entries **and** starts an unattended pipeline on a host that
   cannot know what was already in flight (the `workflow-active` label is best-effort, so a task lost with
   the queue may carry no label to stop its issue running twice). `createMaoApp` therefore reads
   `store.inspect(QUEUE_GATING_FIELD)` once and calls `workflowEngine.requireQueueRecovery(problem)`
@@ -487,13 +501,15 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   cannot report that back; and it must not go through the engine, which holds no store reference (rule 3).
   Two call sites in the composition root, and still nothing outside it: no shell, and no other `core/`
   module, writes the field.
-- **The discard and the late re-save share one implementation, deliberately.** They are the same write
-  with different preconditions: replace an unusable stored value with the queue this process holds — the
-  guard's empty list when halted (so it needs explicit confirmation) or the real queue after a clean boot
-  (so it is safe to offer directly). They were built separately once, and the second one promptly drifted
-  into an unconditional write that overwrote a repair with a stale queue. Keep them on `healStoredQueue()`
-  so that cannot recur, and keep `resaveStoredQueue()`'s refusal-while-halted — without it the repair path
-  is a silent discard.
+- **The discard and the late re-save share one implementation, deliberately.** They use the same
+  observe/conditional-write sequence with different preconditions and replacement sources. A halted
+  confirmation writes the *fresh observation's* valid subset, then restores the engine from that subset
+  without directly resuming; later queue activity in an already-running host may process it after the
+  latch is released. Using the boot-time engine queue would delete a valid task another process added
+  while leaving the stored list mixed. A clean session's late re-save writes its live engine queue. They were
+  built separately once, and the second one promptly drifted into an unconditional write that overwrote a
+  repair with a stale queue. Keep them on `healStoredQueue()` so that cannot recur, and keep
+  `resaveStoredQueue()`'s refusal-while-halted — without it the repair path is a silent discard.
 - **An action's result must outlive the condition it reports on.** `src/components/Sidebar.tsx` renders
   queue-action messages *outside* the problem card. `already-readable` means the file is genuinely
   repaired, so the refresh that follows empties the problem list and unmounts the card — a message
@@ -505,8 +521,9 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   kinds, each saying only what was established: `'replaced'` (still unusable at the conditional write's
   compare, and the write did not throw), `'already-readable'` (readable again, so **nothing is written** —
   the latch is monotone, so after a repair made outside this process the store reads clean while this
-  process still holds the coerced empty queue, and persisting it would overwrite that repair with exactly
-  the loss the latch exists to prevent; the operator has to restart), `'superseded'` (the value moved
+  process still holds only its filtered startup subset, and persisting it would overwrite that repair
+  with exactly the loss the latch exists to prevent; the operator has to restart), `'superseded'` (the
+  value moved
   between the observation and the compare, so the write refused and nothing was written),
   `'unverified'` (the store could not be read or compared, so nothing is written rather than written on a
   guess) and `'write-failed'` (the attempt threw, so what reached the file is unknown and the halt
@@ -519,8 +536,9 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   closed the destructive interleaving. It did not: `'already-readable'` only catches a repair that finished
   *before* the observation, so a repair landing between the observation and the write was still destroyed
   and still reported as success. `MaoStore.setIfUnchanged()` is what *narrows* it — the write is keyed on
-  the raw value the observation saw, and answers `'superseded'` without writing if it moved. Replacing one
-  unusable value with another loses nothing, because neither could be restored.
+  the raw value the observation saw, and answers `'superseded'` without writing if it moved. A still-mixed
+  value can contain a newer valid subset, so halted confirmation must derive its replacement from that
+  same observation rather than from the queue captured at boot.
   It does **not** close the race, and must not be described as doing so. Two residues remain, both real
   and both pinned as tests: a repair landing inside the compare → `writeFileSync` interval is still
   overwritten and still reported `'written'` (the pair is atomic only against callers *in this process*),
@@ -537,9 +555,10 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   and cannot be parsed, so it arrives as `readable: false` and latches. Every **other** field still reads
   as its schema default, because the constructor keeps the swallowing `load()` — issue #67 is therefore
   narrower than it was, not closed, and it is still the tracking issue for the rest of the schema.
-  Element-level
-  validity is out of scope exactly as for `githubRepos` — `workflowTasks: [null]` passes `Array.isArray`
-  and then throws inside `restore()` (issue #75). And `mao swarm` reads none of this: it is a separate
+  Element-level validation covers the complete declared `aiProviders` and `workflowTasks` shapes, but
+  deliberately does not add semantic policy such as requiring non-empty credentials, known models, or a
+  PR number at a particular stage; those remain the owning settings/engine paths' errors. `mao swarm`
+  reads none of this: it is a separate
   Python engine with a separate credential, so "the queue is latched" must never be read as "this host
   performs no unattended GitHub writes".
 - **Repository identity is case-insensitive, and the list is canonicalised before it is stored**:

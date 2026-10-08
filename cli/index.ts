@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-import fs from 'node:fs'
 import path from 'node:path'
 import { Command } from 'commander'
 import { createMaoApp, type MaoApp } from '../core/app.ts'
@@ -10,9 +9,10 @@ import { clearPersistenceBrokenMarker, hasPersistenceBrokenMarker } from '../cor
 import { runSwarm, SwarmRepositoryPathError } from '../core/swarm-runner.ts'
 import { describeUnverifiedGrants } from '../core/repo-capabilities.ts'
 import { sameRepoRef } from '../core/repo-registry.ts'
-import type { AiEffort, AiProviderConfig } from '../core/ai/types.ts'
+import type { AiEffort } from '../core/ai/types.ts'
 import type { QueuedTask, RepoRef, RunOverride } from '../core/workflow-engine.ts'
 import type { ThemePreference } from '../core/store.ts'
+import { importProvidersFromFile } from './import-providers.ts'
 
 function log(...args: unknown[]) {
   console.log('[mao]', ...args)
@@ -81,14 +81,8 @@ config
   .command('import-providers <file>')
   .description('Load AI provider configs from a JSON file (array of AiProviderConfig)')
   .action((file: string) => {
-    const parsed: unknown = JSON.parse(fs.readFileSync(path.resolve(file), 'utf-8'))
-    if (!Array.isArray(parsed)) {
-      throw new Error(`Expected ${file} to contain a JSON array of AI provider configs`)
-    }
-    const providers = parsed as AiProviderConfig[]
     const { store } = loadApp()
-    store.set('aiProviders', providers)
-    log(`Imported ${providers.length} AI provider(s): ${providers.map((p) => p.id).join(', ')}`)
+    importProvidersFromFile(file, store, (message) => log(message))
   })
 
 config
@@ -401,6 +395,12 @@ workflow
       throw new Error(
         'The replacement write failed, so what reached the config file is unknown and automation stays ' +
           'halted. Inspect the file before salvaging anything from it, then retry.',
+      )
+    }
+    if (outcome.kind === 'invalid-replacement') {
+      throw new Error(
+        'MAO rejected the readable task subset before writing because it contains an invalid task. ' +
+          'Nothing was written and automation remains halted. Inspect the retained tasks, then retry.',
       )
     }
     log(

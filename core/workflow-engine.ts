@@ -40,9 +40,13 @@ const MAX_FINISHED_TASKS = 50
 /** Applied to every issue that enters the workflow, so the auto-trigger poller never processes it twice. */
 export const WORKFLOW_ACTIVE_LABEL = 'workflow-active'
 
-export interface RepoRef {
+/** The repository identity a queued task needs after registry-only polling settings are left behind. */
+export interface RepoIdentity {
   owner: string
   repo: string
+}
+
+export interface RepoRef extends RepoIdentity {
   /** Whether auto-trigger should poll this repo for new issues. Defaults to true when unset. */
   autoTrigger?: boolean
   /** Auto-trigger poll interval for this repo, in milliseconds. Defaults to the global auto-trigger interval. */
@@ -69,7 +73,8 @@ export interface WorkflowStepResult {
 export interface QueuedTask {
   id: string
   title: string
-  repo: RepoRef
+  /** Snapshot of repository identity only; polling settings belong to the registry, not durable task state. */
+  repo: RepoIdentity
   stage: WorkflowStageName
   history: WorkflowStepResult[]
   status: WorkflowTaskStatus
@@ -145,7 +150,7 @@ function slugify(text: string): string {
  * What `createMaoApp`'s `confirmQueueRecovery()` actually did, decided in `core/` so both shells render one
  * answer instead of each re-deriving "did that work?" for themselves.
  *
- * Five kinds, because each says something different about what was actually established:
+ * Six kinds, because each says something different about what was actually established:
  *
  * - `'replaced'` — the stored value was still unusable, the conditional write confirmed it had not moved
  *   since it was observed, and the write did not throw.
@@ -161,6 +166,9 @@ function slugify(text: string): string {
  * - `'unverified'` — the store could not be read, or its value could not be serialized to compare, so
  *   whether it is still the unusable one is **unknown**. Nothing is written rather than written on a
  *   guess: a transient read failure, or a repair this process cannot see, would otherwise be overwritten.
+ * - `'invalid-replacement'` — the proposed replacement failed shape validation before the stored value
+ *   was compared or the backend write was attempted. Nothing was written, and any queue-recovery halt
+ *   stands until the replacement itself is corrected.
  * - `'write-failed'` — the write was attempted and threw, so what reached the file is unknown. The halt
  *   stands and the operator is told to inspect the file before salvaging.
  *
@@ -184,13 +192,29 @@ export type QueueRecoveryOutcome =
   | { kind: 'already-readable' }
   | { kind: 'superseded' }
   | { kind: 'unverified'; reason: string }
+  | { kind: 'invalid-replacement' }
   | { kind: 'write-failed' }
+
+/**
+ * Checks a complete candidate queue before the engine adopts or announces it.
+ *
+ * The composition root supplies the store's shared write-shape check. A rejection throws synchronously,
+ * before the task enters the in-memory queue and before the `'change'` persistence listener runs, so a
+ * caller mistake cannot leave behind a task that every later queue write rejects. Optional because the
+ * engine's isolated unit tests and non-persisting consumers do not own a store.
+ */
+export type ProspectiveQueueValidator = (tasks: QueuedTask[]) => void
+
+function repoIdentity(repo: RepoIdentity): RepoIdentity {
+  return { owner: repo.owner, repo: repo.repo }
+}
 
 export class WorkflowEngine extends EventEmitter {
   private queue: QueuedTask[] = []
   private providers: AiProviderConfig[] = []
   private processing = false
   private github: GithubService
+  private validateProspectiveQueue: ProspectiveQueueValidator | undefined
   private githubToken = ''
   private workspaceRoot = ''
   /**
@@ -224,9 +248,10 @@ export class WorkflowEngine extends EventEmitter {
    */
   private queueRecoveryReason: string | undefined
 
-  constructor(github: GithubService) {
+  constructor(github: GithubService, validateProspectiveQueue?: ProspectiveQueueValidator) {
     super()
     this.github = github
+    this.validateProspectiveQueue = validateProspectiveQueue
   }
 
   setProviders(providers: AiProviderConfig[]) {
@@ -343,6 +368,7 @@ export class WorkflowEngine extends EventEmitter {
   restore(tasks: QueuedTask[], options: { resume?: boolean } = {}) {
     this.queue = tasks.map((task) => ({
       ...task,
+      repo: repoIdentity(task.repo),
       autoAdvance: task.autoAdvance ?? true,
       active: undefined,
       status: task.status === 'running' ? 'pending' : task.status,
@@ -427,12 +453,25 @@ export class WorkflowEngine extends EventEmitter {
     return task
   }
 
+  /** Validates and adopts a new task before emitting the change that persists it. */
+  private appendTask(task: QueuedTask): QueuedTask {
+    const prospective = [...this.queue, task]
+    // The validator is deliberately before the assignment and notify. If it rejects, both the live queue
+    // and every listener remain untouched; there is therefore nothing for processQueue() to run or for a
+    // later notifyAfterStage() to misdiagnose as a durable persistence failure.
+    this.validateProspectiveQueue?.(prospective)
+    this.queue = prospective
+    this.notify()
+    void this.processQueue()
+    return task
+  }
+
   enqueue(title: string, repo: RepoRef, autoAdvance = true, providerOverride?: ProviderOverride): QueuedTask {
     this.assertQueueWritable()
     const task: QueuedTask = {
       id: randomUUID(),
       title,
-      repo,
+      repo: repoIdentity(repo),
       stage: STAGE_ORDER[0],
       history: [],
       status: 'pending',
@@ -440,10 +479,7 @@ export class WorkflowEngine extends EventEmitter {
       providerOverride,
       github: {},
     }
-    this.queue.push(task)
-    this.notify()
-    void this.processQueue()
-    return task
+    return this.appendTask(task)
   }
 
   /**
@@ -466,7 +502,7 @@ export class WorkflowEngine extends EventEmitter {
     const task: QueuedTask = {
       id: randomUUID(),
       title,
-      repo,
+      repo: repoIdentity(repo),
       stage: 'pr',
       history: [],
       status: 'pending',
@@ -474,10 +510,7 @@ export class WorkflowEngine extends EventEmitter {
       providerOverride,
       github: { issueNumber, issueUrl },
     }
-    this.queue.push(task)
-    this.notify()
-    void this.processQueue()
-    return task
+    return this.appendTask(task)
   }
 
   /**

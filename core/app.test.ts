@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createMaoApp } from './app.ts'
 import { FileStore, createGuardedStore, type MaoStoreSchema } from './store.ts'
 import { hasPersistenceBrokenMarker, writePersistenceBrokenMarker } from './persistence-guard.ts'
+import type { AiProviderConfig } from './ai/types.ts'
 import type { QueuedTask } from './workflow-engine.ts'
 
 const tmpDirs: string[] = []
@@ -65,6 +66,13 @@ function makePendingTask(id: string): QueuedTask {
     autoAdvance: false,
     github: {},
   }
+}
+
+const claudeProvider: AiProviderConfig = {
+  id: 'claude',
+  name: 'Claude',
+  kind: 'cli',
+  command: 'claude',
 }
 
 describe('createMaoApp', () => {
@@ -138,6 +146,105 @@ describe('createMaoApp', () => {
     expect(task.error).toMatch(/no GitHub token is configured/)
     // Still stalled at its own stage, so restoring the token and retrying re-runs it unchanged.
     expect(task.stage).toBe('issue')
+  })
+
+  it('rejects an invalid prospective task before memory, disk or persistence state can diverge', () => {
+    const { dataDir, store, filePath } = makeRealDataDirHolding({ workflowTasks: [] })
+    const app = createMaoApp({
+      store,
+      workspaceRoot: path.join(dataDir, 'workspaces'),
+      dataDir,
+      resume: false,
+    })
+    const { workflowEngine } = app
+    const preflight = vi.spyOn(app.githubService, 'assertRepoWorkflowWritable')
+
+    expect(() =>
+      workflowEngine.enqueue(
+        'Invalid override',
+        { owner: 'acme', repo: 'widgets' },
+        false,
+        { effort: 'not-an-effort' } as never,
+      ),
+    ).toThrow(/Refusing to write "workflowTasks".*1 invalid entry/s)
+
+    expect(workflowEngine.getTasks()).toEqual([])
+    expect(preflight).not.toHaveBeenCalled()
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).workflowTasks).toEqual([])
+    expect(workflowEngine.isPersistenceBroken()).toBe(false)
+    expect(hasPersistenceBrokenMarker(dataDir)).toBe(false)
+  })
+
+  it('persists a task from a full registry entry using repository identity only', async () => {
+    const { dataDir, store, filePath } = makeRealDataDirHolding({ workflowTasks: [] })
+    const { workflowEngine } = createMaoApp({
+      store,
+      workspaceRoot: path.join(dataDir, 'workspaces'),
+      dataDir,
+      resume: false,
+    })
+
+    const task = workflowEngine.enqueue(
+      'Registry settings stay out of tasks',
+      { owner: 'acme', repo: 'widgets', autoTrigger: true, pollIntervalMs: null } as never,
+      false,
+    )
+    await new Promise((resolve) => setTimeout(resolve, 20))
+
+    expect(task.repo).toEqual({ owner: 'acme', repo: 'widgets' })
+    const persisted = JSON.parse(fs.readFileSync(filePath, 'utf-8')).workflowTasks as QueuedTask[]
+    expect(persisted).toHaveLength(1)
+    expect(persisted[0]!.repo).toEqual({ owner: 'acme', repo: 'widgets' })
+    expect(workflowEngine.isPersistenceBroken()).toBe(false)
+    expect(hasPersistenceBrokenMarker(dataDir)).toBe(false)
+  })
+})
+
+describe('MaoApp.saveProviders', () => {
+  it('refuses to overwrite a filtered provider view and preserves hidden API keys', () => {
+    const hiddenKey = 'must-remain-only-in-config'
+    const invalidProvider = {
+      id: 'future-provider',
+      name: 'Future provider',
+      kind: 'api',
+      apiFormat: 'future-format',
+      apiKey: hiddenKey,
+    }
+    const rawProviders = [claudeProvider, invalidProvider]
+    captureWarnings()
+    const { dataDir, store, filePath } = makeRealDataDirHolding({ aiProviders: rawProviders })
+    const app = createMaoApp({
+      store,
+      workspaceRoot: path.join(dataDir, 'workspaces'),
+      dataDir,
+      resume: false,
+    })
+    const conditionalWrite = vi.spyOn(store, 'setIfUnchanged')
+    const updateEngine = vi.spyOn(app.workflowEngine, 'setProviders')
+
+    expect(() => app.saveProviders([claudeProvider])).toThrow(/filtered provider list.*Nothing was written/s)
+
+    expect(conditionalWrite).not.toHaveBeenCalled()
+    expect(updateEngine).not.toHaveBeenCalled()
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).aiProviders).toEqual(rawProviders)
+    expect(fs.readFileSync(filePath, 'utf-8')).toContain(hiddenKey)
+  })
+
+  it('conditionally persists a clean list before updating the live engine', () => {
+    const { dataDir, store, filePath } = makeRealDataDirHolding({ aiProviders: [claudeProvider] })
+    const app = createMaoApp({
+      store,
+      workspaceRoot: path.join(dataDir, 'workspaces'),
+      dataDir,
+      resume: false,
+    })
+    const updated = [{ ...claudeProvider, name: 'Claude updated' }]
+    const updateEngine = vi.spyOn(app.workflowEngine, 'setProviders')
+
+    expect(app.saveProviders(updated)).toEqual(updated)
+
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).aiProviders).toEqual(updated)
+    expect(updateEngine).toHaveBeenCalledWith(updated)
   })
 })
 
@@ -643,6 +750,35 @@ describe('MaoApp.confirmQueueRecovery', () => {
     expect(racing.data.workflowTasks).toEqual([atBoot, addedLater])
     expect(app.workflowEngine.getTasks()).toEqual([atBoot, addedLater])
     expect(app.workflowEngine.isQueueRecoveryLatched()).toBe(false)
+  })
+
+  it('preserves the readable durable task while normalizing its in-memory restart state', () => {
+    captureWarnings()
+    const running = {
+      ...makePendingTask('running-at-recovery'),
+      status: 'running' as const,
+      active: { agentId: 'agent-a', agentName: 'Agent A', prompt: 'work in progress' },
+    }
+    const racing = racingStore([running, null])
+    const app = bootWith(racing.store)
+
+    expect(app.confirmQueueRecovery()).toEqual({ kind: 'replaced' })
+
+    expect(racing.data.workflowTasks).toEqual([running])
+    expect(app.workflowEngine.getTasks()).toEqual([
+      expect.objectContaining({ id: running.id, status: 'pending', active: undefined }),
+    ])
+  })
+
+  it('reports an invalid replacement separately from an attempted backend write', () => {
+    captureWarnings()
+    const racing = racingStore()
+    const app = bootWith(racing.store)
+    vi.spyOn(racing.store, 'setIfUnchanged').mockReturnValue('invalid')
+
+    expect(app.confirmQueueRecovery()).toEqual({ kind: 'invalid-replacement' })
+    expect(racing.writes).toEqual([])
+    expect(app.workflowEngine.isQueueRecoveryLatched()).toBe(true)
   })
 
   it('writes nothing when the store cannot be read, and quotes no error', () => {

@@ -8,7 +8,7 @@ import type { QueueRecoveryState } from '../../core/workflow-engine'
 /**
  * Sidebar on its own, driven by props.
  *
- * The queue-recovery rules are prop-level — "offer the discard only while the file still holds the
+ * The queue-recovery rules are prop-level — "offer recovery only while the file still holds the
  * unreadable value" is a decision about two inputs, not about a round trip — and App's own poll runs on a
  * 30s interval, so asserting them through a mounted App would mean either faking timers (which deadlocks
  * with user-event, per SKILL.md) or clicking something to force a re-read. Rendering the component
@@ -31,7 +31,7 @@ const UNUSABLE_QUEUE: StoredValueProblem = {
 const HALTED: QueueRecoveryState = { required: true, reason: UNUSABLE_QUEUE.message }
 
 function renderSidebar(overrides: Partial<Parameters<typeof Sidebar>[0]> = {}) {
-  const onDiscardQueue = vi.fn(async () => {})
+  const onRecoverQueue = vi.fn(async () => {})
   const onResaveQueue = vi.fn(async () => {})
   const props = {
     repos: [],
@@ -42,40 +42,45 @@ function renderSidebar(overrides: Partial<Parameters<typeof Sidebar>[0]> = {}) {
     onResetRepoList: vi.fn(async () => {}),
     queueRecovery: { required: false, reason: undefined } as QueueRecoveryState,
     queueStoredStillUnreadable: false,
-    onDiscardQueue,
+    onRecoverQueue,
     onResaveQueue,
     view: 'project' as const,
     onViewChange: vi.fn(),
     ...overrides,
   }
   render(<Sidebar {...props} />)
-  return { onDiscardQueue, onResaveQueue, user: userEvent.setup() }
+  return { onRecoverQueue, onResaveQueue, user: userEvent.setup() }
 }
 
 describe('Sidebar queue recovery', () => {
-  it('offers a two-step discard while the file still holds the unreadable value', async () => {
-    const { onDiscardQueue, user } = renderSidebar({
+  it('explains the consequences before recovering an unreadable stored queue', async () => {
+    const { onRecoverQueue, user } = renderSidebar({
       queueRecovery: HALTED,
       queueStoredStillUnreadable: true,
       storeProblems: [UNUSABLE_QUEUE],
     })
 
     expect(screen.getByText('Workflow automation is halted')).toBeInTheDocument()
-    await user.click(screen.getByRole('button', { name: 'Discard unreadable queue' }))
-    expect(onDiscardQueue).not.toHaveBeenCalled()
+    await user.click(screen.getByRole('button', { name: 'Recover readable tasks' }))
+    expect(onRecoverQueue).not.toHaveBeenCalled()
+    expect(screen.getByText(/permanently deletes invalid queue entries/)).toBeInTheDocument()
+    expect(screen.getByText(/retains every readable task/)).toBeInTheDocument()
+    expect(screen.getByText(/stored as running are restored as pending/)).toBeInTheDocument()
+    expect(screen.getByText(/auto-trigger poll.*may execute those retained tasks/s)).toBeInTheDocument()
+    expect(screen.getByText(/half-finished branches or pull requests/)).toBeInTheDocument()
 
-    await user.click(screen.getByRole('button', { name: 'Confirm discard' }))
-    expect(onDiscardQueue).toHaveBeenCalledTimes(1)
+    await user.click(screen.getByRole('button', { name: 'Confirm recovery' }))
+    expect(onRecoverQueue).toHaveBeenCalledTimes(1)
   })
 
-  it('does not offer the discard once something else has repaired the file', () => {
+  it('does not offer recovery once something else has repaired the file', () => {
     // The rule this file exists for. The latch is monotone, so it stays up after an out-of-band repair —
     // but the write would then replace that repair with this session's filtered startup subset, which is
     // the exact loss the latch exists to prevent. A restart is the only correct way out of that state.
     renderSidebar({ queueRecovery: HALTED, queueStoredStillUnreadable: false, storeProblems: [] })
 
     expect(screen.getByText('Workflow automation is halted')).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: 'Discard unreadable queue' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Recover readable tasks' })).toBeNull()
     expect(screen.getByText(/Restart MAO to load it/)).toBeInTheDocument()
     expect(screen.getByText(/in-memory queue may be incomplete/)).toBeInTheDocument()
   })
@@ -146,18 +151,18 @@ describe('Sidebar queue recovery', () => {
     }
   })
 
-  it('offers a save of this session\'s queue for a late problem, never a discard', async () => {
+  it('offers a save of this session\'s queue for a late problem, never recovery', async () => {
     // Review's finding: recommending `mao workflow confirm-queue-recovery` here is actively unsafe. That
     // command discards, and run in a separate process it writes ITS empty queue over the file — so this
     // session's real queue is lost the moment it restarts without having written. The safe action is for
     // THIS session to save the queue it is holding.
-    const { user, onResaveQueue, onDiscardQueue } = renderSidebar({
+    const { user, onResaveQueue, onRecoverQueue } = renderSidebar({
       queueRecovery: { required: false, reason: undefined },
       queueStoredStillUnreadable: true,
       storeProblems: [UNUSABLE_QUEUE],
     })
 
-    expect(screen.queryByRole('button', { name: 'Discard unreadable queue' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Recover readable tasks' })).toBeNull()
     expect(screen.queryByText(/Restart MAO to load it/)).toBeNull()
     // And the destructive CLI command must not be named in this state.
     expect(screen.queryByText(/confirm-queue-recovery/)).toBeNull()
@@ -165,7 +170,7 @@ describe('Sidebar queue recovery', () => {
     await user.click(screen.getByRole('button', { name: /Save this session/ }))
 
     expect(onResaveQueue).toHaveBeenCalledTimes(1)
-    expect(onDiscardQueue).not.toHaveBeenCalled()
+    expect(onRecoverQueue).not.toHaveBeenCalled()
   })
 
   it('shows why a late save failed instead of failing silently', async () => {
@@ -196,6 +201,6 @@ describe('Sidebar queue recovery', () => {
     renderSidebar()
 
     expect(screen.queryByText('Workflow automation is halted')).toBeNull()
-    expect(screen.queryByRole('button', { name: 'Discard unreadable queue' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Recover readable tasks' })).toBeNull()
   })
 })

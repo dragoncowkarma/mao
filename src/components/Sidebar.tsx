@@ -60,12 +60,12 @@ interface SidebarProps {
   queueRecovery: QueueRecoveryState
   /**
    * Whether the config file *still* holds the unreadable queue. False while the latch is up means
-   * something else already repaired it, and then the discard must not be offered: it would replace the
+   * something else already repaired it, and then recovery must not be offered: it would replace the
    * repair with this process's filtered, restart-normalized queue.
    */
   queueStoredStillUnreadable: boolean
-  /** Discards invalid stored queue data, retains readable tasks and releases the engine. */
-  onDiscardQueue: () => Promise<void>
+  /** Recovers the queue by deleting invalid entries, retaining readable tasks and releasing the engine. */
+  onRecoverQueue: () => Promise<void>
   /**
    * Rewrites the stored queue from the one this session is holding.
    *
@@ -87,7 +87,7 @@ export default function Sidebar({
   onResetRepoList,
   queueRecovery,
   queueStoredStillUnreadable,
-  onDiscardQueue,
+  onRecoverQueue,
   onResaveQueue,
   view,
   onViewChange,
@@ -101,8 +101,8 @@ export default function Sidebar({
   const [confirmingReset, setConfirmingReset] = useState(false)
   const [resetting, setResetting] = useState(false)
   const [resetError, setResetError] = useState('')
-  const [confirmingDiscard, setConfirmingDiscard] = useState(false)
-  const [discarding, setDiscarding] = useState(false)
+  const [confirmingRecovery, setConfirmingRecovery] = useState(false)
+  const [recovering, setRecovering] = useState(false)
   const [resaving, setResaving] = useState(false)
   const [queueError, setQueueError] = useState('')
 
@@ -146,17 +146,17 @@ export default function Sidebar({
     }
   }
 
-  async function submitDiscard() {
-    if (discarding) return
-    setDiscarding(true)
+  async function submitRecovery() {
+    if (recovering) return
+    setRecovering(true)
     setQueueError('')
     try {
-      await onDiscardQueue()
-      setConfirmingDiscard(false)
+      await onRecoverQueue()
+      setConfirmingRecovery(false)
     } catch (err) {
       setQueueError(readableIpcError(err))
     } finally {
-      setDiscarding(false)
+      setRecovering(false)
     }
   }
 
@@ -264,34 +264,46 @@ export default function Sidebar({
               </>
             )}
             {queueRecovery.required && queueStoredStillUnreadable ? (
-              confirmingDiscard ? (
-                <div className="flex gap-2">
-                  <button onClick={submitDiscard} className="btn btn-primary text-xs" disabled={discarding}>
-                    {discarding ? 'Discarding…' : 'Confirm discard'}
-                  </button>
-                  {/* Disabled mid-write rather than hidden, like the repo-list reset: the write is
-                      already queued and a Cancel that appeared to work would say otherwise. */}
-                  <button
-                    onClick={() => {
-                      setConfirmingDiscard(false)
-                      setQueueError('')
-                    }}
-                    className="btn btn-secondary text-xs"
-                    disabled={discarding}
-                  >
-                    Cancel
-                  </button>
+              confirmingRecovery ? (
+                <div className="flex flex-col gap-2">
+                  <p className="text-muted text-[11px] leading-snug">
+                    Recovery permanently deletes invalid queue entries and retains every readable task.
+                    Tasks stored as running are restored as pending. After automation is released, later
+                    queue activity — including an auto-trigger poll that enqueues work — may execute those
+                    retained tasks.
+                  </p>
+                  <p className="text-muted text-[11px] leading-snug">
+                    Before continuing, check the target repositories for workflow-active issues and
+                    half-finished branches or pull requests so recovery does not repeat GitHub work.
+                  </p>
+                  <div className="flex gap-2">
+                    <button onClick={submitRecovery} className="btn btn-primary text-xs" disabled={recovering}>
+                      {recovering ? 'Recovering…' : 'Confirm recovery'}
+                    </button>
+                    {/* Disabled mid-write rather than hidden, like the repo-list reset: the write is
+                        already queued and a Cancel that appeared to work would say otherwise. */}
+                    <button
+                      onClick={() => {
+                        setConfirmingRecovery(false)
+                        setQueueError('')
+                      }}
+                      className="btn btn-secondary text-xs"
+                      disabled={recovering}
+                    >
+                      Cancel
+                    </button>
+                  </div>
                 </div>
               ) : (
                 <button
-                  onClick={() => setConfirmingDiscard(true)}
+                  onClick={() => setConfirmingRecovery(true)}
                   className="btn btn-secondary self-start text-xs"
                 >
-                  Discard unreadable queue
+                  Recover readable tasks
                 </button>
               )
             ) : queueRecovery.required ? (
-              /* Something outside this window already repaired the file. Offering the discard here
+              /* Something outside this window already repaired the file. Offering recovery here
                  would overwrite that repair with this process's filtered, restart-normalized subset,
                  so the way out is a restart — only a fresh boot can load the complete repaired queue. */
               <p className="text-muted text-[11px] leading-snug">

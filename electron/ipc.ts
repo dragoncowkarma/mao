@@ -13,7 +13,7 @@ export function registerIpcHandlers() {
   const buildSha = process.env.MAO_BUILD_SHA ?? ''
   if (buildSha) store.set('buildSha', buildSha)
 
-  const { githubService, workflowEngine, updateRepos, confirmQueueRecovery, resaveStoredQueue } = createMaoApp({
+  const { githubService, workflowEngine, saveProviders, updateRepos, confirmQueueRecovery, resaveStoredQueue } = createMaoApp({
     store,
     workspaceRoot: path.join(app.getPath('userData'), 'workspaces'),
     dataDir: app.getPath('userData'),
@@ -44,11 +44,7 @@ export function registerIpcHandlers() {
 
   ipcMain.handle('ai:list', () => store.get('aiProviders'))
 
-  ipcMain.handle('ai:save', (_event, providers: AiProviderConfig[]) => {
-    store.set('aiProviders', providers)
-    workflowEngine.setProviders(providers)
-    return providers
-  })
+  ipcMain.handle('ai:save', (_event, providers: AiProviderConfig[]) => saveProviders(providers))
 
   ipcMain.handle('ai:run', async (_event, providerId: string, prompt: string) => {
     const providers = store.get('aiProviders')

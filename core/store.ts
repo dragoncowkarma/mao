@@ -8,6 +8,7 @@ import {
   PROVIDER_KIND_IDS,
   type AiProviderConfig,
 } from './ai/types.ts'
+import { isRepoRef } from './repo-registry.ts'
 import { WORKFLOW_ACTIVE_LABEL, WORKFLOW_TASK_STATUSES } from './workflow-engine.ts'
 import type { QueuedTask, RepoRef } from './workflow-engine.ts'
 
@@ -124,17 +125,6 @@ export function isAiProviderConfig(value: unknown): value is AiProviderConfig {
   )
 }
 
-function isStoredRepoRef(value: unknown): value is RepoRef {
-  if (!isRecord(value)) return false
-  const record = value
-  return (
-    typeof record.owner === 'string' &&
-    typeof record.repo === 'string' &&
-    hasOptional(record, 'autoTrigger', (entry) => typeof entry === 'boolean') &&
-    hasOptional(record, 'pollIntervalMs', isFiniteNumber)
-  )
-}
-
 function isWorkflowStep(value: unknown): boolean {
   if (!isRecord(value)) return false
   return (
@@ -211,7 +201,7 @@ function hasQueuedTaskShape(value: unknown, allowMissingAutoAdvance: boolean): v
   return (
     typeof value.id === 'string' &&
     typeof value.title === 'string' &&
-    isStoredRepoRef(value.repo) &&
+    isRepoRef(value.repo) &&
     isOneOf(value.stage, AGENT_STAGES) &&
     Array.isArray(value.history) &&
     everyArrayEntry(value.history, isWorkflowStep) &&
@@ -236,7 +226,14 @@ function isRestorableQueuedTask(value: unknown): value is RestorableQueuedTask {
 }
 
 function normalizeRestorableTask(task: RestorableQueuedTask): QueuedTask {
-  return { ...task, autoAdvance: task.autoAdvance ?? true }
+  return {
+    ...task,
+    // A queued task needs repository identity, not mutable registration settings. Older stores may
+    // carry those settings because enqueue once snapshotted a complete RepoRef; drop them while reading
+    // so a later queue write cannot preserve policy the workflow neither reads nor owns.
+    repo: { owner: task.repo.owner, repo: task.repo.repo },
+    autoAdvance: task.autoAdvance ?? true,
+  }
 }
 
 /**
@@ -317,21 +314,30 @@ export function describeUnusableProviderList(value: unknown, source: string): st
     const invalid = countInvalidEntries(value, isAiProviderConfig)
     if (invalid === 0) return null
     const valid = value.length - invalid
+    const routingConsequence =
+      valid === 0
+        ? 'No valid provider remains, so workflow stages cannot be routed. '
+        : valid === 1
+          ? 'Only one valid provider remains, so maker-checker cannot select a distinct reviewer and the supported single-provider fallback may reuse that provider for review. '
+          : ''
     return (
       `[store] "aiProviders" in ${source} contains ${countPhrase(invalid, 'invalid entry', 'invalid entries')} out of ` +
       `${value.length} — ignoring ${invalid === 1 ? 'it' : 'them'} in memory and keeping ` +
       `${countPhrase(valid, 'valid provider')}. No stored value, token or API key is shown in this ` +
-      'report. The invalid entries are still in the file; any provider-list write overwrites them. ' +
-      '`mao config import-providers <file>`, or the GUI\'s Global settings pane, replaces the list — ' +
+      `report. ${routingConsequence}The invalid entries are still in the file. The GUI's Global settings pane ` +
+      'refuses to save its filtered view while this problem remains, because doing so would delete ' +
+      'those entries and any apiKey values they contain. Repair the file or use `mao config ' +
+      'import-providers <file>` to replace the complete list — ' +
       `copy anything you still need out of ${source} first.`
     )
   }
   return (
     `[store] "aiProviders" in ${source} is ${describeStoredType(value)}, not a JSON array of AI ` +
     'provider configs — ignoring it, so no AI providers are registered and every workflow stage fails ' +
-    'for want of an agent to route to. The unusable value is still in the file; any provider-list write ' +
-    "overwrites it. `mao config import-providers <file>`, or the GUI's Global settings pane, replaces " +
-    'it — neither needs a GitHub token. Copy any provider configs you still need out of ' +
+    'for want of an agent to route to. The unusable value is still in the file. The GUI\'s Global ' +
+    'settings pane refuses to overwrite an unreadable provider list; repair the file or use `mao ' +
+    'config import-providers <file>` to replace it. Neither route needs a GitHub token. Copy any ' +
+    'provider configs you still need out of ' +
     `${source} first, including their apiKey values, which exist nowhere else.`
   )
 }
@@ -373,8 +379,9 @@ export function describeUnusableTaskQueue(value: unknown, source: string): strin
       'no longer account for, so running another task could duplicate an issue, branch or PR. The invalid ' +
       `entries are still in ${source}. Copy anything you need out first, then check the target repos for ` +
       `issues still labelled "${WORKFLOW_ACTIVE_LABEL}" and half-finished branches or PRs. ` +
-      '`mao workflow confirm-queue-recovery` (or the sidebar\'s Discard unreadable queue) writes back ' +
-      'the readable tasks only and releases the engine.'
+      '`mao workflow confirm-queue-recovery` (or the sidebar\'s Recover readable tasks) writes back ' +
+      'the readable tasks only and releases the engine. A retained running task is restored as pending, ' +
+      'and later queue activity in an already-running host may execute retained tasks.'
     )
   }
   return (
@@ -386,7 +393,7 @@ export function describeUnusableTaskQueue(value: unknown, source: string): strin
     'happened. The unusable value is still in the file. Copy anything you still need out of ' +
     `${source} first, then check the target repo for an issue still labelled "${WORKFLOW_ACTIVE_LABEL}" ` +
     'whose branch or PR is half-finished and finish or clean it up by hand. `mao workflow ' +
-    'confirm-queue-recovery` (or the sidebar\'s Discard unreadable queue) then discards the unreadable ' +
+    'confirm-queue-recovery` (or the sidebar\'s Recover readable tasks) then discards the unreadable ' +
     'value and releases the engine.'
   )
 }
@@ -394,9 +401,10 @@ export function describeUnusableTaskQueue(value: unknown, source: string): strin
 type StoredShapeRule<K extends keyof MaoStoreSchema> = (raw: MaoStoreSchema[K], source: string) => string | null
 
 /**
- * The single table of fields whose stored *shape* is validated, and the report for each — so the guard
- * below and `describeStoredProblems()` cannot disagree about which values are usable, and so adding a
- * field is one entry rather than an edit in two places (issue #68 adds the other array-typed fields).
+ * The registry of fields whose stored *shape* is validated and the report for each, so the guard and
+ * `describeStoredProblems()` cannot disagree about which fields are covered. Element filtering and
+ * strict prospective-write predicates remain field-specific below because read migration and current
+ * write shape intentionally differ for `workflowTasks`.
  *
  * A table rather than a predicate over every schema key, because `describeStoredProblems()` iterates it
  * to decide what to *read*: electron-store re-reads and re-parses the whole config file on every `get`,
@@ -571,7 +579,7 @@ function witnessOf(raw: unknown): string | undefined {
 }
 
 /** What a conditional write did. See `MaoStore.setIfUnchanged()`. */
-export type ConditionalWriteResult = 'written' | 'superseded' | 'unverifiable'
+export type ConditionalWriteResult = 'written' | 'superseded' | 'unverifiable' | 'invalid'
 
 /**
  * One read of a stored value, carrying both what a caller may use and what the guard had to do.
@@ -689,6 +697,8 @@ export function createStoredReadGuard(
  */
 export interface MaoStore {
   get<K extends keyof MaoStoreSchema>(key: K): MaoStoreSchema[K]
+  /** Returns a value-free rejection reason for an invalid prospective write, else `undefined`. */
+  validateWrite<K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]): string | undefined
   /** Rejects an invalid provider/task list before the backend can mutate either memory or disk. */
   set<K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]): void
   /**
@@ -719,7 +729,8 @@ export interface MaoStore {
    *
    * `'superseded'` means the raw value moved and **nothing was written**. `'unverifiable'` means the
    * current value could not be read or serialized, so whether it moved is unknown — also nothing written.
-   * Throws only if the underlying write throws.
+   * `'invalid'` means the replacement failed prospective shape validation before any backend read or
+   * write. Throws only if the underlying write throws.
    *
    * **What `'written'` actually establishes, stated narrowly because an earlier revision of this comment
    * promised more.** The compare and the write are one synchronous run of JavaScript with no `await`
@@ -806,6 +817,9 @@ export function createGuardedStore(
     get<K extends keyof MaoStoreSchema>(key: K): MaoStoreSchema[K] {
       return guardRead(key, readRaw(key))
     },
+    validateWrite<K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]): string | undefined {
+      return describeInvalidStoredWrite(key, value, source) ?? undefined
+    },
     set<K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]): void {
       assertStoredWrite(key, value, source)
       backend.set(key, value)
@@ -845,7 +859,7 @@ export function createGuardedStore(
       witness: string | undefined,
       value: MaoStoreSchema[K],
     ): ConditionalWriteResult {
-      assertStoredWrite(key, value, source)
+      if (describeInvalidStoredWrite(key, value, source) !== null) return 'invalid'
       if (witness === undefined) return 'unverifiable'
       let current: string | undefined
       try {
@@ -940,6 +954,10 @@ export class FileStore implements MaoStore {
 
   get<K extends keyof MaoStoreSchema>(key: K): MaoStoreSchema[K] {
     return this.guarded.get(key)
+  }
+
+  validateWrite<K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]): string | undefined {
+    return this.guarded.validateWrite(key, value)
   }
 
   set<K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]): void {

@@ -361,9 +361,14 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   which write heals it, and **does losing it let unattended work start against state MAO can no longer
   account for?** All three array-typed fields are guarded now. `aiProviders` is reported and filtered but
   halts nothing — an empty provider list stops every stage at `selectAgent()` before any GitHub write,
-  so latching for it would be a larger outage than the fault. Any unusable `workflowTasks` entry halts
-  everything; see the next bullet.
-  The discard is not silent in either shell, and that is a contract, not a log line: `get()` returns only
+  so latching for it would be a larger outage than the fault. A mixed list that leaves exactly one valid
+  provider is different: the supported single-provider fallback may reuse it for review, so the report
+  explicitly warns that maker-checker cannot select a distinct reviewer. `MaoApp.saveProviders()` refuses
+  a GUI save while the raw list is unusable; otherwise the filtered editor snapshot would permanently
+  delete the hidden provider and its `apiKey`. Repair the file or explicitly replace the complete list
+  with `mao config import-providers`. Any unusable `workflowTasks` entry halts everything; see the next
+  bullet.
+  The recovery is not silent in either shell, and that is a contract, not a log line: `get()` returns only
   the corrected value (a default or a filtered subset), so the fact cannot ride on the value. `MaoStore`
   therefore carries `problems()` — evaluated on demand against what the backend holds *now*, never
   accumulated as reads happen, because the renderer polls it over a channel of its own and the order of
@@ -408,7 +413,7 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   adoption, which is what retries the one it held back — releasing that hold is load-bearing and
   tested: leak it and the window never adopts another repair, silently, for the rest of its life.
   Two backend details make "the two shells cannot answer differently" true rather than aspirational.
-  `STORED_SHAPE_RULES` is the one table of checked fields, and `describeStoredProblems()` iterates it
+  `STORED_SHAPE_RULES` is the registry of checked fields, and `describeStoredProblems()` iterates it
   to decide what to *read* — electron-store re-reads and re-parses the whole file on every `get`, so
   walking all six schema keys cost six full file reads per call on the main process. And conf merges
   `defaults` only when it first writes the file, so a key an operator deletes by hand comes back
@@ -419,8 +424,11 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   rather than the raw one passed, while making the GUI permanently blind. `problems()` must read raw:
   the guard has already substituted the default, so asking it what is wrong always answers "nothing".
   The **write** side is the mirror image and deliberately refuses rather than coerces:
-  `createGuardedStore.set()` and `setIfUnchanged()` reject an `aiProviders` or `workflowTasks` list with
-  any invalid entry before the backend mutates memory or disk. That single boundary protects both shells:
+  `createGuardedStore.set()` throws for an invalid `aiProviders` or `workflowTasks` list, while
+  `setIfUnchanged()` returns `'invalid'`; both decide before a backend read or write. The shared
+  `validateWrite()` lets `WorkflowEngine` validate `[...queue, task]` before adopting a new task, so a
+  rejected enqueue cannot pollute memory, make every later persistence attempt fail, or create a false
+  `persistenceBroken` marker. That single boundary protects both shells:
   notably `mao config import-providers` cannot persist `[null]` and then crash while printing `p.id`, and
   Electron's `ai:save` cannot swap the engine to a list the store refused. Read filtering recovers bytes
   that already exist; write rejection preserves the last durable value. Validators walk array indexes
@@ -437,6 +445,11 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   into the module-level defaults — a shallow spread let a caller that pushed into the empty list it read
   leak a phantom entry into the default, which the next `FileStore` in that process read back as a
   tracked repository for auto-trigger to poll.
+- **Queued tasks snapshot repository identity, not registry policy.** `RepoRef` owns optional
+  `autoTrigger` / `pollIntervalMs`; `QueuedTask.repo` is only `{ owner, repo }`. Both enqueue paths strip
+  registry settings before prospective validation and mutation, and restore strips settings written by
+  older builds. Task validation reuses `isRepoRef()` for the non-empty identity rule, so it cannot both
+  reject a registry-only value the queue never reads and accept an empty owner/repo.
 - **An unusable `workflowTasks` container or entry halts unattended automation, and the latch is derived —
   no marker, no `clear-` command.** Review of PR #69 established why correcting the queue and carrying on
   is not enough: both long-lived hosts call `startAutoTrigger()` immediately after `createMaoApp()` and
@@ -501,7 +514,7 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   cannot report that back; and it must not go through the engine, which holds no store reference (rule 3).
   Two call sites in the composition root, and still nothing outside it: no shell, and no other `core/`
   module, writes the field.
-- **The discard and the late re-save share one implementation, deliberately.** They use the same
+- **The recovery and the late re-save share one implementation, deliberately.** They use the same
   observe/conditional-write sequence with different preconditions and replacement sources. A halted
   confirmation writes the *fresh observation's* valid subset, then restores the engine from that subset
   without directly resuming; later queue activity in an already-running host may process it after the
@@ -509,7 +522,7 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   while leaving the stored list mixed. A clean session's late re-save writes its live engine queue. They were
   built separately once, and the second one promptly drifted into an unconditional write that overwrote a
   repair with a stale queue. Keep them on `healStoredQueue()` so that cannot recur, and keep
-  `resaveStoredQueue()`'s refusal-while-halted — without it the repair path is a silent discard.
+  `resaveStoredQueue()`'s refusal-while-halted — without it the repair path is a silent deletion.
 - **An action's result must outlive the condition it reports on.** `src/components/Sidebar.tsx` renders
   queue-action messages *outside* the problem card. `already-readable` means the file is genuinely
   repaired, so the refresh that follows empties the problem list and unmounts the card — a message
@@ -517,7 +530,7 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   it did nothing. Pinned by a renderer test that empties the list after the action.
 - **`confirmQueueRecovery()` lives on `MaoApp`, owns its own postcondition, and writes conditionally.** It
   returns a typed `QueueRecoveryOutcome` so the CLI command and the GUI button cannot disagree about whether
-  confirmation worked — a bare boolean had the CLI re-deriving success while the GUI reported it. **Five**
+  confirmation worked — a bare boolean had the CLI re-deriving success while the GUI reported it. **Six**
   kinds, each saying only what was established: `'replaced'` (still unusable at the conditional write's
   compare, and the write did not throw), `'already-readable'` (readable again, so **nothing is written** —
   the latch is monotone, so after a repair made outside this process the store reads clean while this
@@ -526,8 +539,9 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   value moved
   between the observation and the compare, so the write refused and nothing was written),
   `'unverified'` (the store could not be read or compared, so nothing is written rather than written on a
-  guess) and `'write-failed'` (the attempt threw, so what reached the file is unknown and the halt
-  stands). The write itself goes through `store.setIfUnchanged`, and the latch is cleared **after** it is
+  guess), `'invalid-replacement'` (prospective validation rejected the replacement before any backend
+  read or write, so nothing was written) and `'write-failed'` (the attempt threw, so what reached the file
+  is unknown and the halt stands). The write itself goes through `store.setIfUnchanged`, and the latch is cleared **after** it is
   confirmed — not before, and not through an emit. None interpolates the backend's error text:
   an I/O or parse failure can quote the file's own bytes and that file holds `githubToken` in plaintext,
   so the reasons come from a closed set.
@@ -590,7 +604,7 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   row's settings — which is how the GUI's Remove button re-enabled polling on a repo it was asked to
   delete. Keep
   canonicalisation there, not in a shell. Deliberately **not** a lower-casing of stored entries:
-  `QueuedTask.repo` is snapshotted at enqueue time and the board and queue views filter tasks by an
+  `QueuedTask.repo` snapshots only owner/repo at enqueue time and the board and queue views filter tasks by an
   exact `t.repo.owner === repo.owner`, so rewriting stored spellings would hide every task queued
   before the change — and it would misspell repositories back at the operator in the sidebar.
 - **Registration and every stage are gated on a read-only permission preflight**

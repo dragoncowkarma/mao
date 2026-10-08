@@ -339,6 +339,89 @@ describe('WorkflowEngine', () => {
     expect(current.history).toHaveLength(1)
   })
 
+  it.each([
+    [
+      'enqueue',
+      (engine: WorkflowEngine, repoWithRegistrySettings: RepoRef) =>
+        engine.enqueue('Identity-only task', repoWithRegistrySettings, false),
+    ],
+    [
+      'enqueueFromIssue',
+      (engine: WorkflowEngine, repoWithRegistrySettings: RepoRef) =>
+        engine.enqueueFromIssue(
+          7,
+          'https://github.com/acme/widgets/issues/7',
+          'Identity-only existing issue',
+          repoWithRegistrySettings,
+          false,
+        ),
+    ],
+  ])('snapshots only owner/repo before validating a task created by %s', async (_name, enqueue) => {
+    const validate = vi.fn()
+    const engine = new WorkflowEngine(makeFakeGithub(), validate)
+    // A repository-list entry can carry settings a workflow task never reads. In particular, an older
+    // or hand-edited registry can contain null here even though RepoRef's TypeScript surface says number;
+    // carrying that field into the task used to make the store reject every later queue write.
+    const repoWithRegistrySettings = {
+      owner: 'acme',
+      repo: 'widgets',
+      autoTrigger: true,
+      pollIntervalMs: null,
+    } as unknown as RepoRef
+
+    const task = enqueue(engine, repoWithRegistrySettings)
+
+    expect(task.repo).toEqual({ owner: 'acme', repo: 'widgets' })
+    expect(validate).toHaveBeenCalledTimes(1)
+    expect(validate.mock.calls[0]![0]).toEqual([
+      expect.objectContaining({ id: task.id, repo: { owner: 'acme', repo: 'widgets' } }),
+    ])
+    await waitFor(() => engine.getTasks().find((candidate) => candidate.id === task.id)?.status === 'error')
+  })
+
+  it('normalizes restored tasks to repository identity only', () => {
+    const engine = new WorkflowEngine(makeFakeGithub())
+    const stored = {
+      ...makePendingQueueTask('task-with-registry-settings'),
+      repo: {
+        owner: 'acme',
+        repo: 'widgets',
+        autoTrigger: false,
+        pollIntervalMs: null,
+      } as unknown as RepoRef,
+    }
+
+    engine.restore([stored])
+
+    expect(engine.getTasks()[0]!.repo).toEqual({ owner: 'acme', repo: 'widgets' })
+  })
+
+  it.each([
+    ['enqueue', (engine: WorkflowEngine) => engine.enqueue('Rejected task', repo, false)],
+    [
+      'enqueueFromIssue',
+      (engine: WorkflowEngine) =>
+        engine.enqueueFromIssue(7, 'https://github.com/acme/widgets/issues/7', 'Rejected issue', repo, false),
+    ],
+  ])('rejects %s prospectively without mutating or notifying the queue', (_name, enqueue) => {
+    const github = makeFakeGithub()
+    const validate = vi.fn((_tasks: QueuedTask[]) => {
+      throw new Error('prospective queue rejected')
+    })
+    const engine = new WorkflowEngine(github, validate)
+    const changes = vi.fn()
+    engine.on('change', changes)
+
+    expect(() => enqueue(engine)).toThrow('prospective queue rejected')
+
+    expect(validate).toHaveBeenCalledTimes(1)
+    expect(validate.mock.calls[0]![0]).toHaveLength(1)
+    expect(engine.getTasks()).toEqual([])
+    expect(changes).not.toHaveBeenCalled()
+    expect(github.assertRepoWorkflowWritable).not.toHaveBeenCalled()
+    expect(engine.isPersistenceBroken()).toBe(false)
+  })
+
   describe('provider override', () => {
     it('honors the preferred provider except when it would violate maker-checker, across all stages', async () => {
       const github = makeFakeGithub()

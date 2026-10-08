@@ -103,7 +103,7 @@ npm run cli -- workflow list
 npm run cli -- workflow retry <taskId> [--provider <id>] [--model <model>] [--effort <level>]
 npm run cli -- workflow advance <taskId> [--provider <id>] [--model <model>] [--effort <level>]
 npm run cli -- workflow clear-completed
-npm run cli -- workflow confirm-queue-recovery   # discard an unreadable stored queue, releasing the engine
+npm run cli -- workflow confirm-queue-recovery   # retain readable tasks, delete invalid entries, release the engine
 npm run cli -- run                               # foreground: auto-trigger + resume queue
 npm run cli -- swarm --repo-root /path/to/repo --status
 npm run cli -- swarm --repo-root /path/to/repo --dry-run --once
@@ -162,7 +162,16 @@ Reads never repair the file. On the write side, the shared guard rejects an `aiP
 `workflowTasks` list with any invalid entry before either backend mutates memory or disk. This includes
 sparse-array holes, which JSON would otherwise turn into `null`. Therefore `mao config import-providers`
 cannot save `[null]` and then crash while logging provider ids, and Electron's `ai:save` cannot hand the
-engine a list the store refused.
+engine a list the store refused. `setIfUnchanged()` reports an invalid replacement as `'invalid'` before
+its fresh comparison or backend write, so recovery can distinguish "provably nothing written" from an
+I/O failure. New queue entries are prospectively validated before the engine adopts or emits them.
+
+If filtering leaves one valid provider, the diagnostic warns that maker-checker cannot choose a distinct
+reviewer and the supported single-provider fallback may reuse that provider. Global settings refuses to
+save while the raw provider list is unusable: its editor only received the filtered view, so saving it
+would delete hidden entries and their `apiKey` values. Repair `config.json` or explicitly replace the
+complete list with `mao config import-providers <file>`; import errors name the input file and log success
+only after the guarded write succeeds.
 
 ```
 [store] "githubRepos" in /path/to/config.json is an object, not a JSON array of { owner, repo }
@@ -238,7 +247,7 @@ running its real queue):
 2. Check the target repo for an issue still labelled `workflow-active` whose branch or PR is
    half-finished, and finish or clean it up by hand. Re-enqueueing it blind can open a second branch and
    PR for the same issue.
-3. `mao workflow confirm-queue-recovery`, or the sidebar's two-step **Discard unreadable queue**.
+3. `mao workflow confirm-queue-recovery`, or the sidebar's two-step **Recover readable tasks**.
 
 That command is the only queue path that is not gated, and it is deliberately **not**
 `clear-completed` — `clear-completed` also writes the queue, so it is refused too; leaving it open would
@@ -247,10 +256,11 @@ the file immediately before it writes, and reports only what that established:
 
 | It says | What happened |
 | --- | --- |
-| discarded the unreadable queue | the value was still unusable right before the write; its fresh readable subset was retained, invalid entries were discarded, and the write did not throw. Confirmation itself does not resume tasks. The one-shot CLI exits, so use `mao run`; in an already-running host, later queue activity may process them after the latch is released |
+| recovered the stored workflow queue | the value was still unusable right before the write; its fresh readable subset was retained, invalid entries were deleted, and the write did not throw. Durable readable entries are preserved as observed; in memory, a retained `running` task is restored as `pending` with `active` cleared. Confirmation itself does not resume tasks. The one-shot CLI exits, so use `mao run`; in an already-running host, later queue activity or an auto-trigger enqueue may process retained tasks after the latch is released |
 | reads normally — nothing written | something else repaired the file first (a hand-edit, or the same command in another terminal). **Nothing is written**, because this process still holds only its filtered startup subset and writing it would destroy that repair. Restart to load the real one |
 | nothing was written (could not read) | the config file could not be read at all, so whether the unusable value is still there is unknown. Refusing beats writing on a guess — fix the file or its permissions and retry |
 | the stored queue changed while confirming | the value moved between the check and the write, so the write refused and **nothing was written**. Something else is writing the file — re-check it and retry |
+| the replacement was invalid | prospective validation rejected the replacement before the comparison or backend write, so **nothing was written** and the halt remains |
 | the replacement write failed | the attempt threw, so what reached the file is unknown. Inspect it before salvaging, then retry |
 
 None of those messages quotes the underlying error, because an I/O or parse failure can echo the file's

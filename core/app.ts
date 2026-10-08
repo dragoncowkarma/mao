@@ -1,6 +1,7 @@
 import { GithubService } from './github-service.ts'
 import { createRepoRegistrar } from './repo-registry.ts'
 import { WorkflowEngine, type QueuedTask, type QueueRecoveryOutcome } from './workflow-engine.ts'
+import type { AiProviderConfig } from './ai/types.ts'
 import {
   QUEUE_GATING_FIELD,
   describeUninspectableStore,
@@ -37,6 +38,12 @@ export interface MaoApp {
   githubService: GithubService
   workflowEngine: WorkflowEngine
   store: MaoStore
+  /**
+   * Saves the complete provider editor snapshot only while the raw stored list is readable and has not
+   * moved since inspection. This prevents the GUI from overwriting a hidden invalid entry (and its
+   * apiKey) with the read guard's filtered view.
+   */
+  saveProviders: (providers: AiProviderConfig[]) => AiProviderConfig[]
   /**
    * Replaces an unusable stored queue with its freshly observed readable tasks and releases the halt.
    * Invalid entries are discarded; valid entries survive the ordinary restart normalization.
@@ -98,7 +105,10 @@ function observeStoredQueue(store: MaoStore): StoredObservation<typeof QUEUE_GAT
 
 export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOptions): MaoApp {
   const githubService = new GithubService()
-  const workflowEngine = new WorkflowEngine(githubService)
+  const workflowEngine = new WorkflowEngine(githubService, (tasks) => {
+    const problem = store.validateWrite('workflowTasks', tasks)
+    if (problem !== undefined) throw new Error(problem)
+  })
 
   const token = store.get('githubToken')
   if (token) {
@@ -167,6 +177,72 @@ export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOp
   workflowEngine.restore(observedQueue.value, { resume: safeToResume })
 
   /**
+   * Persist the provider editor's complete list without letting a filtered read become destructive.
+   *
+   * `ai:list` intentionally returns only structurally valid entries so the renderer stays usable. If
+   * the raw list is mixed, that means the editor does not hold everything on disk — an unconditional
+   * save would permanently delete the hidden entries and any API keys they contain. Inspect once,
+   * refuse that state, then key the write to the clean observation so an external edit cannot be lost
+   * between load and save. The engine adopts the new providers only after the durable write succeeds.
+   */
+  function saveProviders(providers: AiProviderConfig[]): AiProviderConfig[] {
+    let observed: StoredObservation<'aiProviders'>
+    try {
+      observed = store.inspect('aiProviders')
+    } catch {
+      throw new Error(
+        'Cannot save AI providers because the stored provider list could not be read. Nothing was ' +
+          'written; inspect the config file and retry.',
+      )
+    }
+
+    if (!observed.readable) {
+      throw new Error(
+        'Cannot save AI providers because the stored provider list could not be read. Nothing was ' +
+          'written; inspect the config file and retry.',
+      )
+    }
+    if (observed.problem !== undefined) {
+      throw new Error(
+        'Cannot save the filtered provider list from Global settings. Nothing was written. ' +
+          observed.problem,
+      )
+    }
+
+    const validationProblem = store.validateWrite('aiProviders', providers)
+    if (validationProblem !== undefined) throw new Error(validationProblem)
+
+    let result
+    try {
+      result = store.setIfUnchanged('aiProviders', observed.witness, providers)
+    } catch {
+      throw new Error(
+        'The AI provider write failed, so what reached the config file is unknown. Inspect the file ' +
+          'before retrying; no provider value, token or API key is shown.',
+      )
+    }
+
+    if (result === 'invalid') {
+      throw new Error('The AI provider replacement was rejected before any write. Nothing was written.')
+    }
+    if (result === 'superseded') {
+      throw new Error(
+        'The stored AI provider list changed before Save completed. Nothing was written; reload ' +
+          'Global settings and apply the edit again.',
+      )
+    }
+    if (result === 'unverifiable') {
+      throw new Error(
+        'The stored AI provider list could not be verified before Save. Nothing was written; inspect ' +
+          'the config file and retry.',
+      )
+    }
+
+    workflowEngine.setProviders(providers)
+    return providers
+  }
+
+  /**
    * Replace an unusable stored queue — observed fresh, written only if nothing moved, and never on a
    * state that could not be established.
    *
@@ -218,6 +294,7 @@ export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOp
       return { kind: 'write-failed' }
     }
     if (written === 'superseded') return { kind: 'superseded' }
+    if (written === 'invalid') return { kind: 'invalid-replacement' }
     if (written === 'unverifiable') {
       return { kind: 'unverified', reason: describeUninspectableStore(QUEUE_GATING_FIELD, 'the config file') }
     }
@@ -265,6 +342,7 @@ export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOp
     githubService,
     workflowEngine,
     store,
+    saveProviders,
     updateRepos: createRepoRegistrar(githubService, store),
     confirmQueueRecovery,
     resaveStoredQueue,

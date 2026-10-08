@@ -17,6 +17,7 @@ import {
   type StoredValueBackend,
 } from './store.ts'
 import { canonicalRepoList } from './repo-registry.ts'
+import { importProvidersFromFile } from '../cli/import-providers.ts'
 import type { AiProviderConfig } from './ai/types.ts'
 import type { QueuedTask, RepoRef } from './workflow-engine.ts'
 
@@ -272,6 +273,10 @@ describe('FileStore aiProviders read guard', () => {
     expect(message).toContain('2 invalid entries')
     expect(message).toContain('out of 3')
     expect(message).toContain(filePath)
+    expect(message).toContain('maker-checker cannot select a distinct reviewer')
+    expect(message).toContain('single-provider fallback may reuse that provider for review')
+    expect(message).toContain('Global settings pane refuses to save its filtered view')
+    expect(message).toContain('mao config import-providers')
     expect(message).not.toContain(leakedId)
     expect(message).not.toContain(leakedKey)
   })
@@ -285,6 +290,16 @@ describe('FileStore aiProviders read guard', () => {
 
     expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).aiProviders).toEqual([claude])
     expect(new FileStore(filePath).get('aiProviders')).toEqual([claude])
+  })
+
+  it('rejects a non-array prospective write before the durable provider list changes', () => {
+    const { store, filePath } = storeHolding({ aiProviders: [claude] })
+
+    expect(() => store.set('aiProviders', {} as unknown as AiProviderConfig[])).toThrow(
+      /expected a JSON array, received an object.*Nothing was written/,
+    )
+
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).aiProviders).toEqual([claude])
   })
 
   it('rejects nested shape errors on write without printing provider contents', () => {
@@ -408,6 +423,32 @@ describe('FileStore workflowTasks read guard', () => {
     expect(warn).not.toHaveBeenCalled()
   })
 
+  it('validates task repository identity only and drops old registry settings on read', () => {
+    const taskWithRegistrySettings = {
+      ...pendingTask,
+      repo: {
+        owner: 'acme',
+        repo: 'widgets',
+        autoTrigger: 'not-task-state',
+        pollIntervalMs: null,
+      },
+    }
+    const { store } = storeHolding({ workflowTasks: [taskWithRegistrySettings] })
+
+    expect(store.get('workflowTasks')).toEqual([
+      { ...pendingTask, repo: { owner: 'acme', repo: 'widgets' } },
+    ])
+    expect(store.problems()).toEqual([])
+  })
+
+  it('rejects an empty repository identity even when every other task field is valid', () => {
+    const invalid = { ...pendingTask, repo: { owner: '', repo: 'widgets' } }
+    const { store, filePath } = storeHolding({ workflowTasks: [pendingTask] })
+
+    expect(() => store.set('workflowTasks', [invalid] as QueuedTask[])).toThrow(/1 invalid entry.*out of 1/)
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).workflowTasks).toEqual([pendingTask])
+  })
+
   it('rejects an invalid task list before a queue write changes the durable value', () => {
     const { store, filePath } = storeHolding({ workflowTasks: [pendingTask] })
 
@@ -457,10 +498,12 @@ describe('FileStore workflowTasks read guard', () => {
     // `mao workflow clear-completed` also emits `'change'`, so it is gated too — naming it would send
     // the operator at a command that now refuses. And it must point at the workflow-active label,
     // because the queue that recorded what was in flight is the thing that is gone.
-    const message = describeUnusableTaskQueue('task-1', '/tmp/config.json')!
+    const message = describeUnusableTaskQueue([pendingTask, null], '/tmp/config.json')!
 
     expect(message).toContain('mao workflow confirm-queue-recovery')
     expect(message).toContain('workflow-active')
+    expect(message).toContain('duplicate an issue, branch or PR')
+    expect(message).toContain('half-finished')
     expect(message).toContain('refused')
     expect(message).not.toContain('clear-completed')
   })
@@ -722,23 +765,30 @@ describe("electron/store.ts, the other MaoStore backend", () => {
 })
 
 describe('cli config import-providers', () => {
-  const source = withoutComments(fs.readFileSync(path.join(REPO_ROOT, 'cli', 'index.ts'), 'utf-8'))
+  it('names the invalid input file, preserves the durable list and emits no success log', () => {
+    const { store, filePath } = storeHolding({ aiProviders: [claude] })
+    const inputPath = path.join(path.dirname(filePath), 'invalid-providers.json')
+    fs.writeFileSync(inputPath, JSON.stringify([null]))
+    const log = vi.fn()
 
-  it('passes the whole list through the guarded store before reading provider ids for success output', () => {
-    // The behavioural half lives above: a FileStore rejects `[null]` without changing the durable
-    // provider list. This source coupling pins the CLI half of the reproduced crash — if the success
-    // message touches `p.id` first, the command throws the old TypeError before the shared boundary can
-    // diagnose the field, path and invalid count.
-    const start = source.indexOf(".command('import-providers <file>')")
-    const end = source.indexOf(".command('set-theme <theme>')", start)
-    expect(start).toBeGreaterThanOrEqual(0)
-    expect(end).toBeGreaterThan(start)
+    expect(() => importProvidersFromFile(inputPath, store, log)).toThrow(
+      new RegExp(`Cannot import AI providers from .*${path.basename(inputPath)}.*1 invalid entry`),
+    )
 
-    const action = source.slice(start, end)
-    const guardedWrite = action.indexOf("store.set('aiProviders', providers)")
-    const successRead = action.indexOf('providers.map((p) => p.id)')
-    expect(guardedWrite).toBeGreaterThanOrEqual(0)
-    expect(successRead).toBeGreaterThan(guardedWrite)
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).aiProviders).toEqual([claude])
+    expect(log).not.toHaveBeenCalled()
+  })
+
+  it('persists a valid list before logging its provider ids', () => {
+    const { store, filePath } = storeHolding({ aiProviders: [] })
+    const inputPath = path.join(path.dirname(filePath), 'valid-providers.json')
+    fs.writeFileSync(inputPath, JSON.stringify([claude]))
+    const log = vi.fn(() => {
+      expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).aiProviders).toEqual([claude])
+    })
+
+    expect(importProvidersFromFile(inputPath, store, log)).toEqual([claude])
+    expect(log).toHaveBeenCalledWith('Imported 1 AI provider(s): claude')
   })
 })
 
@@ -889,10 +939,34 @@ describe('MaoStore.setIfUnchanged', () => {
     const { store, filePath } = storeHolding({ workflowTasks: raw })
     const observed = store.inspect('workflowTasks')
 
-    expect(() =>
-      store.setIfUnchanged('workflowTasks', observed.witness, [null] as unknown as QueuedTask[]),
-    ).toThrow(/1 invalid entry.*out of 1/)
+    expect(store.setIfUnchanged('workflowTasks', observed.witness, [null] as unknown as QueuedTask[])).toBe(
+      'invalid',
+    )
     expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).workflowTasks).toEqual(raw)
+  })
+
+  it('returns invalid before reading fresh state or calling the backend write', () => {
+    let freshReads = 0
+    let writes = 0
+    const store = createGuardedStore(
+      {
+        get: () => [pendingTask] as never,
+        getFresh: <K extends keyof MaoStoreSchema>(_key: K) => {
+          freshReads += 1
+          return [pendingTask] as MaoStoreSchema[K]
+        },
+        set: () => {
+          writes += 1
+        },
+      },
+      '/tmp/config.json',
+    )
+
+    expect(store.setIfUnchanged('workflowTasks', 'unused-witness', [null] as unknown as QueuedTask[])).toBe(
+      'invalid',
+    )
+    expect(freshReads).toBe(0)
+    expect(writes).toBe(0)
   })
 
   it('refuses, and writes nothing, when the stored value moved since the observation', () => {

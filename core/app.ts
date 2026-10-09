@@ -172,7 +172,8 @@ export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOp
   // Two independent facts, deliberately not conflated: the marker means a prior process could no longer
   // *write*, the latch means this process cannot *read* the queue. `mao config show` reports them
   // separately so neither is diagnosed as the other.
-  const safeToResume = resume && !hasPersistenceBrokenMarker(dataDir) && !workflowEngine.isQueueRecoveryLatched()
+  const safeToResume =
+    resume && !hasPersistenceBrokenMarker(dataDir) && !workflowEngine.isQueueRecoveryLatched()
   // The value from the same observation the latch was decided on — never a second `store.get`.
   workflowEngine.restore(observedQueue.value, { resume: safeToResume })
 
@@ -279,7 +280,10 @@ export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOp
   function healStoredQueue(replacementSource: 'fresh-subset' | 'live-engine'): QueueRecoveryOutcome {
     const observed = observeStoredQueue(store)
     if (!observed.readable) {
-      return { kind: 'unverified', reason: observed.problem ?? describeUninspectableStore(QUEUE_GATING_FIELD, 'the config file') }
+      return {
+        kind: 'unverified',
+        reason: observed.problem ?? describeUninspectableStore(QUEUE_GATING_FIELD, 'the config file'),
+      }
     }
     if (observed.problem === undefined) return { kind: 'already-readable' }
 

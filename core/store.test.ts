@@ -17,7 +17,7 @@ import {
   type StoredValueBackend,
 } from './store.ts'
 import { canonicalRepoList } from './repo-registry.ts'
-import { importProvidersFromFile } from '../cli/import-providers.ts'
+import { importProvidersFromFile } from './provider-import.ts'
 import type { AiProviderConfig } from './ai/types.ts'
 import type { QueuedTask, RepoRef } from './workflow-engine.ts'
 

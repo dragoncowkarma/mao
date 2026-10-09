@@ -13,7 +13,14 @@ export function registerIpcHandlers() {
   const buildSha = process.env.MAO_BUILD_SHA ?? ''
   if (buildSha) store.set('buildSha', buildSha)
 
-  const { githubService, workflowEngine, saveProviders, updateRepos, confirmQueueRecovery, resaveStoredQueue } = createMaoApp({
+  const {
+    githubService,
+    workflowEngine,
+    saveProviders,
+    updateRepos,
+    confirmQueueRecovery,
+    resaveStoredQueue,
+  } = createMaoApp({
     store,
     workspaceRoot: path.join(app.getPath('userData'), 'workspaces'),
     dataDir: app.getPath('userData'),

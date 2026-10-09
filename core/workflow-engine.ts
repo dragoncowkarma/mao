@@ -453,7 +453,13 @@ export class WorkflowEngine extends EventEmitter {
     return task
   }
 
-  /** Validates and adopts a new task before emitting the change that persists it. */
+  /**
+   * Validates and adopts a new task before emitting the change that persists it.
+   *
+   * Later queue mutators rely on tasks entering through this check, or through `restore()`'s
+   * normalization, with a durable shape. A new mutator that can introduce another shape must validate
+   * before it changes the live queue too.
+   */
   private appendTask(task: QueuedTask): QueuedTask {
     const prospective = [...this.queue, task]
     // The validator is deliberately before the assignment and notify. If it rejects, both the live queue

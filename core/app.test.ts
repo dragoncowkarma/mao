@@ -619,10 +619,10 @@ describe('core/app.ts and the engine, as source order', () => {
     // so this is the second line of defence, not the first. Pinned so a refactor cannot quietly make the
     // boot path depend on processQueue's check alone.
     const safeToResume = appSource.slice(appSource.indexOf('const safeToResume ='))
-    const line = safeToResume.slice(0, safeToResume.indexOf('\n'))
+    const assignment = safeToResume.slice(0, safeToResume.indexOf('workflowEngine.restore('))
 
-    expect(line).toContain('isQueueRecoveryLatched()')
-    expect(line).toContain('hasPersistenceBrokenMarker(dataDir)')
+    expect(assignment).toContain('isQueueRecoveryLatched()')
+    expect(assignment).toContain('hasPersistenceBrokenMarker(dataDir)')
   })
 
   it('keeps both of processQueue\'s latch checks', () => {

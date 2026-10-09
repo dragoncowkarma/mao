@@ -314,19 +314,21 @@ export function describeUnusableProviderList(value: unknown, source: string): st
     const invalid = countInvalidEntries(value, isAiProviderConfig)
     if (invalid === 0) return null
     const valid = value.length - invalid
+    const invalidCount = countPhrase(invalid, 'invalid entry', 'invalid entries')
     const routingConsequence =
       valid === 0
         ? 'No valid provider remains, so workflow stages cannot be routed. '
         : valid === 1
-          ? 'Only one valid provider remains, so maker-checker cannot select a distinct reviewer and the supported single-provider fallback may reuse that provider for review. '
+          ? 'Only one valid provider remains, so maker-checker cannot select a distinct reviewer ' +
+            'and the supported single-provider fallback may reuse that provider for review. '
           : ''
     return (
-      `[store] "aiProviders" in ${source} contains ${countPhrase(invalid, 'invalid entry', 'invalid entries')} out of ` +
+      `[store] "aiProviders" in ${source} contains ${invalidCount} out of ` +
       `${value.length} — ignoring ${invalid === 1 ? 'it' : 'them'} in memory and keeping ` +
       `${countPhrase(valid, 'valid provider')}. No stored value, token or API key is shown in this ` +
-      `report. ${routingConsequence}The invalid entries are still in the file. The GUI's Global settings pane ` +
-      'refuses to save its filtered view while this problem remains, because doing so would delete ' +
-      'those entries and any apiKey values they contain. Repair the file or use `mao config ' +
+      `report. ${routingConsequence}The invalid entries are still in the file. The GUI's Global ` +
+      'settings pane refuses to save its filtered view while this problem remains, because doing so ' +
+      'would delete those entries and any apiKey values they contain. Repair the file or use `mao config ' +
       'import-providers <file>` to replace the complete list — ' +
       `copy anything you still need out of ${source} first.`
     )

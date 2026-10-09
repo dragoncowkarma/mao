@@ -9,10 +9,10 @@ import { clearPersistenceBrokenMarker, hasPersistenceBrokenMarker } from '../cor
 import { runSwarm, SwarmRepositoryPathError } from '../core/swarm-runner.ts'
 import { describeUnverifiedGrants } from '../core/repo-capabilities.ts'
 import { sameRepoRef } from '../core/repo-registry.ts'
+import { importProvidersFromFile } from '../core/provider-import.ts'
 import type { AiEffort } from '../core/ai/types.ts'
 import type { QueuedTask, RepoRef, RunOverride } from '../core/workflow-engine.ts'
 import type { ThemePreference } from '../core/store.ts'
-import { importProvidersFromFile } from './import-providers.ts'
 
 function log(...args: unknown[]) {
   console.log('[mao]', ...args)

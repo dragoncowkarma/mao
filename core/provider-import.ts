@@ -1,7 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import type { MaoStore } from '../core/store.ts'
-import type { AiProviderConfig } from '../core/ai/types.ts'
+import type { MaoStore } from './store.ts'
+import type { AiProviderConfig } from './ai/types.ts'
 
 export type ProviderImportLogger = (message: string) => void
 

@@ -830,6 +830,21 @@ describe('cli config import-providers', () => {
     expect(quotedBackslashMessage).not.toContain(`"${quotedBackslashPath}"`)
   })
 
+  it('escapes the line separators that would split a one-line diagnostic', () => {
+    // The only characters the escape set renders with the four-digit `%uXXXX` form, and the only ones
+    // a terminal would treat as a line break inside what every other path keeps to a single line.
+    for (const [separator, escape] of [
+      ['\u2028', '%u2028'],
+      ['\u2029', '%u2029'],
+    ]) {
+      const resolvedPath = path.resolve(`providers${separator}list.json`)
+      const message = unreadableImportMessage(`providers${separator}list.json`)
+
+      expect(message).toContain(`"${resolvedPath.replace(separator, escape)}"`)
+      expect(message).not.toContain(separator)
+    }
+  })
+
   it('names the invalid input file, preserves the durable list and emits no success log', () => {
     const { store, filePath } = storeHolding({ aiProviders: [claude] })
     const inputPath = path.join(path.dirname(filePath), 'invalid-providers.json')

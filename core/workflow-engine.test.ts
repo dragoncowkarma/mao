@@ -1,5 +1,8 @@
+import fs from 'node:fs'
+import path from 'node:path'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { WorkflowEngine, type QueuedTask, type RepoRef } from './workflow-engine.ts'
+import { AGENT_STAGES } from './ai/types.ts'
 import { RepoCapabilityError, evaluateRepoCapability } from './repo-capabilities.ts'
 import type { AgentStage, AiProviderConfig } from './ai/types.ts'
 import type { GithubService } from './github-service.ts'
@@ -1384,3 +1387,47 @@ function makePendingQueueTask(id: string): QueuedTask {
     github: {},
   }
 }
+
+const REPO_ROOT = path.join(
+  (import.meta as unknown as { dirname?: string }).dirname ?? path.join(process.cwd(), 'core'),
+  '..',
+)
+
+/** Comments may legitimately name the list; only executable text should satisfy the assertion. */
+function withoutComments(source: string): string {
+  return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+}
+
+/**
+ * `STAGE_ORDER` as a derivation, asserted rather than assumed.
+ *
+ * The pipeline's order used to be a second hand-written copy of `AGENT_STAGES`, and the two could
+ * drift because `STAGE_ORDER`'s annotation (`WorkflowStageName[]`) accepts a list with an element
+ * *missing* — only an extra one fails tsc. A stage reachable per the union but absent from the order
+ * makes `STAGE_ORDER[STAGE_ORDER.indexOf(task.stage) + 1]` select `STAGE_ORDER[0]`, so the pipeline
+ * restarts at `issue` and performs real GitHub writes instead of advancing (issue #79).
+ *
+ * Deriving it removes that by construction — but nothing *keeps* it derived: replacing
+ * `const STAGE_ORDER = AGENT_STAGES` with an equal literal leaves every behavioural test green
+ * (verified by mutation), so the drift hazard would silently return. A drifted literal is caught by
+ * the stage-progression tests above; this is what stops the copy coming back at all. Asserted on the
+ * source because `STAGE_ORDER` is module-private and an equal literal is runtime-indistinguishable
+ * from the derivation — the same reason core/store.test.ts reads electron/store.ts as text.
+ */
+describe('the engine stage order', () => {
+  const engineSource = withoutComments(
+    fs.readFileSync(path.join(REPO_ROOT, 'core', 'workflow-engine.ts'), 'utf-8'),
+  )
+
+  it('derives STAGE_ORDER from AGENT_STAGES instead of restating it', () => {
+    const assignments = [...engineSource.matchAll(/^const STAGE_ORDER\b[^\n]*$/gm)].map((match) => match[0])
+
+    expect(assignments).toEqual(['const STAGE_ORDER = AGENT_STAGES'])
+  })
+
+  it('still orders every stage the union admits, so no stage can be unreachable', () => {
+    // Guards the other direction: the derivation is only worth pinning while AGENT_STAGES is itself
+    // the full, ordered set the rest of the engine switches on.
+    expect([...AGENT_STAGES]).toEqual(['issue', 'pr', 'review', 'merge'])
+  })
+})

@@ -618,11 +618,12 @@ describe('core/app.ts and the engine, as source order', () => {
     // Also unobservable on its own — restore(resume: true) reaches processQueue, which is gated anyway —
     // so this is the second line of defence, not the first. Pinned so a refactor cannot quietly make the
     // boot path depend on processQueue's check alone.
-    const safeToResume = appSource.slice(appSource.indexOf('const safeToResume ='))
-    const assignment = safeToResume.slice(0, safeToResume.indexOf('workflowEngine.restore('))
+    const normalized = appSource.replace(/\s+/g, ' ')
 
-    expect(assignment).toContain('isQueueRecoveryLatched()')
-    expect(assignment).toContain('hasPersistenceBrokenMarker(dataDir)')
+    expect(normalized).toContain(
+      'const safeToResume = resume && !hasPersistenceBrokenMarker(dataDir) && ' +
+        '!workflowEngine.isQueueRecoveryLatched()',
+    )
   })
 
   it('keeps both of processQueue\'s latch checks', () => {

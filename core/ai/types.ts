@@ -36,10 +36,10 @@ export interface ModelEffortPreset {
 }
 
 /**
- * A stage in the MAO workflow pipeline. Defined here (alongside AiProviderConfig) so that
- * provider configs can reference stage names without creating a circular import with
- * workflow-engine.ts (which imports from this file). workflow-engine.ts re-exports this as
- * WorkflowStageName for backward compatibility.
+ * The canonical ordered stages in the MAO workflow pipeline. Defined here (alongside
+ * AiProviderConfig) so provider configs can reference stage names without creating a circular import
+ * with workflow-engine.ts (which derives its stage order from this list). workflow-engine.ts
+ * re-exports the derived union as WorkflowStageName for backward compatibility.
  */
 export const AGENT_STAGES = ['issue', 'pr', 'review', 'merge'] as const
 export type AgentStage = (typeof AGENT_STAGES)[number]

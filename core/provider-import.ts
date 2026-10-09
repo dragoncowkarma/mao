@@ -5,6 +5,19 @@ import type { AiProviderConfig } from './ai/types.ts'
 
 export type ProviderImportLogger = (message: string) => void
 
+function quotePathForDisplay(inputPath: string): string {
+  const escaped = inputPath.replace(
+    /[%"\u0000-\u001f\u007f-\u009f\u2028\u2029]/g,
+    (character) => {
+      const codePoint = character.codePointAt(0)!
+      const width = codePoint <= 0xff ? 2 : 4
+      const prefix = codePoint <= 0xff ? '%' : '%u'
+      return `${prefix}${codePoint.toString(16).toUpperCase().padStart(width, '0')}`
+    },
+  )
+  return `"${escaped}"`
+}
+
 /**
  * Imports a provider list without ever persisting unvalidated input.
  *
@@ -18,7 +31,9 @@ export function importProvidersFromFile(
   log: ProviderImportLogger,
 ): AiProviderConfig[] {
   const inputPath = path.resolve(file)
-  const displayedPath = JSON.stringify(inputPath)
+  // Percent-escape the delimiter, percent signs and control characters so the representation stays
+  // reversible without doubling the backslashes an operator needs to copy from a Windows path.
+  const displayedPath = quotePathForDisplay(inputPath)
 
   let source: string
   try {

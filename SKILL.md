@@ -524,10 +524,10 @@ Two traps:
 
 ### Add a pipeline stage
 
-1. `core/ai/types.ts`: extend `AGENT_STAGES` (the `AgentStage` / re-exported
-   `WorkflowStageName` unions derive from it). Then update `core/workflow-engine.ts`:
-   `STAGE_ORDER`, `buildPromptForStage`, `applyGithubAction` (+ `runPrWithCodeEdits`-style
-   special-casing if needed).
+1. `core/ai/types.ts`: extend the ordered `AGENT_STAGES` (the `AgentStage` / re-exported
+   `WorkflowStageName` unions and workflow-engine stage order derive from it). Then update
+   `core/workflow-engine.ts`: `buildPromptForStage`, `applyGithubAction`
+   (+ `runPrWithCodeEdits`-style special-casing if needed).
 2. Update `STAGE_LABELS` in `src/components/KanbanBoard.tsx` and
    `src/components/WorkflowQueue.tsx`, plus `ALL_STAGES` and `STAGE_LABELS` in
    `src/components/GlobalSettings.tsx` (duplicated by convention).

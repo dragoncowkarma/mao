@@ -32,7 +32,7 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
 | `core/github-service.ts` | Octokit REST wrapper (issues, PRs, labels, reviews, merge, CI status) — plus the read-only `checkRepoWorkflowCapability()` / `assertRepoWorkflowWritable()` preflight |
 | `core/repo-capabilities.ts` | Pure verdict logic for "can this credential run the pipeline in this repo?" — `evaluateRepoCapability()`, `describeRepoCapability()`, `describeUnverifiedGrants()`, `RepoCapabilityError` |
 | `core/repo-registry.ts` | Pure, renderer-importable repository identity plus the single definition of "this repo entry is newly registered" — `repoRefKey()`/`sameRepoRef()` (case-insensitive, as GitHub resolves owner/repo), `canonicalRepoList()`, `reposNeedingCapabilityCheck()` / `assertReposRegistrable()`, and the serialized `createRepoRegistrar()` both `github:setRepos` and `mao repos add`/`remove` write through |
-| `core/provider-import.ts` | Shared provider-file import logic: read, parse, validate, persist, and report without exposing provider values or secrets |
+| `core/provider-import.ts` | CLI-only provider-file import for `mao config import-providers` (no IPC channel): reads and parses input, validates through the store write guard, persists, then logs imported IDs; rejection messages omit parser/backend errors and provider values |
 | `core/git-workspace.ts` | Local git clone/branch/commit/push via `execFile` (no shell) |
 | `core/swarm-runner.ts` | Shell-free launcher and repository/asset validation for the autonomous Swarm Orchestrator |
 | `core/auto-trigger.ts` | Per-repo polling scheduler; auto-enqueues new open issues |
@@ -176,8 +176,8 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   three-state `permissions.push`, and the unverified pipeline grants must stay aligned, with
   regressions in both TypeScript and Python suites. Credential acquisition and command-failure
   classification deliberately differ because Swarm checks the active `gh` credential.
-- **New pipeline stage** → `AGENT_STAGES` (the `AgentStage` union is derived from it) in
-  `core/ai/types.ts`, then `STAGE_ORDER` + `buildPromptForStage` + `applyGithubAction` in
+- **New pipeline stage** → the ordered `AGENT_STAGES` (both the `AgentStage` union and workflow-engine
+  stage order derive from it) in `core/ai/types.ts`, then `buildPromptForStage` + `applyGithubAction` in
   `core/workflow-engine.ts`, **plus** the `STAGE_LABELS` record in
   `src/components/KanbanBoard.tsx` and `src/components/WorkflowQueue.tsx`, and both
   `ALL_STAGES` + `STAGE_LABELS` in `src/components/GlobalSettings.tsx`, plus
@@ -190,7 +190,7 @@ There is no codegen — these couplings are maintained by hand and only `npm run
 
 ## Workflow-engine domain invariants
 
-- Stages: `issue → pr → review → merge` (`STAGE_ORDER`). Task statuses derive from
+- Stages: `issue → pr → review → merge` (`AGENT_STAGES`; the engine aliases it as `STAGE_ORDER`). Task statuses derive from
   `WORKFLOW_TASK_STATUSES`: `pending | running | done | error | paused`.
 - **Maker-checker**: `selectAgent()` excludes the `agentId` of the last
   `task.history` entry; falls back to the sole provider if only one is registered.

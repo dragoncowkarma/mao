@@ -281,6 +281,17 @@ describe('FileStore aiProviders read guard', () => {
     expect(message).not.toContain(leakedKey)
   })
 
+  it('uses singular and plural grammar for invalid provider entries left on disk', () => {
+    const single = describeUnusableProviderList([claude, null], '/tmp/config.json')!
+    const multiple = describeUnusableProviderList([claude, null, null], '/tmp/config.json')!
+
+    expect(single).toContain('The invalid entry is still in the file')
+    expect(single).not.toContain('The invalid entries are')
+    expect(single).not.toContain('those entries')
+    expect(single).not.toContain('they contain')
+    expect(multiple).toContain('The invalid entries are still in the file')
+  })
+
   it('rejects the invalid list used by `config import-providers` before the durable value changes', () => {
     const { store, filePath } = storeHolding({ aiProviders: [claude] })
 
@@ -506,6 +517,15 @@ describe('FileStore workflowTasks read guard', () => {
     expect(message).toContain('half-finished')
     expect(message).toContain('refused')
     expect(message).not.toContain('clear-completed')
+  })
+
+  it('uses singular and plural grammar for invalid task entries left on disk', () => {
+    const single = describeUnusableTaskQueue([pendingTask, null], '/tmp/config.json')!
+    const multiple = describeUnusableTaskQueue([pendingTask, null, null], '/tmp/config.json')!
+
+    expect(single).toContain('The invalid entry is still in /tmp/config.json')
+    expect(single).not.toContain('The invalid entries are')
+    expect(multiple).toContain('The invalid entries are still in /tmp/config.json')
   })
 
   it('prints no stored value, whatever the value was', () => {
@@ -765,6 +785,51 @@ describe("electron/store.ts, the other MaoStore backend", () => {
 })
 
 describe('cli config import-providers', () => {
+  function unreadableImportMessage(inputPath: string): string {
+    const { store } = storeHolding({ aiProviders: [claude] })
+    const log = vi.fn()
+    let message = ''
+
+    try {
+      importProvidersFromFile(inputPath, store, log)
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error)
+    }
+
+    expect(log).not.toHaveBeenCalled()
+    return message
+  }
+
+  it('keeps Windows path separators readable in a quoted rejection path', () => {
+    const inputPath = String.raw`C:\Users\mao\missing-providers.json`
+    const resolvedPath = path.resolve(inputPath)
+    const message = unreadableImportMessage(inputPath)
+
+    expect(message).toContain(`"${resolvedPath}"`)
+    expect(message).not.toContain(JSON.stringify(resolvedPath))
+  })
+
+  it('keeps control characters, literal escapes and quoted backslashes distinct', () => {
+    const newlinePath = path.resolve('providers\nlist.json')
+    const literalEscapePath = path.resolve(String.raw`providers\nlist.json`)
+    const percentEscapePath = path.resolve('providers%0Alist.json')
+    const quotedBackslashPath = path.resolve(String.raw`providers\"draft.json`)
+
+    const newlineMessage = unreadableImportMessage('providers\nlist.json')
+    const literalEscapeMessage = unreadableImportMessage(String.raw`providers\nlist.json`)
+    const percentEscapeMessage = unreadableImportMessage('providers%0Alist.json')
+    const quotedBackslashMessage = unreadableImportMessage(String.raw`providers\"draft.json`)
+
+    expect(newlineMessage).toContain(`"${newlinePath.replace('\n', '%0A')}"`)
+    expect(newlineMessage).not.toContain('\n')
+    expect(literalEscapeMessage).toContain(`"${literalEscapePath}"`)
+    expect(newlineMessage).not.toBe(literalEscapeMessage)
+    expect(percentEscapeMessage).toContain(`"${percentEscapePath.replace('%', '%25')}"`)
+    expect(newlineMessage).not.toBe(percentEscapeMessage)
+    expect(quotedBackslashMessage).toContain(`"${quotedBackslashPath.replace('"', '%22')}"`)
+    expect(quotedBackslashMessage).not.toContain(`"${quotedBackslashPath}"`)
+  })
+
   it('names the invalid input file, preserves the durable list and emits no success log', () => {
     const { store, filePath } = storeHolding({ aiProviders: [claude] })
     const inputPath = path.join(path.dirname(filePath), 'invalid-providers.json')

@@ -315,6 +315,7 @@ export function describeUnusableProviderList(value: unknown, source: string): st
     if (invalid === 0) return null
     const valid = value.length - invalid
     const invalidCount = countPhrase(invalid, 'invalid entry', 'invalid entries')
+    const invalidSubject = invalid === 1 ? 'The invalid entry is' : 'The invalid entries are'
     const routingConsequence =
       valid === 0
         ? 'No valid provider remains, so workflow stages cannot be routed. '
@@ -326,9 +327,10 @@ export function describeUnusableProviderList(value: unknown, source: string): st
       `[store] "aiProviders" in ${source} contains ${invalidCount} out of ` +
       `${value.length} — ignoring ${invalid === 1 ? 'it' : 'them'} in memory and keeping ` +
       `${countPhrase(valid, 'valid provider')}. No stored value, token or API key is shown in this ` +
-      `report. ${routingConsequence}The invalid entries are still in the file. The GUI's Global ` +
+      `report. ${routingConsequence}${invalidSubject} still in the file. The GUI's Global ` +
       'settings pane refuses to save its filtered view while this problem remains, because doing so ' +
-      'would delete those entries and any apiKey values they contain. Repair the file or use `mao config ' +
+      'would delete the invalid stored data and any apiKey values it contains. Repair the file or use ' +
+      '`mao config ' +
       'import-providers <file>` to replace the complete list — ' +
       `copy anything you still need out of ${source} first.`
     )
@@ -372,14 +374,16 @@ export function describeUnusableTaskQueue(value: unknown, source: string): strin
     const invalid = countInvalidEntries(value, isRestorableQueuedTask)
     if (invalid === 0) return null
     const valid = value.length - invalid
+    const invalidSubject = invalid === 1 ? 'The invalid entry is' : 'The invalid entries are'
     return (
       `[store] "workflowTasks" in ${source} contains ${countPhrase(invalid, 'invalid queued task')} ` +
       `out of ${value.length} — ignoring ${invalid === 1 ? 'it' : 'them'} in memory, preserving ` +
       `${countPhrase(valid, 'readable task')}, and halting unattended work: auto-resume, auto-trigger ` +
       'polling and every queue write are refused until this is resolved. No stored task, prompt, token ' +
       'or API key is shown in this report. A discarded durable task may represent GitHub work MAO can ' +
-      'no longer account for, so running another task could duplicate an issue, branch or PR. The invalid ' +
-      `entries are still in ${source}. Copy anything you need out first, then check the target repos for ` +
+      'no longer account for, so running another task could duplicate an issue, branch or PR. ' +
+      `${invalidSubject} still in ${source}. Copy anything you need out first, then check the target repos ` +
+      'for ' +
       `issues still labelled "${WORKFLOW_ACTIVE_LABEL}" and half-finished branches or PRs. ` +
       '`mao workflow confirm-queue-recovery` (or the sidebar\'s Recover readable tasks) writes back ' +
       'the readable tasks only and releases the engine. A retained running task is restored as pending, ' +

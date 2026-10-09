@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { createAiProvider } from './ai/index.ts'
-import { AI_EFFORTS } from './ai/types.ts'
+import { AGENT_STAGES, AI_EFFORTS } from './ai/types.ts'
 import type { AgentStage, AiEffort, AiProviderConfig, ProviderKindId } from './ai/types.ts'
 import { resolveStageAgent } from './agent-selection.ts'
 import type { ProviderOverride, RunOverride } from './agent-selection.ts'
@@ -14,7 +14,7 @@ import { ensureClone, checkoutBranch, hasChanges, commitAndPush } from './git-wo
  */
 export type WorkflowStageName = AgentStage
 
-const STAGE_ORDER: WorkflowStageName[] = ['issue', 'pr', 'review', 'merge']
+const STAGE_ORDER = AGENT_STAGES
 
 /** Runtime list paired with the persisted task-status union, for untyped store validation. */
 export const WORKFLOW_TASK_STATUSES = ['pending', 'running', 'done', 'error', 'paused'] as const
@@ -364,6 +364,9 @@ export class WorkflowEngine extends EventEmitter {
    * `mao config show`) must not have that trigger real GitHub/AI-provider calls as a side effect.
    * Pass resume: true (or call resumeProcessing() once ready) for long-lived processes that should
    * pick back up where they left off, such as the Electron main process or `mao run`.
+   *
+   * This method normalizes migrations but does not validate task shapes. Production callers must pass
+   * the already-filtered subset returned by the store read guard.
    */
   restore(tasks: QueuedTask[], options: { resume?: boolean } = {}) {
     this.queue = tasks.map((task) => ({
@@ -456,9 +459,9 @@ export class WorkflowEngine extends EventEmitter {
   /**
    * Validates and adopts a new task before emitting the change that persists it.
    *
-   * Later queue mutators rely on tasks entering through this check, or through `restore()`'s
-   * normalization, with a durable shape. A new mutator that can introduce another shape must validate
-   * before it changes the live queue too.
+   * Later queue mutators rely on new tasks passing this check and restored tasks already having passed
+   * the store read guard. `restore()` normalizes but does not validate. A new mutator that can introduce
+   * another shape must validate before it changes the live queue too.
    */
   private appendTask(task: QueuedTask): QueuedTask {
     const prospective = [...this.queue, task]

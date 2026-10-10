@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-import fs from 'node:fs'
 import path from 'node:path'
 import { Command } from 'commander'
 import { createMaoApp, type MaoApp } from '../core/app.ts'
@@ -10,7 +9,8 @@ import { clearPersistenceBrokenMarker, hasPersistenceBrokenMarker } from '../cor
 import { runSwarm, SwarmRepositoryPathError } from '../core/swarm-runner.ts'
 import { describeUnverifiedGrants } from '../core/repo-capabilities.ts'
 import { sameRepoRef } from '../core/repo-registry.ts'
-import type { AiEffort, AiProviderConfig } from '../core/ai/types.ts'
+import { importProvidersFromFile } from '../core/provider-import.ts'
+import type { AiEffort } from '../core/ai/types.ts'
 import type { QueuedTask, RepoRef, RunOverride } from '../core/workflow-engine.ts'
 import type { ThemePreference } from '../core/store.ts'
 
@@ -81,14 +81,8 @@ config
   .command('import-providers <file>')
   .description('Load AI provider configs from a JSON file (array of AiProviderConfig)')
   .action((file: string) => {
-    const parsed: unknown = JSON.parse(fs.readFileSync(path.resolve(file), 'utf-8'))
-    if (!Array.isArray(parsed)) {
-      throw new Error(`Expected ${file} to contain a JSON array of AI provider configs`)
-    }
-    const providers = parsed as AiProviderConfig[]
     const { store } = loadApp()
-    store.set('aiProviders', providers)
-    log(`Imported ${providers.length} AI provider(s): ${providers.map((p) => p.id).join(', ')}`)
+    importProvidersFromFile(file, store, (message) => log(message))
   })
 
 config
@@ -371,10 +365,10 @@ workflow
 workflow
   .command('confirm-queue-recovery')
   .description(
-    'Discard an unreadable stored workflow queue and release the engine. Only run this after copying ' +
-      "anything you still need out of the config file and checking the target repo for an issue still " +
-      'labelled workflow-active whose branch or PR is half-finished — confirming replaces the unreadable ' +
-      'value, so whatever it held is gone.',
+    'Discard invalid entries from an unusable stored workflow queue, retain readable tasks and release ' +
+      'the engine. Only run this after copying anything you still need out of the config file and ' +
+      'checking the target repo for an issue still labelled workflow-active whose branch or PR is ' +
+      'half-finished — confirming permanently removes anything the store could not validate.',
   )
   .action(() => {
     // resume: false, so booting this command cannot start the pipeline it is about to release.
@@ -403,7 +397,16 @@ workflow
           'halted. Inspect the file before salvaging anything from it, then retry.',
       )
     }
-    log('Discarded the unreadable stored workflow queue. Auto-resume, polling and queue writes are released.')
+    if (outcome.kind === 'invalid-replacement') {
+      throw new Error(
+        'MAO rejected the readable task subset before writing because it contains an invalid task. ' +
+          'Nothing was written and automation remains halted. Inspect the retained tasks, then retry.',
+      )
+    }
+    log(
+      'Recovered the stored workflow queue: readable tasks were retained and invalid entries were ' +
+        'discarded. Restart MAO or run `mao run` to resume retained tasks; polling and queue writes are released.',
+    )
   })
 
 // --- run ----------------------------------------------------------------------

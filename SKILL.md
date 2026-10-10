@@ -103,7 +103,7 @@ npm run cli -- workflow list
 npm run cli -- workflow retry <taskId> [--provider <id>] [--model <model>] [--effort <level>]
 npm run cli -- workflow advance <taskId> [--provider <id>] [--model <model>] [--effort <level>]
 npm run cli -- workflow clear-completed
-npm run cli -- workflow confirm-queue-recovery   # discard an unreadable stored queue, releasing the engine
+npm run cli -- workflow confirm-queue-recovery   # retain readable tasks, delete invalid entries, release the engine
 npm run cli -- run                               # foreground: auto-trigger + resume queue
 npm run cli -- swarm --repo-root /path/to/repo --status
 npm run cli -- swarm --repo-root /path/to/repo --dry-run --once
@@ -147,13 +147,31 @@ replaces its entry", so the flags you pass (or omit) win, and omitting `--no-aut
 polling. Where two entries for one repository disagree about `autoTrigger`, the fold resolves to
 `false`: re-enabling unattended polling by accident is far worse than leaving it off.
 
-**Recovering a `config.json` whose `githubRepos`, `aiProviders` or `workflowTasks` is not a list.**
+**Recovering a `config.json` with an unusable stored list or list entry.**
 `config.json` is unvalidated JSON, so a hand-edit (or a file an older build wrote) can leave any of the
 schema's three array fields as an object, a string, `null` — anything but the array it declares. Every
-read of all three now goes through a guard in `core/store.ts` that answers with an empty list instead,
-and reports once **per field** per command on **stderr** naming the field, what the file actually holds,
-and the file's path. It never prints the value: the same file holds `githubToken` in plaintext, and a
-malformed field is exactly the hand-edit that can leave a fragment of a neighbouring key inside it.
+read of all three goes through a guard in `core/store.ts`: a wrong container becomes the empty schema
+default, while a mixed `aiProviders` or `workflowTasks` array keeps its structurally valid entries in
+order and ignores only the invalid ones. The guard reports once **per field** per command on **stderr**,
+naming the field and file plus the actual container type or invalid-entry count. It never prints an
+entry, prompt, token or API key: the same file holds `githubToken` in plaintext, and a malformed field is
+exactly the hand-edit that can leave a fragment of a neighbouring key inside it. `githubRepos` entry
+semantics remain `isRepoRef`/`canonicalRepoList`'s responsibility.
+
+Reads never repair the file. On the write side, the shared guard rejects an `aiProviders` or
+`workflowTasks` list with any invalid entry before either backend mutates memory or disk. This includes
+sparse-array holes, which JSON would otherwise turn into `null`. Therefore `mao config import-providers`
+cannot save `[null]` and then crash while logging provider ids, and Electron's `ai:save` cannot hand the
+engine a list the store refused. `setIfUnchanged()` reports an invalid replacement as `'invalid'` before
+its fresh comparison or backend write, so recovery can distinguish "provably nothing written" from an
+I/O failure. New queue entries are prospectively validated before the engine adopts or emits them.
+
+If filtering leaves one valid provider, the diagnostic warns that maker-checker cannot choose a distinct
+reviewer and the supported single-provider fallback may reuse that provider. Global settings refuses to
+save while the raw provider list is unusable: its editor only received the filtered view, so saving it
+would delete hidden entries and their `apiKey` values. Repair `config.json` or explicitly replace the
+complete list with `mao config import-providers <file>`; import errors name the input file and log success
+only after the guarded write succeeds.
 
 ```
 [store] "githubRepos" in /path/to/config.json is an object, not a JSON array of { owner, repo }
@@ -192,9 +210,10 @@ replaced — without that line the command that always heals prints only `No tra
 and reads like a no-op.
 
 **Recovering an unreadable `workflowTasks` — the one field that halts automation.** The other two are
-reported and coerced and nothing else: `mao repos list` prints `[]`, `mao config show` stays parseable,
-and an unusable `aiProviders` just leaves every stage failing with the existing retryable "No AI
-providers registered". An unusable **queue** is different, and deliberately fails closed:
+reported and safely corrected for readers and nothing else: `mao repos list` prints `[]`, `mao config
+show` stays parseable, and an unusable `aiProviders` keeps any valid entries (or leaves none, so every
+stage fails with the existing retryable "No AI providers registered"). A queue with a wrong container
+or even one invalid entry is different, and deliberately fails closed:
 
 ```
 $ mao run
@@ -206,8 +225,8 @@ $ echo $?
 1
 ```
 
-Why halt rather than carry on with an empty queue: both long-lived hosts call `startAutoTrigger()`
-immediately after boot and it polls at once, so the first poll would enqueue an open issue, and that
+Why halt rather than carry on with the corrected queue (empty or a readable subset): both long-lived
+hosts call `startAutoTrigger()` immediately after boot and it polls at once, so the first poll would enqueue an open issue, and that
 write would replace the unreadable value — the only salvageable record of what was already in flight —
 while starting a real pipeline. The `workflow-active` label is best-effort, so a task lost with the queue
 may carry no label to stop its issue being run a second time.
@@ -223,12 +242,12 @@ show` reports `workflowQueueRecoveryRequired: true` — a **separate** field fro
 To recover (this is the **halted** case — see the late-corruption note below if the session is still
 running its real queue):
 
-1. Copy anything you still need out of the config file — confirming **discards** whatever it holds for
-   the queue, and nothing reconstructs it.
+1. Copy anything you still need out of the invalid queue entries — confirmation retains every currently
+   readable task from a fresh observation, but **discards invalid entries**, and nothing reconstructs them.
 2. Check the target repo for an issue still labelled `workflow-active` whose branch or PR is
    half-finished, and finish or clean it up by hand. Re-enqueueing it blind can open a second branch and
    PR for the same issue.
-3. `mao workflow confirm-queue-recovery`, or the sidebar's two-step **Discard unreadable queue**.
+3. `mao workflow confirm-queue-recovery`, or the sidebar's two-step **Recover readable tasks**.
 
 That command is the only queue path that is not gated, and it is deliberately **not**
 `clear-completed` — `clear-completed` also writes the queue, so it is refused too; leaving it open would
@@ -237,10 +256,11 @@ the file immediately before it writes, and reports only what that established:
 
 | It says | What happened |
 | --- | --- |
-| discarded the unreadable queue | the value was still unusable right before the write, and the write did not throw |
-| reads normally — nothing written | something else repaired the file first (a hand-edit, or the same command in another terminal). **Nothing is written**, because this process is still holding an empty queue and writing it would destroy that repair. Restart to load the real one |
+| recovered the stored workflow queue | the value was still unusable right before the write; its fresh readable subset was retained, invalid entries were deleted, and the write did not throw. Durable readable entries are preserved as observed; in memory, a retained `running` task is restored as `pending` with `active` cleared. Confirmation itself does not resume tasks. The one-shot CLI exits, so use `mao run`; in an already-running host, later queue activity or an auto-trigger enqueue may process retained tasks after the latch is released |
+| reads normally — nothing written | something else repaired the file first (a hand-edit, or the same command in another terminal). **Nothing is written**, because this process still holds only its filtered startup subset and writing it would destroy that repair. Restart to load the real one |
 | nothing was written (could not read) | the config file could not be read at all, so whether the unusable value is still there is unknown. Refusing beats writing on a guess — fix the file or its permissions and retry |
 | the stored queue changed while confirming | the value moved between the check and the write, so the write refused and **nothing was written**. Something else is writing the file — re-check it and retry |
+| the replacement was invalid | prospective validation rejected the replacement before the comparison or backend write, so **nothing was written** and the halt remains |
 | the replacement write failed | the attempt threw, so what reached the file is unknown. Inspect it before salvaging, then retry |
 
 None of those messages quotes the underlying error, because an I/O or parse failure can echo the file's
@@ -259,14 +279,15 @@ running, the engine is still holding the queue it loaded and its next queue writ
 it. The sidebar says exactly that, in its own words rather than repeating the store's "automation is
 halted" report, which would be false there.
 
-Do **not** reach for `mao workflow confirm-queue-recovery` in that state. It *discards*, and run in a
-separate process it writes **that** process's empty queue over the file — so the running session's real
-queue is lost the moment it restarts without having written. The sidebar instead offers **Save this
+Do **not** reach for `mao workflow confirm-queue-recovery` in that state. It discards invalid entries,
+and run in a separate process it writes **that** process's corrected startup subset over the file — often
+empty for a wrong container — so the running session's real queue is lost the moment it restarts without
+having written. The sidebar instead offers **Save this
 session's queue now**, which rewrites the file from the queue the running process is holding
 (`MaoApp.resaveStoredQueue()`). It is the *same* conditional write the discard uses — observe the store
 fresh, write only if the value has not moved, report what was established — and it refuses while that
-session is halted, because a halted session's queue is the coerced empty list and saving it would make
-this a silent discard. So it can also answer "nothing was written": if something repaired the file first,
+session is halted, because a halted session's queue is only a filtered startup subset and saving it would
+make this a silent discard. So it can also answer "nothing was written": if something repaired the file first,
 you are told rather than left assuming the click saved anything.
 With no GUI open, the safe equivalent is to let the running `mao run` reach its next queue write, or to
 stop it and then recover — not to discard from a second terminal while it is live.
@@ -277,9 +298,10 @@ What the halt does **not** cover, so do not read it as more: a `config.json` tha
 all **does** now latch the queue, because the boot observation goes through `inspect()` → `getFresh()` →
 `loadStrict()`, which throws on a file that exists and cannot be parsed — so it arrives as unreadable and
 halts. Every *other* field still reads as its schema default, because the constructor keeps the
-swallowing `load()`, so issue #67 is narrower than it was rather than closed; element-level garbage such as
-`{"workflowTasks": [null]}` passes the container check and then throws inside `restore()` (issue #75);
-and `mao swarm` reads none of this, so "the queue is latched" never means "this host performs no
+swallowing `load()`, so issue #67 is narrower than it was rather than closed. Element-level validation
+covers complete declared provider/task shapes but deliberately leaves semantic requirements (for example,
+non-empty credentials or a stage-specific PR number) to their owning settings and workflow paths. `mao
+swarm` reads none of this, so "the queue is latched" never means "this host performs no
 unattended GitHub writes".
 
 The GUI shows the same unverified-grants caveat the CLI prints (`github:setRepos` returns the
@@ -493,17 +515,22 @@ Two traps:
    one, that no preflight can block and that performs no GitHub write of its own — and **does losing it
    let unattended work start against state MAO can no longer account for?** If it does, the field needs a
    latch like `workflowTasks`', not just a report; if it does not, say so in the rule's comment, as
-   `aiProviders` does. A per-shape table test in `core/store.test.ts` goes with every new rule.
+   `aiProviders` does. For structured arrays, validate both the container and every declared nested
+   shape: filter invalid existing entries on read, preserve valid entries in order, reject the entire
+   invalid list on `set`/`setIfUnchanged`, and count sparse holes as invalid before JSON turns them into
+   `null`. A per-shape table test in `core/store.test.ts` goes with every new rule.
 3. Renderer needs it? Add get/set IPC channels (recipe above). CLI needs it?
    Extend `cli/index.ts` (keep `config show` redaction for anything secret).
 
 ### Add a pipeline stage
 
-1. `core/workflow-engine.ts`: the `WorkflowStageName` union, `STAGE_ORDER`,
-   `buildPromptForStage`, `applyGithubAction` (+ `runPrWithCodeEdits`-style
-   special-casing if needed).
-2. Update `STAGE_LABELS` in **both** `src/components/KanbanBoard.tsx` and
-   `src/components/WorkflowQueue.tsx` (duplicated by convention).
+1. `core/ai/types.ts`: extend the ordered `AGENT_STAGES` (the `AgentStage` / re-exported
+   `WorkflowStageName` unions and workflow-engine stage order derive from it). Then update
+   `core/workflow-engine.ts`: `buildPromptForStage`, `applyGithubAction`
+   (+ `runPrWithCodeEdits`-style special-casing if needed).
+2. Update `STAGE_LABELS` in `src/components/KanbanBoard.tsx` and
+   `src/components/WorkflowQueue.tsx`, plus `ALL_STAGES` and `STAGE_LABELS` in
+   `src/components/GlobalSettings.tsx` (duplicated by convention).
 3. Extend `core/workflow-engine.test.ts` — stage progression, maker-checker
    alternation, and error/retry behavior against the existing fakes.
 
@@ -542,8 +569,8 @@ Two traps:
 
 ### Add an AI provider integration
 
-- New HTTP API shape → extend `core/ai/api-provider.ts`, the `apiFormat` union
-  in `core/ai/types.ts`, and the format picker in
+- New HTTP API shape → extend `core/ai/api-provider.ts`, `AI_API_FORMATS` (the
+  `AiApiFormat` union derives from it) in `core/ai/types.ts`, and the format picker in
   `src/components/GlobalSettings.tsx`.
 - New local CLI → extend the per-CLI flag tables in `core/ai/cli-provider.ts`
   (system-prompt and tool-use flags). Keep the 15-min SIGKILL timeout; keep
@@ -676,7 +703,7 @@ Two traps:
 Per AGENTS.md, the reviewer should be a different agent than the implementer.
 Check, in order: architecture rules (core Electron-free? logic in shells? does the
 `core` vitest project still run with no plugins and no DOM?),
-lockstep files all updated (IPC 3-file chain, store pair, STAGE_LABELS × 2),
+lockstep files all updated (IPC 3-file chain, store pair, stage labels/options in all three UI copies),
 a new store-shape rule — does the field latch, and is `confirmQueueRecovery()` still the only reader
 that observes the store (every gate reads the field)?,
 domain invariants (maker-checker, CI gate, timeouts, error-not-crash), secrets

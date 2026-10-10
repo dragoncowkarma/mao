@@ -1,5 +1,8 @@
+import fs from 'node:fs'
+import path from 'node:path'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { WorkflowEngine, type QueuedTask, type RepoRef } from './workflow-engine.ts'
+import { AGENT_STAGES } from './ai/types.ts'
 import { RepoCapabilityError, evaluateRepoCapability } from './repo-capabilities.ts'
 import type { AgentStage, AiProviderConfig } from './ai/types.ts'
 import type { GithubService } from './github-service.ts'
@@ -337,6 +340,89 @@ describe('WorkflowEngine', () => {
     const current = engine.getTasks().find((t) => t.id === paused.id)!
     expect(current.stage).toBe('review')
     expect(current.history).toHaveLength(1)
+  })
+
+  it.each([
+    [
+      'enqueue',
+      (engine: WorkflowEngine, repoWithRegistrySettings: RepoRef) =>
+        engine.enqueue('Identity-only task', repoWithRegistrySettings, false),
+    ],
+    [
+      'enqueueFromIssue',
+      (engine: WorkflowEngine, repoWithRegistrySettings: RepoRef) =>
+        engine.enqueueFromIssue(
+          7,
+          'https://github.com/acme/widgets/issues/7',
+          'Identity-only existing issue',
+          repoWithRegistrySettings,
+          false,
+        ),
+    ],
+  ])('snapshots only owner/repo before validating a task created by %s', async (_name, enqueue) => {
+    const validate = vi.fn()
+    const engine = new WorkflowEngine(makeFakeGithub(), validate)
+    // A repository-list entry can carry settings a workflow task never reads. In particular, an older
+    // or hand-edited registry can contain null here even though RepoRef's TypeScript surface says number;
+    // carrying that field into the task used to make the store reject every later queue write.
+    const repoWithRegistrySettings = {
+      owner: 'acme',
+      repo: 'widgets',
+      autoTrigger: true,
+      pollIntervalMs: null,
+    } as unknown as RepoRef
+
+    const task = enqueue(engine, repoWithRegistrySettings)
+
+    expect(task.repo).toEqual({ owner: 'acme', repo: 'widgets' })
+    expect(validate).toHaveBeenCalledTimes(1)
+    expect(validate.mock.calls[0]![0]).toEqual([
+      expect.objectContaining({ id: task.id, repo: { owner: 'acme', repo: 'widgets' } }),
+    ])
+    await waitFor(() => engine.getTasks().find((candidate) => candidate.id === task.id)?.status === 'error')
+  })
+
+  it('normalizes restored tasks to repository identity only', () => {
+    const engine = new WorkflowEngine(makeFakeGithub())
+    const stored = {
+      ...makePendingQueueTask('task-with-registry-settings'),
+      repo: {
+        owner: 'acme',
+        repo: 'widgets',
+        autoTrigger: false,
+        pollIntervalMs: null,
+      } as unknown as RepoRef,
+    }
+
+    engine.restore([stored])
+
+    expect(engine.getTasks()[0]!.repo).toEqual({ owner: 'acme', repo: 'widgets' })
+  })
+
+  it.each([
+    ['enqueue', (engine: WorkflowEngine) => engine.enqueue('Rejected task', repo, false)],
+    [
+      'enqueueFromIssue',
+      (engine: WorkflowEngine) =>
+        engine.enqueueFromIssue(7, 'https://github.com/acme/widgets/issues/7', 'Rejected issue', repo, false),
+    ],
+  ])('rejects %s prospectively without mutating or notifying the queue', (_name, enqueue) => {
+    const github = makeFakeGithub()
+    const validate = vi.fn((_tasks: QueuedTask[]) => {
+      throw new Error('prospective queue rejected')
+    })
+    const engine = new WorkflowEngine(github, validate)
+    const changes = vi.fn()
+    engine.on('change', changes)
+
+    expect(() => enqueue(engine)).toThrow('prospective queue rejected')
+
+    expect(validate).toHaveBeenCalledTimes(1)
+    expect(validate.mock.calls[0]![0]).toHaveLength(1)
+    expect(engine.getTasks()).toEqual([])
+    expect(changes).not.toHaveBeenCalled()
+    expect(github.assertRepoWorkflowWritable).not.toHaveBeenCalled()
+    expect(engine.isPersistenceBroken()).toBe(false)
   })
 
   describe('provider override', () => {
@@ -1243,8 +1329,8 @@ describe('WorkflowEngine queue-recovery latch', () => {
   })
 
   it('never downgrades, and only clearQueueRecovery() releases it', () => {
-    // Monotone on purpose: this process's in-memory queue is the coerced empty one, so un-latching after
-    // an out-of-band repair would run the wrong queue and then persist it over the real one.
+    // Monotone on purpose: this process's in-memory queue may be only a filtered startup subset, so
+    // un-latching after an out-of-band repair would run the wrong queue and persist it over the real one.
     const { engine } = latchedEngine()
 
     engine.requireQueueRecovery('a different, softer reason')
@@ -1301,3 +1387,47 @@ function makePendingQueueTask(id: string): QueuedTask {
     github: {},
   }
 }
+
+const REPO_ROOT = path.join(
+  (import.meta as unknown as { dirname?: string }).dirname ?? path.join(process.cwd(), 'core'),
+  '..',
+)
+
+/** Comments may legitimately name the list; only executable text should satisfy the assertion. */
+function withoutComments(source: string): string {
+  return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+}
+
+/**
+ * `STAGE_ORDER` as a derivation, asserted rather than assumed.
+ *
+ * The pipeline's order used to be a second hand-written copy of `AGENT_STAGES`, and the two could
+ * drift because `STAGE_ORDER`'s annotation (`WorkflowStageName[]`) accepts a list with an element
+ * *missing* — only an extra one fails tsc. A stage reachable per the union but absent from the order
+ * makes `STAGE_ORDER[STAGE_ORDER.indexOf(task.stage) + 1]` select `STAGE_ORDER[0]`, so the pipeline
+ * restarts at `issue` and performs real GitHub writes instead of advancing (issue #79).
+ *
+ * Deriving it removes that by construction — but nothing *keeps* it derived: replacing
+ * `const STAGE_ORDER = AGENT_STAGES` with an equal literal leaves every behavioural test green
+ * (verified by mutation), so the drift hazard would silently return. A drifted literal is caught by
+ * the stage-progression tests above; this is what stops the copy coming back at all. Asserted on the
+ * source because `STAGE_ORDER` is module-private and an equal literal is runtime-indistinguishable
+ * from the derivation — the same reason core/store.test.ts reads electron/store.ts as text.
+ */
+describe('the engine stage order', () => {
+  const engineSource = withoutComments(
+    fs.readFileSync(path.join(REPO_ROOT, 'core', 'workflow-engine.ts'), 'utf-8'),
+  )
+
+  it('derives STAGE_ORDER from AGENT_STAGES instead of restating it', () => {
+    const assignments = [...engineSource.matchAll(/^const STAGE_ORDER\b[^\n]*$/gm)].map((match) => match[0])
+
+    expect(assignments).toEqual(['const STAGE_ORDER = AGENT_STAGES'])
+  })
+
+  it('still orders every stage the union admits, so no stage can be unreachable', () => {
+    // Guards the other direction: the derivation is only worth pinning while AGENT_STAGES is itself
+    // the full, ordered set the rest of the engine switches on.
+    expect([...AGENT_STAGES]).toEqual(['issue', 'pr', 'review', 'merge'])
+  })
+})

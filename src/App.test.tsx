@@ -1008,15 +1008,20 @@ describe('App repository add and unsaved global settings', () => {
  * exactly where the repo-list reset does.
  */
 describe('App halted workflow queue', () => {
-  it('shows the store report and offers a two-step discard', async () => {
+  it('shows the store report and offers a two-step recovery', async () => {
     const { user, stub } = await renderApp([], [UNUSABLE_QUEUE])
 
     expect(await screen.findByText(/MAO will not start unattended work/)).toBeInTheDocument()
-    // Two-step, like the repo-list reset: this write discards whatever the file held for the queue.
-    await user.click(await screen.findByRole('button', { name: 'Discard unreadable queue' }))
+    // Two-step, like the repo-list reset: this write retains readable tasks but deletes invalid entries.
+    await user.click(await screen.findByRole('button', { name: 'Recover readable tasks' }))
     expect(stub.confirmQueueRecovery).not.toHaveBeenCalled()
 
-    await user.click(screen.getByRole('button', { name: 'Confirm discard' }))
+    expect(screen.getByText(/permanently deletes invalid queue entries/)).toBeInTheDocument()
+    expect(screen.getByText(/stored as running are restored as pending/)).toBeInTheDocument()
+    expect(screen.getByText(/auto-trigger poll.*may execute those retained tasks/s)).toBeInTheDocument()
+    expect(screen.getByText(/half-finished branches or pull requests/)).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Confirm recovery' }))
 
     await waitFor(() => expect(stub.confirmQueueRecovery).toHaveBeenCalled())
     await waitFor(() => expect(screen.queryByText(/MAO will not start unattended work/)).toBeNull())
@@ -1024,26 +1029,26 @@ describe('App halted workflow queue', () => {
 
   it('refuses to overwrite a queue something else already repaired, and says to restart', async () => {
     // The latch is monotone, so after a repair made outside this window the store reads clean while this
-    // session still holds the coerced empty queue. Core answers `already-readable` and writes nothing;
+    // session still holds only its filtered startup subset. Core answers `already-readable` and writes nothing;
     // the operator has to be told that a restart — not another click — is what loads the real queue.
     // (That the button is not even *offered* in that state is a prop-level rule, pinned in
     // src/components/Sidebar.test.tsx where it can be asserted without waiting on a 30s poll.)
     const { user, stub } = await renderApp([], [UNUSABLE_QUEUE])
     stub.confirmQueueRecovery.mockResolvedValue({ kind: 'already-readable' })
 
-    await user.click(await screen.findByRole('button', { name: 'Discard unreadable queue' }))
-    await user.click(screen.getByRole('button', { name: 'Confirm discard' }))
+    await user.click(await screen.findByRole('button', { name: 'Recover readable tasks' }))
+    await user.click(screen.getByRole('button', { name: 'Confirm recovery' }))
 
     expect(await screen.findByText(/Restart MAO to load it/)).toBeInTheDocument()
     expect(screen.getByText('Workflow automation is halted')).toBeInTheDocument()
   })
 
-  it('keeps the card up and says why when the discard itself fails', async () => {
+  it('keeps the card up and says why when recovery itself fails', async () => {
     const { user, stub } = await renderApp([], [UNUSABLE_QUEUE])
     stub.confirmQueueRecovery.mockResolvedValue({ kind: 'write-failed' })
 
-    await user.click(await screen.findByRole('button', { name: 'Discard unreadable queue' }))
-    await user.click(screen.getByRole('button', { name: 'Confirm discard' }))
+    await user.click(await screen.findByRole('button', { name: 'Recover readable tasks' }))
+    await user.click(screen.getByRole('button', { name: 'Confirm recovery' }))
 
     expect(await screen.findByText(/what reached the config file is unknown/)).toBeInTheDocument()
     expect(screen.getByText('Workflow automation is halted')).toBeInTheDocument()
@@ -1080,9 +1085,9 @@ describe('App halted workflow queue', () => {
 
     expect(await screen.findByText('Workflow automation is halted')).toBeInTheDocument()
     // And it fails SAFE: with nobody able to say whether the file still holds the unreadable value, the
-    // discard stays on offer rather than the renderer claiming a repair it cannot see. Clicking it is
+    // recovery stays on offer rather than the renderer claiming a repair it cannot see. Clicking it is
     // harmless either way — `confirmQueueRecovery()` re-probes and writes nothing if the value is gone.
-    expect(await screen.findByRole('button', { name: 'Discard unreadable queue' })).toBeInTheDocument()
+    expect(await screen.findByRole('button', { name: 'Recover readable tasks' })).toBeInTheDocument()
     expect(screen.queryByText(/Restart MAO to load it/)).toBeNull()
   })
 
@@ -1134,6 +1139,7 @@ describe('App halted workflow queue', () => {
       [{ kind: 'superseded' }, /changed while saving/],
       [{ kind: 'unverified', reason: 'could not read the config file' }, /could not read the config file/],
       [{ kind: 'write-failed' }, /what reached the config file is unknown/],
+      [{ kind: 'invalid-replacement' }, /rejected this session's queue before writing.*Nothing was written/s],
     ]
 
     for (const [outcome, expected] of cases) {
@@ -1156,6 +1162,6 @@ describe('App halted workflow queue', () => {
     await renderApp([ONE])
 
     expect(screen.queryByText('Workflow automation is halted')).toBeNull()
-    expect(screen.queryByRole('button', { name: 'Discard unreadable queue' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Recover readable tasks' })).toBeNull()
   })
 })

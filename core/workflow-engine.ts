@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { createAiProvider } from './ai/index.ts'
-import { AI_EFFORTS } from './ai/types.ts'
+import { AGENT_STAGES, AI_EFFORTS } from './ai/types.ts'
 import type { AgentStage, AiEffort, AiProviderConfig, ProviderKindId } from './ai/types.ts'
 import { resolveStageAgent } from './agent-selection.ts'
 import type { ProviderOverride, RunOverride } from './agent-selection.ts'
@@ -14,7 +14,11 @@ import { ensureClone, checkoutBranch, hasChanges, commitAndPush } from './git-wo
  */
 export type WorkflowStageName = AgentStage
 
-const STAGE_ORDER: WorkflowStageName[] = ['issue', 'pr', 'review', 'merge']
+const STAGE_ORDER = AGENT_STAGES
+
+/** Runtime list paired with the persisted task-status union, for untyped store validation. */
+export const WORKFLOW_TASK_STATUSES = ['pending', 'running', 'done', 'error', 'paused'] as const
+export type WorkflowTaskStatus = (typeof WORKFLOW_TASK_STATUSES)[number]
 
 /**
  * Re-exported from core/agent-selection.ts, where the maker-checker rules now live as pure functions
@@ -36,9 +40,13 @@ const MAX_FINISHED_TASKS = 50
 /** Applied to every issue that enters the workflow, so the auto-trigger poller never processes it twice. */
 export const WORKFLOW_ACTIVE_LABEL = 'workflow-active'
 
-export interface RepoRef {
+/** The repository identity a queued task needs after registry-only polling settings are left behind. */
+export interface RepoIdentity {
   owner: string
   repo: string
+}
+
+export interface RepoRef extends RepoIdentity {
   /** Whether auto-trigger should poll this repo for new issues. Defaults to true when unset. */
   autoTrigger?: boolean
   /** Auto-trigger poll interval for this repo, in milliseconds. Defaults to the global auto-trigger interval. */
@@ -65,10 +73,11 @@ export interface WorkflowStepResult {
 export interface QueuedTask {
   id: string
   title: string
-  repo: RepoRef
+  /** Snapshot of repository identity only; polling settings belong to the registry, not durable task state. */
+  repo: RepoIdentity
   stage: WorkflowStageName
   history: WorkflowStepResult[]
-  status: 'pending' | 'running' | 'done' | 'error' | 'paused'
+  status: WorkflowTaskStatus
   error?: string
   /** When false, a finished stage parks the task in 'paused' instead of auto-continuing to the next stage. */
   autoAdvance: boolean
@@ -141,15 +150,15 @@ function slugify(text: string): string {
  * What `createMaoApp`'s `confirmQueueRecovery()` actually did, decided in `core/` so both shells render one
  * answer instead of each re-deriving "did that work?" for themselves.
  *
- * Five kinds, because each says something different about what was actually established:
+ * Six kinds, because each says something different about what was actually established:
  *
  * - `'replaced'` — the stored value was still unusable, the conditional write confirmed it had not moved
  *   since it was observed, and the write did not throw.
  * - `'already-readable'` — the stored queue reads normally again, so **nothing was written**. The latch
  *   is monotone, so something healed the value out of band (a hand-edit, or another process's recovery)
- *   while this process stayed halted; this process's in-memory queue is the coerced empty one, so
- *   persisting it would overwrite that repair with the very loss the latch exists to prevent. The
- *   operator has to restart to load it.
+ *   while this process stayed halted; this process's in-memory queue is only the validated,
+ *   restart-normalized subset, so persisting it would overwrite that repair with the very loss the
+ *   latch exists to prevent. The operator has to restart to load it.
  * - `'superseded'` — the stored value changed between the observation and the write, so the conditional
  *   write refused and **nothing was written**. This is the kind that makes the previous one mean anything:
  *   observing immediately before an *unconditional* write still destroys a repair landing in between,
@@ -157,6 +166,9 @@ function slugify(text: string): string {
  * - `'unverified'` — the store could not be read, or its value could not be serialized to compare, so
  *   whether it is still the unusable one is **unknown**. Nothing is written rather than written on a
  *   guess: a transient read failure, or a repair this process cannot see, would otherwise be overwritten.
+ * - `'invalid-replacement'` — the proposed replacement failed shape validation before the stored value
+ *   was compared or the backend write was attempted. Nothing was written, and any queue-recovery halt
+ *   stands until the replacement itself is corrected.
  * - `'write-failed'` — the write was attempted and threw, so what reached the file is unknown. The halt
  *   stands and the operator is told to inspect the file before salvaging.
  *
@@ -180,13 +192,29 @@ export type QueueRecoveryOutcome =
   | { kind: 'already-readable' }
   | { kind: 'superseded' }
   | { kind: 'unverified'; reason: string }
+  | { kind: 'invalid-replacement' }
   | { kind: 'write-failed' }
+
+/**
+ * Checks a complete candidate queue before the engine adopts or announces it.
+ *
+ * The composition root supplies the store's shared write-shape check. A rejection throws synchronously,
+ * before the task enters the in-memory queue and before the `'change'` persistence listener runs, so a
+ * caller mistake cannot leave behind a task that every later queue write rejects. Optional because the
+ * engine's isolated unit tests and non-persisting consumers do not own a store.
+ */
+export type ProspectiveQueueValidator = (tasks: QueuedTask[]) => void
+
+function repoIdentity(repo: RepoIdentity): RepoIdentity {
+  return { owner: repo.owner, repo: repo.repo }
+}
 
 export class WorkflowEngine extends EventEmitter {
   private queue: QueuedTask[] = []
   private providers: AiProviderConfig[] = []
   private processing = false
   private github: GithubService
+  private validateProspectiveQueue: ProspectiveQueueValidator | undefined
   private githubToken = ''
   private workspaceRoot = ''
   /**
@@ -207,9 +235,10 @@ export class WorkflowEngine extends EventEmitter {
    * Set once by `createMaoApp()` (the only boot path) before it subscribes the `'change'` →
    * `store.set('workflowTasks', …)` listener and before `restore()`, so nothing can write over the
    * unreadable value in between. Released only by `clearQueueRecovery()`, which `createMaoApp`'s
-   * `confirmQueueRecovery()` calls *after* its conditional write has been confirmed. **Monotone**: it never downgrades and no later check clears it, because
-   * this process's in-memory queue is the coerced `[]` rather than whatever the file holds — un-latching
-   * would run the wrong queue and then persist it over the real one.
+   * `confirmQueueRecovery()` calls *after* its conditional write has been confirmed. **Monotone**: it
+   * never downgrades and no later check clears it, because this process's in-memory queue contains only
+   * the validated, restart-normalized subset rather than everything the file holds — un-latching on an
+   * out-of-band repair would run the wrong queue and then persist it over the real one.
    *
    * Deliberately *not* re-derived from the store at gate time. Review of PR #69 showed the boot case is
    * the dangerous one (both hosts tick auto-trigger immediately after boot), while a corruption appearing
@@ -219,9 +248,10 @@ export class WorkflowEngine extends EventEmitter {
    */
   private queueRecoveryReason: string | undefined
 
-  constructor(github: GithubService) {
+  constructor(github: GithubService, validateProspectiveQueue?: ProspectiveQueueValidator) {
     super()
     this.github = github
+    this.validateProspectiveQueue = validateProspectiveQueue
   }
 
   setProviders(providers: AiProviderConfig[]) {
@@ -334,10 +364,14 @@ export class WorkflowEngine extends EventEmitter {
    * `mao config show`) must not have that trigger real GitHub/AI-provider calls as a side effect.
    * Pass resume: true (or call resumeProcessing() once ready) for long-lived processes that should
    * pick back up where they left off, such as the Electron main process or `mao run`.
+   *
+   * This method normalizes migrations but does not validate task shapes. Production callers must pass
+   * the already-filtered subset returned by the store read guard.
    */
   restore(tasks: QueuedTask[], options: { resume?: boolean } = {}) {
     this.queue = tasks.map((task) => ({
       ...task,
+      repo: repoIdentity(task.repo),
       autoAdvance: task.autoAdvance ?? true,
       active: undefined,
       status: task.status === 'running' ? 'pending' : task.status,
@@ -422,12 +456,31 @@ export class WorkflowEngine extends EventEmitter {
     return task
   }
 
+  /**
+   * Validates and adopts a new task before emitting the change that persists it.
+   *
+   * Later queue mutators rely on new tasks passing this check and restored tasks already having passed
+   * the store read guard. `restore()` normalizes but does not validate. A new mutator that can introduce
+   * another shape must validate before it changes the live queue too.
+   */
+  private appendTask(task: QueuedTask): QueuedTask {
+    const prospective = [...this.queue, task]
+    // The validator is deliberately before the assignment and notify. If it rejects, both the live queue
+    // and every listener remain untouched; there is therefore nothing for processQueue() to run or for a
+    // later notifyAfterStage() to misdiagnose as a durable persistence failure.
+    this.validateProspectiveQueue?.(prospective)
+    this.queue = prospective
+    this.notify()
+    void this.processQueue()
+    return task
+  }
+
   enqueue(title: string, repo: RepoRef, autoAdvance = true, providerOverride?: ProviderOverride): QueuedTask {
     this.assertQueueWritable()
     const task: QueuedTask = {
       id: randomUUID(),
       title,
-      repo,
+      repo: repoIdentity(repo),
       stage: STAGE_ORDER[0],
       history: [],
       status: 'pending',
@@ -435,10 +488,7 @@ export class WorkflowEngine extends EventEmitter {
       providerOverride,
       github: {},
     }
-    this.queue.push(task)
-    this.notify()
-    void this.processQueue()
-    return task
+    return this.appendTask(task)
   }
 
   /**
@@ -461,7 +511,7 @@ export class WorkflowEngine extends EventEmitter {
     const task: QueuedTask = {
       id: randomUUID(),
       title,
-      repo,
+      repo: repoIdentity(repo),
       stage: 'pr',
       history: [],
       status: 'pending',
@@ -469,10 +519,7 @@ export class WorkflowEngine extends EventEmitter {
       providerOverride,
       github: { issueNumber, issueUrl },
     }
-    this.queue.push(task)
-    this.notify()
-    void this.processQueue()
-    return task
+    return this.appendTask(task)
   }
 
   /**

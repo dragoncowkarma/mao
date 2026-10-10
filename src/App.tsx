@@ -49,7 +49,7 @@ export default function App() {
    * Whether `app:storeProblems` has ever answered. Until it has, the renderer does not know whether the
    * config file still holds the unreadable queue — and the two unknowns are not symmetric: telling a
    * halted operator "already repaired, just restart" when nobody has read the file is a dead end, while
-   * offering the discard is safe because `confirmQueueRecovery()` re-probes and writes nothing if the
+   * offering recovery is safe because `confirmQueueRecovery()` re-probes and writes nothing if the
    * value is gone. So an unread store counts as still-unreadable.
    */
   const [storeProblemsRead, setStoreProblemsRead] = useState(false)
@@ -469,7 +469,7 @@ export default function App() {
   }
 
   /**
-   * Discards an unreadable stored workflow queue and releases the engine.
+   * Discards invalid durable queue data, retains readable tasks and releases the engine.
    *
    * The outcome is decided in `core/` (see `QueueRecoveryOutcome`) rather than inferred here, so this
    * button and `mao workflow confirm-queue-recovery` cannot disagree about whether it worked. Both
@@ -479,7 +479,7 @@ export default function App() {
    * `'already-readable'` means something else repaired the file first and writing would have destroyed
    * that repair. Both reads are refreshed afterwards either way.
    */
-  async function discardUnreadableQueue() {
+  async function recoverUnreadableQueue() {
     try {
       const outcome = await electronApi().workflow.confirmQueueRecovery()
       // Every non-success outcome is surfaced by throwing, because Sidebar's own catch is what puts a
@@ -495,6 +495,12 @@ export default function App() {
         throw new Error(
           'The replacement write failed, so what reached the config file is unknown and automation stays ' +
             'halted. Inspect the file before salvaging anything from it, then try again.',
+        )
+      }
+      if (outcome.kind === 'invalid-replacement') {
+        throw new Error(
+          'MAO rejected the replacement queue before writing because it contains an invalid task. Nothing ' +
+            'was written and automation stays halted. Inspect the retained tasks, then try again.',
         )
       }
       if (outcome.kind === 'already-readable') {
@@ -532,6 +538,12 @@ export default function App() {
       if (outcome.kind === 'write-failed') {
         throw new Error(
           'The save failed, so what reached the config file is unknown. Inspect it, then try again.',
+        )
+      }
+      if (outcome.kind === 'invalid-replacement') {
+        throw new Error(
+          'MAO rejected this session\'s queue before writing because it contains an invalid task. Nothing ' +
+            'was written. Inspect the in-memory queue, then try again.',
         )
       }
     } finally {
@@ -624,7 +636,7 @@ export default function App() {
         onResetRepoList={resetRepoList}
         queueRecovery={queueRecovery}
         queueStoredStillUnreadable={!storeProblemsRead || storeProblems.some((problem) => problem.field === 'workflowTasks')}
-        onDiscardQueue={discardUnreadableQueue}
+        onRecoverQueue={recoverUnreadableQueue}
         onResaveQueue={resaveStoredQueue}
         view={view}
         onViewChange={selectView}

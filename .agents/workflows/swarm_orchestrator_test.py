@@ -3311,6 +3311,71 @@ class WorktreeSafetyTest(unittest.TestCase):
 
         determine.assert_called_once_with([])
 
+    def test_trusted_pr_comment_reaches_action_selection_through_the_query(self):
+        # The negative test above only proves the filter can say no. Nothing proved it
+        # can still say yes, so renaming "authorAssociation", dropping either half of
+        # the condition, or losing "MEMBER" from the tuple left the suite green while
+        # silently ending every revision. Drive the real comment query so the field
+        # names the filter reads are the ones gh actually returns.
+        raw = {
+            "number": 101,
+            "title": "[PR] 99 - mixed feedback",
+            "body": "[Reviewer: claude | Model: opus 5 | Reasoning: high]",
+            "headRefName": "worker/99-mixed",
+            "headRefOid": "a" * 40,
+            "isCrossRepository": False,
+        }
+        issue = {
+            "number": 99,
+            "title": "[Task] mixed feedback",
+            "body": "[Worker: codex | Model: 5.6 | Reasoning: high]",
+        }
+
+        def comment(login, assoc):
+            return {
+                "id": f"{login}-{assoc}",
+                "author": {"login": login},
+                "authorAssociation": assoc,
+                "body": f"note from {login}",
+            }
+
+        # The self-authored comment deliberately carries NONE — an association the
+        # filter does not trust — so only the author_login == current_user half can
+        # admit it. That half is what keeps the orchestrator's own lifecycle comments
+        # trusted whatever association GitHub reports for its credential.
+        comments = [
+            comment("mallory", "NONE"),
+            comment("mallory", "CONTRIBUTOR"),
+            comment("olivia", "OWNER"),
+            comment("carol", "COLLABORATOR"),
+            comment("mia", "MEMBER"),
+            comment("alice", "NONE"),
+        ]
+        trusted = comments[2:]
+
+        def fake_gh(args, **_kwargs):
+            self.assertEqual(args[:2], ["pr", "view"])
+            self.assertIn("comments", args[args.index("--json") + 1].split(","))
+            return json.dumps({"comments": comments})
+
+        with (
+            patch.object(self.swarm, "gh", side_effect=fake_gh),
+            patch.object(self.swarm, "fetch_issue", return_value=issue),
+            patch.object(
+                self.swarm,
+                "determine_pr_action",
+                return_value=("review", None, -1),
+            ) as determine,
+            patch.object(
+                self.swarm.tracker,
+                "should_dispatch",
+                return_value=(False, self.swarm.DISPATCH_RUNNING),
+            ),
+        ):
+            self.swarm._process_pr_batch(open_prs=[raw], current_user="alice")
+
+        determine.assert_called_once_with(trusted)
+
     def test_fork_flag_flows_from_gh_query_to_revision_guard(self):
         payload = {
             "number": 101,
@@ -3365,6 +3430,90 @@ class WorktreeSafetyTest(unittest.TestCase):
             self.swarm._process_pr_batch(open_prs=prs, current_user="alice")
 
         fetch_head.assert_not_called()
+
+    def test_same_repository_pr_still_reaches_revision_dispatch(self):
+        # The fork test above only proves the guard can refuse. A flag stuck on —
+        # hardcoded, or defaulted the other way — refuses every PR instead, which no
+        # assertion noticed because a Swarm that dispatches nothing looks idle rather
+        # than broken. Pin the accepting direction through the same query.
+        expected_sha = "b" * 40
+        payload = {
+            "number": 101,
+            "title": "[PR] 99 - same repo",
+            "body": "[Reviewer: claude | Model: opus 5 | Reasoning: high]",
+            "headRefName": "worker/99-same-repo",
+            "headRefOid": expected_sha,
+        }
+
+        def fake_gh(args, **_kwargs):
+            fields = args[args.index("--json") + 1].split(",")
+            response = dict(payload)
+            if "isCrossRepository" in fields:
+                response["isCrossRepository"] = False
+            return json.dumps([response])
+
+        with patch.object(self.swarm, "gh", side_effect=fake_gh):
+            prs = self.swarm.fetch_open_prs()
+
+        signal_comment = {
+            "id": "feedback",
+            "body": (
+                "Please revise\n"
+                "[Reviewer: claude | Model: opus 5 | Reasoning: high]"
+            ),
+        }
+        issue = {
+            "number": 99,
+            "title": "[Task] same repo",
+            "body": "[Worker: codex | Model: 5.6 | Reasoning: high]",
+        }
+        output = MagicMock()
+        with (
+            patch.object(self.swarm, "fetch_issue", return_value=issue),
+            patch.object(self.swarm, "fetch_pr_comments", return_value=[]),
+            patch.object(
+                self.swarm,
+                "determine_pr_action",
+                return_value=("revise", signal_comment, 0),
+            ),
+            patch.object(
+                self.swarm.tracker,
+                "should_dispatch",
+                return_value=(True, "new event"),
+            ),
+            patch.object(
+                self.swarm,
+                "fetch_pr_head",
+                return_value=expected_sha,
+            ) as fetch_head,
+            patch.object(self.swarm, "create_worktree", return_value=self.repo),
+            patch.object(
+                self.swarm,
+                "write_prompt_file",
+                return_value=self.repo / "prompt.md",
+            ),
+            patch.object(
+                self.swarm,
+                "build_ai_argv",
+                return_value=(["codex", "exec"], False),
+            ),
+            patch.object(
+                self.swarm,
+                "create_log_files",
+                return_value=(self.repo / "worker.log", output, output),
+            ),
+            patch.object(self.swarm, "_prepare_ai_process_spawn", return_value={}),
+            patch.object(
+                self.swarm,
+                "_spawn_ai_process",
+                return_value=MagicMock(pid=4321),
+            ),
+            patch.object(self.swarm.tracker, "adopt"),
+            patch.object(self.swarm.tracker, "persist_registration"),
+        ):
+            self.swarm._process_pr_batch(open_prs=prs, current_user="alice")
+
+        fetch_head.assert_called_once_with(101, expected_sha)
 
     def test_pr_user_lookup_failure_fails_once_closed(self):
         prs = [{"number": 7, "title": "[PR] 7 - change"}]

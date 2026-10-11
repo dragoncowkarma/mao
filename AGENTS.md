@@ -52,6 +52,7 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
 | `.agents/workflows/swarm_orchestrator.py` | Autonomous Worker/Reviewer/Maintainer lifecycle, credential-aligned write preflight, origin fetch/push identity binding, isolated worktrees, process registry, retry/cooldown, and safe merged-task cleanup; copied beside the CLI bundle by `scripts/build-cli.mjs` |
 | `.agents/workflows/swarm_orchestrator_test.py` | Standalone Python preflight, credential non-disclosure, dry-run, and worktree-safety regressions, included in `npm run test` |
 | `core/node-environment.test.ts` | Architecture rule 8 as a test: asserts the `core` vitest project still runs with no DOM in scope |
+| `src/electron-ipc-surface.test.ts` | The IPC lockstep's untypeable half as a test: channel strings in `electron/ipc.ts` and `electron/preload.ts` must be the same set, registered and exposed once each, and each named after the bridge method that calls it — plus a pin that the bridge still carries `satisfies Window['electronAPI']` |
 | `scripts/test-workflow.ts` | Standalone e2e harness against a real (throwaway) repo |
 | `scripts/check-origin.mjs` | Publish-preflight guard: validates every effective `origin` fetch/push URL against an expected host/owner/repo; failure output is fixed-category-only, never remote-derived strings (see SKILL.md) |
 | `scripts/check-origin.test.mjs` | Committed negative/positive matrix for the guard incl. its no-leak contract — `npm run test:origin`, also run in CI |
@@ -144,13 +145,23 @@ There is no codegen — these couplings are maintained by hand and only `npm run
 (tsc) catches part of the drift:
 
 - **New IPC channel** → 3 files in lockstep: `electron/ipc.ts`
-  (`ipcMain.handle('<domain>:<camelCaseAction>', …)`, domains `ai`/`github`/`workflow`),
-  `electron/preload.ts` (same channel string, same namespace), `src/electron.d.ts`
-  (mirror the signature). Channel strings are duplicated literals; a typo surfaces
-  only at runtime. A fourth file follows automatically:
-  `src/test/electron-api-stub.ts` builds its fake bridge with `satisfies ElectronApi`,
-  so tsc refuses to compile until the new channel is stubbed there too — that one you
-  find at lint time rather than at runtime.
+  (`ipcMain.handle('<domain>:<camelCaseAction>', …)`, domains
+  `app`/`ai`/`github`/`workflow`/`ui`), `electron/preload.ts` (same channel string, same
+  namespace), `src/electron.d.ts` (mirror the signature). Two more files follow
+  automatically, and between them most of this is no longer maintained by eye:
+  `src/test/electron-api-stub.ts` builds its fake bridge with `satisfies ElectronApi`, and
+  the bridge in `electron/preload.ts` itself carries `satisfies Window['electronAPI']` —
+  `contextBridge.exposeInMainWorld` takes `any`, so without that annotation tsc checked the
+  bridge against nothing at all. With it, a method missing from either side, an extra one,
+  or a signature that disagrees is a lint error. **Never remove it**; a test pins that it is
+  still there, because deleting it would silence every check it performs without anything
+  going red.
+  What no type can reach is the channel **strings** — `invoke('app:storeProblms')` is a
+  valid `string`, and `ipcMain.handle` is keyed by the same untyped literal in another file.
+  `src/electron-ipc-surface.test.ts` owns that half: the two sets must be equal, each
+  channel registered and exposed exactly once, and every channel named
+  `<namespace>:<method>` after the bridge method that invokes it. Keep that naming — it is
+  what turns a typo into a message naming the offending method rather than two sorted lists.
 - **Repository registration** → the add-vs-update rule lives ONLY in `core/repo-registry.ts`;
   `electron/ipc.ts`'s `github:setRepos` and `cli/index.ts`'s `repos add`/`repos remove` must all stay
   thin delegations to `createMaoApp()`'s `updateRepos`. Re-implementing the diff in either shell is how the two paths silently drift.

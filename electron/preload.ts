@@ -17,6 +17,30 @@ export interface AppUpdateCheck extends SelfUpdateCheck {
   runningTaskCount: number
 }
 
+/**
+ * The bridge, checked against the renderer's own declaration of it.
+ *
+ * `contextBridge.exposeInMainWorld` takes `any`, so for as long as this object was unannotated tsc
+ * checked it only against `core/` types — never against `src/electron.d.ts`, the file whose whole job
+ * is to describe it. The three-file IPC lockstep (AGENTS.md) was therefore maintained entirely by eye,
+ * and SKILL.md said so: a channel added here and forgotten there, a renamed method, or a signature
+ * that drifted all compiled cleanly and failed only when an operator clicked the thing.
+ *
+ * `satisfies` closes that, and in both directions — a method this object omits is TS2741, one it adds
+ * that the declaration does not have is TS2353 (object-literal excess property check), and a
+ * parameter or return type that disagrees is TS2322. It is `satisfies` rather than a type annotation
+ * on purpose: an annotation would widen each function to the declared type and let the real
+ * `ipcRenderer.invoke` return type stop being checked against it.
+ *
+ * Pointing at the ambient `Window['electronAPI']` introduces no import, so nothing here depends on a
+ * module under `src/` and the `electron/* -> core/*` direction is untouched. The arrow is deliberate:
+ * `src/` may not import `electron`, so the declaration cannot be derived from this file and has to be
+ * hand-mirrored — which is exactly why it is worth pinning this object to it rather than the reverse.
+ *
+ * What this cannot see is the channel *strings*: `invoke('app:storeProblms')` is a perfectly valid
+ * `string`. `src/electron-ipc-surface.test.ts` covers that half, and also pins that this annotation
+ * is still here.
+ */
 contextBridge.exposeInMainWorld('electronAPI', {
   platform: process.platform,
   app: {
@@ -77,4 +101,4 @@ contextBridge.exposeInMainWorld('electronAPI', {
     getTheme: (): Promise<ThemePreference> => ipcRenderer.invoke('ui:getTheme'),
     setTheme: (theme: ThemePreference): Promise<void> => ipcRenderer.invoke('ui:setTheme', theme),
   },
-})
+} satisfies Window['electronAPI'])

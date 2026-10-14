@@ -44,7 +44,7 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
 | `electron/main.ts` | BrowserWindow, external-link handling, dev/prod load |
 | `electron/ipc.ts` | All `ipcMain.handle` channels — thin delegations only |
 | `electron/preload.ts` | `contextBridge` exposing `window.electronAPI` |
-| `electron/store.ts` | One line: `createGuardedStore(backing, backing.path)`. The electron-store instance is never exported and never read anywhere else |
+| `electron/store.ts` | One call: `openGuardedStoreFile(configPath, () => new Store(…))`. The file is judged before conf is constructed, because conf writes merged defaults from its own constructor; the instance is never bound to a name, exported, or read anywhere else |
 | `src/` | React 18 renderer (Vite + Tailwind); `App.tsx` owns all cross-view state |
 | `src/electron-api.ts` | The renderer's only door to the preload bridge: `setElectronApi()` binds it (production from `src/main.tsx`, tests from a stub), `electronApi()` reads it |
 | `src/test/` | Renderer test harness — `setup.ts` (jsdom polyfills, unmount + unbind between tests) and `electron-api-stub.ts` (a typed fake bridge, `satisfies ElectronApi`) |
@@ -608,16 +608,29 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   `UnreadableStoreError` a `cause`. V8 puts the input's first ten characters into `SyntaxError.message`
   (`Unexpected token 'g', "ghp_SENTIN"... is not valid JSON`), and a `config.json` clobbered down to a bare
   token is exactly that input.
-- **Known gap: the Electron backend destroys a valid-JSON-but-not-an-object `config.json` before any gate
-  can run.** conf builds its store inside its own constructor, at module scope in `electron/store.ts`. For
-  an *unparseable* file it rethrows (`clearInvalidConfig` defaults to `false`) and the bytes survive — but
-  for `null`, an array, a string or a number its `store` getter succeeds (`Object.assign({}, [1,2,3])`),
-  the constructor's `assert.deepEqual` mismatch then runs `this.store = store`, and the file is rewritten
-  with schema defaults *before any `set()` exists to refuse*. Verified against the installed conf 14.0.0.
-  No write gate can reach this; the fix is to validate the file before constructing electron-store and to
-  move that construction off module scope so the throw is catchable and an operator can be shown a dialog.
-  Do **not** write a "both backends fail closed on the same inputs" invariant until that lands — it is
-  false today for exactly the shape `loadStrict()` now rejects.
+- **conf is judged *before* it is constructed, because its constructor writes.** The write gate above is
+  not enough for the GUI, and this is the one place ordering is the fix rather than a detail. conf builds
+  its store inside its own constructor: for an **unparseable** file it rethrows (`clearInvalidConfig`
+  defaults to `false`) and the bytes survive, but for `null`, an array, a string or a number its `store`
+  getter *succeeds* (`Object.assign({}, [1,2,3])`), the `assert.deepEqual` against the merged defaults then
+  fails, and it writes those defaults straight back — destroying the file *before any `set()` exists to
+  refuse it*. Measured against the installed conf 14.0.0 for all four shapes. So
+  `openGuardedStoreFile()` runs `loadStoredFileStrict()` first and never reaches `new Store(...)` for a
+  file it cannot use. A check placed after construction would run on a file conf had already overwritten.
+  The `try` around the construction is the second half and is not redundant: conf rethrows V8's own parse
+  error, which quotes the input's first ten characters, so for a `config.json` clobbered down to a bare
+  token letting that escape publishes the credential into the main process's logs. It is rewrapped
+  value-free, which also covers the window where the file changes between the check and the construction.
+  `electron/store.ts` must therefore pin `cwd` and `name`: the gate needs the path before an instance
+  exists, so there is no `backing.path` to read, and leaving those to conf's defaults would make the judged
+  file and the opened file agree only by coincidence. Never pass `clearInvalidConfig: true` — conf would
+  answer `{}` for an unparseable file and write the defaults over it, inside the library where no gate can
+  intercept it.
+  Still open, and narrower than it was: this throws at module load, and `electron/main.ts` reaches it
+  through `electron/ipc.ts`, so the app exits before a window exists and the operator sees **no dialog**.
+  The bytes survive and `mao config show` reports the cause against the same file (the CLI's data directory
+  is Electron's `userData`), so there is a recovery path. Showing it in the GUI needs the construction moved
+  off module scope and is its own change.
 - **Repository identity is case-insensitive, and the list is canonicalised before it is stored**:
   GitHub resolves owner/repo without regard to case, so `sameRepoRef()`/`repoRefKey()` lower-case
   both halves — otherwise `mao repos add DragonCowKarma MAO` registered a *second* entry for an

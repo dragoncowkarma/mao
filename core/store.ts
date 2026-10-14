@@ -690,6 +690,70 @@ export function describeUnloadableStore(source: string, failure: StoreReadFailur
 }
 
 /**
+ * Reads and parses a config file, refusing anything that is not a usable settings object.
+ *
+ * The one strict loader, shared by both backends rather than reimplemented beside each: `FileStore`'s
+ * `getFresh` reads through it, and `electron/store.ts` runs it *before* electron-store exists (see
+ * `openGuardedStoreFile`). `{}` for a missing file — the normal first run — and `UnreadableStoreError`
+ * for everything else.
+ *
+ * A top-level `null`, array, string or number is refused rather than returned. Each parses cleanly and
+ * then spreads to nothing — or, for a string, to numeric index keys — so it used to arrive as a complete
+ * defaults object with `readable: true` and nothing anywhere to report it: the one shape with no signal.
+ */
+export function loadStoredFileStrict(filePath: string): Partial<MaoStoreSchema> {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(fs.readFileSync(filePath, 'utf-8'))
+  } catch (error) {
+    const failure = classifyStoreReadFailure(error)
+    if (failure === null) return {}
+    throw new UnreadableStoreError(filePath, failure)
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new UnreadableStoreError(filePath, 'not-an-object')
+  }
+  return parsed as Partial<MaoStoreSchema>
+}
+
+/**
+ * Composes a backend whose *construction* already reads — and may already write — the config file.
+ *
+ * This exists for electron-store, and the ordering is the whole point. conf builds its store inside its
+ * own constructor: for a file that is valid JSON but not an object its getter succeeds
+ * (`Object.assign({}, [1,2,3])`), its `assert.deepEqual` against the merged defaults then fails, and it
+ * writes those defaults straight back — destroying the file *before any `set()` exists to refuse it*.
+ * Verified against conf 14.0.0 for `null`, `[]`, a bare string and a number. No write gate can reach
+ * that, so the file has to be judged before the backend is built, which is what `loadStoredFileStrict`
+ * does here.
+ *
+ * The `try` around `construct()` is the second half, and not redundant with the check above. conf
+ * rethrows V8's own parse error for an unparseable file, and V8 puts the input's first ten characters
+ * into that message (`Unexpected token 'g', "ghp_SENTIN"... is not valid JSON`) — so for a `config.json`
+ * clobbered down to a bare token, letting conf's error escape publishes the credential into the main
+ * process's logs. Rewrapping it value-free closes that, and also covers the narrow window where the file
+ * changes between the check and the construction.
+ *
+ * `filePath` is the caller's own resolved path rather than one read back off the constructed backend,
+ * because there is no backend yet when it is needed. Callers must therefore pin whatever options
+ * determine that path instead of relying on the backend's defaults.
+ */
+export function openGuardedStoreFile(
+  filePath: string,
+  construct: () => StoredValueBackend,
+  warn?: (message: string) => void,
+): MaoStore {
+  loadStoredFileStrict(filePath)
+  let backing: StoredValueBackend
+  try {
+    backing = construct()
+  } catch (error) {
+    throw new UnreadableStoreError(filePath, classifyStoreReadFailure(error) ?? 'unreadable')
+  }
+  return createGuardedStore(backing, filePath, warn)
+}
+
+/**
  * The report for a backend that could not be read at all, rather than one holding the wrong shape.
  *
  * Value-free by construction: an I/O or parse failure is free to quote the file's own bytes, and
@@ -1136,19 +1200,7 @@ export class FileStore implements MaoStore {
    * can print V8's parse message, which embeds a prefix of the file — see `UnreadableStoreError`.
    */
   private loadStrict(): Partial<MaoStoreSchema> {
-    let parsed: unknown
-    try {
-      parsed = JSON.parse(fs.readFileSync(this.filePath, 'utf-8'))
-    } catch (error) {
-      // A missing file is the normal first run, and reads as "nothing stored" rather than a failure.
-      const failure = classifyStoreReadFailure(error)
-      if (failure === null) return {}
-      throw new UnreadableStoreError(this.filePath, failure)
-    }
-    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      throw new UnreadableStoreError(this.filePath, 'not-an-object')
-    }
-    return parsed as Partial<MaoStoreSchema>
+    return loadStoredFileStrict(this.filePath)
   }
 
   private persist() {

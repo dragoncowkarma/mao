@@ -15,6 +15,8 @@ import {
   createGuardedStore,
   classifyStoreReadFailure,
   UnreadableStoreError,
+  openGuardedStoreFile,
+  loadStoredFileStrict,
   type MaoStoreSchema,
   type StoredValueBackend,
 } from './store.ts'
@@ -764,16 +766,49 @@ describe("electron/store.ts, the other MaoStore backend", () => {
   const source = withoutComments(fs.readFileSync(path.join(REPO_ROOT, 'electron', 'store.ts'), 'utf-8'))
 
   it("is core's composition and nothing else", () => {
-    // What is left to check once the behaviour lives in `createGuardedStore` (covered above against a
-    // fake that models conf's absent-key answer): that this file only composes, and never reaches for
-    // the instance again. A second reference is the bypass — `backing.store[key]`, say, which is
-    // tsc-clean, names no `get`, and would hand the renderer unvalidated values with nothing to flag it.
-    const backend = source.match(/const\s+(\w+)\s*=\s*new Store</)?.[1]
-    expect(backend, 'electron/store.ts must construct an electron-store instance').toBeTruthy()
+    // What is left to check once the behaviour lives in core (covered behaviourally against a conf-shaped
+    // fake in the block below): that this file only composes. The electron-store instance is now built
+    // inside the thunk `openGuardedStoreFile` calls, so it is never bound to a name at all — the bypass
+    // this used to guard against (`backing.store[key]`, tsc-clean and naming no `get`) has nothing to
+    // reach for.
+    expect(source).toMatch(/openGuardedStoreFile\(/)
+    expect([...source.matchAll(/openGuardedStoreFile\(/g)]).toHaveLength(1)
+    expect([...source.matchAll(/new Store</g)]).toHaveLength(1)
+    expect(source).not.toMatch(/const\s+\w+\s*=\s*new Store</)
+    // Not `createGuardedStore` directly: that composes a backend which already exists, and conf's
+    // constructor is exactly what must not run before the file is judged.
+    expect(source).not.toMatch(/createGuardedStore\(/)
+  })
 
-    expect(source).toMatch(new RegExp(`createGuardedStore\\(\\s*${backend}\\s*,\\s*${backend}\\.path\\s*\\)`))
-    // Three: where it is made, and the two arguments it is handed to core as.
-    expect([...source.matchAll(new RegExp(`\\b${backend}\\b`, 'g'))]).toHaveLength(3)
+  it('judges the file before electron-store is constructed, never after', () => {
+    // The ordering is the whole fix for the GUI half of #67. conf writes merged defaults from its own
+    // constructor for a valid-JSON non-object file, so a check placed after `new Store(...)` would run on
+    // a file conf had already destroyed.
+    const gate = source.indexOf('openGuardedStoreFile(')
+    const construct = source.indexOf('new Store<')
+    // Both anchors asserted present first: `indexOf` answers -1 for a call that is not there, and -1 is
+    // less than any real offset — so comparing them alone passes vacuously for a file that dropped the
+    // gate entirely, which is the regression this test exists to catch.
+    expect(gate, 'electron/store.ts must call openGuardedStoreFile').toBeGreaterThanOrEqual(0)
+    expect(construct, 'electron/store.ts must construct an electron-store instance').toBeGreaterThanOrEqual(0)
+    expect(gate).toBeLessThan(construct)
+  })
+
+  it('pins the options that decide the config path, so the judged file is the one conf opens', () => {
+    // `openGuardedStoreFile` needs the path before an instance exists, so it cannot read `backing.path`.
+    // Leaving `cwd`/`name` to conf's defaults would make the two agree only by matching those defaults
+    // from memory — and the gate would then judge a file conf does not open.
+    expect(source).toMatch(/cwd:/)
+    expect(source).toMatch(/name: 'config'/)
+    expect(source).toMatch(/configPath/)
+  })
+
+  it("never turns on electron-store's clearInvalidConfig recovery", () => {
+    // conf's default is `false`, which is what makes an unparseable file rethrow instead of resetting.
+    // Enabling it is the obvious-looking fix for "the GUI won't start" and is the bug: conf would answer
+    // `{}` and then write the defaults over the file, inside the library where no gate can intercept it.
+    // Asserted on comment-stripped source, so the option can still be named in a comment saying why.
+    expect(source).not.toMatch(/clearInvalidConfig/)
   })
 
   it('exports only the guarded store, never the raw backend', () => {
@@ -783,6 +818,144 @@ describe("electron/store.ts, the other MaoStore backend", () => {
 
     expect(exported).toEqual(['store'])
     expect(source).toMatch(/export const store: MaoStore\b/)
+  })
+})
+
+/**
+ * `openGuardedStoreFile` — the composition `electron/store.ts` is, tested behaviourally.
+ *
+ * The real backend cannot be imported from `core/` (architecture rule 1) and electron-store needs a live
+ * Electron app, which is why that file could only ever be checked as text. The behaviour it delegates to
+ * *is* reachable here, so the conf-shaped hazards are pinned against a fake that reproduces them: a
+ * constructor that writes merged defaults over a file it could parse, and one that rethrows V8's own
+ * parse error. Both are measured conf 14.0.0 behaviour, not hypotheticals.
+ */
+describe('openGuardedStoreFile', () => {
+  /** What the file parses to, or `undefined` when it holds no usable settings object. */
+  function readObject(filePath: string): Record<string, unknown> | undefined {
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(fs.readFileSync(filePath, 'utf-8'))
+    } catch {
+      return undefined
+    }
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined
+    return parsed as Record<string, unknown>
+  }
+
+  /**
+   * conf 14.0.0's constructor and read model, as measured.
+   *
+   * Three behaviours matter and all three are reproduced: it reads and merges `defaults` **inside the
+   * constructor** and writes them back when the result differs from the file — which is what destroys a
+   * valid-JSON non-object file; it re-reads the file on every `get`, which is why a key an operator
+   * deletes comes back `undefined` rather than as a schema default; and it rethrows a parse failure
+   * rather than resetting, because `clearInvalidConfig` defaults to `false`.
+   */
+  function confLikeConstruct(filePath: string, calls: string[]) {
+    return () => {
+      calls.push('constructed')
+      const parsed = readObject(filePath)
+      const merged = { ...structuredClone(MAO_STORE_DEFAULTS), ...(parsed ?? {}) }
+      if (JSON.stringify(parsed) !== JSON.stringify(merged)) {
+        fs.writeFileSync(filePath, JSON.stringify(merged, null, 2))
+      }
+      return {
+        get: <K extends keyof MaoStoreSchema>(key: K) =>
+          readObject(filePath)?.[key] as MaoStoreSchema[K] | undefined,
+        set: <K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]) => {
+          fs.writeFileSync(filePath, JSON.stringify({ ...(readObject(filePath) ?? {}), [key]: value }, null, 2))
+        },
+      } satisfies StoredValueBackend
+    }
+  }
+
+  it('does not construct the backend for a valid-JSON non-object file, so nothing rewrites it', () => {
+    // The GUI half of issue #67, and the reason the check cannot live in `set()`: conf destroys the file
+    // from its constructor, before any write exists to refuse. Measured for all four shapes.
+    for (const bytes of ['null', '[]', '"ghp_x"', '42']) {
+      const filePath = rawConfigFile(bytes)
+      const calls: string[] = []
+
+      expect(() => openGuardedStoreFile(filePath, confLikeConstruct(filePath, calls)), bytes).toThrow(
+        UnreadableStoreError,
+      )
+      expect(calls, bytes).toEqual([])
+      expect(fs.readFileSync(filePath, 'utf-8'), bytes).toBe(bytes)
+    }
+  })
+
+  it('does not construct the backend for an unparseable file either', () => {
+    const filePath = rawConfigFile('{ "githubToken": ')
+    const calls: string[] = []
+
+    const open = () => openGuardedStoreFile(filePath, confLikeConstruct(filePath, calls))
+
+    expect(open).toThrow(UnreadableStoreError)
+    expect(calls).toEqual([])
+    expect(fs.readFileSync(filePath, 'utf-8')).toBe('{ "githubToken": ')
+  })
+
+  it('does construct for a missing file and for a usable one', () => {
+    // The gate must not brick a fresh install, which is the only case where answering defaults is right.
+    const missing = missingConfigFile()
+    const missingCalls: string[] = []
+    openGuardedStoreFile(missing, confLikeConstruct(missing, missingCalls))
+    expect(missingCalls).toEqual(['constructed'])
+
+    const usable = rawConfigFile(JSON.stringify({ theme: 'dark' }))
+    const usableCalls: string[] = []
+    openGuardedStoreFile(usable, confLikeConstruct(usable, usableCalls))
+    expect(usableCalls).toEqual(['constructed'])
+  })
+
+  it('keeps the file bytes out of a construction failure, and attaches no cause', () => {
+    // conf rethrows V8's parse error, and V8 puts the input's first ten characters into it — so for a
+    // config.json clobbered down to a bare token, letting that escape publishes the credential into the
+    // main process's logs. The file here is usable, so the gate passes and `construct` is reached: that is
+    // the narrow window where conf can still fail, and the rewrap is what covers it.
+    const filePath = rawConfigFile(JSON.stringify({ theme: 'dark' }))
+    const short = 'ghp_SENTINEL_X'
+    const long = 'ghp_SENTINEL_MUST_SURVIVE_INTACT'
+
+    for (const secret of [short, long]) {
+      let caught: unknown
+      try {
+        openGuardedStoreFile(filePath, () => {
+          // Exactly what conf does: let `JSON.parse`'s own error out of the constructor.
+          JSON.parse(secret)
+          throw new Error('unreachable')
+        })
+      } catch (error) {
+        caught = error
+      }
+
+      expect(caught, secret).toBeInstanceOf(UnreadableStoreError)
+      const message = String((caught as Error).message)
+      expect(message, secret).not.toContain(secret)
+      expect(message, secret).not.toContain('ghp_')
+      expect((caught as Error).cause, secret).toBeUndefined()
+      expect((caught as UnreadableStoreError).failure, secret).toBe('unparseable')
+    }
+  })
+
+  it('returns a store that coerces and reports a wrong-shaped field, like the other backend', () => {
+    // A file that LOADED with one field of the wrong shape is the other axis entirely, and must still
+    // behave as it did: coerce on read, report through `problems()`, and let the next write heal it.
+    captureWarnings()
+    const filePath = rawConfigFile(JSON.stringify({ githubRepos: 'nonsense' }))
+    const calls: string[] = []
+
+    const store = openGuardedStoreFile(filePath, confLikeConstruct(filePath, calls))
+
+    expect(calls).toEqual(['constructed'])
+    expect(store.get('githubRepos')).toEqual([])
+    expect(store.problems().map((problem) => problem.field)).toEqual(['githubRepos'])
+
+    store.set('githubRepos', [widgets])
+
+    expect(store.get('githubRepos')).toEqual([widgets])
+    expect(store.problems()).toEqual([])
   })
 })
 
@@ -1458,5 +1631,52 @@ describe('UnreadableStoreError', () => {
     // V8 embeds a prefix of the input in `SyntaxError.message`, Node prints the `[cause]` chain for an
     // uncaught throw, and any handler may log it — so attaching it would publish a plaintext token.
     expect(new UnreadableStoreError('/tmp/config.json', 'unparseable').cause).toBeUndefined()
+  })
+})
+
+/**
+ * The one strict loader both backends share — `FileStore.getFresh` reads through it, and
+ * `electron/store.ts` runs it before electron-store exists.
+ */
+describe('loadStoredFileStrict', () => {
+  it('answers {} for a missing file, because a fresh install is not a failure', () => {
+    expect(loadStoredFileStrict(missingConfigFile())).toEqual({})
+  })
+
+  it('returns the parsed object for a usable file', () => {
+    expect(loadStoredFileStrict(rawConfigFile(JSON.stringify({ theme: 'dark' })))).toEqual({ theme: 'dark' })
+  })
+
+  it('classifies each way a present file can be unusable', () => {
+    const cases: Array<[string, string]> = [
+      ['{ "theme": ', 'unparseable'],
+      ['null', 'not-an-object'],
+      ['[]', 'not-an-object'],
+      ['"ghp_x"', 'not-an-object'],
+      ['42', 'not-an-object'],
+    ]
+
+    for (const [bytes, failure] of cases) {
+      const filePath = rawConfigFile(bytes)
+      let caught: unknown
+      try {
+        loadStoredFileStrict(filePath)
+      } catch (error) {
+        caught = error
+      }
+
+      expect(caught, bytes).toBeInstanceOf(UnreadableStoreError)
+      expect((caught as UnreadableStoreError).failure, bytes).toBe(failure)
+      expect((caught as UnreadableStoreError).source, bytes).toBe(filePath)
+    }
+  })
+
+  it('reads without writing, so a command that only looks leaves the file alone', () => {
+    const bytes = JSON.stringify({ theme: 'dark' })
+    const filePath = rawConfigFile(bytes)
+
+    loadStoredFileStrict(filePath)
+
+    expect(fs.readFileSync(filePath, 'utf-8')).toBe(bytes)
   })
 })

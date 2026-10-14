@@ -298,11 +298,51 @@ What the halt does **not** cover, so do not read it as more: a `config.json` tha
 all **does** now latch the queue, because the boot observation goes through `inspect()` → `getFresh()` →
 `loadStrict()`, which throws on a file that exists and cannot be parsed — so it arrives as unreadable and
 halts. Every *other* field still reads as its schema default, because the constructor keeps the
-swallowing `load()`, so issue #67 is narrower than it was rather than closed. Element-level validation
+swallowing `load()` — but that is no longer a route to data loss, because the destroying write is refused
+(see below). Element-level validation
 covers complete declared provider/task shapes but deliberately leaves semantic requirements (for example,
 non-empty credentials or a stage-specific PR number) to their owning settings and workflow paths. `mao
 swarm` reads none of this, so "the queue is latched" never means "this host performs no
 unattended GitHub writes".
+
+**A `config.json` MAO cannot read at all.** The guards above are about one *field* of the wrong shape in a
+file that loaded. A file that will not parse — a truncated write, a stray trailing comma — one that is
+valid JSON but not an object (`null`, `[]`, a bare string), or one the process is not allowed to open is a
+different failure: MAO keeps **reading** so you can diagnose it, and **refuses every write** so the file
+survives (issue #67).
+
+Reads still answer, and `config show` now tells you why instead of printing `storeProblems: []`:
+
+```
+$ mao config show
+{ "githubToken": "[unset]", ..., "workflowQueueRecoveryRequired": true,
+  "storeProblems": [ { "field": "workflowTasks", "source": "/path/to/config.json",
+    "message": "[store] /path/to/config.json could not be read at all, so no stored value was
+     established ... It is not valid JSON. Repair the JSON by hand, or move the file aside ..." } ] }
+```
+
+Any write exits 1 and changes nothing:
+
+```
+$ mao config set-theme dark
+[mao] [store] Refusing to write "theme" to /path/to/config.json, because the file could not be read.
+A write replaces the whole file, so it would overwrite the stored GitHub token, AI providers, tracked
+repositories and workflow queue with schema defaults. Nothing has been written ...
+```
+
+Before this, that same command exited **0**, printed `Theme preference set to dark`, and replaced the file
+with defaults — destroying the token, providers, tracked repositories and the queue. `mao repos remove` was
+worse: it printed `No tracked repo matches …` and destroyed the file in the same breath. The remedy is
+named per cause — repair the JSON, or fix the file's permissions and owner — never "check the permissions"
+for a trailing comma. Nothing is renamed, copied or backed up: the file is left exactly as it was, which is
+why the report tells you to copy anything you need out of it before repairing it by hand. Its contents are
+never printed, because the token is in it in plain text.
+
+A **missing** `config.json` is not this case: that is a fresh install, it stays silent, writes work, and the
+file is created on the first save. `mao config clear-persistence-broken` does not load the store, so it
+works regardless. One gap remains, tracked in AGENTS.md: the **Electron** backend rewrites a
+valid-JSON-but-not-an-object `config.json` from electron-store's own constructor, before any write gate can
+run — the CLI is unaffected.
 
 The GUI shows the same unverified-grants caveat the CLI prints (`github:setRepos` returns the
 verdicts), and the board's **Refresh** surfaces a failed preflight instead of reporting a clean sync —
@@ -507,7 +547,10 @@ Two traps:
 ### Add a store field
 
 1. Add to **both** `MaoStoreSchema` and `MAO_STORE_DEFAULTS` in `core/store.ts`.
-2. Backends (`electron/store.ts`, `FileStore`) pick up get/set automatically — but not shape
+2. Nothing is needed for the whole-file tier: a `config.json` that could not be loaded refuses **every**
+   write in `createGuardedStore.set()` and is reported by `problems()`, so a new field inherits that
+   protection by existing. The per-field tier is the part that needs you — backends
+   (`electron/store.ts`, `FileStore`) pick up get/set automatically, but not shape
    validation. Neither backend validates the JSON it reads, so a field whose declared type a
    hand-edited `config.json` can violate (an array, an object) belongs in `STORED_SHAPE_RULES` in the
    same file. Read `createStoredReadGuard`'s doc comment first, and answer three questions in the rule's

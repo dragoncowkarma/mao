@@ -13,6 +13,8 @@ import {
   describeUninspectableStore,
   findStoredQueueProblem,
   createGuardedStore,
+  classifyStoreReadFailure,
+  UnreadableStoreError,
   type MaoStoreSchema,
   type StoredValueBackend,
 } from './store.ts'
@@ -992,6 +994,27 @@ describe('describeUninspectableStore', () => {
     expect(message).toContain('/tmp/config.json')
     expect(message).toContain('unusable')
   })
+
+  it('keeps its original wording when the failure kind is unknown', () => {
+    // `core/app.ts`'s `observeStoredQueue` falls back to this with no error to classify, so the
+    // kind-less form has to stay a complete, true sentence rather than a gap where a cause would go.
+    const message = describeUninspectableStore('workflowTasks', '/tmp/config.json')
+
+    expect(message).toContain('Check the file and the permissions on it')
+    expect(message).not.toContain('  ')
+  })
+
+  it('names the cause and the matching remedy once the kind is known', () => {
+    const parse = describeUninspectableStore('workflowTasks', '/tmp/config.json', 'unparseable')
+    const shape = describeUninspectableStore('workflowTasks', '/tmp/config.json', 'not-an-object')
+    const perms = describeUninspectableStore('workflowTasks', '/tmp/config.json', 'unreadable')
+
+    expect(parse).toContain('not valid JSON')
+    expect(parse).toContain('Repair the JSON')
+    expect(shape).toContain('not a JSON object')
+    expect(perms).toContain('filesystem refused to open it')
+    expect(perms).toContain('permissions and owner')
+  })
 })
 
 /**
@@ -1186,5 +1209,254 @@ describe('setIfUnchanged — what it does not close', () => {
     // The repair is gone. Closing this needs an advisory lock both writers take, or O_EXCL + rename
     // keyed on a stored version — a primitive neither backend has. Tracked as issue #73.
     expect(data.workflowTasks).toEqual([])
+  })
+})
+
+/**
+ * A real `config.json` holding exactly these bytes, with no `FileStore` opened on it.
+ *
+ * Separate from `storeHolding` because these cases are bytes `JSON.stringify` cannot produce — a
+ * truncated write, a hand-edit with a trailing comma, a file an editor left as a bare scalar.
+ */
+function rawConfigFile(contents: string): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mao-store-test-'))
+  tmpDirs.push(dir)
+  const filePath = path.join(dir, 'config.json')
+  fs.writeFileSync(filePath, contents)
+  return filePath
+}
+
+/** The path a fresh install starts from: a real directory with no `config.json` written yet. */
+function missingConfigFile(): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mao-store-test-'))
+  tmpDirs.push(dir)
+  return path.join(dir, 'config.json')
+}
+
+/** The error a write threw, which `expect(...).toThrow` does not hand back for inspection. */
+function writeFailure(store: FileStore, key: 'theme' | 'githubRepos' = 'theme'): unknown {
+  try {
+    if (key === 'theme') store.set('theme', 'dark')
+    else store.set('githubRepos', [widgets])
+  } catch (error) {
+    return error
+  }
+  return null
+}
+
+/**
+ * Issue #67 — a `config.json` that exists and cannot be loaded must not be overwritten.
+ *
+ * Both backends persist the whole schema as one blob on every `set()`, so a write performed while the
+ * load failed does not change one field: it replaces the file with the defaults the failed load left in
+ * memory. `githubToken` is plaintext and exists nowhere else, so this was credential loss reachable from
+ * any ordinary command. The fix refuses the WRITE rather than the BOOT — see the reads test below for the
+ * half of that which matters.
+ */
+describe('FileStore write refusal on a config.json it cannot load', () => {
+  const token = 'ghp_SENTINEL_MUST_SURVIVE'
+
+  it('refuses the write for an unparseable file, and leaves it byte-for-byte intact', () => {
+    captureWarnings()
+    const bytes = `{\n  "githubToken": "${token}",\n}\n`
+    const filePath = rawConfigFile(bytes)
+    const store = new FileStore(filePath)
+
+    expect(() => store.set('theme', 'dark')).toThrow(/Refusing to write "theme"/)
+    expect(fs.readFileSync(filePath, 'utf-8')).toBe(bytes)
+  })
+
+  it('refuses for every valid-JSON-but-not-an-object shape, which had no signal at all', () => {
+    // The hole nothing on main covered: `null`, an array, a number and a string all parse cleanly and
+    // then spread to nothing — or, for a string, to numeric index keys — so the queue latch never fired,
+    // `problems()` answered `[]`, and the next write destroyed the file. A loop over the shapes rather
+    // than one case, because each reaches the check by a different branch of the same condition.
+    for (const bytes of ['null', '[]', '"ghp_x"', '42']) {
+      captureWarnings()
+      const filePath = rawConfigFile(bytes)
+      const store = new FileStore(filePath)
+
+      expect(writeFailure(store), `contents: ${bytes}`).toBeInstanceOf(Error)
+      expect(fs.readFileSync(filePath, 'utf-8'), `contents: ${bytes}`).toBe(bytes)
+      expect(store.inspect('workflowTasks').readable, `contents: ${bytes}`).toBe(false)
+    }
+  })
+
+  it('names the field, the file, the cause and the remedy', () => {
+    captureWarnings()
+    const filePath = rawConfigFile('{ "githubToken": ')
+    const store = new FileStore(filePath)
+
+    const message = String((writeFailure(store) as Error).message)
+
+    expect(message).toContain('"theme"')
+    expect(message).toContain(filePath)
+    expect(message).toContain('not valid JSON')
+    expect(message).toContain('Nothing has been written')
+  })
+
+  it('never reports the file contents, whatever the parse error quoted', () => {
+    // V8 puts a prefix of the input into `SyntaxError.message` — `JSON.parse('ghp_SENTINEL_X')` reports
+    // `Unexpected token 'g', "ghp_SENTINEL_X" is not valid JSON` — and a config.json clobbered down to a
+    // bare token is exactly that input. So a report built from the underlying error publishes the
+    // credential, through `cause`, through Node's uncaught-exception chain, or through any handler that
+    // logs it.
+    //
+    // Two lengths on purpose. V8 embeds a value of 14 characters whole but truncates a longer one to its
+    // first ten plus `"...`, so asserting only on a long sentinel passes while ten characters of the
+    // token leak — which is exactly how the first version of this test failed to catch the mutation that
+    // appended `String(error)` to the report. The short case pins the whole value; the `ghp_` assertion
+    // pins the truncated prefix the long case still exposes.
+    captureWarnings()
+    const short = 'ghp_SENTINEL_X'
+    const long = 'ghp_SENTINEL_MUST_SURVIVE_INTACT'
+
+    for (const secret of [short, long]) {
+      const store = new FileStore(rawConfigFile(secret))
+      const message = String((writeFailure(store) as Error).message)
+
+      expect(message, secret).not.toContain(secret)
+      expect(message, secret).not.toContain('ghp_')
+    }
+  })
+
+  it('gives the remedy that fits the failure, not one remedy for all of them', () => {
+    // "Check the file and the permissions on it" is useless advice for a trailing comma, and it was the
+    // only advice this module gave before the kind was carried through.
+    captureWarnings()
+    const unparseable = new FileStore(rawConfigFile('{ oops'))
+    const notAnObject = new FileStore(rawConfigFile('[]'))
+
+    expect(String((writeFailure(unparseable) as Error).message)).toContain('Repair the JSON')
+    expect(String((writeFailure(notAnObject) as Error).message)).toContain('not a JSON object')
+  })
+
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    'refuses for a file it is not allowed to read, and says so as a permission problem',
+    () => {
+      // EACCES is not ENOENT: the file exists and holds settings this process cannot see, so answering it
+      // with defaults a write then persists is the same destruction by a different cause. Skipped on
+      // Windows (no mode bits) and as root (which ignores them).
+      captureWarnings()
+      const filePath = rawConfigFile(JSON.stringify({ githubToken: token }))
+      const store = new FileStore(filePath)
+      fs.chmodSync(filePath, 0o000)
+
+      const message = String((writeFailure(store) as Error).message)
+
+      expect(message).toContain('filesystem refused to open it')
+      expect(message).toContain('permissions and owner')
+
+      fs.chmodSync(filePath, 0o600)
+      expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).githubToken).toBe(token)
+    },
+  )
+
+  it('still writes for a missing file — the fresh-install path is not a failure', () => {
+    // Every CLI command builds a FileStore, so treating ENOENT like the rest would make a clean install
+    // unusable: the first `config set-token` would refuse and there would be no way in.
+    const warn = captureWarnings()
+    const filePath = missingConfigFile()
+    const store = new FileStore(filePath)
+
+    store.set('theme', 'dark')
+
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).theme).toBe('dark')
+    expect(warn).not.toHaveBeenCalled()
+  })
+
+  it('still writes for a readable file holding a wrong-shaped field — the #60 heal must not regress', () => {
+    // The regression this fix could most easily cause. A field that is present but the wrong shape in a
+    // file that LOADED is the other axis entirely: it coerces, reports, and the next list write heals it.
+    // Refusing there would take `mao repos remove` — the documented way back — down with it.
+    captureWarnings()
+    const filePath = rawConfigFile(JSON.stringify({ githubToken: token, githubRepos: { 'acme/w': widgets } }))
+    const store = new FileStore(filePath)
+
+    store.set('githubRepos', [widgets])
+
+    const written = JSON.parse(fs.readFileSync(filePath, 'utf-8'))
+    expect(written.githubRepos).toEqual([widgets])
+    expect(written.githubToken).toBe(token)
+  })
+
+  it('leaves every read answering, so the operator can still find out why', () => {
+    // The reason this refuses the write and not the boot. A throwing constructor would take `mao config
+    // show`, `mao repos list` and the Sidebar's diagnostic poll down with the destructive write, leaving
+    // the operator a dead process and no statement of what was wrong.
+    captureWarnings()
+    const store = new FileStore(rawConfigFile('{ "githubToken": '))
+
+    expect(store.get('githubToken')).toBe('')
+    expect(store.get('githubRepos')).toEqual([])
+    expect(store.problems()).toHaveLength(1)
+  })
+})
+
+describe('MaoStore.problems for a file that could not be loaded', () => {
+  it('reports the file once, where it answered "nothing is wrong" before', () => {
+    // Every per-field rule reads the already-defaulted snapshot, which is valid, so an unparseable file
+    // produced `storeProblems: []` beside `githubToken: '[unset]'` for a file that still held the token —
+    // pointing the operator at `mao config set-token`, the most destructive command available.
+    captureWarnings()
+    const filePath = rawConfigFile('{ "githubToken": "ghp_x", }')
+
+    const problems = new FileStore(filePath).problems()
+
+    expect(problems).toHaveLength(1)
+    expect(problems[0]!.message).toContain('could not be read at all')
+    expect(problems[0]!.message).toContain('every setting in the file is affected')
+    expect(problems[0]!.source).toBe(filePath)
+    expect(problems[0]!.message).not.toContain('ghp_x')
+  })
+
+  it('carries it on the gating field, so the queue card and the latch still find it', () => {
+    // An unreadable file IS an unreadable queue, and `findStoredQueueProblem` is what both shells and the
+    // boot latch agree through. It deliberately does not claim to be a `githubRepos` problem: that is what
+    // puts the Sidebar's destructive "Reset stored list" button under a message not about repositories.
+    captureWarnings()
+    const problems = new FileStore(rawConfigFile('nope')).problems()
+
+    expect(findStoredQueueProblem(problems)).toBeDefined()
+    expect(problems.some((problem) => problem.field === 'githubRepos')).toBe(false)
+  })
+
+  it('still reports per field when the file itself loaded', () => {
+    captureWarnings()
+    const { store } = storeHolding({ githubRepos: 'nonsense', aiProviders: 7 })
+
+    const fields = store.problems().map((problem) => problem.field)
+
+    expect(fields).toContain('githubRepos')
+    expect(fields).toContain('aiProviders')
+  })
+})
+
+describe('classifyStoreReadFailure', () => {
+  it('reports nothing for ENOENT, because a missing file is a fresh install', () => {
+    expect(classifyStoreReadFailure(Object.assign(new Error('x'), { code: 'ENOENT' }))).toBeNull()
+  })
+
+  it('separates a parse failure from everything the filesystem refuses', () => {
+    expect(classifyStoreReadFailure(new SyntaxError('x'))).toBe('unparseable')
+    expect(classifyStoreReadFailure(Object.assign(new Error('x'), { code: 'EACCES' }))).toBe('unreadable')
+    expect(classifyStoreReadFailure(Object.assign(new Error('x'), { code: 'EISDIR' }))).toBe('unreadable')
+    expect(classifyStoreReadFailure('not even an error')).toBe('unreadable')
+  })
+})
+
+describe('UnreadableStoreError', () => {
+  it('carries the classification and never the file contents', () => {
+    const error = new UnreadableStoreError('/tmp/config.json', 'unparseable')
+
+    expect(error.failure).toBe('unparseable')
+    expect(error.source).toBe('/tmp/config.json')
+    expect(error.message).toContain('/tmp/config.json')
+  })
+
+  it('never attaches the original error as `cause`', () => {
+    // V8 embeds a prefix of the input in `SyntaxError.message`, Node prints the `[cause]` chain for an
+    // uncaught throw, and any handler may log it — so attaching it would publish a plaintext token.
+    expect(new UnreadableStoreError('/tmp/config.json', 'unparseable').cause).toBeUndefined()
   })
 })

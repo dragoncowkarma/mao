@@ -342,13 +342,17 @@ A **missing** `config.json` is not this case: that is a fresh install, it stays 
 file is created on the first save. `mao config clear-persistence-broken` does not load the store, so it
 works regardless.
 
-The **GUI** is covered too, and needed more than the write gate: electron-store's conf writes merged
-defaults from its own *constructor*, so a valid-JSON-but-not-an-object `config.json` was destroyed just by
-opening the app. The file is now judged before conf is built, so that never happens, and conf's own parse
-error — which quotes the first ten characters of the file — is rewrapped so a clobbered token cannot reach
-the main process's logs. What remains: the GUI still exits at startup with **no dialog** for a file it
-cannot use. The bytes survive, and `mao config show` reads the same file (the CLI's data directory is
-Electron's `userData`), so run it to see the cause.
+The **GUI** is covered too, and needed more than the write gate. conf writes merged defaults from its own
+*constructor*, so a valid-JSON-but-not-an-object `config.json` was destroyed just by opening the app — and
+conf does not fail for a root it can coerce, so the same file arriving *after* a clean boot read as a
+healthy store and the next write destroyed it anyway. Both are closed: the file is judged before conf is
+built, and the fresh read every gate consults is strict for both backends rather than the library's own.
+conf's parse error — which quotes the first ten characters of the file — is rewrapped, so neither a failed
+`get()` nor a mid-diagnostic failure can put a clobbered token into a log or an IPC reply.
+
+What remains is **issue #91**: the GUI still exits at startup, with no dialog, for a file it cannot use.
+The bytes survive. Do not assume `mao config show` reads the same file — a GUI-only install ships no CLI,
+and Electron's `userData` uses `productName` while the CLI resolves `defaultDataDir('mao')`.
 
 The GUI shows the same unverified-grants caveat the CLI prints (`github:setRepos` returns the
 verdicts), and the board's **Refresh** surfaces a failed preflight instead of reporting a clean sync —

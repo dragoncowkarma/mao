@@ -832,39 +832,48 @@ describe("electron/store.ts, the other MaoStore backend", () => {
  */
 describe('openGuardedStoreFile', () => {
   /** What the file parses to, or `undefined` when it holds no usable settings object. */
-  function readObject(filePath: string): Record<string, unknown> | undefined {
-    let parsed: unknown
+  /**
+   * conf's `store` getter, as measured: parse, then `Object.assign` onto a plain object.
+   *
+   * The load-bearing detail is what it does **not** do. A parse failure propagates (`clearInvalidConfig`
+   * defaults to `false`), but a root it can still coerce does not fail at all — `[1,2,3]` becomes
+   * `{0:1,1:2,2:3}` and `null` becomes `{}`, so every schema key simply reads as absent and the store
+   * looks healthy. A fake that answered `undefined` for those would hide the whole P1 hazard.
+   */
+  function confLikeRead(filePath: string): Record<string, unknown> {
+    let text: string
     try {
-      parsed = JSON.parse(fs.readFileSync(filePath, 'utf-8'))
-    } catch {
-      return undefined
+      text = fs.readFileSync(filePath, 'utf-8')
+    } catch (error) {
+      // conf's getter answers an empty store for a missing file and lets every other errno propagate.
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return {}
+      throw error
     }
-    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined
-    return parsed as Record<string, unknown>
+    return Object.assign({}, JSON.parse(text)) as Record<string, unknown>
   }
 
   /**
-   * conf 14.0.0's constructor and read model, as measured.
+   * conf 14.0.0's constructor and read model.
    *
    * Three behaviours matter and all three are reproduced: it reads and merges `defaults` **inside the
    * constructor** and writes them back when the result differs from the file — which is what destroys a
-   * valid-JSON non-object file; it re-reads the file on every `get`, which is why a key an operator
-   * deletes comes back `undefined` rather than as a schema default; and it rethrows a parse failure
-   * rather than resetting, because `clearInvalidConfig` defaults to `false`.
+   * valid-JSON non-object file; it re-reads and re-parses on every `get`, so a key an operator deletes
+   * comes back `undefined` and a file that turns bad mid-session starts throwing from reads; and it
+   * rethrows a parse failure rather than resetting.
    */
   function confLikeConstruct(filePath: string, calls: string[]) {
     return () => {
       calls.push('constructed')
-      const parsed = readObject(filePath)
-      const merged = { ...structuredClone(MAO_STORE_DEFAULTS), ...(parsed ?? {}) }
+      const parsed = confLikeRead(filePath)
+      const merged = { ...structuredClone(MAO_STORE_DEFAULTS), ...parsed }
       if (JSON.stringify(parsed) !== JSON.stringify(merged)) {
         fs.writeFileSync(filePath, JSON.stringify(merged, null, 2))
       }
       return {
         get: <K extends keyof MaoStoreSchema>(key: K) =>
-          readObject(filePath)?.[key] as MaoStoreSchema[K] | undefined,
+          confLikeRead(filePath)[key] as MaoStoreSchema[K] | undefined,
         set: <K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]) => {
-          fs.writeFileSync(filePath, JSON.stringify({ ...(readObject(filePath) ?? {}), [key]: value }, null, 2))
+          fs.writeFileSync(filePath, JSON.stringify({ ...confLikeRead(filePath), [key]: value }, null, 2))
         },
       } satisfies StoredValueBackend
     }
@@ -937,6 +946,41 @@ describe('openGuardedStoreFile', () => {
       expect((caught as Error).cause, secret).toBeUndefined()
       expect((caught as UnreadableStoreError).failure, secret).toBe('unparseable')
     }
+  })
+
+  it('refuses writes after the file is replaced with a non-object, post-construction', () => {
+    // conf does not fail for a root it can still coerce — `[1,2,3]` becomes `{0:1,1:2,2:3}` — so after a
+    // clean boot every schema key read as absent and the store looked healthy. The write gate passed and
+    // the next `set()` rewrote the file from defaults: issue #67 again, on the far side of boot. Judging
+    // the file at construction cannot cover this, which is why the fresh read has to be strict too.
+    for (const bytes of ['[1,2,3]', '"ghp_x"', 'null', '42']) {
+      captureWarnings()
+      const filePath = rawConfigFile(JSON.stringify({ githubToken: 'ghp_keep', theme: 'dark' }))
+      const store = openGuardedStoreFile(filePath, confLikeConstruct(filePath, []))
+      fs.writeFileSync(filePath, bytes)
+
+      expect(() => store.set('theme', 'dark'), bytes).toThrow(/Refusing to write/)
+      expect(fs.readFileSync(filePath, 'utf-8'), bytes).toBe(bytes)
+    }
+  })
+
+  it('reports it, and refuses the conditional write too, once the file has turned non-object', () => {
+    // The diagnostic and the recovery path have to agree with the gate: an observation taken while the
+    // file was healthy must not stay usable as a witness after it is not.
+    captureWarnings()
+    const filePath = rawConfigFile(JSON.stringify({ theme: 'dark' }))
+    const store = openGuardedStoreFile(filePath, confLikeConstruct(filePath, []))
+    const healthy = store.inspect('workflowTasks')
+
+    expect(healthy.readable).toBe(true)
+    expect(store.problems()).toEqual([])
+
+    fs.writeFileSync(filePath, '[1,2,3]')
+
+    expect(store.inspect('workflowTasks').readable).toBe(false)
+    expect(store.setIfUnchanged('workflowTasks', healthy.witness, [])).toBe('unverifiable')
+    expect(store.problems()).toHaveLength(1)
+    expect(fs.readFileSync(filePath, 'utf-8')).toBe('[1,2,3]')
   })
 
   it('returns a store that coerces and reports a wrong-shaped field, like the other backend', () => {
@@ -1678,5 +1722,75 @@ describe('loadStoredFileStrict', () => {
     loadStoredFileStrict(filePath)
 
     expect(fs.readFileSync(filePath, 'utf-8')).toBe(bytes)
+  })
+})
+
+/**
+ * The value-free read boundary — no backend's own error may reach a caller, because it may quote the file.
+ *
+ * conf re-reads and re-parses `config.json` on every `get`, so these are not hypothetical paths: a file
+ * that turns bad mid-session makes ordinary reads throw, with V8's message, which carries the input's
+ * first ten characters.
+ */
+describe('createGuardedStore read boundary', () => {
+  const secret = 'ghp_SENTINEL_X'
+
+  /** A backend whose read throws V8's own parse error, the way conf's does. */
+  function throwingBackend(failAfter = 0): StoredValueBackend {
+    let reads = 0
+    return {
+      get: <K extends keyof MaoStoreSchema>(): MaoStoreSchema[K] | undefined => {
+        reads += 1
+        if (reads > failAfter) JSON.parse(secret)
+        return undefined
+      },
+      set: () => {},
+      getFresh: <K extends keyof MaoStoreSchema>(): MaoStoreSchema[K] | undefined => undefined,
+    }
+  }
+
+  it('converts a failed get() instead of letting the backend error escape', () => {
+    // Measured against the real backend before this: `get()` reported
+    // `Unexpected token 'g', "ghp_SENTINEL_X" is not valid JSON`. Converted rather than swallowed —
+    // answering schema defaults for a file MAO could not read is the silence issue #67 was about.
+    const store = createGuardedStore(throwingBackend(), '/tmp/config.json')
+
+    let caught: unknown
+    try {
+      store.get('githubToken')
+    } catch (error) {
+      caught = error
+    }
+
+    expect(caught).toBeInstanceOf(UnreadableStoreError)
+    expect(String((caught as Error).message)).not.toContain(secret)
+    expect(String((caught as Error).message)).not.toContain('ghp_')
+    expect((caught as Error).cause).toBeUndefined()
+    expect((caught as UnreadableStoreError).failure).toBe('unparseable')
+  })
+
+  it('keeps a read that fails mid-diagnostic inside the boundary', () => {
+    // `describeStoredProblems` reads every guarded field, and for conf each one is a fresh parse. With the
+    // probe and the rules in separate `try`s, a file that turned unparseable after the probe succeeded let
+    // V8's error escape from the middle of a diagnostic whose whole job is to report safely.
+    const store = createGuardedStore(throwingBackend(1), '/tmp/config.json')
+
+    const problems = store.problems()
+
+    expect(problems).toHaveLength(1)
+    expect(problems[0]!.field).toBe('workflowTasks')
+    expect(problems[0]!.message).toContain('could not be read at all')
+    expect(problems[0]!.message).not.toContain(secret)
+    expect(problems[0]!.message).not.toContain('ghp_')
+  })
+
+  it('still answers normally when the backend reads fine', () => {
+    captureWarnings()
+    const { backend } = fakeBackend({ theme: 'dark', githubRepos: 'nonsense' })
+    const store = createGuardedStore(backend, '/tmp/config.json')
+
+    expect(store.get('theme')).toBe('dark')
+    expect(store.get('githubRepos')).toEqual([])
+    expect(store.problems().map((problem) => problem.field)).toEqual(['githubRepos'])
   })
 })

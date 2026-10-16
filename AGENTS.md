@@ -589,8 +589,9 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   was reachable from any ordinary command: `mao config set-theme dark`, or a `mao repos remove` that
   matched nothing, printed `No tracked repo matches …` and destroyed the file in the same breath. The gate
   is `assertStoredFileLoadable()` inside `createGuardedStore.set()` — one place, so it covers `FileStore`
-  and electron-store together, and covers a file corrupted *after* a clean boot, which no constructor check
-  could see. It is the action `StoredObservation.readable` already documented ("a caller about to write
+  and electron-store together, and covers a file corrupted *after* a clean boot — but only because the
+  fresh read it consults is strict for **both** backends; see the conf rail below for why that does not
+  come free. It is the action `StoredObservation.readable` already documented ("a caller about to write
   must refuse") generalised from the one field `saveProviders` applied it to.
   **Refuse the write, never the boot.** A throwing constructor was the other candidate and is wrong here:
   it would take `mao config show`, `mao repos list` and the Sidebar's diagnostic poll down together with
@@ -626,11 +627,26 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   file and the opened file agree only by coincidence. Never pass `clearInvalidConfig: true` — conf would
   answer `{}` for an unparseable file and write the defaults over it, inside the library where no gate can
   intercept it.
-  Still open, and narrower than it was: this throws at module load, and `electron/main.ts` reaches it
+  **Judging the file at construction is only half of it, because conf does not fail for a root it can
+  coerce.** Its getter is `Object.assign({}, parsed)`, so a `config.json` replaced with `[1,2,3]`, `null`, a
+  bare string or a number *after* a clean boot comes back as a property bag with every schema key simply
+  absent — no error at all. `readRawFresh`'s fallback to `backend.get` therefore saw a healthy store, the
+  write gate passed, and the next `set()` rewrote the file from defaults: issue #67 again on the far side
+  of boot, measured for all four shapes. So `openGuardedStoreFile` also *supplies* `getFresh` from
+  `loadStoredFileStrict(filePath)` rather than letting the backend's own read stand in for it. A backend
+  opened from a path gets the path's rules, not the library's. Never hand a file-backed backend to
+  `createGuardedStore` directly — that is what loses this.
+  **No backend's own read error may reach a caller.** conf re-reads and re-parses on every `get`, so an
+  ordinary read can fail, and its error is V8's — which quotes the file. `get()` and `problems()` convert
+  through `asUnreadableStoreError`, and `problems()` keeps the probe *and* the per-field rules inside one
+  boundary, because `describeStoredProblems` reads every guarded field and each of those is another parse.
+  Converted, never swallowed: answering schema defaults for a file MAO could not read is the silence #67
+  was about, and the write gate already stops anything persisting over it.
+  Still open, tracked as **issue #91**: this throws at module load, and `electron/main.ts` reaches it
   through `electron/ipc.ts`, so the app exits before a window exists and the operator sees **no dialog**.
-  The bytes survive and `mao config show` reports the cause against the same file (the CLI's data directory
-  is Electron's `userData`), so there is a recovery path. Showing it in the GUI needs the construction moved
-  off module scope and is its own change.
+  The bytes survive. Do not repeat the claim that `mao config show` is the recovery path without checking
+  it — `build.files` ships no `dist-cli`, and Electron's `userData` uses `productName` (`MAO`) while the
+  CLI resolves `defaultDataDir('mao')`, which are different paths on a case-sensitive filesystem.
 - **Repository identity is case-insensitive, and the list is canonicalised before it is stored**:
   GitHub resolves owner/repo without regard to case, so `sameRepoRef()`/`repoRefKey()` lower-case
   both halves — otherwise `mao repos add DragonCowKarma MAO` registered a *second* entry for an

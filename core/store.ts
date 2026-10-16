@@ -622,6 +622,19 @@ export class UnreadableStoreError extends Error {
 }
 
 /**
+ * Any read failure as this module's own value-free error.
+ *
+ * The single place a foreign error is converted, so no caller has to remember that a backend's own error
+ * may quote the file. conf rethrows V8's parse error, which carries the input's first ten characters —
+ * `Unexpected token 'g', "ghp_SENTIN"... is not valid JSON` — so for a `config.json` clobbered down to a
+ * bare token, letting it reach a log or an IPC reply publishes the credential.
+ */
+function asUnreadableStoreError(error: unknown, source: string): UnreadableStoreError {
+  if (error instanceof UnreadableStoreError) return error
+  return new UnreadableStoreError(source, classifyStoreReadFailure(error) ?? 'unreadable')
+}
+
+/**
  * The failure kind behind a caught read error.
  *
  * Classifies a raw error too, rather than only reading `UnreadableStoreError.failure`: the Electron
@@ -748,9 +761,23 @@ export function openGuardedStoreFile(
   try {
     backing = construct()
   } catch (error) {
-    throw new UnreadableStoreError(filePath, classifyStoreReadFailure(error) ?? 'unreadable')
+    throw asUnreadableStoreError(error, filePath)
   }
-  return createGuardedStore(backing, filePath, warn)
+  // The strict fresh read is supplied here rather than left to the backend, and it is not a convenience.
+  // conf does not fail for a root it can still coerce: its getter is `Object.assign({}, parsed)`, so a
+  // `config.json` replaced with `[1,2,3]`, `null`, a bare string or a number after a clean boot comes back
+  // as a property bag — every schema key simply absent — and `readRawFresh`'s fallback to `get` saw a
+  // healthy store. `assertStoredFileLoadable` then passed and the next `set()` rewrote the file from
+  // defaults, which is issue #67 again on the far side of boot. Judging the file at construction cannot
+  // cover that; only a fresh read that applies the same root-shape rule can, and this is the one place
+  // that knows both the path and that the backend was opened from it.
+  const strict: StoredValueBackend = {
+    get: <K extends keyof MaoStoreSchema>(key: K) => backing.get(key),
+    set: <K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]) => backing.set(key, value),
+    getFresh: <K extends keyof MaoStoreSchema>(key: K) =>
+      loadStoredFileStrict(filePath)[key] as MaoStoreSchema[K] | undefined,
+  }
+  return createGuardedStore(strict, filePath, warn)
 }
 
 /**
@@ -1051,7 +1078,18 @@ export function createGuardedStore(
 
   return {
     get<K extends keyof MaoStoreSchema>(key: K): MaoStoreSchema[K] {
-      return guardRead(key, readRaw(key))
+      // conf re-reads and re-parses the file on every `get`, so this read can fail — and its error is
+      // V8's, which quotes the file. Converted rather than swallowed: answering schema defaults for a
+      // file MAO could not read is exactly the silence issue #67 was about, and the write gate already
+      // stops anything from persisting over it, so failing loudly costs the caller nothing it needs.
+      // `FileStore` answers from its constructor snapshot and cannot reach this path at all.
+      let raw: MaoStoreSchema[K]
+      try {
+        raw = readRaw(key)
+      } catch (error) {
+        throw asUnreadableStoreError(error, source)
+      }
+      return guardRead(key, raw)
     },
     validateWrite<K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]): string | undefined {
       return describeInvalidStoredWrite(key, value, source) ?? undefined
@@ -1073,13 +1111,18 @@ export function createGuardedStore(
       // find it (an unreadable file *is* an unreadable queue). It deliberately does not claim to be a
       // `githubRepos` problem, which would put the Sidebar's destructive "Reset stored list" button under
       // a message that is not about repositories — and that write is refused now anyway.
+      //
+      // The probe and the per-field rules sit inside ONE boundary, not two. `describeStoredProblems` reads
+      // every guarded field, and for conf each of those is a fresh parse of the file — so a file that
+      // turned unparseable after the probe succeeded used to let V8's error, and the bytes it quotes,
+      // escape from the middle of a diagnostic whose whole job is to report safely.
       try {
         readRawFresh(QUEUE_GATING_FIELD)
+        return describeStoredProblems(readRaw, source)
       } catch (error) {
         const message = describeUnloadableStore(source, storeReadFailureOf(error))
         return [{ field: QUEUE_GATING_FIELD, source, message }]
       }
-      return describeStoredProblems(readRaw, source)
     },
     inspect<K extends keyof MaoStoreSchema>(key: K): StoredObservation<K> {
       let raw: MaoStoreSchema[K]

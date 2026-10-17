@@ -635,6 +635,19 @@ function asUnreadableStoreError(error: unknown, source: string): UnreadableStore
 }
 
 /**
+ * A failure raised while *writing*, with anything that could quote the file replaced.
+ *
+ * Narrower than `asUnreadableStoreError` on purpose. A backend's `set` re-reads before it writes — conf
+ * does — so a replacement landing at that moment surfaces as a parse error carrying the file's first ten
+ * characters. Only that class is rewrapped: an errno failure names the path, which is not secret, and
+ * converting it would report a failed write as a failed read.
+ */
+function withoutStoredBytes(error: unknown, source: string): unknown {
+  if (error instanceof UnreadableStoreError) return error
+  return error instanceof SyntaxError ? new UnreadableStoreError(source, 'unparseable') : error
+}
+
+/**
  * The failure kind behind a caught read error.
  *
  * Classifies a raw error too, rather than only reading `UnreadableStoreError.failure`: the Electron
@@ -715,18 +728,53 @@ export function describeUnloadableStore(source: string, failure: StoreReadFailur
  * defaults object with `readable: true` and nothing anywhere to report it: the one shape with no signal.
  */
 export function loadStoredFileStrict(filePath: string): Partial<MaoStoreSchema> {
-  let parsed: unknown
+  let text: string
   try {
-    parsed = JSON.parse(fs.readFileSync(filePath, 'utf-8'))
+    text = fs.readFileSync(filePath, 'utf-8')
   } catch (error) {
     const failure = classifyStoreReadFailure(error)
     if (failure === null) return {}
     throw new UnreadableStoreError(filePath, failure)
   }
+  return parseStoredSettings(text, filePath)
+}
+
+/**
+ * The root-shape rule on its own, over text rather than a path.
+ *
+ * Split out so the *same* rule can be handed to a backend that does its own reading — see
+ * `createStoredFileParser`. `JSON.parse` can only fail with a `SyntaxError`, so the kind is fixed here
+ * rather than classified.
+ */
+export function parseStoredSettings(text: string, source: string): Partial<MaoStoreSchema> {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    throw new UnreadableStoreError(source, 'unparseable')
+  }
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new UnreadableStoreError(filePath, 'not-an-object')
+    throw new UnreadableStoreError(source, 'not-an-object')
   }
   return parsed as Partial<MaoStoreSchema>
+}
+
+/**
+ * The root-shape rule as a backend's own deserializer — for electron-store's `deserialize` option.
+ *
+ * This is what closes the interval `openGuardedStoreFile`'s pre-check cannot: the check reads the file,
+ * then conf reads it *again* inside its constructor, and a replacement landing in between was coerced and
+ * written back before anything could refuse it. Judging conf's **own** bytes removes the interval rather
+ * than narrowing it — there is no longer a read that escapes the rule. It also makes every later conf
+ * read strict, including the one its `set()` performs internally, so a parse failure there surfaces as
+ * this module's value-free error instead of V8's, which quotes the file.
+ *
+ * Typed as returning the full schema because that is the option's signature. The value really is partial
+ * and that is correct: conf merges its `defaults` over whatever this returns, and the read guard handles
+ * a key that is missing or the wrong shape regardless.
+ */
+export function createStoredFileParser(source: string): (text: string) => MaoStoreSchema {
+  return (text) => parseStoredSettings(text, source) as MaoStoreSchema
 }
 
 /**
@@ -773,7 +821,16 @@ export function openGuardedStoreFile(
   // that knows both the path and that the backend was opened from it.
   const strict: StoredValueBackend = {
     get: <K extends keyof MaoStoreSchema>(key: K) => backing.get(key),
-    set: <K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]) => backing.set(key, value),
+    set: <K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]) => {
+      // The write gate ran before this, but a backend that re-reads to merge can still meet a file
+      // replaced in between — and conf's error for that quotes the bytes. Covers `setIfUnchanged`'s
+      // final write too, which reaches the backend through this same wrapper.
+      try {
+        backing.set(key, value)
+      } catch (error) {
+        throw withoutStoredBytes(error, filePath)
+      }
+    },
     getFresh: <K extends keyof MaoStoreSchema>(key: K) =>
       loadStoredFileStrict(filePath)[key] as MaoStoreSchema[K] | undefined,
   }

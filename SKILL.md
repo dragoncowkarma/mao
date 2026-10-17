@@ -345,10 +345,14 @@ works regardless.
 The **GUI** is covered too, and needed more than the write gate. conf writes merged defaults from its own
 *constructor*, so a valid-JSON-but-not-an-object `config.json` was destroyed just by opening the app — and
 conf does not fail for a root it can coerce, so the same file arriving *after* a clean boot read as a
-healthy store and the next write destroyed it anyway. Both are closed: the file is judged before conf is
-built, and the fresh read every gate consults is strict for both backends rather than the library's own.
-conf's parse error — which quotes the first ten characters of the file — is rewrapped, so neither a failed
-`get()` nor a mid-diagnostic failure can put a clobbered token into a log or an IPC reply.
+healthy store and the next write destroyed it anyway. All of it is closed, and not by narrowing windows: the
+file is judged before conf is built, the fresh read every gate consults is strict for both backends, and
+conf is handed core's own deserializer so the same rule applies to the bytes **conf** parses — in its
+constructor, on every later read, and on the merge inside a write. A replacement landing between the check
+and the construction, or at the setter's re-read, is therefore refused rather than coerced. conf's parse
+error — which quotes the first ten characters of the file — is rewrapped everywhere it can surface, so
+neither a failed `get()`, a mid-diagnostic failure, nor a failed write can put a clobbered token into a
+log or an IPC reply. A genuine write failure keeps its own error, since its message names only the path.
 
 What remains is **issue #91**: the GUI still exits at startup, with no dialog, for a file it cannot use.
 The bytes survive. Do not assume `mao config show` reads the same file — a GUI-only install ships no CLI,

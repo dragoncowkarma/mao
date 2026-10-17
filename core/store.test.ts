@@ -17,6 +17,8 @@ import {
   UnreadableStoreError,
   openGuardedStoreFile,
   loadStoredFileStrict,
+  parseStoredSettings,
+  createStoredFileParser,
   type MaoStoreSchema,
   type StoredValueBackend,
 } from './store.ts'
@@ -801,6 +803,12 @@ describe("electron/store.ts, the other MaoStore backend", () => {
     expect(source).toMatch(/cwd:/)
     expect(source).toMatch(/name: 'config'/)
     expect(source).toMatch(/configPath/)
+  })
+
+  it("hands conf core's own deserializer, so no read of its own escapes the rule", () => {
+    // The pre-check cannot cover conf's constructor-time read, nor the one its `set()` does to merge.
+    // Both were measured destroying the file / leaking V8's quoted bytes before this option was passed.
+    expect(source).toMatch(/deserialize:\s*createStoredFileParser\(configPath\)/)
   })
 
   it("never turns on electron-store's clearInvalidConfig recovery", () => {
@@ -1792,5 +1800,179 @@ describe('createGuardedStore read boundary', () => {
     expect(store.get('theme')).toBe('dark')
     expect(store.get('githubRepos')).toEqual([])
     expect(store.problems().map((problem) => problem.field)).toEqual(['githubRepos'])
+  })
+})
+
+/**
+ * The two intervals the pre-check cannot cover, because a file-reading backend reads again after it.
+ *
+ * Both were reproduced against real electron-store 10 / conf 14 before the fix: a replacement landing
+ * between `loadStoredFileStrict()` and `new Store(...)` was coerced and written back with no exception,
+ * and one landing at the setter's internal re-read threw V8's error, which quotes the file. Neither is
+ * closed by narrowing the window — they are closed by giving the backend the same rule, so no read of
+ * its own escapes it.
+ */
+describe('openGuardedStoreFile — the backend reads again after the pre-check', () => {
+  const secret = 'ghp_SENTINEL_X'
+
+  /**
+   * conf as `electron/store.ts` configures it: the constructor merges `defaults` and writes them back,
+   * and **every** read goes through `createStoredFileParser` — conf's `deserialize` option.
+   */
+  function strictConfLike(filePath: string, beforeConstruct?: () => void) {
+    const parse = createStoredFileParser(filePath)
+    const read = (): Record<string, unknown> => {
+      let text: string
+      try {
+        text = fs.readFileSync(filePath, 'utf-8')
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return {}
+        throw error
+      }
+      return Object.assign({}, parse(text)) as unknown as Record<string, unknown>
+    }
+    return () => {
+      beforeConstruct?.()
+      const parsed = read()
+      const merged = { ...structuredClone(MAO_STORE_DEFAULTS), ...parsed }
+      if (JSON.stringify(parsed) !== JSON.stringify(merged)) {
+        fs.writeFileSync(filePath, JSON.stringify(merged, null, 2))
+      }
+      return {
+        get: <K extends keyof MaoStoreSchema>(key: K) => read()[key] as MaoStoreSchema[K] | undefined,
+        set: <K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]) => {
+          fs.writeFileSync(filePath, JSON.stringify({ ...read(), [key]: value }, null, 2))
+        },
+      } satisfies StoredValueBackend
+    }
+  }
+
+  it('refuses a replacement that lands between the pre-check and the construction', () => {
+    // The interval itself: `loadStoredFileStrict()` has already succeeded when `construct()` runs, and
+    // conf reads the file again in there. Injected inside the callback, which is the only way to test it
+    // deterministically — every earlier test changed the file after the store was already open.
+    for (const bytes of ['"ghp_x"', '[1,2,3]', 'null', '42', '{ "theme": ']) {
+      const filePath = rawConfigFile(JSON.stringify({ githubToken: secret, theme: 'dark' }))
+      const construct = strictConfLike(filePath, () => fs.writeFileSync(filePath, bytes))
+
+      expect(() => openGuardedStoreFile(filePath, construct), bytes).toThrow(UnreadableStoreError)
+      expect(fs.readFileSync(filePath, 'utf-8'), bytes).toBe(bytes)
+    }
+  })
+
+  it('names no file contents when the construction-time read fails on a bare token', () => {
+    const filePath = rawConfigFile(JSON.stringify({ theme: 'dark' }))
+    const construct = strictConfLike(filePath, () => fs.writeFileSync(filePath, secret))
+
+    let caught: unknown
+    try {
+      openGuardedStoreFile(filePath, construct)
+    } catch (error) {
+      caught = error
+    }
+
+    expect(caught).toBeInstanceOf(UnreadableStoreError)
+    expect(String((caught as Error).message)).not.toContain(secret)
+    expect(String((caught as Error).message)).not.toContain('ghp_')
+    expect((caught as Error).cause).toBeUndefined()
+  })
+
+  it('opens normally when nothing replaces the file', () => {
+    captureWarnings()
+    const filePath = rawConfigFile(JSON.stringify({ githubToken: secret, theme: 'dark' }))
+
+    const store = openGuardedStoreFile(filePath, strictConfLike(filePath))
+
+    expect(store.get('githubToken')).toBe(secret)
+    expect(store.get('theme')).toBe('dark')
+    expect(store.problems()).toEqual([])
+  })
+
+  it('converts a parse failure raised by the backend while writing', () => {
+    // conf's setter re-reads to merge, so a replacement landing after the write gate's own fresh read
+    // surfaces from inside `backing.set` — and before this it surfaced as V8's error, which quotes the
+    // file. Measured at the previous head: `set('theme','dark')` threw
+    // `Unexpected token 'g', "ghp_SENTINEL_X" is not valid JSON`.
+    const filePath = rawConfigFile(JSON.stringify({ theme: 'dark' }))
+    const store = openGuardedStoreFile(filePath, () => ({
+      get: <K extends keyof MaoStoreSchema>(): MaoStoreSchema[K] | undefined => undefined,
+      set: () => {
+        JSON.parse(secret)
+      },
+    }))
+
+    let caught: unknown
+    try {
+      store.set('theme', 'dark')
+    } catch (error) {
+      caught = error
+    }
+
+    expect(caught).toBeInstanceOf(UnreadableStoreError)
+    expect(String((caught as Error).message)).not.toContain(secret)
+    expect(String((caught as Error).message)).not.toContain('ghp_')
+    expect((caught as Error).cause).toBeUndefined()
+  })
+
+  it('leaves a genuine write failure as it is, rather than reporting it as a read failure', () => {
+    // The conversion is deliberately narrow. An errno failure names the path, which is not secret, and
+    // relabelling a failed write as "could not be read" would send an operator after the wrong thing.
+    const filePath = rawConfigFile(JSON.stringify({ theme: 'dark' }))
+    const store = openGuardedStoreFile(filePath, () => ({
+      get: <K extends keyof MaoStoreSchema>(): MaoStoreSchema[K] | undefined => undefined,
+      set: () => {
+        throw Object.assign(new Error('EACCES: permission denied, open'), { code: 'EACCES' })
+      },
+    }))
+
+    let caught: unknown
+    try {
+      store.set('theme', 'dark')
+    } catch (error) {
+      caught = error
+    }
+
+    expect(caught).not.toBeInstanceOf(UnreadableStoreError)
+    expect(String((caught as Error).message)).toContain('EACCES')
+  })
+})
+
+describe('parseStoredSettings', () => {
+  it('returns the object for usable text', () => {
+    expect(parseStoredSettings('{"theme":"dark"}', '/tmp/config.json')).toEqual({ theme: 'dark' })
+  })
+
+  it('refuses unparseable text and every non-object root', () => {
+    const cases: Array<[string, string]> = [
+      ['{ "theme": ', 'unparseable'],
+      ['null', 'not-an-object'],
+      ['[]', 'not-an-object'],
+      ['"ghp_x"', 'not-an-object'],
+      ['42', 'not-an-object'],
+    ]
+
+    for (const [text, failure] of cases) {
+      let caught: unknown
+      try {
+        parseStoredSettings(text, '/tmp/config.json')
+      } catch (error) {
+        caught = error
+      }
+
+      expect(caught, text).toBeInstanceOf(UnreadableStoreError)
+      expect((caught as UnreadableStoreError).failure, text).toBe(failure)
+    }
+  })
+
+  it('is what createStoredFileParser hands a backend, with the source bound', () => {
+    const parse = createStoredFileParser('/tmp/mine.json')
+
+    expect(parse('{"theme":"dark"}')).toEqual({ theme: 'dark' })
+    expect(() => parse('[]')).toThrow(UnreadableStoreError)
+    try {
+      parse('[]')
+    } catch (error) {
+      expect((error as UnreadableStoreError).source).toBe('/tmp/mine.json')
+    }
   })
 })

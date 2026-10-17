@@ -636,6 +636,18 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   `loadStoredFileStrict(filePath)` rather than letting the backend's own read stand in for it. A backend
   opened from a path gets the path's rules, not the library's. Never hand a file-backed backend to
   `createGuardedStore` directly — that is what loses this.
+  **A pre-check cannot cover a backend that reads again, so conf is given the rule itself.** Two intervals
+  sit past the check, and both were measured destroying the file or leaking on the real library. A
+  replacement landing between `loadStoredFileStrict()` and `new Store(...)` was coerced and written back
+  from conf's constructor with no exception — the `try` never fired, and a `getFresh` installed afterwards
+  cannot recover bytes already gone. And conf's `set()` re-reads to merge *after* the write gate's own
+  fresh read, so a replacement at that moment surfaced as V8's error, quoting the file. Narrowing those
+  windows is not a fix; `electron/store.ts` therefore passes `deserialize: createStoredFileParser(configPath)`
+  so the root-shape rule applies to the bytes **conf itself** parses — in its constructor, on every later
+  read, and on the merge inside a write. There is then no read of the backend's own that escapes the rule.
+  The write path also converts through `withoutStoredBytes`, which is deliberately narrower than
+  `asUnreadableStoreError`: only a parse failure can carry the file's bytes, and relabelling an errno
+  write failure as "could not be read" would send an operator after the wrong thing.
   **No backend's own read error may reach a caller.** conf re-reads and re-parses on every `get`, so an
   ordinary read can fail, and its error is V8's — which quotes the file. `get()` and `problems()` convert
   through `asUnreadableStoreError`, and `problems()` keeps the probe *and* the per-field rules inside one

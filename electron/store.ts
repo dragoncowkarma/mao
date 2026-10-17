@@ -1,7 +1,13 @@
 import { app } from 'electron'
 import path from 'node:path'
 import Store from 'electron-store'
-import { openGuardedStoreFile, MAO_STORE_DEFAULTS, type MaoStore, type MaoStoreSchema } from '../core/store.ts'
+import {
+  createStoredFileParser,
+  openGuardedStoreFile,
+  MAO_STORE_DEFAULTS,
+  type MaoStore,
+  type MaoStoreSchema,
+} from '../core/store.ts'
 
 /**
  * Where electron-store would put the file anyway, resolved here instead of read back off the instance.
@@ -53,5 +59,9 @@ export const store: MaoStore = openGuardedStoreFile(configPath, () =>
     defaults: MAO_STORE_DEFAULTS,
     cwd: path.dirname(configPath),
     name: 'config',
+    // conf's own reader, so the root-shape rule applies to the bytes conf actually parses — inside its
+    // constructor, and on every later read and merge-before-write. Without it the pre-check above only
+    // narrows the window instead of closing it.
+    deserialize: createStoredFileParser(configPath),
   }),
 )

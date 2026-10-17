@@ -29,6 +29,23 @@ function unverifiedNotice(checked: RepoWorkflowCapability[]): string {
   )
 }
 
+/**
+ * What a confirmed "Reset stored list" actually did.
+ *
+ * A typed outcome rather than a bare promise, for the reason `QueueRecoveryOutcome` is one: the reset
+ * re-reads the store before it writes and can legitimately decide not to write at all, and a resolved
+ * `Promise<void>` cannot tell the operator that. Both no-write cases are reachable by someone repairing
+ * `config.json` — which is what the report in this very card asks them to do — between the moment it
+ * rendered and the moment they confirmed.
+ */
+export type RepoListResetOutcome =
+  /** The stored value still held nothing usable, and an empty list was written over it. */
+  | 'replaced'
+  /** The list reads normally again, so nothing was written. */
+  | 'already-readable'
+  /** Some entries turned out to be usable, so writing an empty list would have deleted them. */
+  | 'partly-usable'
+
 interface SidebarProps {
   repos: RepoRef[]
   selectedIndex: number | null
@@ -47,8 +64,12 @@ interface SidebarProps {
    * sidebar's Remove was not something the operator could actually do.
    */
   storeProblems: StoredValueProblem[]
-  /** Discards the unusable stored value by writing an empty list. Rejects if even that write fails. */
-  onResetRepoList: () => Promise<void>
+  /**
+   * Discards the unusable stored value by writing an empty list — but only after a fresh read confirms
+   * there is still nothing usable in it. Resolves with what it actually did (see
+   * `RepoListResetOutcome`); rejects if the write itself fails.
+   */
+  onResetRepoList: () => Promise<RepoListResetOutcome>
   /**
    * Whether unattended work is halted because the stored workflow queue is unreadable, and the store's
    * own report saying why.
@@ -101,6 +122,7 @@ export default function Sidebar({
   const [confirmingReset, setConfirmingReset] = useState(false)
   const [resetting, setResetting] = useState(false)
   const [resetError, setResetError] = useState('')
+  const [resetNotice, setResetNotice] = useState('')
   const [confirmingRecovery, setConfirmingRecovery] = useState(false)
   const [recovering, setRecovering] = useState(false)
   const [resaving, setResaving] = useState(false)
@@ -114,7 +136,22 @@ export default function Sidebar({
    * and third fields this now has to be distinguished from, so the check is load-bearing rather than
    * merely prospective.
    */
-  const repoListUnusable = storeProblems.some((problem) => problem.field === 'githubRepos')
+  const repoListProblem = storeProblems.find((problem) => problem.field === 'githubRepos')
+  const repoListUnusable = repoListProblem !== undefined
+
+  /**
+   * Whether the reset would lose nothing — the second half of the same question, and the one issue #72
+   * added.
+   *
+   * The button writes an *empty* list, which is lossless only while the stored value holds nothing a
+   * caller could have used. A `githubRepos` that is an array with some usable entries is reported too
+   * now, and there the rows below are real: the operator can select one, reach the Settings tab and use
+   * Remove. Offering "Reset stored list" under that report would hand them a one-click deletion of
+   * every repository they can see working, to fix entries they were only being told about. Core decides
+   * this (`StoredValueProblem.nothingUsable`) rather than this component comparing a defect kind, so a
+   * state nobody here has heard of withholds the destructive control instead of offering it.
+   */
+  const resetLosesNothing = repoListProblem?.nothingUsable === true
 
   /**
    * Whether the stored queue is unusable *right now*, which is not the same as this session being halted.
@@ -186,6 +223,31 @@ export default function Sidebar({
   }
 
   /**
+   * What to tell the operator about a reset that wrote nothing, or `''` when it wrote.
+   *
+   * Only the no-write cases get a sentence. A reset that did replace the value proves itself: the report
+   * goes, the rows go, and the empty state appears — whereas "nothing was written" is invisible, and in
+   * the `already-readable` case indistinguishable from a successful wipe, because the card unmounts
+   * either way.
+   */
+  function resetOutcomeNotice(outcome: RepoListResetOutcome): string {
+    if (outcome === 'already-readable') {
+      return (
+        'Nothing was written: the stored repository list reads normally again, so resetting it would ' +
+        'have discarded a repair someone else just made. The repositories it holds are shown now.'
+      )
+    }
+    if (outcome === 'partly-usable') {
+      return (
+        'Nothing was written: some entries in the stored list turned out to name repositories, and ' +
+        'replacing the whole list would have deleted them. They are shown now; the entries that cannot ' +
+        'name a repository are still in the file.'
+      )
+    }
+    return ''
+  }
+
+  /**
    * Two-step, like removing a project: this throws away whatever the file holds for the list, and the
    * report above it says to copy anything still wanted out of that file first.
    *
@@ -198,8 +260,9 @@ export default function Sidebar({
     if (resetting) return
     setResetting(true)
     setResetError('')
+    setResetNotice('')
     try {
-      await onResetRepoList()
+      setResetNotice(resetOutcomeNotice(await onResetRepoList()))
       setConfirmingReset(false)
     } catch (err) {
       setResetError(readableIpcError(err))
@@ -333,6 +396,22 @@ export default function Sidebar({
           </div>
         )}
 
+        {/* OUTSIDE the problem card, deliberately, and for the reason the queue's messages are: this
+            reports an action that has finished, while the card reports a condition that currently holds
+            — and the message that matters most says the condition is *gone*. `already-readable` means
+            the file is genuinely repaired, so the refresh that follows empties the problem list and
+            unmounts the card; a sentence rendered inside it would disappear along with the thing it was
+            explaining, leaving a confirmed click that looked like it had done nothing. */}
+        {resetNotice && (
+          <div className="card mb-2 gap-1.5 p-2">
+            <p className="card-title text-[13px]">Stored repository list</p>
+            <p className="text-muted text-[11px] leading-snug">{resetNotice}</p>
+            <button onClick={() => setResetNotice('')} className="btn btn-secondary self-start text-xs">
+              Dismiss
+            </button>
+          </div>
+        )}
+
         {otherProblems.length > 0 && (
           <div className="card mb-2 gap-1.5 p-2">
             <p className="card-title text-[13px]">Stored settings could not be read</p>
@@ -341,7 +420,7 @@ export default function Sidebar({
                 {problem.message}
               </p>
             ))}
-            {repoListUnusable &&
+            {resetLosesNothing &&
               (confirmingReset ? (
                 <div className="flex gap-2">
                   <button onClick={submitReset} className="btn btn-primary text-xs" disabled={resetting}>

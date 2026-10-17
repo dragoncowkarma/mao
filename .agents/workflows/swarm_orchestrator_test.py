@@ -1474,29 +1474,226 @@ class WorktreeSafetyTest(unittest.TestCase):
 
         resolve.assert_called_once_with(task_checkout)
 
-    def test_worktree_push_target_rejects_host_only_drift(self):
+    def test_worktree_push_target_rejects_each_identity_component_alone(self):
+        """Host, owner and repo must each be independently load-bearing.
+
+        A fixture that drifts more than one component at a time lets a sibling
+        term stand in for the one under test, so dropping `owner` or `repo` from
+        the comparison stayed green. Every case here holds the transport
+        endpoints equal to the bound target so the identity list is the only
+        thing that can reject.
+        """
         target = self._bind_test_target()
-        drifted = self.swarm.GitHubRepoTarget(
-            "mirror.example",
-            target.owner,
-            target.repo,
+        task_checkout = self.repo / ".worktrees" / "task-checkout"
+        drifts = {
+            "host": ("mirror.example", target.owner, target.repo),
+            "owner": (target.host, "attacker", target.repo),
+            "repo": (target.host, target.owner, "attacker-widgets"),
+        }
+        for component, (host, owner, repo) in drifts.items():
+            with self.subTest(component=component):
+                drifted = self.swarm.GitHubRepoTarget(
+                    host,
+                    owner,
+                    repo,
+                    http_endpoint=target.http_endpoint,
+                )
+                with (
+                    patch.object(
+                        self.swarm,
+                        "_resolve_origin_repository",
+                        return_value=drifted,
+                    ),
+                    patch.object(
+                        self.swarm,
+                        "_read_git_config_values",
+                    ) as read_config,
+                ):
+                    with self.assertRaises(
+                        self.swarm.SwarmPreflightConfigError,
+                    ) as raised:
+                        self.swarm._assert_worktree_push_target(
+                            task_checkout,
+                            "worker/1-test",
+                        )
+
+                self.assertIn("differs", str(raised.exception))
+                self.assertNotIn(owner, str(raised.exception))
+                self.assertNotIn(repo, str(raised.exception))
+                read_config.assert_not_called()
+
+    def test_worktree_push_target_accepts_a_case_variant_of_the_bound_target(self):
+        """GitHub resolves owner/repo case-insensitively, so the guard must too.
+
+        Without this the three rejection cases above are also satisfied by a
+        comparison that rejects everything, and the `.lower()` folding has no
+        witness.
+        """
+        target = self._bind_test_target()
+        task_checkout = self.repo / ".worktrees" / "task-checkout"
+        recased = self.swarm.GitHubRepoTarget(
+            "GitHub.com",
+            "ACME",
+            "Widgets",
             http_endpoint=target.http_endpoint,
         )
         with (
             patch.object(
                 self.swarm,
                 "_resolve_origin_repository",
-                return_value=drifted,
+                return_value=recased,
+            ),
+            patch.object(
+                self.swarm,
+                "_read_git_config_values",
+                return_value=(),
+            ),
+        ):
+            self.swarm._assert_worktree_push_target(task_checkout, "worker/1-test")
+
+    def test_worktree_push_target_requires_a_bound_startup_target(self):
+        """An unbound target must refuse dispatch, not skip the comparison."""
+        self.swarm._ACTIVE_GH_REPO_CONTEXT = None
+        self.swarm._ACTIVE_REPO_TARGET = None
+        with (
+            patch.object(
+                self.swarm,
+                "_resolve_origin_repository",
+                return_value=self.swarm.GitHubRepoTarget(
+                    "github.com",
+                    "acme",
+                    "widgets",
+                ),
             ),
             patch.object(self.swarm, "_read_git_config_values") as read_config,
         ):
-            with self.assertRaises(self.swarm.SwarmPreflightConfigError):
+            with self.assertRaises(self.swarm.SwarmPreflightConfigError) as raised:
                 self.swarm._assert_worktree_push_target(
                     self.repo / ".worktrees" / "task-checkout",
                     "worker/1-test",
                 )
 
+        self.assertIn("not bound", str(raised.exception))
         read_config.assert_not_called()
+
+    def test_worktree_push_target_checks_every_push_selector(self):
+        """Each of the three selectors must reject on its own.
+
+        The pre-existing coverage drove `_read_git_config_values` with a
+        positional `side_effect`, so whichever key happened to be read first
+        absorbed the rejection and the other two keys had no witness.
+        """
+        target = self._bind_test_target()
+        task_checkout = self.repo / ".worktrees" / "task-checkout"
+        branch_name = "worker/1-test"
+        selectors = (
+            "remote.pushDefault",
+            f"branch.{branch_name}.pushRemote",
+            f"branch.{branch_name}.remote",
+        )
+        for selector in selectors:
+            with self.subTest(selector=selector):
+                def read_config(key, repo_root, _selector=selector):
+                    if repo_root == task_checkout and key == _selector:
+                        return ("attacker",)
+                    return ()
+
+                with (
+                    patch.object(
+                        self.swarm,
+                        "_resolve_origin_repository",
+                        return_value=target,
+                    ),
+                    patch.object(
+                        self.swarm,
+                        "_read_git_config_values",
+                        side_effect=read_config,
+                    ) as read,
+                ):
+                    with self.assertRaises(
+                        self.swarm.SwarmPreflightConfigError,
+                    ) as raised:
+                        self.swarm._assert_worktree_push_target(
+                            task_checkout,
+                            branch_name,
+                        )
+
+                self.assertIn("other than origin", str(raised.exception))
+                self.assertNotIn("attacker", str(raised.exception))
+                self.assertIn(call(selector, task_checkout), read.mock_calls)
+
+    def test_worktree_push_target_accepts_selectors_naming_origin(self):
+        """A correctly configured checkout must still be dispatchable.
+
+        Every selector case above is also satisfied by a predicate that rejects
+        any configured value at all, which would leave Swarm refusing every
+        dispatch — idle rather than visibly broken.
+        """
+        target = self._bind_test_target()
+        task_checkout = self.repo / ".worktrees" / "task-checkout"
+        branch_name = "worker/1-test"
+        with (
+            patch.object(
+                self.swarm,
+                "_resolve_origin_repository",
+                return_value=target,
+            ),
+            patch.object(
+                self.swarm,
+                "_read_git_config_values",
+                return_value=("origin",),
+            ) as read,
+        ):
+            self.swarm._assert_worktree_push_target(task_checkout, branch_name)
+
+        self.assertEqual(
+            [args.args for args in read.call_args_list],
+            [
+                ("remote.pushDefault", task_checkout),
+                (f"branch.{branch_name}.pushRemote", task_checkout),
+                (f"branch.{branch_name}.remote", task_checkout),
+            ],
+        )
+
+    def test_dispatch_revalidation_keeps_ssh_transport_verification_on(self):
+        """`_assert_worktree_push_target` takes the resolver's default, so the
+        default has to stay fail-closed — and has to inspect the task checkout.
+        """
+        bound = self.swarm.GitHubRepoTarget(
+            "github.com",
+            "acme",
+            "widgets",
+            ssh_endpoint=self.swarm.SshEndpoint("github.com", "git", 22),
+        )
+        self.swarm._ACTIVE_GH_REPO_CONTEXT = bound.gh_context
+        self.swarm._ACTIVE_REPO_TARGET = bound
+        task_checkout = self.repo / ".worktrees" / "task-checkout"
+        resolved = subprocess.CompletedProcess(
+            ["ssh", "-G"],
+            0,
+            "user git\nhostname github.com\nport 22\n",
+            "",
+        )
+        with (
+            patch.object(
+                self.swarm,
+                "_read_origin_urls",
+                return_value=["git@github.com:acme/widgets.git"],
+            ),
+            patch.object(
+                self.swarm,
+                "_assert_standard_git_ssh_context",
+            ) as transport,
+            patch.object(self.swarm.subprocess, "run", return_value=resolved),
+            patch.object(
+                self.swarm,
+                "_read_git_config_values",
+                return_value=(),
+            ),
+        ):
+            self.swarm._assert_worktree_push_target(task_checkout, "worker/1-test")
+
+        transport.assert_called_once_with(task_checkout)
 
     def test_worktree_push_target_reads_branch_remote_from_task_checkout(self):
         target = self._bind_test_target()
@@ -1542,6 +1739,22 @@ class WorktreeSafetyTest(unittest.TestCase):
             with self.assertRaises(self.swarm.SwarmPreflightConfigError):
                 self.swarm._read_git_config_values(
                     "branch.worker/1-test.remote",
+                    self.repo,
+                )
+
+    def test_git_config_reader_rejects_scope_output_without_a_separator(self):
+        """Unparseable `--show-scope` output must fail closed, not read as
+        "no selector configured"."""
+        result = subprocess.CompletedProcess(
+            ["git", "config"],
+            0,
+            "origin\n",
+            "",
+        )
+        with patch.object(self.swarm.subprocess, "run", return_value=result):
+            with self.assertRaises(self.swarm.SwarmPreflightConfigError):
+                self.swarm._read_git_config_values(
+                    "remote.pushDefault",
                     self.repo,
                 )
 
@@ -2496,6 +2709,36 @@ class WorktreeSafetyTest(unittest.TestCase):
             self.swarm.SshEndpoint("evil-github.com", "git", 443),
         )
 
+    def test_ssh_github_equivalence_binds_the_whole_endpoint(self):
+        """Only `git@ssh.github.com:443` is GitHub's documented alternate
+        endpoint; a different user or port is a different target."""
+        cases = {
+            "other-user": ("deploy", 443),
+            "other-port": ("git", 22),
+        }
+        for label, (user, port) in cases.items():
+            with self.subTest(case=label):
+                resolved = subprocess.CompletedProcess(
+                    ["ssh", "-G"],
+                    0,
+                    f"user {user}\nhostname ssh.github.com\nport {port}\n",
+                    "",
+                )
+                with (
+                    patch.object(self.swarm, "_assert_standard_git_ssh_context"),
+                    patch.object(
+                        self.swarm.subprocess,
+                        "run",
+                        return_value=resolved,
+                    ),
+                ):
+                    endpoint = self.swarm._resolve_ssh_endpoint("ssh.github.com")
+
+                self.assertEqual(
+                    endpoint,
+                    self.swarm.SshEndpoint("ssh.github.com", user, port),
+                )
+
     def test_origin_resolution_consumes_every_push_url(self):
         fetch = subprocess.CompletedProcess(
             ["git", "remote"],
@@ -2553,6 +2796,25 @@ class WorktreeSafetyTest(unittest.TestCase):
                 self.swarm._assert_checkout_push_target(task_checkout)
 
         guard.assert_not_called()
+
+    def test_attached_checkout_forwards_its_branch_to_the_push_guard(self):
+        """The mirror of the detached case: a checked-out branch must reach the
+        inner guard, or its branch-scoped selectors are never validated."""
+        attached = subprocess.CompletedProcess(
+            ["git", "symbolic-ref"],
+            0,
+            "worker/1-test\n",
+            "",
+        )
+        task_checkout = self.swarm.REPO_ROOT / ".worktrees" / "1"
+        with (
+            patch.object(self.swarm.subprocess, "run", return_value=attached),
+            patch.object(self.swarm, "_assert_worktree_push_target") as guard,
+        ):
+            branch_name = self.swarm._assert_checkout_push_target(task_checkout)
+
+        self.assertEqual(branch_name, "worker/1-test")
+        guard.assert_called_once_with(task_checkout, "worker/1-test")
 
     def test_detached_dispatch_pins_only_the_unscoped_push_remote(self):
         self.swarm._ACTIVE_GH_REPO_CONTEXT = "github.com/acme/widgets"
@@ -4462,6 +4724,31 @@ class WorktreeSafetyTest(unittest.TestCase):
 
         self.assertEqual(inherited.status, self.swarm.ProcessStatus.STUCK)
         self.assertEqual(inherited.failure_reason, self.swarm.DISPATCH_RESIDUAL)
+        save.assert_called_once_with()
+
+    def test_orphan_reconciliation_releases_a_stuck_record_once_its_group_exits(self):
+        """STUCK blocks its lifecycle event only until an operator clears the
+        residual tree; the next poll has to observe that and release it."""
+        attempt_tracker = self.swarm.ProcessTracker.__new__(self.swarm.ProcessTracker)
+        inherited = self._tracked_process(
+            "review#1-head",
+            self.swarm.ProcessStatus.STUCK,
+            role="reviewer",
+            pid=4321,
+        )
+        inherited.failure_reason = self.swarm.DISPATCH_RESIDUAL
+        attempt_tracker._active = {}
+        attempt_tracker._history = [inherited]
+
+        with (
+            patch.object(attempt_tracker, "check_pid_alive", return_value=False),
+            patch.object(self.swarm, "_process_group_exists", return_value=False),
+            patch.object(attempt_tracker, "_save_registry") as save,
+            patch.object(self.swarm.log, "warning"),
+        ):
+            attempt_tracker.poll_all()
+
+        self.assertEqual(inherited.status, self.swarm.ProcessStatus.UNKNOWN)
         save.assert_called_once_with()
 
     def test_registry_write_is_atomic_when_serialization_fails(self):

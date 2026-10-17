@@ -37,14 +37,14 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
 | `core/swarm-runner.ts` | Shell-free launcher and repository/asset validation for the autonomous Swarm Orchestrator |
 | `core/auto-trigger.ts` | Per-repo polling scheduler; auto-enqueues new open issues |
 | `core/assignment.ts` | Issue/PR body directive parser — `parseAssignmentTags()` for swarm_orchestrator-style `[Worker: id]`/`[Reviewer: id]`/`[Maintainer: id]` role tags, and `parseProviderOverride()` which folds those plus task-level `[Model: id]`/`[Effort: level]` tags into a `ProviderOverride` |
-| `core/store.ts` | `MaoStoreSchema`, `MAO_STORE_DEFAULTS`, the `MaoStore` interface, `FileStore` (JSON impl for the CLI), `createStoredReadGuard()` — the read-path guard every backend applies so a field's declared type survives contact with unvalidated JSON — and `describeStoredProblems()` behind `MaoStore.problems()`, which answers *which* values it had to replace |
+| `core/store.ts` | `MaoStoreSchema`, `MAO_STORE_DEFAULTS`, the `MaoStore` interface, `FileStore` (JSON impl for the CLI), `createStoredReadGuard()` — the read-path guard every backend applies so a field's declared type survives contact with unvalidated JSON — `describeStoredProblems()` behind `MaoStore.problems()`, which answers *which* values it had to replace, and the whole-file tier below those — `classifyStoreReadFailure()`/`UnreadableStoreError` plus the write refusal in `createGuardedStore.set()` that closes issue #67 |
 | `core/app.ts` | `createMaoApp()` — the **single composition root** both frontends call |
 | `core/paths.ts` | Platform-appropriate data dir for the CLI (mirrors Electron's `userData`) |
 | `core/ai/` | `AiProvider` interface + adapters: `api-provider.ts` (Anthropic / OpenAI-compatible HTTP) and `cli-provider.ts` (spawns `claude`, `codex`, …) |
 | `electron/main.ts` | BrowserWindow, external-link handling, dev/prod load |
 | `electron/ipc.ts` | All `ipcMain.handle` channels — thin delegations only |
 | `electron/preload.ts` | `contextBridge` exposing `window.electronAPI` |
-| `electron/store.ts` | One line: `createGuardedStore(backing, backing.path)`. The electron-store instance is never exported and never read anywhere else |
+| `electron/store.ts` | One call: `openGuardedStoreFile(configPath, () => new Store(…))`. The file is judged before conf is constructed, because conf writes merged defaults from its own constructor; the instance is never bound to a name, exported, or read anywhere else |
 | `src/` | React 18 renderer (Vite + Tailwind); `App.tsx` owns all cross-view state |
 | `src/electron-api.ts` | The renderer's only door to the preload bridge: `setElectronApi()` binds it (production from `src/main.tsx`, tests from a stub), `electronApi()` reads it |
 | `src/test/` | Renderer test harness — `setup.ts` (jsdom polyfills, unmount + unbind between tests) and `electron-api-stub.ts` (a typed fake bridge, `satisfies ElectronApi`) |
@@ -496,10 +496,14 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   config file on every `get`, so for Electron the two are the same call. `FileStore` answers `get` from the
   snapshot taken in its constructor, so it supplies `StoredValueBackend.getFresh` — without it a CLI
   recovery would compare against a value taken at construction and miss a repair that had already landed.
-  That fresh read uses a *strict* loader: a file that exists and cannot be read throws, so an unreadable
-  file becomes "unknown" rather than "unchanged". The constructor keeps the swallowing `load()`, because
-  answering schema defaults for an unparseable file is pre-existing behaviour and its own tracked gap
-  (#67) — do not quietly change what every boot does while fixing a write path.
+  That fresh read uses a *strict* loader: a file that exists and cannot be loaded throws, so an unreadable
+  file becomes "unknown" rather than "unchanged". `loadStrict()` also rejects a top-level `null`, array,
+  string or number — those parse cleanly and then spread to nothing (a string, to numeric index keys), so
+  they used to arrive as `readable: true` with nothing anywhere to report them. The constructor still keeps
+  the swallowing `load()`, and deliberately so: boot coerces, which is what keeps every read-only command
+  answering while the file is broken. Issue #67 is answered on the **write** side instead — see the
+  write-refusal rail below — which is what the earlier reservation here ("do not quietly change what every
+  boot does while fixing a write path") was asking for.
 - **One observation decides the latch and feeds `restore()`.** `createMaoApp` calls
   `store.inspect(QUEUE_GATING_FIELD)` once (through one guarded helper) and uses that single result for
   both. `get()` and `problems()` are two reads and conf re-reads and re-parses the whole file on every
@@ -568,14 +572,93 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   valid JSON at all no longer slips past the *queue* latch, and that changed with the fresh read: the boot
   observation goes through `inspect()` → `getFresh()` → `loadStrict()`, which throws on a file that exists
   and cannot be parsed, so it arrives as `readable: false` and latches. Every **other** field still reads
-  as its schema default, because the constructor keeps the swallowing `load()` — issue #67 is therefore
-  narrower than it was, not closed, and it is still the tracking issue for the rest of the schema.
+  as its schema default, because the constructor keeps the swallowing `load()`. That is no longer a route to
+  data loss — the write refusal below stops the destroying write for every field — but it does mean the
+  *halt* is still only about the queue: the latch says "this host runs no unattended pipeline work", never
+  "the file is fine".
   Element-level validation covers the complete declared `aiProviders` and `workflowTasks` shapes, but
   deliberately does not add semantic policy such as requiring non-empty credentials, known models, or a
   PR number at a particular stage; those remain the owning settings/engine paths' errors. `mao swarm`
   reads none of this: it is a separate
   Python engine with a separate credential, so "the queue is latched" must never be read as "this host
   performs no unattended GitHub writes".
+- **A write is refused when the file it would rewrite could not be read (issue #67).** Both backends
+  persist the whole schema as one JSON blob on every `set()`, so a write performed while the load failed
+  does not change one field — it replaces the file with the schema defaults the failed load left in memory.
+  `githubToken` is stored there in plain text and exists nowhere else, so this was credential loss, and it
+  was reachable from any ordinary command: `mao config set-theme dark`, or a `mao repos remove` that
+  matched nothing, printed `No tracked repo matches …` and destroyed the file in the same breath. The gate
+  is `assertStoredFileLoadable()` inside `createGuardedStore.set()` — one place, so it covers `FileStore`
+  and electron-store together, and covers a file corrupted *after* a clean boot — but only because the
+  fresh read it consults is strict for **both** backends; see the conf rail below for why that does not
+  come free. It is the action `StoredObservation.readable` already documented ("a caller about to write
+  must refuse") generalised from the one field `saveProviders` applied it to.
+  **Refuse the write, never the boot.** A throwing constructor was the other candidate and is wrong here:
+  it would take `mao config show`, `mao repos list` and the Sidebar's diagnostic poll down together with
+  the destructive write, leaving an operator a dead process and no statement of what broke. Reads keep
+  coercing; `problems()` is what tells them. Nothing is renamed or copied aside either — not writing
+  preserves the file more completely than moving it, and `config.json` is secret-bearing, so an automatic
+  rename would plant the token at a second path the operator never chose.
+  `problems()` probes the whole file *before* the per-field rules, because when the load failed those
+  rules read an already-defaulted snapshot and answer "nothing is wrong" — which is how `mao config show`
+  printed `storeProblems: []` beside `githubToken: '[unset]'` for a file that still held the token. The one
+  entry is carried on `QUEUE_GATING_FIELD` so `findStoredQueueProblem()` and the Sidebar's queue card still
+  find it; it deliberately does not claim to be a `githubRepos` problem, which would put that card's
+  destructive "Reset stored list" button under a message that is not about repositories.
+  Never interpolate the underlying read error into any of these reports, and never give
+  `UnreadableStoreError` a `cause`. V8 puts the input's first ten characters into `SyntaxError.message`
+  (`Unexpected token 'g', "ghp_SENTIN"... is not valid JSON`), and a `config.json` clobbered down to a bare
+  token is exactly that input.
+- **conf is judged *before* it is constructed, because its constructor writes.** The write gate above is
+  not enough for the GUI, and this is the one place ordering is the fix rather than a detail. conf builds
+  its store inside its own constructor: for an **unparseable** file it rethrows (`clearInvalidConfig`
+  defaults to `false`) and the bytes survive, but for `null`, an array, a string or a number its `store`
+  getter *succeeds* (`Object.assign({}, [1,2,3])`), the `assert.deepEqual` against the merged defaults then
+  fails, and it writes those defaults straight back — destroying the file *before any `set()` exists to
+  refuse it*. Measured against the installed conf 14.0.0 for all four shapes. So
+  `openGuardedStoreFile()` runs `loadStoredFileStrict()` first and never reaches `new Store(...)` for a
+  file it cannot use. A check placed after construction would run on a file conf had already overwritten.
+  The `try` around the construction is the second half and is not redundant: conf rethrows V8's own parse
+  error, which quotes the input's first ten characters, so for a `config.json` clobbered down to a bare
+  token letting that escape publishes the credential into the main process's logs. It is rewrapped
+  value-free, which also covers the window where the file changes between the check and the construction.
+  `electron/store.ts` must therefore pin `cwd` and `name`: the gate needs the path before an instance
+  exists, so there is no `backing.path` to read, and leaving those to conf's defaults would make the judged
+  file and the opened file agree only by coincidence. Never pass `clearInvalidConfig: true` — conf would
+  answer `{}` for an unparseable file and write the defaults over it, inside the library where no gate can
+  intercept it.
+  **Judging the file at construction is only half of it, because conf does not fail for a root it can
+  coerce.** Its getter is `Object.assign({}, parsed)`, so a `config.json` replaced with `[1,2,3]`, `null`, a
+  bare string or a number *after* a clean boot comes back as a property bag with every schema key simply
+  absent — no error at all. `readRawFresh`'s fallback to `backend.get` therefore saw a healthy store, the
+  write gate passed, and the next `set()` rewrote the file from defaults: issue #67 again on the far side
+  of boot, measured for all four shapes. So `openGuardedStoreFile` also *supplies* `getFresh` from
+  `loadStoredFileStrict(filePath)` rather than letting the backend's own read stand in for it. A backend
+  opened from a path gets the path's rules, not the library's. Never hand a file-backed backend to
+  `createGuardedStore` directly — that is what loses this.
+  **A pre-check cannot cover a backend that reads again, so conf is given the rule itself.** Two intervals
+  sit past the check, and both were measured destroying the file or leaking on the real library. A
+  replacement landing between `loadStoredFileStrict()` and `new Store(...)` was coerced and written back
+  from conf's constructor with no exception — the `try` never fired, and a `getFresh` installed afterwards
+  cannot recover bytes already gone. And conf's `set()` re-reads to merge *after* the write gate's own
+  fresh read, so a replacement at that moment surfaced as V8's error, quoting the file. Narrowing those
+  windows is not a fix; `electron/store.ts` therefore passes `deserialize: createStoredFileParser(configPath)`
+  so the root-shape rule applies to the bytes **conf itself** parses — in its constructor, on every later
+  read, and on the merge inside a write. There is then no read of the backend's own that escapes the rule.
+  The write path also converts through `withoutStoredBytes`, which is deliberately narrower than
+  `asUnreadableStoreError`: only a parse failure can carry the file's bytes, and relabelling an errno
+  write failure as "could not be read" would send an operator after the wrong thing.
+  **No backend's own read error may reach a caller.** conf re-reads and re-parses on every `get`, so an
+  ordinary read can fail, and its error is V8's — which quotes the file. `get()` and `problems()` convert
+  through `asUnreadableStoreError`, and `problems()` keeps the probe *and* the per-field rules inside one
+  boundary, because `describeStoredProblems` reads every guarded field and each of those is another parse.
+  Converted, never swallowed: answering schema defaults for a file MAO could not read is the silence #67
+  was about, and the write gate already stops anything persisting over it.
+  Still open, tracked as **issue #91**: this throws at module load, and `electron/main.ts` reaches it
+  through `electron/ipc.ts`, so the app exits before a window exists and the operator sees **no dialog**.
+  The bytes survive. Do not repeat the claim that `mao config show` is the recovery path without checking
+  it — `build.files` ships no `dist-cli`, and Electron's `userData` uses `productName` (`MAO`) while the
+  CLI resolves `defaultDataDir('mao')`, which are different paths on a case-sensitive filesystem.
 - **Repository identity is case-insensitive, and the list is canonicalised before it is stored**:
   GitHub resolves owner/repo without regard to case, so `sameRepoRef()`/`repoRefKey()` lower-case
   both halves — otherwise `mao repos add DragonCowKarma MAO` registered a *second* entry for an

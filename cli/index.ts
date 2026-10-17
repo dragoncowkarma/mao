@@ -201,7 +201,10 @@ repos
     else for (const r of tracked) log(`Stopped tracking ${r.owner}/${r.repo}`)
     // A removal against an unusable stored value matches nothing, so `No tracked repo matches …` was all
     // it said — while the write it had just performed was the recovery the store's own report told the
-    // operator to run. Left there, the one command that always heals reads like a no-op.
+    // operator to run. Left there, the command that heals a wrong-shaped *field* reads like a no-op.
+    // It heals only a file that LOADED: when the file itself could not be read, the write is refused
+    // before it happens (issue #67), this command exits non-zero with that report, and nothing below
+    // runs — which is the point, because the write would have destroyed the token along with the list.
     const remaining = store.problems()
     for (const before of problemsBefore) {
       if (!remaining.some((problem) => problem.field === before.field)) {

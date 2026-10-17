@@ -1,9 +1,14 @@
 import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
-import Sidebar from './Sidebar'
-import { describeUnusableTaskQueue, type StoredValueProblem } from '../../core/store'
-import type { QueueRecoveryState } from '../../core/workflow-engine'
+import Sidebar, { type RepoListResetOutcome } from './Sidebar'
+import {
+  describeUnusableRepoList,
+  describeUnusableTaskQueue,
+  type StoredValueProblem,
+} from '../../core/store'
+import type { QueueRecoveryState, RepoRef } from '../../core/workflow-engine'
+import { storedValueProblem } from '../test/store-problem'
 
 /**
  * Sidebar on its own, driven by props.
@@ -22,11 +27,33 @@ import type { QueueRecoveryState } from '../../core/workflow-engine'
  * found after a clean start, so rendering it there contradicted the card's own next sentence. Importing
  * the describer means the test keeps checking the words that actually ship.
  */
-const UNUSABLE_QUEUE: StoredValueProblem = {
-  field: 'workflowTasks',
-  source: '/data/config.json',
-  message: describeUnusableTaskQueue({ 'task-1': {} }, '/data/config.json')!,
-}
+const UNUSABLE_QUEUE = storedValueProblem(
+  'workflowTasks',
+  'value',
+  describeUnusableTaskQueue({ 'task-1': {} }, '/data/config.json')!,
+)
+
+const WIDGETS: RepoRef = { owner: 'acme', repo: 'widgets' }
+
+/**
+ * A stored repository list with nothing usable in it, and one with some usable entries — the pair the
+ * reset has to tell apart (issue #72).
+ *
+ * Built from core's own describer, like `UNUSABLE_QUEUE` above and for the same reason, but nothing here
+ * asserts on the wording: which words ship is `core/store.test.ts`'s business, and what this file states
+ * is a decision about two props.
+ */
+const NOTHING_USABLE_REPO_LIST = storedValueProblem(
+  'githubRepos',
+  'every-entry',
+  describeUnusableRepoList([null], '/data/config.json')!,
+)
+
+const PARTLY_USABLE_REPO_LIST = storedValueProblem(
+  'githubRepos',
+  'some-entries',
+  describeUnusableRepoList([WIDGETS, null], '/data/config.json')!,
+)
 
 const HALTED: QueueRecoveryState = { required: true, reason: UNUSABLE_QUEUE.message }
 
@@ -39,7 +66,7 @@ function renderSidebar(overrides: Partial<Parameters<typeof Sidebar>[0]> = {}) {
     onSelect: vi.fn(),
     onAddRepo: vi.fn(async () => []),
     storeProblems: [] as StoredValueProblem[],
-    onResetRepoList: vi.fn(async () => {}),
+    onResetRepoList: vi.fn(async (): Promise<RepoListResetOutcome> => 'replaced'),
     queueRecovery: { required: false, reason: undefined } as QueueRecoveryState,
     queueStoredStillUnreadable: false,
     onRecoverQueue,
@@ -48,8 +75,14 @@ function renderSidebar(overrides: Partial<Parameters<typeof Sidebar>[0]> = {}) {
     onViewChange: vi.fn(),
     ...overrides,
   }
-  render(<Sidebar {...props} />)
-  return { onRecoverQueue, onResaveQueue, user: userEvent.setup() }
+  const { rerender } = render(<Sidebar {...props} />)
+  return {
+    onRecoverQueue,
+    onResaveQueue,
+    onResetRepoList: props.onResetRepoList,
+    user: userEvent.setup(),
+    rerender: (next: Partial<Parameters<typeof Sidebar>[0]> = {}) => rerender(<Sidebar {...props} {...next} />),
+  }
 }
 
 describe('Sidebar queue recovery', () => {
@@ -99,11 +132,11 @@ describe('Sidebar queue recovery', () => {
   })
 
   it('still shows another field report alongside the queue card', () => {
-    const providers: StoredValueProblem = {
-      field: 'aiProviders',
-      source: '/data/config.json',
-      message: '[store] "aiProviders" in /data/config.json is an object.',
-    }
+    const providers = storedValueProblem(
+      'aiProviders',
+      'value',
+      '[store] "aiProviders" in /data/config.json is an object.',
+    )
     renderSidebar({
       queueRecovery: HALTED,
       queueStoredStillUnreadable: true,
@@ -113,6 +146,85 @@ describe('Sidebar queue recovery', () => {
     expect(screen.getByText('Workflow automation is halted')).toBeInTheDocument()
     expect(screen.getByText('Stored settings could not be read')).toBeInTheDocument()
     expect(screen.getByText(providers.message)).toBeInTheDocument()
+  })
+
+  it('withholds the repo-list reset when some of the stored list is still usable', () => {
+    // Issue #72's destructive edge. The button writes an *empty* list, which is lossless only while the
+    // store holds nothing a caller could have used. With some entries usable the rows below are real:
+    // the operator can select one, reach the Settings tab and remove it one at a time — so a one-click
+    // "reset" there deletes repositories they can see working, to fix entries they were only being told
+    // about.
+    renderSidebar({ repos: [WIDGETS], storeProblems: [PARTLY_USABLE_REPO_LIST] })
+
+    expect(screen.getByText('Stored settings could not be read')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Reset stored list' })).toBeNull()
+  })
+
+  it('still offers it when nothing in the stored list is usable', () => {
+    // The control for the test above, and it is only that: today's gate would pass this either way. It
+    // is here because without it a gate that hid the button in *both* states would look correct.
+    renderSidebar({ repos: [], storeProblems: [NOTHING_USABLE_REPO_LIST] })
+
+    expect(screen.getByRole('button', { name: 'Reset stored list' })).toBeInTheDocument()
+  })
+
+  it('still shows a partly usable list report, even with no action to offer', () => {
+    // The plausible wrong fix for the test above — filtering a report nothing can act on out of the card
+    // — would restore the silence issue #72 is actually about. The entries are one list write from being
+    // deleted, and this paragraph is the only warning the operator gets.
+    renderSidebar({ repos: [WIDGETS], storeProblems: [PARTLY_USABLE_REPO_LIST] })
+
+    expect(screen.getByText(PARTLY_USABLE_REPO_LIST.message)).toBeInTheDocument()
+  })
+
+  it('says a confirmed reset wrote nothing, and keeps saying it after the card goes', async () => {
+    // AGENTS.md: an action's result must outlive the condition it reports on. `already-readable` means
+    // the file is genuinely repaired, so the refresh that follows empties the problem list and unmounts
+    // the card — and a sentence rendered inside it would vanish with the thing it was explaining,
+    // leaving a confirmed destructive click that looked like it had done nothing at all.
+    const onResetRepoList = vi.fn(async (): Promise<RepoListResetOutcome> => 'already-readable')
+    const { user, rerender } = renderSidebar({
+      storeProblems: [NOTHING_USABLE_REPO_LIST],
+      onResetRepoList,
+    })
+
+    await user.click(screen.getByRole('button', { name: 'Reset stored list' }))
+    await user.click(screen.getByRole('button', { name: 'Confirm reset' }))
+
+    expect(onResetRepoList).toHaveBeenCalledTimes(1)
+    expect(await screen.findByText(/Nothing was written/)).toBeInTheDocument()
+
+    rerender({ storeProblems: [] })
+
+    expect(screen.getByText(/Nothing was written/)).toBeInTheDocument()
+    expect(screen.queryByText('Stored settings could not be read')).toBeNull()
+  })
+
+  it('says which no-write case it was, because they ask different things of the operator', async () => {
+    const onResetRepoList = vi.fn(async (): Promise<RepoListResetOutcome> => 'partly-usable')
+    const { user } = renderSidebar({
+      repos: [WIDGETS],
+      storeProblems: [NOTHING_USABLE_REPO_LIST],
+      onResetRepoList,
+    })
+
+    await user.click(screen.getByRole('button', { name: 'Reset stored list' }))
+    await user.click(screen.getByRole('button', { name: 'Confirm reset' }))
+
+    // Named specifically: this one says entries turned out to name repositories and a whole-list
+    // write would have deleted them, which "the list reads normally again" would not have told them.
+    expect(await screen.findByText(/would have deleted them/)).toBeInTheDocument()
+  })
+
+  it('says nothing at all when the reset did write', async () => {
+    // The replacement proves itself: the report goes, the rows go, the empty state appears. A notice
+    // there would be noise, and the two cases have to stay distinguishable.
+    const { user } = renderSidebar({ storeProblems: [NOTHING_USABLE_REPO_LIST] })
+
+    await user.click(screen.getByRole('button', { name: 'Reset stored list' }))
+    await user.click(screen.getByRole('button', { name: 'Confirm reset' }))
+
+    expect(screen.queryByText(/Nothing was written/)).toBeNull()
   })
 
   it('offers the repo-list reset only for a githubRepos report, never for the queue', () => {

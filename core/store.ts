@@ -250,13 +250,48 @@ function describeStoredType(value: unknown): string {
 }
 
 /**
- * The actionable report for a stored `githubRepos` that is not a list — or `null` when it is one and
- * there is nothing to report.
+ * The distinct *types* of the entries a predicate rejected, in the order they were first met.
+ *
+ * Types, never values, and this is the field whose entries most invite the opposite: a half-written
+ * `{"owner":"acme"}` is the likeliest hand-edit and naming it would genuinely help. But `config.json`
+ * holds `githubToken` in plaintext, a malformed entry is exactly the edit that can leave a fragment of
+ * a neighbouring key inside it, and this text travels into piped CLI output, agent logs, an IPC payload
+ * and a window an operator may be screen-sharing. The *count* is the fact that cannot be recovered
+ * anywhere else — the sidebar and `github:getRepos` show only the survivors, so nothing else says
+ * whether one entry or twelve are about to be overwritten.
+ */
+function describeInvalidEntryTypes(value: unknown[], usableEntry: (entry: unknown) => boolean): string {
+  const types: string[] = []
+  for (let index = 0; index < value.length; index += 1) {
+    if (usableEntry(value[index])) continue
+    const type = describeStoredType(value[index])
+    if (!types.includes(type)) types.push(type)
+  }
+  return types.join(', ')
+}
+
+/**
+ * The actionable report for a stored `githubRepos` the schema cannot fully use — a value that is not a
+ * list, or a list holding entries that cannot name a repository — or `null` when every entry is usable.
  *
  * Names the field, what the file actually holds, and the file itself, because none of those were
  * recoverable from what the operator used to get (`store.get(...).filter is not a function`). It also
  * states the recovery explicitly: the unusable value stays on disk, so the next list write is what
  * replaces it, and anything the operator wants to salvage has to be copied out first.
+ *
+ * **Entry-level reports say something different, and the difference is the point of issue #72.** PR #57
+ * made individual entries *safe* — `canonicalRepoList()` and `github:getRepos` drop whatever `isRepoRef`
+ * rejects — and that drop was completely silent. A `config.json` holding `[null]`, a half-written
+ * `[{"owner":"acme"}]` or a bare `["acme/widgets"]` reached the renderer as `[]` and read as *"No
+ * projects yet"*, character-for-character what a genuinely empty list shows; a mixed list showed its
+ * survivors and said nothing about the rest; and the next list write erased them from the file for good.
+ * So an array is reported too, and in two voices, because the safe recovery is not the same one:
+ *
+ * - **Nothing usable** — the sidebar has no row, so the whole-list recovery is lossless and is named
+ *   here exactly as it is for a wrong container.
+ * - **Some usable** — the sidebar has rows, Remove is reachable, and a whole-list reset would delete
+ *   repositories the operator can see working. So this one names neither it nor any write: it says the
+ *   entries are still on disk and that the next repository-list write is what destroys them.
  *
  * The recovery it names first registers nothing, and that ordering is load-bearing. Any list write heals
  * the file, but only a write that registers nothing new is exempt from the write-permission preflight
@@ -266,20 +301,67 @@ function describeStoredType(value: unknown): string {
  * remove` heals regardless. Recommending the blockable path first would send an operator whose token is
  * the reason they were editing `config.json` straight back into the wall.
  *
- * It names the GUI's **Reset stored list**, not its Remove, for a reason that is easy to get wrong: an
- * unusable list leaves the sidebar with no row, so no project is selected, so the Settings tab and the
- * Remove button inside it never render. Naming an action the operator cannot reach is worse than naming
- * none. Reset is the sidebar control this report itself is shown next to, and it writes an empty list.
+ * Where it names the GUI's **Reset stored list**, it names that and not Remove, for a reason that is
+ * easy to get wrong: a list with nothing usable in it leaves the sidebar with no row, so no project is
+ * selected, so the Settings tab and the Remove button inside it never render. Naming an action the
+ * operator cannot reach is worse than naming none. Reset is the sidebar control this report is shown
+ * next to, and it writes an empty list — which is exactly why the mixed report must not name it, and why
+ * the sidebar withholds it there (`StoredValueProblem.nothingUsable`).
  */
 export function describeUnusableRepoList(value: unknown, source: string): string | null {
-  if (Array.isArray(value)) return null
+  const defect = storedValueDefect(value, isRepoRef)
+  return defect === null ? null : reportUnusableRepoList(value, source, defect)
+}
+
+/**
+ * The report for a `githubRepos` already classified as defective.
+ *
+ * Total — it never answers "nothing to report" — and that is the point of the split. A describer that
+ * decided *whether* there was a problem on its own was a second classification of the same fact, and
+ * `storedValueProblem()` had to reconcile the two; the only answer available there was to treat a
+ * disagreement as silence, which for `workflowTasks` would have lowered the queue-recovery latch. One
+ * classifier, three total reports, nothing to reconcile.
+ */
+function reportUnusableRepoList(value: unknown, source: string, defect: StoredValueDefect): string {
+  if (defect === 'value') {
+    return (
+      `[store] "githubRepos" in ${source} is ${describeStoredType(value)}, not a JSON array of ` +
+      '{ owner, repo } entries — ignoring it, so no repositories are tracked until it is replaced. The ' +
+      'unusable value is still in the file; any repository-list write overwrites it. `mao repos remove ' +
+      "<owner> <repo>`, or the sidebar's Reset stored list, always works — neither registers anything, so " +
+      'neither is checked for write access. `mao repos add` and the sidebar\'s Add are, so they need a ' +
+      `working GitHub token. Copy any repositories you still need out of ${source} first.`
+    )
+  }
+  const entries = value as unknown[]
+  const invalid = countInvalidEntries(entries, isRepoRef)
+  // One count sentence for both cases, so neither can end up vaguer than the other, and phrased so it
+  // reads correctly for a single entry as well ("1 entry of 1 does not name a repository").
+  const counted =
+    `[store] "githubRepos" in ${source} is a JSON array in which ` +
+    `${countPhrase(invalid, 'entry', 'entries')} of ${entries.length} ` +
+    `${invalid === 1 ? 'does' : 'do'} not name a repository ` +
+    `({ owner, repo }, both non-empty): ${describeInvalidEntryTypes(entries, isRepoRef)}. ` +
+    'No stored value is shown in this report. '
+  if (defect === 'every-entry') {
+    return (
+      counted +
+      `Ignoring ${invalid === 1 ? 'it' : 'them'}, so no repositories are tracked until the list is ` +
+      'replaced. The unusable entries are still in the file; any repository-list write drops them. ' +
+      "`mao repos remove <owner> <repo>`, or the sidebar's Reset stored list, always works — neither " +
+      'registers anything, so neither is checked for write access. `mao repos add` and the sidebar\'s ' +
+      `Add are, so they need a working GitHub token. Copy any repositories you still need out of ${source} ` +
+      'first.'
+    )
+  }
   return (
-    `[store] "githubRepos" in ${source} is ${describeStoredType(value)}, not a JSON array of ` +
-    '{ owner, repo } entries — ignoring it, so no repositories are tracked until it is replaced. The ' +
-    'unusable value is still in the file; any repository-list write overwrites it. `mao repos remove ' +
-    "<owner> <repo>`, or the sidebar's Reset stored list, always works — neither registers anything, so " +
-    'neither is checked for write access. `mao repos add` and the sidebar\'s Add are, so they need a ' +
-    `working GitHub token. Copy any repositories you still need out of ${source} first.`
+    counted +
+    `Ignoring ${invalid === 1 ? 'it' : 'them'} and tracking the ` +
+    `${countPhrase(entries.length - invalid, 'readable repository', 'readable repositories')} normally. ` +
+    `${invalid === 1 ? 'That entry is' : 'Those entries are'} still in ${source}, and the next ` +
+    "repository-list write — adding or removing a repository, or editing one's settings — drops " +
+    `${invalid === 1 ? 'it' : 'them'} for good, so copy out anything you need first. Replacing the whole ` +
+    'list is deliberately not offered here: it would delete the repositories that still work.'
   )
 }
 
@@ -310,10 +392,16 @@ function countPhrase(count: number, singular: string, plural = `${singular}s`): 
  * import-providers` and the GUI's Global settings pane are both reachable without one.
  */
 export function describeUnusableProviderList(value: unknown, source: string): string | null {
-  if (Array.isArray(value)) {
-    const invalid = countInvalidEntries(value, isAiProviderConfig)
-    if (invalid === 0) return null
-    const valid = value.length - invalid
+  const defect = storedValueDefect(value, isAiProviderConfig)
+  return defect === null ? null : reportUnusableProviderList(value, source, defect)
+}
+
+/** The report for an `aiProviders` already classified as defective. See `reportUnusableRepoList`. */
+function reportUnusableProviderList(value: unknown, source: string, defect: StoredValueDefect): string {
+  if (defect !== 'value') {
+    const entries = value as unknown[]
+    const invalid = countInvalidEntries(entries, isAiProviderConfig)
+    const valid = entries.length - invalid
     const invalidCount = countPhrase(invalid, 'invalid entry', 'invalid entries')
     const invalidSubject = invalid === 1 ? 'The invalid entry is' : 'The invalid entries are'
     const routingConsequence =
@@ -325,7 +413,7 @@ export function describeUnusableProviderList(value: unknown, source: string): st
           : ''
     return (
       `[store] "aiProviders" in ${source} contains ${invalidCount} out of ` +
-      `${value.length} — ignoring ${invalid === 1 ? 'it' : 'them'} in memory and keeping ` +
+      `${entries.length} — ignoring ${invalid === 1 ? 'it' : 'them'} in memory and keeping ` +
       `${countPhrase(valid, 'valid provider')}. No stored value, token or API key is shown in this ` +
       `report. ${routingConsequence}${invalidSubject} still in the file. The GUI's Global ` +
       'settings pane refuses to save its filtered view while this problem remains, because doing so ' +
@@ -370,14 +458,20 @@ export function describeUnusableProviderList(value: unknown, source: string): st
  * destruction this latch exists to prevent.
  */
 export function describeUnusableTaskQueue(value: unknown, source: string): string | null {
-  if (Array.isArray(value)) {
-    const invalid = countInvalidEntries(value, isRestorableQueuedTask)
-    if (invalid === 0) return null
-    const valid = value.length - invalid
+  const defect = storedValueDefect(value, isRestorableQueuedTask)
+  return defect === null ? null : reportUnusableTaskQueue(value, source, defect)
+}
+
+/** The report for a `workflowTasks` already classified as defective. See `reportUnusableRepoList`. */
+function reportUnusableTaskQueue(value: unknown, source: string, defect: StoredValueDefect): string {
+  if (defect !== 'value') {
+    const entries = value as unknown[]
+    const invalid = countInvalidEntries(entries, isRestorableQueuedTask)
+    const valid = entries.length - invalid
     const invalidSubject = invalid === 1 ? 'The invalid entry is' : 'The invalid entries are'
     return (
       `[store] "workflowTasks" in ${source} contains ${countPhrase(invalid, 'invalid queued task')} ` +
-      `out of ${value.length} — ignoring ${invalid === 1 ? 'it' : 'them'} in memory, preserving ` +
+      `out of ${entries.length} — ignoring ${invalid === 1 ? 'it' : 'them'} in memory, preserving ` +
       `${countPhrase(valid, 'readable task')}, and halting unattended work: auto-resume, auto-trigger ` +
       'polling and every queue write are refused until this is resolved. No stored task, prompt, token ' +
       'or API key is shown in this report. A discarded durable task may represent GitHub work MAO can ' +
@@ -404,13 +498,61 @@ export function describeUnusableTaskQueue(value: unknown, source: string): strin
   )
 }
 
-type StoredShapeRule<K extends keyof MaoStoreSchema> = (raw: MaoStoreSchema[K], source: string) => string | null
+/**
+ * Which part of a stored value the schema cannot use.
+ *
+ * Three states rather than a message-or-nothing, because both the correction and the safe recovery
+ * differ between them and getting either wrong is destructive in its own direction. A value whose own
+ * *type* is wrong holds no entries, so it becomes the schema default and replacing it loses nothing. An
+ * array whose entries are not all usable keeps the usable ones — substituting the default there would
+ * hide the repositories the operator can see working, and offering to replace the whole value would
+ * delete them.
+ */
+export type StoredValueDefect =
+  /** Not the array the schema declares — an object, a string, `null`. */
+  | 'value'
+  /** An array, and no entry in it is usable. */
+  | 'every-entry'
+  /** An array in which some entries are usable and others are not. */
+  | 'some-entries'
 
 /**
- * The registry of fields whose stored *shape* is validated and the report for each, so the guard and
- * `describeStoredProblems()` cannot disagree about which fields are covered. Element filtering and
- * strict prospective-write predicates remain field-specific below because read migration and current
- * write shape intentionally differ for `workflowTasks`.
+ * Everything field-specific about a guarded field, in one place per field.
+ *
+ * `usableEntry` classifies, `report` words the result and `readEntries` corrects it — one classification
+ * feeding all three, so "the guard substituted a value it said nothing about" is not a reachable state
+ * rather than a tested-against one.
+ */
+interface StoredShapeRule<K extends keyof MaoStoreSchema> {
+  /** Whether one entry of the stored array is safe to hand to every reader of this field. */
+  usableEntry: (entry: unknown) => boolean
+  /**
+   * The operator-facing report for a value `usableEntry` has already classified as defective.
+   *
+   * Total, and it takes the defect rather than deciding one: a report that classified independently was
+   * a second answer to the same question, and the reconciliation had nowhere safe to go — treating a
+   * disagreement as silence would have lowered the `workflowTasks` latch (`MaoStore.inspect()` feeds it),
+   * while throwing would have put a crash on the read path the guard exists to keep crash-free.
+   */
+  report: (raw: MaoStoreSchema[K], source: string, defect: StoredValueDefect) => string
+  /**
+   * The in-memory view of a stored *array* for this field, applied whether or not it has a defect.
+   *
+   * Not conditional on the defect, which is the trap: `workflowTasks` normalizes as well as filters
+   * (`normalizeRestorableTask` strips registry settings an older build snapshotted into `repo` and
+   * migrates a missing `autoAdvance`), and a queue whose entries are all structurally valid has no
+   * defect — so keying this on one would quietly stop normalizing exactly the healthy queues.
+   */
+  readEntries: (raw: unknown[]) => MaoStoreSchema[K]
+}
+
+/**
+ * The registry of fields whose stored *shape* is validated, so the guard, `describeStoredProblems()`
+ * and the in-memory correction cannot disagree about which fields are covered or about what is wrong
+ * with one. The strict prospective-**write** predicates stay separate (`describeInvalidStoredWrite`) and
+ * deliberately cover two of these three fields: read migration and current write shape differ for
+ * `workflowTasks`, and rejecting a `githubRepos` entry on write would make the store an older build
+ * produced unrecoverable through the only API that can replace it.
  *
  * A table rather than a predicate over every schema key, because `describeStoredProblems()` iterates it
  * to decide what to *read*: electron-store re-reads and re-parses the whole config file on every `get`,
@@ -422,41 +564,82 @@ type StoredShapeRule<K extends keyof MaoStoreSchema> = (raw: MaoStoreSchema[K], 
  * to `MAX_FINISHED_TASKS` finished tasks with their full prompts and AI output.
  */
 const STORED_SHAPE_RULES: { [K in keyof MaoStoreSchema]?: StoredShapeRule<K> } = {
-  githubRepos: (raw, source) => describeUnusableRepoList(raw, source),
-  aiProviders: (raw, source) => describeUnusableProviderList(raw, source),
-  workflowTasks: (raw, source) => describeUnusableTaskQueue(raw, source),
+  githubRepos: {
+    // Identity only — `owner` and `repo`, exactly what `canonicalRepoList` drops an entry for. The
+    // report and the drop have to use one predicate or the message describes a different set of entries
+    // than the next write removes, and a report for something no write clears would never go away. The
+    // cost is that this row deliberately checks less than its siblings: a junk `autoTrigger` or
+    // `pollIntervalMs` on an otherwise valid entry is counted among the "readable repositories", and
+    // `core/auto-trigger.ts` reads those two without validating them either. That settings half is a
+    // separate fault with a separate owner and is not reported here.
+    usableEntry: isRepoRef,
+    report: (raw, source, defect) => reportUnusableRepoList(raw, source, defect),
+    // Copied, but not filtered — the deliberate difference from the two fields below, and a `githubRepos`
+    // array therefore reaches every reader exactly as stored however damaged it is. Dropping an entry
+    // that cannot name a repository stays `isRepoRef`/`canonicalRepoList`'s single responsibility, and
+    // `mao repos list` is the one listing that still shows what is about to be dropped — the sidebar and
+    // `github:getRepos` show only the survivors, so filtering here would take the operator's salvage copy
+    // away. (Filtering would be *safe*: `canonicalRepoList` builds its result from entries it accepts and
+    // `github:getRepos` filters for the renderer on its own behalf. It simply would not help, and it would
+    // cost the one thing the report tells the operator to go and read.) Substituting the schema default,
+    // the other tempting correction, would hide the repositories that still work.
+    //
+    // `Array.from` rather than the stored array itself: `FileStore`'s backend answers `get` with its own
+    // snapshot object, so handing it out would let a caller that pushes into what it read mutate the
+    // store's in-memory list — and `persist()` writes that list wholesale on the next `set` of any key.
+    // That is the bug the cloned schema default exists to prevent, one level down.
+    readEntries: (raw) => Array.from(raw) as RepoRef[],
+  },
+  aiProviders: {
+    usableEntry: isAiProviderConfig,
+    report: (raw, source, defect) => reportUnusableProviderList(raw, source, defect),
+    readEntries: (raw) => Array.from(raw).filter(isAiProviderConfig),
+  },
+  workflowTasks: {
+    usableEntry: isRestorableQueuedTask,
+    report: (raw, source, defect) => reportUnusableTaskQueue(raw, source, defect),
+    readEntries: (raw) => Array.from(raw).filter(isRestorableQueuedTask).map(normalizeRestorableTask),
+  },
 }
 
-function unusableStoredValue<K extends keyof MaoStoreSchema>(
-  key: K,
-  raw: MaoStoreSchema[K],
-  source: string,
-): string | null {
-  const rule = STORED_SHAPE_RULES[key] as StoredShapeRule<K> | undefined
-  return rule ? rule(raw, source) : null
+function storedShapeRule<K extends keyof MaoStoreSchema>(key: K): StoredShapeRule<K> | undefined {
+  return STORED_SHAPE_RULES[key] as StoredShapeRule<K> | undefined
 }
 
 /**
- * The safe in-memory view of a value for which `unusableStoredValue()` returned a problem.
+ * Which defect a raw stored value has, by the field's own entry predicate — or `null` when every entry
+ * is usable.
  *
- * A wrong container has no readable entries, so it still becomes the cloned schema default. For the
- * two issue #75 lists, however, a mixed array is not all-or-nothing: keep each entry whose complete
- * declared shape is safe and leave the invalid entries only on disk until an explicit list write.
+ * An empty array is not a defect: it is what the schema default *is*. A non-empty array in which every
+ * entry is unusable is `'every-entry'` rather than `'value'`, because the two have different recoveries
+ * (see `StoredValueDefect`) even though both leave nothing to keep.
  */
-function usableStoredValue<K extends keyof MaoStoreSchema>(
-  key: K,
-  raw: MaoStoreSchema[K],
-  problem: string | null,
-): MaoStoreSchema[K] {
-  if (key === 'aiProviders' && Array.isArray(raw)) {
-    return Array.from(raw as unknown[]).filter(isAiProviderConfig) as MaoStoreSchema[K]
-  }
-  if (key === 'workflowTasks' && Array.isArray(raw)) {
-    return Array.from(raw as unknown[])
-      .filter(isRestorableQueuedTask)
-      .map(normalizeRestorableTask) as MaoStoreSchema[K]
-  }
-  return problem === null ? raw : structuredClone(MAO_STORE_DEFAULTS[key])
+function storedValueDefect(
+  raw: unknown,
+  usableEntry: (entry: unknown) => boolean,
+): StoredValueDefect | null {
+  if (!Array.isArray(raw)) return 'value'
+  const invalid = countInvalidEntries(raw, usableEntry)
+  if (invalid === 0) return null
+  return invalid === raw.length ? 'every-entry' : 'some-entries'
+}
+
+/**
+ * The safe in-memory view of a raw stored value.
+ *
+ * A value whose own type is wrong has no readable entries, so it becomes the schema default — *cloned*,
+ * because returning the shared `MAO_STORE_DEFAULTS` instance would let one caller that pushes into what
+ * it read poison every later read in the process. An array goes through the field's own `readEntries`:
+ * the two issue #75 lists keep each entry whose complete declared shape is safe and leave the invalid
+ * entries only on disk until an explicit list write, while a `githubRepos` array is handed through as
+ * stored — copied, never aliased (see the table above for why that is not an inconsistency but the
+ * point).
+ */
+function usableStoredValue<K extends keyof MaoStoreSchema>(key: K, raw: MaoStoreSchema[K]): MaoStoreSchema[K] {
+  const rule = storedShapeRule(key)
+  if (rule === undefined) return raw
+  if (!Array.isArray(raw)) return structuredClone(MAO_STORE_DEFAULTS[key])
+  return rule.readEntries(raw as unknown[])
 }
 
 /**
@@ -507,6 +690,66 @@ export interface StoredValueProblem {
   source: string
   /** The operator-facing report: the field, the value's actual type, the file, and the way back. */
   message: string
+  /**
+   * Which part of the stored value the schema cannot use (see `StoredValueDefect`). Decides what the
+   * guard substituted, and therefore what a healing write actually did — see
+   * `describeHealedStoredValue()`.
+   */
+  defect: StoredValueDefect
+  /**
+   * Whether nothing in the stored value survived, so replacing the whole value loses nothing a caller
+   * could have used.
+   *
+   * Flattened out of `defect` here rather than derived by the consumer, because the consumer is a
+   * *destructive* control — the sidebar's "Reset stored list", which writes an empty list — and the
+   * direction a stale derivation fails in is *offering* it. A renderer could legally write
+   * `defect !== 'some-entries'`: it is a comparison against a literal, no value import, so nothing in
+   * `src/` or in the renderer-isolation test would stop it (and AGENTS.md rule 6 only stops it importing
+   * the *function* that decides). That is exactly why the answer is computed here. Add a fourth defect
+   * kind and a renderer that has never heard of it still withholds the reset, instead of offering a
+   * one-click deletion of every repository the operator can see working.
+   */
+  nothingUsable: boolean
+}
+
+/**
+ * The complete report for one field's raw stored value, or `null` when the schema can use all of it.
+ *
+ * The single answer to "is there a problem here" in this module: the guard warns from it, `problems()`
+ * lists it, and `inspect()` — whose answer raises the queue-recovery latch in `core/app.ts` — carries its
+ * message. One classification by construction, so there is no disagreement to resolve and therefore no
+ * way for an internal inconsistency to read as a healthy queue.
+ */
+function storedValueProblem<K extends keyof MaoStoreSchema>(
+  field: K,
+  raw: MaoStoreSchema[K],
+  source: string,
+): StoredValueProblem | null {
+  const rule = storedShapeRule(field)
+  if (rule === undefined) return null
+  const defect = storedValueDefect(raw, rule.usableEntry)
+  if (defect === null) return null
+  const message = rule.report(raw, source, defect)
+  return { field, source, message, defect, nothingUsable: defect !== 'some-entries' }
+}
+
+/**
+ * What a write that healed a reported field actually did, for the one shell that can say so afterwards.
+ *
+ * `mao repos remove`'s postscript exists because the command that always heals otherwise prints only
+ * `No tracked repo matches …` and reads like a no-op. It said "Replaced the unusable value" for every
+ * kind of problem — true for a wrong container, and false for an array whose usable entries the write
+ * *kept*: an operator told their value had been replaced would reasonably believe their tracked
+ * repositories were gone. The count belongs to the report that preceded this, not here.
+ */
+export function describeHealedStoredValue(problem: StoredValueProblem): string {
+  if (problem.defect === 'value') {
+    return `Replaced the unusable "${problem.field}" value in ${problem.source}.`
+  }
+  if (problem.defect === 'every-entry') {
+    return `Dropped the unusable "${problem.field}" entries from ${problem.source}.`
+  }
+  return `Dropped the unusable "${problem.field}" entries from ${problem.source}, keeping the readable ones.`
 }
 
 /**
@@ -528,8 +771,8 @@ export function describeStoredProblems(
 ): StoredValueProblem[] {
   const problems: StoredValueProblem[] = []
   for (const field of Object.keys(STORED_SHAPE_RULES) as Array<keyof MaoStoreSchema>) {
-    const message = unusableStoredValue(field, readRaw(field), source)
-    if (message !== null) problems.push({ field, source, message })
+    const problem = storedValueProblem(field, readRaw(field), source)
+    if (problem !== null) problems.push(problem)
   }
   return problems
 }
@@ -651,21 +894,30 @@ export type StoredReadGuard = <K extends keyof MaoStoreSchema>(key: K, raw: MaoS
  * too: that is the point of the rule living here rather than at the read sites, which are scattered
  * across `core/`, `cli/` and `electron/` and would each have to remember it.
  *
- * All three array-typed fields are guarded, and the question `workflowTasks` raised is answered rather
- * than deferred: a queue MAO cannot fully read halts unattended automation (see
- * `describeUnusableTaskQueue()` and `WorkflowEngine.requireQueueRecovery()`), because carrying on with
- * a corrected subset lets the immediate first auto-trigger poll overwrite the unusable durable entries
- * and start a pipeline. `aiProviders` is filtered and reported but deliberately halts nothing. Adding a
- * field here means answering the same question for it: what does the fallback value cost, which write
- * heals it, and does losing data let unattended work start against state MAO can no longer account for?
+ * All three array-typed fields are guarded at both the container and the entry level, and the question
+ * `workflowTasks` raised is answered rather than deferred: a queue MAO cannot fully read halts
+ * unattended automation (see `describeUnusableTaskQueue()` and `WorkflowEngine.requireQueueRecovery()`),
+ * because carrying on with a corrected subset lets the immediate first auto-trigger poll overwrite the
+ * unusable durable entries and start a pipeline. `aiProviders` is filtered and reported but deliberately
+ * halts nothing. Adding a field here means answering the same question for it: what does the fallback
+ * value cost, which write heals it, and does losing data let unattended work start against state MAO can
+ * no longer account for?
+ *
+ * Reporting and correcting are **not** the same scope, and `githubRepos` is the reason the distinction
+ * is written down. Its entries are reported here (issue #72) and corrected nowhere:
+ * `isRepoRef`/`canonicalRepoList` own dropping them, the file keeps them until an explicit list write,
+ * and the report is what stops that write being the operator's first news of it. A field may therefore
+ * be reported more than it is corrected — never the reverse.
  *
  * What this guard does **not** cover, so the halt is not read as more than it is: most fields in a
  * `config.json` that is not valid JSON at all still read as their schema defaults because
  * `FileStore.load()` swallows the parse error (issue #67; the fresh queue observation itself fails
- * closed). `githubRepos` entry validity remains `isRepoRef`/`canonicalRepoList`'s policy (#72).
- * `aiProviders` and `workflowTasks`, by contrast, validate each complete declared entry here (#75):
- * valid entries survive in order, invalid entries stay on disk until an explicit same-field write, and
- * any invalid durable task raises the queue-recovery latch before a host can resume.
+ * closed). A `githubRepos` entry that cannot name a repository is *reported* here (#72) but still
+ * dropped by `isRepoRef`/`canonicalRepoList` rather than by this guard, so a read hands the junk
+ * through and the next list write is what removes it. `aiProviders` and `workflowTasks`, by contrast,
+ * validate each complete declared entry here (#75): valid entries survive in order, invalid entries
+ * stay on disk until an explicit same-field write, and any invalid durable task raises the
+ * queue-recovery latch before a host can resume.
  */
 export function createStoredReadGuard(
   source: string,
@@ -674,15 +926,16 @@ export function createStoredReadGuard(
   const reported = new Set<keyof MaoStoreSchema>()
 
   return function guardStoredRead<K extends keyof MaoStoreSchema>(key: K, raw: MaoStoreSchema[K]): MaoStoreSchema[K] {
-    const problem = unusableStoredValue(key, raw, source)
-    const usable = usableStoredValue(key, raw, problem)
+    // The same `storedValueProblem()` `problems()` answers from, deliberately: a guard that decided
+    // whether to speak from its own copy of the question could warn about a value the GUI was never told
+    // about — which is the half of this that reaches a packaged-app operator and the half that does not.
+    const problem = storedValueProblem(key, raw, source)
+    const usable = usableStoredValue(key, raw)
     if (problem === null) return usable
     if (!reported.has(key)) {
       reported.add(key)
-      warn(problem)
+      warn(problem.message)
     }
-    // A mixed provider/task list keeps its valid entries. A wrong container still gets the schema's
-    // own default, *cloned*: returning the shared instance would let one caller poison every later read.
     return usable
   }
 }
@@ -855,7 +1108,7 @@ export function createGuardedStore(
       // the operator was told. `unusableStoredValue` is read from the SAME `raw`, not from a second read.
       return {
         value: guardRead(key, raw),
-        problem: unusableStoredValue(key, raw, source) ?? undefined,
+        problem: storedValueProblem(key, raw, source)?.message,
         readable: true,
         witness: witnessOf(raw),
       }

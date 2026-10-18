@@ -1577,24 +1577,29 @@ class WorktreeSafetyTest(unittest.TestCase):
         read_config.assert_not_called()
 
     def test_worktree_push_target_checks_every_push_selector(self):
-        """Each of the three selectors must reject on its own.
+        """Every selector that applies must reject on its own.
 
         The pre-existing coverage drove `_read_git_config_values` with a
         positional `side_effect`, so whichever key happened to be read first
         absorbed the rejection and the other two keys had no witness.
+
+        The detached case is the Reviewer/Maintainer shape: `REPO_ROOT` may
+        legitimately have no branch checked out, which leaves
+        `remote.pushDefault` as the only selector carrying the boundary.
         """
         target = self._bind_test_target()
         task_checkout = self.repo / ".worktrees" / "task-checkout"
         branch_name = "worker/1-test"
-        selectors = (
-            "remote.pushDefault",
-            f"branch.{branch_name}.pushRemote",
-            f"branch.{branch_name}.remote",
+        cases = (
+            (task_checkout, branch_name, "remote.pushDefault"),
+            (task_checkout, branch_name, f"branch.{branch_name}.pushRemote"),
+            (task_checkout, branch_name, f"branch.{branch_name}.remote"),
+            (self.repo, None, "remote.pushDefault"),
         )
-        for selector in selectors:
-            with self.subTest(selector=selector):
-                def read_config(key, repo_root, _selector=selector):
-                    if repo_root == task_checkout and key == _selector:
+        for checkout, branch, selector in cases:
+            with self.subTest(branch=branch, selector=selector):
+                def read_config(key, repo_root, _selector=selector, _checkout=checkout):
+                    if repo_root == _checkout and key == _selector:
                         return ("attacker",)
                     return ()
 
@@ -1613,14 +1618,11 @@ class WorktreeSafetyTest(unittest.TestCase):
                     with self.assertRaises(
                         self.swarm.SwarmPreflightConfigError,
                     ) as raised:
-                        self.swarm._assert_worktree_push_target(
-                            task_checkout,
-                            branch_name,
-                        )
+                        self.swarm._assert_worktree_push_target(checkout, branch)
 
                 self.assertIn("other than origin", str(raised.exception))
                 self.assertNotIn("attacker", str(raised.exception))
-                self.assertIn(call(selector, task_checkout), read.mock_calls)
+                self.assertIn(call(selector, checkout), read.mock_calls)
 
     def test_worktree_push_target_accepts_selectors_naming_origin(self):
         """A correctly configured checkout must still be dispatchable.
@@ -1628,32 +1630,50 @@ class WorktreeSafetyTest(unittest.TestCase):
         Every selector case above is also satisfied by a predicate that rejects
         any configured value at all, which would leave Swarm refusing every
         dispatch — idle rather than visibly broken.
+
+        Pinning the exact reads also pins *which* selectors apply in each shape:
+        a detached Reviewer/Maintainer checkout has no branch-scoped keys to
+        read, and still has to read `remote.pushDefault`.
         """
         target = self._bind_test_target()
         task_checkout = self.repo / ".worktrees" / "task-checkout"
         branch_name = "worker/1-test"
-        with (
-            patch.object(
-                self.swarm,
-                "_resolve_origin_repository",
-                return_value=target,
+        cases = {
+            "attached": (
+                task_checkout,
+                branch_name,
+                [
+                    ("remote.pushDefault", task_checkout),
+                    (f"branch.{branch_name}.pushRemote", task_checkout),
+                    (f"branch.{branch_name}.remote", task_checkout),
+                ],
             ),
-            patch.object(
-                self.swarm,
-                "_read_git_config_values",
-                return_value=("origin",),
-            ) as read,
-        ):
-            self.swarm._assert_worktree_push_target(task_checkout, branch_name)
+            "detached": (
+                self.repo,
+                None,
+                [("remote.pushDefault", self.repo)],
+            ),
+        }
+        for label, (checkout, branch, expected_reads) in cases.items():
+            with self.subTest(case=label):
+                with (
+                    patch.object(
+                        self.swarm,
+                        "_resolve_origin_repository",
+                        return_value=target,
+                    ),
+                    patch.object(
+                        self.swarm,
+                        "_read_git_config_values",
+                        return_value=("origin",),
+                    ) as read,
+                ):
+                    self.swarm._assert_worktree_push_target(checkout, branch)
 
-        self.assertEqual(
-            [args.args for args in read.call_args_list],
-            [
-                ("remote.pushDefault", task_checkout),
-                (f"branch.{branch_name}.pushRemote", task_checkout),
-                (f"branch.{branch_name}.remote", task_checkout),
-            ],
-        )
+                self.assertEqual(
+                    [args.args for args in read.call_args_list],
+                    expected_reads,
+                )
 
     def test_dispatch_revalidation_keeps_ssh_transport_verification_on(self):
         """`_assert_worktree_push_target` takes the resolver's default, so the

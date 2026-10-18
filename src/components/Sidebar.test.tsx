@@ -2,7 +2,7 @@ import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 import Sidebar from './Sidebar'
-import { describeUnusableTaskQueue, type StoredValueProblem } from '../../core/store'
+import { describeUnloadableStore, describeUnusableTaskQueue, type StoredValueProblem } from '../../core/store'
 import type { QueueRecoveryState } from '../../core/workflow-engine'
 
 /**
@@ -195,6 +195,60 @@ describe('Sidebar queue recovery', () => {
 
     expect(screen.getAllByText(/This session is not halted/)).toHaveLength(1)
     expect(screen.queryByText(UNUSABLE_QUEUE.message)).toBeNull()
+  })
+
+  /**
+   * A file that did not load at all is a different late state from a wrong-shaped field in a file that did.
+   *
+   * Issue #67 made every write refuse while the file is unloadable, which turned the late card's own
+   * promise — "its next queue write will rewrite the file from that" — into a falsehood, and left a Save
+   * button that `resaveStoredQueue` can only answer `'unverifiable'` for. Core marks the whole-file case
+   * so the UI can tell them apart without parsing the report.
+   */
+  const UNLOADABLE_FILE: StoredValueProblem = {
+    field: 'workflowTasks',
+    source: '/data/config.json',
+    message: describeUnloadableStore('/data/config.json', 'unparseable'),
+    wholeFile: true,
+  }
+
+  it('does not promise a rewrite the write gate refuses', () => {
+    renderSidebar({
+      queueRecovery: { required: false, reason: undefined },
+      queueStoredStillUnreadable: true,
+      storeProblems: [UNLOADABLE_FILE],
+    })
+
+    expect(screen.queryByText(/next queue write will rewrite the file/)).toBeNull()
+    expect(screen.getByText(/every write is refused while this stands/)).toBeInTheDocument()
+    expect(screen.getByText(/still holds everything it held/)).toBeInTheDocument()
+  })
+
+  it('offers no save button for a file it could not read, because that save cannot succeed', async () => {
+    const { onResaveQueue } = renderSidebar({
+      queueRecovery: { required: false, reason: undefined },
+      queueStoredStillUnreadable: true,
+      storeProblems: [UNLOADABLE_FILE],
+    })
+
+    expect(screen.queryByRole('button', { name: /Save this session/ })).toBeNull()
+    expect(onResaveQueue).not.toHaveBeenCalled()
+    // Still not the destructive CLI command, and still not the halted wording.
+    expect(screen.queryByText(/confirm-queue-recovery/)).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Recover readable tasks' })).toBeNull()
+  })
+
+  it('still offers the save for a wrong-shaped field in a file that did load', async () => {
+    // The flag must discriminate, not suppress: this is the state the save was built for.
+    const { user, onResaveQueue } = renderSidebar({
+      queueRecovery: { required: false, reason: undefined },
+      queueStoredStillUnreadable: true,
+      storeProblems: [UNUSABLE_QUEUE],
+    })
+
+    await user.click(screen.getByRole('button', { name: /Save this session/ }))
+
+    expect(onResaveQueue).toHaveBeenCalledTimes(1)
   })
 
   it('says nothing about the queue when nothing is halted', () => {

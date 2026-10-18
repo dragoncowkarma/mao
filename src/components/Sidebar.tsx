@@ -247,21 +247,40 @@ export default function Sidebar({
                  MAO will not start unattended work and every queue write is refused — both false here.
                  Rendering it beside "this session is not halted" gave the operator two opposite
                  instructions at once. The field and the file are what they need. */
-              <>
+              /* Two different late states, and conflating them was the defect. A wrong-shaped FIELD in a
+                 file that loaded really is healed by this session's next queue write, so offering to save
+                 now is the right affordance. A file that did not load at all establishes nothing and
+                 REFUSES every write (issue #67), so for it the promise below would be false and the
+                 button could only ever answer 'unverifiable' — `resaveStoredQueue` fails closed on an
+                 unreadable observation. The flag comes from core; no UI parses the report text. */
+              queueStoredProblem?.wholeFile ? (
                 <p className="text-muted text-[11px] leading-snug">
-                  MAO cannot read the stored workflow queue in {queueStoredProblem?.source}. This session
-                  is not halted — it is still holding the queue it loaded at startup, and its next queue
-                  write will rewrite the file from that. Restarting before that happens will refuse to
-                  start unattended work until the value is replaced.
+                  MAO could not read {queueStoredProblem.source} at all, so it established neither the
+                  stored workflow queue nor any other setting. This session is not halted — it is still
+                  holding the queue it loaded at startup — but every write is refused while this stands, so
+                  the file still holds everything it held. Repair the file, then restart.
                 </p>
-                {/* Deliberately NOT `mao workflow confirm-queue-recovery` here. That command discards
-                    anything its separate process cannot validate and writes ITS startup snapshot over
-                    the file — so this session's real queue could be lost when it next restarts. Saving
-                    from this session writes the queue it is actually holding. */}
-                <button onClick={submitResave} className="btn btn-secondary self-start text-xs" disabled={resaving}>
-                  {resaving ? 'Saving…' : 'Save this session’s queue now'}
-                </button>
-              </>
+              ) : (
+                <>
+                  <p className="text-muted text-[11px] leading-snug">
+                    MAO cannot read the stored workflow queue in {queueStoredProblem?.source}. This session
+                    is not halted — it is still holding the queue it loaded at startup, and its next queue
+                    write will rewrite the file from that. Restarting before that happens will refuse to
+                    start unattended work until the value is replaced.
+                  </p>
+                  {/* Deliberately NOT `mao workflow confirm-queue-recovery` here. That command discards
+                      anything its separate process cannot validate and writes ITS startup snapshot over
+                      the file — so this session's real queue could be lost when it next restarts. Saving
+                      from this session writes the queue it is actually holding. */}
+                  <button
+                    onClick={submitResave}
+                    className="btn btn-secondary self-start text-xs"
+                    disabled={resaving}
+                  >
+                    {resaving ? 'Saving…' : 'Save this session’s queue now'}
+                  </button>
+                </>
+              )
             )}
             {queueRecovery.required && queueStoredStillUnreadable ? (
               confirmingRecovery ? (

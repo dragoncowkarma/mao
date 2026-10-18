@@ -800,9 +800,14 @@ describe("electron/store.ts, the other MaoStore backend", () => {
     // `openGuardedStoreFile` needs the path before an instance exists, so it cannot read `backing.path`.
     // Leaving `cwd`/`name` to conf's defaults would make the two agree only by matching those defaults
     // from memory — and the gate would then judge a file conf does not open.
-    expect(source).toMatch(/cwd:/)
+    // The VALUE, not merely the key: `/cwd:/` matched any value at all, so the one property this test is
+    // named for went unchecked. If `cwd` drifts, `loadStoredFileStrict(configPath)` judges one file while
+    // conf opens and writes another, and `createStoredFileParser(configPath)` is bound to the wrong
+    // source — and architecture rule 1 keeps this file out of reach of a behavioural test, so this
+    // assertion is the only thing holding it.
+    expect(source).toMatch(/cwd: path\.dirname\(configPath\)/)
     expect(source).toMatch(/name: 'config'/)
-    expect(source).toMatch(/configPath/)
+    expect(source).toMatch(/openGuardedStoreFile\(configPath,/)
   })
 
   it("hands conf core's own deserializer, so no read of its own escapes the rule", () => {
@@ -1026,6 +1031,35 @@ describe('cli config import-providers', () => {
     expect(log).not.toHaveBeenCalled()
     return message
   }
+
+  it("forwards the store's own refusal report rather than replacing it", () => {
+    // Before the write could be *refused*, this catch had nothing to swallow — an unreadable file was
+    // destroyed silently. Now "the destination write failed" would be the only thing this one command
+    // says, while `config set-theme`, `repos remove` and `workflow clear-completed` all print the
+    // per-cause report in full. The store's messages are value-free by contract, which is why the
+    // `validateWrite` branch above already forwards one verbatim.
+    captureWarnings()
+    const configPath = rawConfigFile('{ "aiProviders": ')
+    const store = new FileStore(configPath)
+    const providersPath = rawConfigFile(JSON.stringify([claude]))
+    const log = vi.fn()
+
+    let message = ''
+    try {
+      importProvidersFromFile(providersPath, store, log)
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error)
+    }
+
+    expect(log).not.toHaveBeenCalled()
+    expect(message).toContain('Refusing to write "aiProviders"')
+    expect(message).toContain('Nothing has been written')
+    expect(message).toContain(configPath)
+    expect(message).toContain('not valid JSON')
+    // Still value-free: the report says so itself, and nothing from the file is interpolated.
+    expect(message).not.toContain('ghp_')
+    expect(fs.readFileSync(configPath, 'utf-8')).toBe('{ "aiProviders": ')
+  })
 
   it('keeps Windows path separators readable in a quoted rejection path', () => {
     const inputPath = String.raw`C:\Users\mao\missing-providers.json`
@@ -1633,6 +1667,10 @@ describe('MaoStore.problems for a file that could not be loaded', () => {
     expect(problems[0]!.message).toContain('every setting in the file is affected')
     expect(problems[0]!.source).toBe(filePath)
     expect(problems[0]!.message).not.toContain('ghp_x')
+    // The flag the Sidebar branches on. Without it the late-corruption card falls back to wording that
+    // promises "its next queue write will rewrite the file from that" — which the write gate refuses —
+    // and offers a Save button `resaveStoredQueue` can only answer 'unverifiable' for.
+    expect(problems[0]!.wholeFile).toBe(true)
   })
 
   it('carries it on the gating field, so the queue card and the latch still find it', () => {
@@ -1650,10 +1688,14 @@ describe('MaoStore.problems for a file that could not be loaded', () => {
     captureWarnings()
     const { store } = storeHolding({ githubRepos: 'nonsense', aiProviders: 7 })
 
-    const fields = store.problems().map((problem) => problem.field)
+    const problems = store.problems()
+    const fields = problems.map((problem) => problem.field)
 
     expect(fields).toContain('githubRepos')
     expect(fields).toContain('aiProviders')
+    // Not flagged: the file loaded, so these really are per-field faults, and the Sidebar's save-now
+    // affordance is correct for them.
+    expect(problems.every((problem) => problem.wholeFile === undefined)).toBe(true)
   })
 })
 
@@ -1875,6 +1917,29 @@ describe('openGuardedStoreFile — the backend reads again after the pre-check',
     expect(String((caught as Error).message)).not.toContain(secret)
     expect(String((caught as Error).message)).not.toContain('ghp_')
     expect((caught as Error).cause).toBeUndefined()
+  })
+
+  it('leaves a construction-time write failure as itself, not as a read failure', () => {
+    // conf's constructor is a *writer* — merging its defaults back is the behaviour this whole function is
+    // built around — so a construction failure is as likely to be a failed write (a read-only `userData`,
+    // ENOSPC, EROFS) as a failed read. Converting those would tell the operator the file "could not be
+    // read" and send them to check its permissions while the file reads perfectly, and the CLI reading the
+    // very same file would report it healthy. Reproduced against real conf with a chmod 555 directory.
+    const filePath = rawConfigFile(JSON.stringify({ githubToken: 'ghp_keep', theme: 'dark' }))
+
+    let caught: unknown
+    try {
+      openGuardedStoreFile(filePath, () => {
+        throw Object.assign(new Error('EROFS: read-only file system, open'), { code: 'EROFS' })
+      })
+    } catch (error) {
+      caught = error
+    }
+
+    expect(caught).not.toBeInstanceOf(UnreadableStoreError)
+    expect(String((caught as Error).message)).toContain('EROFS')
+    // The file really was readable throughout — which is what makes "could not be read" a false report.
+    expect(loadStoredFileStrict(filePath)).toEqual({ githubToken: 'ghp_keep', theme: 'dark' })
   })
 
   it('opens normally when nothing replaces the file', () => {

@@ -604,7 +604,16 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   printed `storeProblems: []` beside `githubToken: '[unset]'` for a file that still held the token. The one
   entry is carried on `QUEUE_GATING_FIELD` so `findStoredQueueProblem()` and the Sidebar's queue card still
   find it; it deliberately does not claim to be a `githubRepos` problem, which would put that card's
-  destructive "Reset stored list" button under a message that is not about repositories.
+  destructive "Reset stored list" button under a message that is not about repositories. That entry also
+  carries `wholeFile: true`, and `src/components/Sidebar.tsx` must branch on it rather than on the report
+  text: a wrong-shaped *field* in a file that loaded really is healed by this session's next queue write,
+  so the card offers to save now, while a file that did not load refuses every write — there the same copy
+  promises a rewrite that cannot happen and the button can only answer `'unverifiable'`.
+  A read that fails must not escape a caller that cannot catch it, either. `core/auto-trigger.ts`'s
+  `tick()` reads the repository list through `store.get()` and is invoked bare and from `setInterval`, so
+  it guards that read and skips the tick — measured as one unhandled rejection per tick on the Electron
+  host before it did, because conf re-reads and re-parses on every `get` while the queue latch is decided
+  once at boot. Any new long-lived consumer of `get()` owes the same guard.
   Never interpolate the underlying read error into any of these reports, and never give
   `UnreadableStoreError` a `cause`. V8 puts the input's first ten characters into `SyntaxError.message`
   (`Unexpected token 'g', "ghp_SENTIN"... is not valid JSON`), and a `config.json` clobbered down to a bare
@@ -634,8 +643,11 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   write gate passed, and the next `set()` rewrote the file from defaults: issue #67 again on the far side
   of boot, measured for all four shapes. So `openGuardedStoreFile` also *supplies* `getFresh` from
   `loadStoredFileStrict(filePath)` rather than letting the backend's own read stand in for it. A backend
-  opened from a path gets the path's rules, not the library's. Never hand a file-backed backend to
-  `createGuardedStore` directly — that is what loses this.
+  opened from a path gets the path's rules, not the library's. The invariant is not "never call
+  `createGuardedStore` directly" — `FileStore` does exactly that and is correct, because it supplies its
+  own `getFresh` built on `loadStoredFileStrict`. It is: **any backend handed to `createGuardedStore` must
+  supply a `getFresh` that applies the root-shape rule**, and `openGuardedStoreFile` is how a backend that
+  reads the file itself gets one for free.
   **A pre-check cannot cover a backend that reads again, so conf is given the rule itself.** Two intervals
   sit past the check, and both were measured destroying the file or leaking on the real library. A
   replacement landing between `loadStoredFileStrict()` and `new Store(...)` was coerced and written back

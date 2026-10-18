@@ -507,6 +507,18 @@ export interface StoredValueProblem {
   source: string
   /** The operator-facing report: the field, the value's actual type, the file, and the way back. */
   message: string
+  /**
+   * True when the whole file could not be loaded, so `field` names the carrier rather than the fault.
+   *
+   * The two states need different operator text and different affordances, and nothing else distinguishes
+   * them: a wrong-shaped *field* in a file that loaded leaves every other value readable and is healed by
+   * the next write of that field, while a file that did not load establishes nothing and **refuses** every
+   * write. `src/components/Sidebar.tsx` branches on this — it used to promise that "its next queue write
+   * will rewrite the file from that" and offer a Save button, which for an unloadable file is a sentence
+   * that is false and a button that can only answer `'unverifiable'`. Keyed on a flag rather than on the
+   * message text, which no UI should parse.
+   */
+  wholeFile?: true
 }
 
 /**
@@ -792,8 +804,16 @@ export function createStoredFileParser(source: string): (text: string) => MaoSto
  * rethrows V8's own parse error for an unparseable file, and V8 puts the input's first ten characters
  * into that message (`Unexpected token 'g', "ghp_SENTIN"... is not valid JSON`) — so for a `config.json`
  * clobbered down to a bare token, letting conf's error escape publishes the credential into the main
- * process's logs. Rewrapping it value-free closes that, and also covers the narrow window where the file
- * changes between the check and the construction.
+ * process's logs. Rewrapping closes that, and also covers the narrow window where the file changes
+ * between the check and the construction.
+ *
+ * It rewraps through `withoutStoredBytes`, not `asUnreadableStoreError`, and the difference is the whole
+ * reason that narrower helper exists. conf's constructor is a *writer* — merging its defaults back is the
+ * behaviour this function is built around — so a construction failure is as likely to be a failed write
+ * (a read-only `userData`, ENOSPC) as a failed read. Converting those would tell an operator the file
+ * "could not be read" and send them to check its permissions while the file reads perfectly, and the CLI
+ * reading the very same file would report it healthy. Only a parse failure, which can quote the bytes, is
+ * rewritten.
  *
  * `filePath` is the caller's own resolved path rather than one read back off the constructed backend,
  * because there is no backend yet when it is needed. Callers must therefore pin whatever options
@@ -809,7 +829,7 @@ export function openGuardedStoreFile(
   try {
     backing = construct()
   } catch (error) {
-    throw asUnreadableStoreError(error, filePath)
+    throw withoutStoredBytes(error, filePath)
   }
   // The strict fresh read is supplied here rather than left to the backend, and it is not a convenience.
   // conf does not fail for a root it can still coerce: its getter is `Object.assign({}, parsed)`, so a
@@ -1138,8 +1158,14 @@ export function createGuardedStore(
       // conf re-reads and re-parses the file on every `get`, so this read can fail — and its error is
       // V8's, which quotes the file. Converted rather than swallowed: answering schema defaults for a
       // file MAO could not read is exactly the silence issue #67 was about, and the write gate already
-      // stops anything from persisting over it, so failing loudly costs the caller nothing it needs.
-      // `FileStore` answers from its constructor snapshot and cannot reach this path at all.
+      // stops anything from persisting over it. `FileStore` answers from its constructor snapshot and
+      // cannot reach this path at all, so this is the Electron host's path only.
+      //
+      // It does NOT follow that throwing is free for every caller. `core/auto-trigger.ts`'s `tick()`
+      // reads the repository list through this, and it is invoked bare and from `setInterval` — a throw
+      // escaping there is an unhandled rejection nothing can catch, measured as one per tick before that
+      // caller was guarded. A new consumer of `get()` on a long-lived host has to handle this the same
+      // way; reverting to a coerced default here instead would restore the silence.
       let raw: MaoStoreSchema[K]
       try {
         raw = readRaw(key)
@@ -1178,7 +1204,7 @@ export function createGuardedStore(
         return describeStoredProblems(readRaw, source)
       } catch (error) {
         const message = describeUnloadableStore(source, storeReadFailureOf(error))
-        return [{ field: QUEUE_GATING_FIELD, source, message }]
+        return [{ field: QUEUE_GATING_FIELD, source, message, wholeFile: true }]
       }
     },
     inspect<K extends keyof MaoStoreSchema>(key: K): StoredObservation<K> {

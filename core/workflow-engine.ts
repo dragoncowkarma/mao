@@ -241,10 +241,16 @@ export class WorkflowEngine extends EventEmitter {
    * out-of-band repair would run the wrong queue and then persist it over the real one.
    *
    * Deliberately *not* re-derived from the store at gate time. Review of PR #69 showed the boot case is
-   * the dangerous one (both hosts tick auto-trigger immediately after boot), while a corruption appearing
-   * after a *clean* boot is harmless — the engine is holding the true queue, so its next write restores
-   * the file faithfully. Probing per gate would instead have put three whole-config reads on the
-   * `'change'` path and, worse, let a transient read failure latch a healthy host forever.
+   * the dangerous one (both hosts tick auto-trigger immediately after boot). Probing per gate would
+   * instead have put three whole-config reads on the `'change'` path and, worse, let a transient read
+   * failure latch a healthy host forever.
+   *
+   * What a corruption appearing after a *clean* boot does is no longer "harmless because the next write
+   * restores the file faithfully" — that was true only while an unreadable file was silently overwritten.
+   * Since issue #67 the next write is **refused** (`createGuardedStore.set`), so the engine keeps the true
+   * queue in memory and the file keeps whatever it holds. Nothing is lost either way, but the honest
+   * statement is that this latch covers the boot case while a post-boot corruption surfaces as a refused
+   * write — see `notifyAfterStage`, which reports a throwing `'change'` listener as a persistence failure.
    */
   private queueRecoveryReason: string | undefined
 

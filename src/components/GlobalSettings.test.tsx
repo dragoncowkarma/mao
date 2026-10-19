@@ -207,4 +207,69 @@ describe('GlobalSettings saves only what it can stand behind', () => {
     expect(saved.map((p) => p.name)).toEqual(['Claude', 'New'])
     expect(base).toEqual([claude])
   })
+
+  /** A load the test answers by hand, so two loads can be made to overlap in either order. */
+  function deferredList() {
+    let answer!: (list: AiProviderConfig[]) => void
+    const promise = new Promise<AiProviderConfig[]>((resolve) => {
+      answer = resolve
+    })
+    return { promise, answer }
+  }
+
+  it.each([['in order'], ['out of order']])(
+    'does not resurrect a provider deleted between two overlapping loads (%s)',
+    async (order) => {
+      // The fifth review's reproduction: a double-clicked Retry, with `import-providers` deleting B between
+      // the two reads. Carrying the earlier load's B over as if it were typed made the next token-only Save
+      // write B — and its API key — back.
+      const other = { id: 'other', name: 'Other', kind: 'api' as const, apiKey: 'test-key' }
+      const stub = createElectronApiStub()
+      const first = deferredList()
+      const second = deferredList()
+      stub.listProviders
+        .mockRejectedValueOnce(new Error('EACCES'))
+        .mockReturnValueOnce(first.promise)
+        .mockReturnValueOnce(second.promise)
+      stub.api.github.setToken.mockResolvedValue(undefined as never)
+      const user = userEvent.setup()
+
+      render(<GlobalSettings theme="system" onThemeChange={() => {}} />)
+      const retry = await screen.findByRole('button', { name: 'Retry loading providers' })
+      await user.click(retry)
+      await user.click(retry)
+      if (order === 'in order') {
+        first.answer([claude, other])
+        second.answer([claude])
+      } else {
+        second.answer([claude])
+        first.answer([claude, other])
+      }
+
+      expect(await screen.findByDisplayValue('Claude')).toBeInTheDocument()
+      expect(screen.queryByDisplayValue('Other')).toBeNull()
+      await user.type(screen.getByPlaceholderText('ghp_...'), 'ghp_test')
+      await user.click(screen.getByRole('button', { name: 'Save changes' }))
+      await screen.findByText('Saved')
+      expect(stub.api.ai.save).not.toHaveBeenCalled()
+    },
+  )
+
+  it('keeps an error that still applies when Retry succeeds', async () => {
+    // Only the never-loaded refusal is made moot by a load. A token write that failed is still unsaved.
+    const stub = createElectronApiStub()
+    stub.listProviders.mockRejectedValueOnce(new Error('EACCES')).mockResolvedValue([claude])
+    stub.api.github.setToken.mockRejectedValue(new Error('The GitHub token could not be written.'))
+    const user = userEvent.setup()
+
+    render(<GlobalSettings theme="system" onThemeChange={() => {}} />)
+    await screen.findByText(/provider list could not be loaded/)
+    await user.type(screen.getByPlaceholderText('ghp_...'), 'ghp_test')
+    await user.click(screen.getByRole('button', { name: 'Save changes' }))
+    await screen.findByText('The GitHub token could not be written.')
+
+    await user.click(screen.getByRole('button', { name: 'Retry loading providers' }))
+    expect(await screen.findByDisplayValue('Claude')).toBeInTheDocument()
+    expect(screen.getByText('The GitHub token could not be written.')).toBeInTheDocument()
+  })
 })

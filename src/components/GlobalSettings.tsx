@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { electronApi } from '../electron-api'
 import type { AgentStage, AiProviderConfig, ModelEffortPreset, ProviderKindId } from '../../core/ai/types'
 import { PROVIDER_OPTIONS } from '../../core/ai/provider-options'
@@ -404,27 +404,48 @@ export default function GlobalSettings({ theme, onThemeChange }: GlobalSettingsP
    * providers yet" misreading the warning exists to prevent.
    */
   const [loadFailed, setLoadFailed] = useState(false)
+  /**
+   * Ids of providers the operator added in this pane and has not saved yet — the only editor entries a
+   * reload may carry over. Anything else the editor holds came from a load, and keeping it across a newer
+   * load would resurrect a provider deleted elsewhere in between, API key and all.
+   */
+  const unsavedAdditions = useRef(new Set<string>())
+  /** Bumped per load; only the most recently started load's answer is applied (Retry clicks, StrictMode). */
+  const loadGeneration = useRef(0)
+  /** Whether the save error on screen is the never-loaded refusal — the one a successful load makes moot. */
+  const saveErrorIsBlindRefusal = useRef(false)
+
+  function showSaveError(message: string, blindRefusal = false) {
+    setSaveError(message)
+    saveErrorIsBlindRefusal.current = blindRefusal
+  }
 
   function loadProviders() {
-    // Read at call time: true only for a Retry, which is rendered while the load has failed.
-    const retrying = loadFailed
+    const generation = (loadGeneration.current += 1)
     electronApi()
       .ai.list()
       .then(
         (list) => {
-          // A provider typed while the load had failed is kept as an unsaved edit on top of the list now
-          // loaded, rather than silently discarded with its API key; the next Save writes both against this
-          // load. On the first load there is nothing typed, so this is just the list.
-          setProviders((typed) => [...list, ...typed.filter((p) => !list.some((loaded) => loaded.id === p.id))])
+          if (generation !== loadGeneration.current) return
+          // A provider the operator added while the load had failed is kept as an unsaved edit on top of
+          // the list now loaded, rather than silently discarded with its API key; the next Save writes both
+          // against this load.
+          setProviders((current) => [
+            ...list,
+            ...current.filter((p) => unsavedAdditions.current.has(p.id) && !list.some((loaded) => loaded.id === p.id)),
+          ])
           setLoadedProviders(JSON.parse(JSON.stringify(list)) as AiProviderConfig[])
           setLoadFailed(false)
-          // The refusal a Save gave while the list was missing no longer applies once it is here.
-          if (retrying) setSaveError('')
+          // The refusal a Save gave while the list was missing no longer applies once it is here. Any other
+          // error — a token write that failed, say — still does, and stays.
+          if (saveErrorIsBlindRefusal.current) showSaveError('')
         },
         // Said, not swallowed: an empty pane after a failed load reads exactly like "no providers yet",
         // and saving from it would replace the real list blind. The error text is not shown — a parse
         // failure can quote the config file, and the GitHub token is stored in it in plain text.
-        () => setLoadFailed(true),
+        () => {
+          if (generation === loadGeneration.current) setLoadFailed(true)
+        },
       )
   }
 
@@ -435,20 +456,23 @@ export default function GlobalSettings({ theme, onThemeChange }: GlobalSettingsP
   }
 
   function addProvider() {
-    setProviders((prev) => [...prev, emptyProvider()])
+    const added = emptyProvider()
+    unsavedAdditions.current.add(added.id)
+    setProviders((prev) => [...prev, added])
   }
 
   function removeProvider(id: string) {
+    unsavedAdditions.current.delete(id)
     setProviders((prev) => prev.filter((p) => p.id !== id))
   }
 
   async function saveAll() {
     if (saving) return
-    setSaveError('')
+    showSaveError('')
 
     const errors = validateProviders(providers)
     if (errors.length > 0) {
-      setSaveError(errors.join(' '))
+      showSaveError(errors.join(' '))
       return
     }
 
@@ -459,9 +483,10 @@ export default function GlobalSettings({ theme, onThemeChange }: GlobalSettingsP
         ? providers.length > 0
         : JSON.stringify(providers) !== JSON.stringify(loadedProviders)
     if (providersChanged && loadedProviders === undefined) {
-      setSaveError(
+      showSaveError(
         'The stored AI provider list was never loaded, so saving these providers would replace it blind. ' +
-          'Nothing was saved. Reopen Global settings and apply the edit again.',
+          'Nothing was saved. Retry loading providers, then save again.',
+        true,
       )
       return
     }
@@ -470,15 +495,17 @@ export default function GlobalSettings({ theme, onThemeChange }: GlobalSettingsP
     try {
       if (providersChanged) {
         await electronApi().ai.save(providers, loadedProviders)
-        // What is stored now is what was just saved, so it is the base the next save is derived from.
+        // What is stored now is what was just saved, so it is the base the next save is derived from — and
+        // nothing in the editor is an unsaved addition any more.
         setLoadedProviders(JSON.parse(JSON.stringify(providers)) as AiProviderConfig[])
+        unsavedAdditions.current.clear()
       }
       if (githubToken) await electronApi().github.setToken(githubToken)
       // Only claim a save that happened.
       setSavedMessage(providersChanged || githubToken ? 'Saved' : 'Nothing to save')
       setTimeout(() => setSavedMessage(''), 1500)
     } catch (err) {
-      setSaveError(err instanceof Error ? err.message : String(err))
+      showSaveError(err instanceof Error ? err.message : String(err))
     } finally {
       setSaving(false)
     }

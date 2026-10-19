@@ -1179,18 +1179,30 @@ describe('mao run queue persistence beside another process (issue #73)', () => {
     expect(onDisk(filePath).workflowTasks).toEqual([pausedTask()])
   })
 
-  it('forgets only the least-recently-touched task forms once past its bound', () => {
-    // Bounded so a host that runs for months does not keep every form of every task it ever saw: with one
-    // id past the bound, the oldest is forgotten (so a stale copy of it is refused) and the rest still count.
+  it('never forgets a task still in the queue, however many there are', () => {
+    // The fifth review's reproduction: a busy repo can queue more than the bound. Evicting live tasks made
+    // this process's own late-corrupted queue read as another host's, refusing both the re-save and the
+    // automatic repair.
     captureWarnings()
     const tasks = Array.from({ length: 1_001 }, (_, i) => pausedTask(`task-${i}`))
-    const oldest = bootLongRunning({ workflowTasks: tasks })
-    fs.writeFileSync(oldest.filePath, JSON.stringify({ workflowTasks: [tasks[0], null] }))
-    expect(oldest.app.resaveStoredQueue().kind).toBe('unverified')
+    const { filePath, app } = bootLongRunning({ workflowTasks: tasks })
+    fs.writeFileSync(filePath, JSON.stringify({ workflowTasks: [...tasks, null] }))
 
-    const newest = bootLongRunning({ workflowTasks: tasks })
-    fs.writeFileSync(newest.filePath, JSON.stringify({ workflowTasks: [tasks[1_000], null] }))
-    expect(newest.app.resaveStoredQueue()).toEqual({ kind: 'replaced' })
+    expect(app.resaveStoredQueue()).toEqual({ kind: 'replaced' })
+  })
+
+  it('forgets only the least-recently-removed tasks once past its bound', () => {
+    // Bounded so a host that runs for months does not keep every form of every task it ever removed: with
+    // one removed id past the bound, the earliest removed is forgotten and the rest still count as its own.
+    captureWarnings()
+    const done = Array.from({ length: 1_001 }, (_, i) => ({ ...pausedTask(`done-${i}`), status: 'done' as const }))
+    const { filePath, app } = bootLongRunning({ workflowTasks: [pausedTask(), ...done] })
+    app.workflowEngine.clearCompleted()
+
+    fs.writeFileSync(filePath, JSON.stringify({ workflowTasks: [pausedTask(), done[0], null] }))
+    expect(app.resaveStoredQueue().kind).toBe('unverified')
+    fs.writeFileSync(filePath, JSON.stringify({ workflowTasks: [pausedTask(), done[1_000], null] }))
+    expect(app.resaveStoredQueue()).toEqual({ kind: 'replaced' })
   })
 
   it('repairs the same stale own copy automatically on its next queue write', () => {

@@ -128,10 +128,10 @@ export function describeQueueWriteConflict(): string {
 }
 
 /**
- * How many task ids' forms a host remembers as its own (see `ownTaskForms` in `createMaoApp`). Far above the
- * queue's own size — at most `MAX_FINISHED_TASKS` finished tasks plus the live ones — so a task cleared or
- * capped away stays recognised for many hundreds of later tasks, while the map stays bounded in a host that
- * runs for months.
+ * How many *removed* task ids' forms a host remembers as its own (see `ownTaskForms` in `createMaoApp`) —
+ * tasks it has cleared or capped away. Tasks still in the queue are always remembered on top of this, so a
+ * task removed stays recognised for many hundreds of later removals while the map stays bounded in a host
+ * that runs for months.
  */
 const OWN_TASK_FORM_IDS = 1_000
 
@@ -222,8 +222,11 @@ export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOp
    * A task this process removed itself — "Clear completed", or the finished-task cap dropping the oldest on
    * every completion of a busy host — keeps its forms too: a stale copy of it is still this process's own
    * past state, and forgetting it at removal wedged the session the same way the last-write-only rule did.
-   * The map is bounded instead, by recency: each write touches the ids it holds, and only the
-   * least-recently-touched beyond `OWN_TASK_FORM_IDS` are forgotten — hashes, so a few hundred kilobytes.
+   * The map is bounded instead, by recency, and only among tasks that have left the queue: each write
+   * touches the ids it holds, and of the ids it does *not* hold, the least-recently-touched beyond
+   * `OWN_TASK_FORM_IDS` are forgotten. A task still in the queue is never forgotten, however many there are
+   * — forgetting a live one made this process's own queue read as another host's. Hashes, so a few
+   * hundred kilobytes.
    */
   const ownTaskForms = new Map<string, Set<string>>()
   const formOf = (task: QueuedTask) => createHash('sha256').update(JSON.stringify(task)).digest('hex')
@@ -235,9 +238,13 @@ export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOp
       ownTaskForms.delete(task.id)
       ownTaskForms.set(task.id, forms)
     }
+    const live = new Set(tasks.map((task) => task.id))
+    let removedCount = ownTaskForms.size - live.size
     for (const id of ownTaskForms.keys()) {
-      if (ownTaskForms.size <= OWN_TASK_FORM_IDS) break
+      if (removedCount <= OWN_TASK_FORM_IDS) break
+      if (live.has(id)) continue
       ownTaskForms.delete(id)
+      removedCount -= 1
     }
   }
   rememberOwnForms(observedQueue.value)

@@ -264,8 +264,9 @@ function patchEntry(stored: RepoRef, before: RepoRef, after: RepoRef): RepoRef {
  * Everything the edit did not touch is kept **as stored now**. When the stored list still is `base`
  * (the ordinary case) `next` is returned unchanged, so nothing about a window that is the only writer
  * changes; and with no `base` at all — a caller that predates it — or a stored value that is not a list
- * (`previousUsable: false`) or holds entries that are not repositories, the edit is the whole list, as
- * before.
+ * (`previousUsable: false`), the edit is the whole list, as before. A stored list that holds entries which
+ * are not repositories keeps every rule above but one: a repository the window lists and the stored list no
+ * longer names may have been mangled rather than removed, so it is carried forward rather than dropped.
  * A repository listed more than once is replaced wholesale rather than patched field by field, since
  * which occurrence a field edit meant is not knowable; `canonicalRepoList` then folds it as it always has.
  */
@@ -282,11 +283,16 @@ export function applyRepoListEdit(
   // counts as a first registration and is preflighted, and Reset still writes the empty list it sends.
   if (!previousUsable) return next
   if (base === undefined || !Array.isArray(base) || !Array.isArray(next) || !Array.isArray(previous)) return next
-  // The same holds for a list with entries `isRepoRef` rejects. The guard checks only the container, so
-  // `[null]` or a mangled `{ ownr: … }` row reaches here as "usable" — and the window, whose mirror never
-  // saw those rows, would read each repository they once named as removed elsewhere and drop it.
-  if (previous.some((ref) => !isRepoRef(ref))) return next
   if (JSON.stringify(previous) === JSON.stringify(base)) return next
+  // A stored list with entries `isRepoRef` rejects is ambiguous about what happened to a repository the
+  // window lists but the stored list no longer names: removed elsewhere, or mangled into one of those
+  // entries (`{ ownr: … }`, a `null`). The guard checks only the container, so such a list reaches here as
+  // usable. Dropping those rows would delete repositories the window still shows; returning the whole edit
+  // instead lets the window's stale list overwrite everything else stored — a hand-set `autoTrigger: false`
+  // reverted, a hand-removed repository resurrected, a hand-added one dropped. So only that one rule
+  // changes: such a row is carried forward in the window's version, and preflighted like any new entry,
+  // while every usable stored entry is still kept and patched as below.
+  const ambiguous = previous.some((ref) => !isRepoRef(ref))
 
   const before = entriesByRepo(base)
   const after = entriesByRepo(next)
@@ -327,7 +333,13 @@ export function applyRepoListEdit(
       result.push(...edit)
     }
   }
-  return [...result, ...added]
+  const carried: RepoRef[] = []
+  if (ambiguous) {
+    for (const [key, entries] of after) {
+      if (before.has(key) && !storedCount.has(key)) carried.push(...entries)
+    }
+  }
+  return [...result, ...carried, ...added]
 }
 
 /**

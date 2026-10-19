@@ -859,12 +859,36 @@ describe('applyRepoListEdit', () => {
     ])
   })
 
-  it('is the whole edit when the stored list holds entries that are not repositories', () => {
-    // A mangled row may be what is left of a repository the window still shows; diffing would read that
-    // repository as removed elsewhere and drop it from the window's edit.
+  it('carries forward a row the stored list may have mangled, rather than dropping it', () => {
+    // A mangled row may be what is left of a repository the window still shows; reading that repository
+    // as removed elsewhere would drop it from the window's edit.
     const mangled = { ownr: 'acme', repo: 'widgets' } as unknown as RepoRef
     const next = [gadgets, { ...widgets, pollIntervalMs: 9 }]
-    expect(applyRepoListEdit([gadgets, mangled], [gadgets, widgets], next)).toBe(next)
+    expect(canonicalRepoList([gadgets, mangled], applyRepoListEdit([gadgets, mangled], [gadgets, widgets], next))).toEqual(
+      next,
+    )
+  })
+
+  it('keeps stored settings and additions when the stored list also holds a mangled row', () => {
+    // The fourth review's reproduction: one hand-edit turned polling off for gadgets, added extra, left
+    // tools out — and mangled the widgets row. The window then changed its own copy of widgets. Returning
+    // the window's whole list reverted autoTrigger: false (unattended polling back on) and dropped extra.
+    // Now every usable stored entry is kept as stored. What stays ambiguous is a repository the window
+    // lists that the stored list does not name — tools here as much as widgets — since "removed" and
+    // "mangled" look the same; those are carried forward in the window's version and preflighted.
+    const tools: RepoRef = { owner: 'acme', repo: 'tools' }
+    const extra: RepoRef = { owner: 'acme', repo: 'extra' }
+    const mangled = { ownr: 'acme', repo: 'widgets' } as unknown as RepoRef
+    const previous = [{ ...gadgets, autoTrigger: false }, mangled, extra]
+    const base = [gadgets, widgets, tools]
+    const next = [gadgets, { ...widgets, pollIntervalMs: 60_000 }, tools]
+
+    expect(canonicalRepoList(previous, applyRepoListEdit(previous, base, next))).toEqual([
+      { ...gadgets, autoTrigger: false },
+      extra,
+      { ...widgets, pollIntervalMs: 60_000 },
+      tools,
+    ])
   })
   it('is the whole edit over a stored value that was not a list, rather than a diff against nothing', () => {
     // The guard answers an unusable value as [], which read as a list would make every repository the

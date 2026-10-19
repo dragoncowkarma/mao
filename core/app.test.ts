@@ -1165,6 +1165,34 @@ describe('mao run queue persistence beside another process (issue #73)', () => {
     expect(hasPersistenceBrokenMarker(dataDir)).toBe(false)
   })
 
+  it('still recognizes a task it cleared itself, when a stale copy of it comes back', () => {
+    // An editor read the file, then "Clear completed" ran, then the editor saved late with a typo. The done
+    // task in that buffer is this session's own past state; forgetting it at removal refused the re-save
+    // as another host's work and left the session unable to persist.
+    captureWarnings()
+    const done = { ...pausedTask('task-2'), status: 'done' as const }
+    const { filePath, app } = bootLongRunning({ workflowTasks: [pausedTask(), done] })
+    app.workflowEngine.clearCompleted()
+    fs.writeFileSync(filePath, JSON.stringify({ ...onDisk(filePath), workflowTasks: [pausedTask(), done, null] }))
+
+    expect(app.resaveStoredQueue()).toEqual({ kind: 'replaced' })
+    expect(onDisk(filePath).workflowTasks).toEqual([pausedTask()])
+  })
+
+  it('forgets only the least-recently-touched task forms once past its bound', () => {
+    // Bounded so a host that runs for months does not keep every form of every task it ever saw: with one
+    // id past the bound, the oldest is forgotten (so a stale copy of it is refused) and the rest still count.
+    captureWarnings()
+    const tasks = Array.from({ length: 1_001 }, (_, i) => pausedTask(`task-${i}`))
+    const oldest = bootLongRunning({ workflowTasks: tasks })
+    fs.writeFileSync(oldest.filePath, JSON.stringify({ workflowTasks: [tasks[0], null] }))
+    expect(oldest.app.resaveStoredQueue().kind).toBe('unverified')
+
+    const newest = bootLongRunning({ workflowTasks: tasks })
+    fs.writeFileSync(newest.filePath, JSON.stringify({ workflowTasks: [tasks[1_000], null] }))
+    expect(newest.app.resaveStoredQueue()).toEqual({ kind: 'replaced' })
+  })
+
   it('repairs the same stale own copy automatically on its next queue write', () => {
     captureWarnings()
     const { filePath, app } = bootLongRunning({ workflowTasks: [pausedTask()] })

@@ -406,13 +406,20 @@ export default function GlobalSettings({ theme, onThemeChange }: GlobalSettingsP
   const [loadFailed, setLoadFailed] = useState(false)
 
   function loadProviders() {
+    // Read at call time: true only for a Retry, which is rendered while the load has failed.
+    const retrying = loadFailed
     electronApi()
       .ai.list()
       .then(
         (list) => {
-          setProviders(list)
+          // A provider typed while the load had failed is kept as an unsaved edit on top of the list now
+          // loaded, rather than silently discarded with its API key; the next Save writes both against this
+          // load. On the first load there is nothing typed, so this is just the list.
+          setProviders((typed) => [...list, ...typed.filter((p) => !list.some((loaded) => loaded.id === p.id))])
           setLoadedProviders(JSON.parse(JSON.stringify(list)) as AiProviderConfig[])
           setLoadFailed(false)
+          // The refusal a Save gave while the list was missing no longer applies once it is here.
+          if (retrying) setSaveError('')
         },
         // Said, not swallowed: an empty pane after a failed load reads exactly like "no providers yet",
         // and saving from it would replace the real list blind. The error text is not shown — a parse

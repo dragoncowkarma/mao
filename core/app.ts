@@ -127,6 +127,14 @@ export function describeQueueWriteConflict(): string {
   )
 }
 
+/**
+ * How many task ids' forms a host remembers as its own (see `ownTaskForms` in `createMaoApp`). Far above the
+ * queue's own size — at most `MAX_FINISHED_TASKS` finished tasks plus the live ones — so a task cleared or
+ * capped away stays recognised for many hundreds of later tasks, while the map stays bounded in a host that
+ * runs for months.
+ */
+const OWN_TASK_FORM_IDS = 1_000
+
 /** Why a re-save refused: the unusable stored queue holds readable tasks this session never loaded or wrote. */
 function describeForeignTasksInStoredQueue(): string {
   return (
@@ -209,8 +217,13 @@ export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOp
    * write made exactly that stale buffer read as another host's work, so the re-save refused, blamed a host
    * that did not exist, and left the session with no way to persist its queue. The boot forms are the
    * guard-normalized reading, not the raw witness, because a queue an older build wrote (a task repo with
-   * registry settings, no `autoAdvance`) reads back normalized. Pruned to the ids of each write, so a task
-   * the engine has dropped stops counting as this process's own.
+   * registry settings, no `autoAdvance`) reads back normalized.
+   *
+   * A task this process removed itself — "Clear completed", or the finished-task cap dropping the oldest on
+   * every completion of a busy host — keeps its forms too: a stale copy of it is still this process's own
+   * past state, and forgetting it at removal wedged the session the same way the last-write-only rule did.
+   * The map is bounded instead, by recency: each write touches the ids it holds, and only the
+   * least-recently-touched beyond `OWN_TASK_FORM_IDS` are forgotten — hashes, so a few hundred kilobytes.
    */
   const ownTaskForms = new Map<string, Set<string>>()
   const formOf = (task: QueuedTask) => createHash('sha256').update(JSON.stringify(task)).digest('hex')
@@ -218,7 +231,13 @@ export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOp
     for (const task of tasks) {
       const forms = ownTaskForms.get(task.id) ?? new Set<string>()
       forms.add(formOf(task))
+      // Re-inserted so the map's insertion order is recency order.
+      ownTaskForms.delete(task.id)
       ownTaskForms.set(task.id, forms)
+    }
+    for (const id of ownTaskForms.keys()) {
+      if (ownTaskForms.size <= OWN_TASK_FORM_IDS) break
+      ownTaskForms.delete(id)
     }
   }
   rememberOwnForms(observedQueue.value)
@@ -226,8 +245,6 @@ export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOp
   /** Records a confirmed write of `tasks` as the stored queue this process's next write is keyed on. */
   function recordQueueWrite(tasks: QueuedTask[]) {
     persistedQueueWitness = storedValueWitness(tasks)
-    const live = new Set(tasks.map((task) => task.id))
-    for (const id of [...ownTaskForms.keys()]) if (!live.has(id)) ownTaskForms.delete(id)
     rememberOwnForms(tasks)
   }
 

@@ -1,6 +1,6 @@
 import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import GlobalSettings from './GlobalSettings'
 import { createElectronApiStub } from '../test/electron-api-stub'
 import type { AiProviderConfig } from '../../core/ai/types'
@@ -180,5 +180,31 @@ describe('GlobalSettings saves only what it can stand behind', () => {
 
     expect(await screen.findByText('Nothing to save')).toBeInTheDocument()
     expect(screen.queryByText('Saved')).toBeNull()
+  })
+
+  it('keeps a provider typed during a failed load when Retry succeeds, and drops the stale refusal', async () => {
+    const stub = createElectronApiStub()
+    stub.listProviders.mockRejectedValueOnce(new Error('EACCES')).mockResolvedValue([claude])
+    stub.api.ai.save.mockImplementation(echoSave)
+    const user = userEvent.setup()
+
+    render(<GlobalSettings theme="system" onThemeChange={() => {}} />)
+    await screen.findByText(/provider list could not be loaded/)
+    await user.click(screen.getByRole('button', { name: '+ Add provider' }))
+    await user.type(screen.getByPlaceholderText('Name'), 'New')
+    await user.type(screen.getByPlaceholderText('API key'), 'test-key')
+    await user.click(screen.getByRole('button', { name: 'Save changes' }))
+    await screen.findByText(/never loaded/)
+
+    await user.click(screen.getByRole('button', { name: 'Retry loading providers' }))
+    expect(await screen.findByDisplayValue('Claude')).toBeInTheDocument()
+    expect(screen.getByDisplayValue('New')).toBeInTheDocument()
+    expect(screen.queryByText(/never loaded/)).toBeNull()
+
+    await user.click(screen.getByRole('button', { name: 'Save changes' }))
+    await screen.findByText('Saved')
+    const [saved, base] = vi.mocked(stub.api.ai.save).mock.calls[0] as unknown as [AiProviderConfig[], AiProviderConfig[]]
+    expect(saved.map((p) => p.name)).toEqual(['Claude', 'New'])
+    expect(base).toEqual([claude])
   })
 })

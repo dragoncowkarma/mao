@@ -124,14 +124,48 @@ function isMissing(err: unknown): boolean {
 }
 
 /**
- * A cross-process write lock for `filePath`, held as an `O_EXCL`-created `<filePath>.lock`.
+ * The file a write to `filePath` actually lands in: symlinks followed, as an in-place write follows them.
+ *
+ * Both the replace and the lock are keyed on it. A rename over the link itself would turn a symlinked
+ * `config.json` — the natural way to point the CLI's `~/.config/mao` at the desktop app's file — into a
+ * private copy, forking the configuration silently; and a lock keyed on the unresolved path would let two
+ * processes reaching one file through different paths each hold their own. A file that does not exist yet
+ * resolves through a dangling link if there is one, else to `filePath` itself.
+ */
+export function resolveStoreFilePath(filePath: string): string {
+  try {
+    return fs.realpathSync(filePath)
+  } catch (err) {
+    if (!isMissing(err)) throw err
+  }
+  try {
+    return path.resolve(path.dirname(filePath), fs.readlinkSync(filePath))
+  } catch {
+    return filePath
+  }
+}
+
+/**
+ * The lock tokens this process holds right now, across every lock instance.
+ *
+ * A lock naming this process's pid is otherwise indistinguishable from a live one — `kill(pid, 0)` always
+ * succeeds for oneself — yet it can be stale: a process restarted under the same pid and hostname after
+ * being killed mid-write (a container's PID 1 is the common case) would wait out the full stale age before
+ * every write. Only a token in this set belongs to a live holder here.
+ */
+const heldLockTokens = new Set<string>()
+
+/**
+ * A cross-process write lock for `filePath`, held as an `O_EXCL`-created `<file>.lock` beside the file a
+ * write actually lands in (`resolveStoreFilePath`).
  *
  * Synchronous on purpose: `setIfUnchanged`'s guarantee rests on nothing being able to run between its
  * compare and its write, and an `await` in here would hand exactly that interval to the event loop.
  *
  * Abandoned locks are broken rather than left to wedge every write, because a holder can die mid-write
  * (SIGKILL, power loss, Ctrl+C on a one-shot command). A lock is abandoned when its owner pid no longer
- * exists on this host (after `DEAD_OWNER_GRACE_MS`), or when it is older than `staleMs` regardless.
+ * exists on this host — or is this process's own pid on a token this process does not hold
+ * (`heldLockTokens`) — after `DEAD_OWNER_GRACE_MS`, or when it is older than `staleMs` regardless.
  * Breaking it moves the file aside and then checks the moved bytes are the ones judged abandoned; if a
  * fresh lock was taken in between, it is put back. That narrows, but does not remove, the race between two
  * processes breaking the same dead lock at the same moment — a crash inside a millisecond hold *and* two
@@ -140,13 +174,12 @@ function isMissing(err: unknown): boolean {
  * Not re-entrant: a nested call would wait on itself until the timeout, so it is refused at once instead.
  */
 export function createStoreWriteLock(filePath: string, options: StoreWriteLockOptions = {}): StoreWriteLock {
-  const lockPath = `${filePath}.lock`
   const timeoutMs = options.timeoutMs ?? STORE_LOCK_TIMEOUT_MS
   const staleMs = options.staleMs ?? STORE_LOCK_STALE_MS
   let held = false
 
   /** Moves an abandoned lock out of the way. True when the caller should retry acquiring at once. */
-  function breakIfAbandoned(): { retry: boolean; owner: LockOwner | undefined } {
+  function breakIfAbandoned(lockPath: string): { retry: boolean; owner: LockOwner | undefined } {
     let text: string
     let mtimeMs: number
     try {
@@ -158,7 +191,10 @@ export function createStoreWriteLock(filePath: string, options: StoreWriteLockOp
     }
     const owner = parseOwner(text)
     const age = Date.now() - mtimeMs
-    const ownerDead = owner !== undefined && owner.host === os.hostname() && !isProcessAlive(owner.pid)
+    const ownerDead =
+      owner !== undefined &&
+      owner.host === os.hostname() &&
+      (owner.pid === process.pid ? !heldLockTokens.has(text) : !isProcessAlive(owner.pid))
     if (!(ownerDead && age >= DEAD_OWNER_GRACE_MS) && age < staleMs) return { retry: false, owner }
 
     const aside = `${lockPath}.abandoned-${process.pid}-${randomBytes(6).toString('hex')}`
@@ -185,19 +221,41 @@ export function createStoreWriteLock(filePath: string, options: StoreWriteLockOp
     return { retry: true, owner }
   }
 
-  function acquire(): string {
+  /**
+   * Creates the lock file and writes the token into it, or leaves nothing behind. `O_EXCL` creation and the
+   * write are two steps, and a write that fails after the create (a full disk, a quota) would otherwise
+   * leave an empty lock no one owns — judged only by age, so every MAO process waits out the stale period.
+   */
+  function tryCreate(lockPath: string, token: string): boolean {
+    let fd: number
+    try {
+      fd = fs.openSync(lockPath, 'wx')
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'EEXIST') return false
+      throw err
+    }
+    try {
+      fs.writeSync(fd, token)
+    } catch (err) {
+      fs.closeSync(fd)
+      fs.rmSync(lockPath, { force: true })
+      throw err
+    }
+    fs.closeSync(fd)
+    return true
+  }
+
+  function acquire(lockPath: string): string {
     const token = JSON.stringify({ pid: process.pid, host: os.hostname(), nonce: randomBytes(12).toString('hex') })
     const startedAt = Date.now()
     let delayMs = 2
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true })
     for (;;) {
-      try {
-        fs.mkdirSync(path.dirname(lockPath), { recursive: true })
-        fs.writeFileSync(lockPath, token, { flag: 'wx' })
+      if (tryCreate(lockPath, token)) {
+        heldLockTokens.add(token)
         return token
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err
       }
-      const { retry, owner } = breakIfAbandoned()
+      const { retry, owner } = breakIfAbandoned(lockPath)
       if (retry) continue
       const waited = Date.now() - startedAt
       if (waited >= timeoutMs) throw new StoreLockError(lockPath, describeOwner(owner), waited)
@@ -207,7 +265,8 @@ export function createStoreWriteLock(filePath: string, options: StoreWriteLockOp
   }
 
   /** Removes the lock only if it is still this holder's — a lock broken as abandoned now belongs to another. */
-  function release(token: string) {
+  function release(lockPath: string, token: string) {
+    heldLockTokens.delete(token)
     try {
       if (fs.readFileSync(lockPath, 'utf-8') === token) fs.unlinkSync(lockPath)
     } catch {
@@ -218,13 +277,15 @@ export function createStoreWriteLock(filePath: string, options: StoreWriteLockOp
 
   return function withStoreWriteLock<T>(critical: () => T): T {
     if (held) throw new Error(`[store] Re-entrant write to ${filePath}: the write lock is already held here.`)
-    const token = acquire()
+    // Resolved per acquisition, not once: the lock must name the file the write will land in now.
+    const lockPath = `${resolveStoreFilePath(filePath)}.lock`
+    const token = acquire(lockPath)
     held = true
     try {
       return critical()
     } finally {
       held = false
-      release(token)
+      release(lockPath, token)
     }
   }
 }
@@ -234,9 +295,11 @@ const TRANSIENT_RENAME_CODES = new Set(['EPERM', 'EBUSY', 'EACCES'])
 
 /**
  * Replaces `filePath` with `text` so that no reader can ever observe a partial file: the bytes go to a
- * temporary file in the same directory, are flushed, and are then renamed over the target.
+ * temporary file in the same directory, are flushed, and are then renamed over the target — the file a
+ * symlink points to, not the link (`resolveStoreFilePath`).
  *
- * The temporary file inherits the target's permission bits, because a rename replaces the inode — and
+ * The temporary file inherits the target's permission bits and, where the writer may set it, its owner,
+ * because a rename replaces the inode — and
  * `config.json` holds the GitHub token in plaintext, so an operator's `chmod 600` must survive a write.
  * (An in-place `writeFileSync`, which this replaces, kept the mode implicitly.) A new file gets the same
  * default an in-place write would have.
@@ -244,20 +307,35 @@ const TRANSIENT_RENAME_CODES = new Set(['EPERM', 'EBUSY', 'EACCES'])
  * A failure removes the temporary file and leaves the target exactly as it was.
  */
 export function writeStoreFileAtomic(filePath: string, text: string): void {
-  const dir = path.dirname(filePath)
+  const target = resolveStoreFilePath(filePath)
+  const dir = path.dirname(target)
   fs.mkdirSync(dir, { recursive: true })
-  let mode: number | undefined
+  let existing: fs.Stats | undefined
   try {
-    mode = fs.statSync(filePath).mode & 0o777
+    existing = fs.statSync(target)
   } catch (err) {
     if (!isMissing(err)) throw err
   }
+  const mode = existing ? existing.mode & 0o777 : undefined
 
-  const tempPath = path.join(dir, `.${path.basename(filePath)}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`)
+  const tempPath = path.join(dir, `.${path.basename(target)}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`)
   try {
     fs.writeFileSync(tempPath, text, { flag: 'wx', mode: mode ?? 0o666 })
     // The creation mode is filtered through the umask; set it exactly so a write never changes it.
     if (mode !== undefined) fs.chmodSync(tempPath, mode)
+    // And the owner, which the rename would otherwise hand to whoever wrote: one `sudo mao …` left an
+    // operator's own token file root-owned and unreadable to them. Only root can give a file away, so
+    // anyone else's attempt is a no-op failure and is ignored; the in-place write this replaced kept the
+    // owner implicitly.
+    if (existing && typeof process.getuid === 'function' && typeof process.getgid === 'function') {
+      if (existing.uid !== process.getuid() || existing.gid !== process.getgid()) {
+        try {
+          fs.chownSync(tempPath, existing.uid, existing.gid)
+        } catch {
+          // Not permitted for a non-root writer; the file simply becomes this writer's, as any new file would.
+        }
+      }
+    }
     const fd = fs.openSync(tempPath, 'r+')
     try {
       fs.fsyncSync(fd)
@@ -266,7 +344,7 @@ export function writeStoreFileAtomic(filePath: string, text: string): void {
     }
     for (let attempt = 1; ; attempt += 1) {
       try {
-        fs.renameSync(tempPath, filePath)
+        fs.renameSync(tempPath, target)
         break
       } catch (err) {
         const code = (err as NodeJS.ErrnoException).code

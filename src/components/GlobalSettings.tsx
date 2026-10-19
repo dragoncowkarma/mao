@@ -383,11 +383,24 @@ function ProviderCard({ provider: p, onUpdate, onRemove }: ProviderCardProps) {
 export default function GlobalSettings({ theme, onThemeChange }: GlobalSettingsProps) {
   const [githubToken, setGithubToken] = useState('')
   const [providers, setProviders] = useState<AiProviderConfig[]>([])
+  /**
+   * The provider list as stored when this pane last loaded or saved it — what the edits in `providers` are
+   * derived from. Sent with every save so core refuses one that would land over a list another process
+   * changed meanwhile (a `mao config import-providers` in a terminal, say), instead of deleting it and its
+   * API keys (issue #73). A JSON copy, never a shared reference, so no edit can reach it, and so it
+   * compares the way core compares stored values.
+   */
+  const [loadedProviders, setLoadedProviders] = useState<AiProviderConfig[] | undefined>(undefined)
   const [savedMessage, setSavedMessage] = useState('')
   const [saveError, setSaveError] = useState('')
 
   useEffect(() => {
-    electronApi().ai.list().then(setProviders)
+    electronApi()
+      .ai.list()
+      .then((list) => {
+        setProviders(list)
+        setLoadedProviders(JSON.parse(JSON.stringify(list)) as AiProviderConfig[])
+      })
   }, [])
 
   function updateProvider(id: string, patch: Partial<AiProviderConfig>) {
@@ -412,7 +425,9 @@ export default function GlobalSettings({ theme, onThemeChange }: GlobalSettingsP
     }
 
     try {
-      await electronApi().ai.save(providers)
+      await electronApi().ai.save(providers, loadedProviders)
+      // What is stored now is what was just saved, so it is the base the next save is derived from.
+      setLoadedProviders(JSON.parse(JSON.stringify(providers)) as AiProviderConfig[])
       if (githubToken) await electronApi().github.setToken(githubToken)
       setSavedMessage('Saved')
       setTimeout(() => setSavedMessage(''), 1500)

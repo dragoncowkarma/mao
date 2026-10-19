@@ -112,7 +112,10 @@ npm run cli -- swarm --repo-root /path/to/repo --dry-run --once
 **Several MAO processes on one config file (issue #73).** A long-running `mao run` (or the desktop
 app) beside one-shot commands in other terminals is supported. Every write replaces only the key it is
 for, merged into the file **as it is now** and swapped in atomically (a temporary file renamed over
-`config.json`, keeping its permission bits), under a cross-process lock file `config.json.lock`. So a
+`config.json`), under a cross-process lock file `config.json.lock`. The CLI's write keeps the file's
+permission bits and owner, and writes *through* a symlinked `config.json` rather than replacing the link;
+the desktop app writes through electron-store, which does not keep a tightened mode — a `chmod 600` there
+returns to the default on its next write, as it always has. So a
 `mao repos remove`, `config set-token`, `import-providers` or theme change made while `mao run` is up is
 no longer reverted by its next queue write — including the `githubRepos` recovery below. What each kind
 of value does when two processes change *the same* key:
@@ -120,8 +123,9 @@ of value does when two processes change *the same* key:
 | Value | Policy |
 | --- | --- |
 | `githubToken`, `theme`, `buildSha`, `import-providers` | stated outright, so the last write wins |
-| tracked repositories (`repos add`/`remove`, the GUI) | written only if unchanged since read; a list another process changed meanwhile is re-planned — your add or remove is applied to the current list and re-preflighted — up to three times, then "Nothing was written" |
-| provider list from Global settings | written only if unchanged since the pane loaded it, else "reload and apply the edit again" (unchanged) |
+| tracked repositories (`repos add`/`remove`) | written only if unchanged since read; a list another process changed meanwhile is re-planned — your add or remove is applied to the current list and re-preflighted — up to three times, then "Nothing was written" |
+| tracked repositories (the desktop app) | the window sends the list its edit was based on, so only what you changed there is applied to the list as stored now: a repository added or removed in a terminal since the window loaded stays that way, and a setting changed elsewhere survives a toggle of a different one. A settings edit to a repository removed elsewhere is dropped rather than re-adding it |
+| provider list from Global settings | written only if the stored list is still the one the pane loaded (or last saved), else "reopen Global settings and apply the edit again" — so a `mao config import-providers` made while the pane is open is not deleted by its next Save |
 | workflow queue | written only if it is still the queue this process last read or wrote |
 
 The queue is the one to plan around. Two hosts running one queue are two engines able to repeat the same
@@ -132,11 +136,15 @@ per config file — `mao run`, the desktop app, or a one-shot `mao workflow enqu
 (which process the queue in the foreground). If it happens: stop the others, check `mao workflow list` and
 the target repos for work either may have repeated, run `mao config clear-persistence-broken`, and
 restart. A queue that becomes *unusable* (hand-corrupted) after a clean start is the exception — that
-session still rewrites it from the queue it holds, as described below.
+session still rewrites it from the queue it holds, as described below, provided every readable task left
+in it is one that session wrote; a value still holding another host's task is refused like any other
+conflict. An enqueue whose write is refused keeps nothing: the command (or the auto-trigger poll) fails, and
+the issue is picked up once writes succeed again, as one task rather than two.
 
 A write that finds the lock held waits up to five seconds, then fails with "Nothing was written", the
 holder's pid and the lock path. A lock left by a process that died mid-write is broken automatically once
-its pid is gone from this host (or after 30 s if it cannot be identified, e.g. another host on a shared
+its pid is gone from this host — or names the writing process's own pid on a lock it does not hold, which
+is a restart under the same pid — or after 30 s if it cannot be identified (another host on a shared
 volume); delete `config.json.lock` by hand only if no MAO process is running. A write to a `config.json`
 that exists but cannot be read is refused rather than merged into an empty file, so the token and
 everything else in it survive.
@@ -302,7 +310,7 @@ None of those messages quotes the underlying error, because an I/O or parse fail
 own bytes and that file holds your GitHub token in plaintext.
 
 Against other MAO processes that check is exclusive: the comparison and the write run under the config
-file's write lock (`config.json.lock`, see "Several MAO processes on one config file" below), so a second
+file's write lock (`config.json.lock`, see "Several MAO processes on one config file" above), so a second
 recovery, a `mao run` or the desktop app cannot write between them. It is **not** exclusive against a
 writer that takes no lock — a hand-edit, or another tool — which can still land inside that step and be
 overwritten while the command reports success. So: do not hand-edit the file while a recovery is running

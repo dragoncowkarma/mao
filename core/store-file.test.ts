@@ -20,6 +20,13 @@ function tempConfigPath(): string {
 /** A pid no live process on this host can have: far above Linux's pid_max and macOS's 99999. */
 const DEAD_PID = 2 ** 30
 
+/**
+ * Another process that is certainly alive for the whole test: the one that started this worker. Not
+ * `process.pid` — a lock naming this process's own pid on a token it does not hold is a stale one from an
+ * earlier process that had the same pid, and is judged as such.
+ */
+const LIVE_OTHER_PID = process.ppid
+
 /** Plants another holder's lock file, as a second process (or a crashed one) would have left it. */
 function plantLock(filePath: string, owner: { pid: number; host?: string }, ageMs = 0) {
   const lockPath = `${filePath}.lock`
@@ -80,9 +87,9 @@ describe('createStoreWriteLock', () => {
   })
 
   it('waits out a live holder rather than breaking its lock', () => {
-    // This process's own pid is alive, and the lock is fresh — exactly a second MAO process mid-write.
+    // A live pid, and a fresh lock — exactly a second MAO process mid-write.
     const filePath = tempConfigPath()
-    const lockPath = plantLock(filePath, { pid: process.pid })
+    const lockPath = plantLock(filePath, { pid: LIVE_OTHER_PID })
     const lock = createStoreWriteLock(filePath, { timeoutMs: 40 })
 
     const startedAt = Date.now()
@@ -95,7 +102,7 @@ describe('createStoreWriteLock', () => {
   it('names the holder and the lock file, and nothing from the config file', () => {
     const filePath = tempConfigPath()
     fs.writeFileSync(filePath, JSON.stringify({ githubToken: 'ghp_SENTINEL_SECRET' }))
-    plantLock(filePath, { pid: process.pid })
+    plantLock(filePath, { pid: LIVE_OTHER_PID })
     const lock = createStoreWriteLock(filePath, { timeoutMs: 10 })
 
     let message = ''
@@ -105,7 +112,7 @@ describe('createStoreWriteLock', () => {
       message = (err as Error).message
     }
 
-    expect(message).toContain(`pid ${process.pid}`)
+    expect(message).toContain(`pid ${LIVE_OTHER_PID}`)
     expect(message).toContain(`${filePath}.lock`)
     expect(message).not.toContain('ghp_SENTINEL_SECRET')
   })
@@ -141,7 +148,7 @@ describe('createStoreWriteLock', () => {
 
   it('breaks any lock older than the stale age, whoever holds it', () => {
     const filePath = tempConfigPath()
-    plantLock(filePath, { pid: process.pid }, 5_000)
+    plantLock(filePath, { pid: LIVE_OTHER_PID }, 5_000)
     const lock = createStoreWriteLock(filePath, { timeoutMs: 30, staleMs: 1_000 })
 
     expect(lock(() => 'ran')).toBe('ran')
@@ -170,7 +177,7 @@ describe('createStoreWriteLock', () => {
     vi.spyOn(fs, 'renameSync').mockImplementation((from, to) => {
       if (!raced && String(from) === lockPath) {
         raced = true
-        fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, host: os.hostname(), nonce: 'live' }))
+        fs.writeFileSync(lockPath, JSON.stringify({ pid: LIVE_OTHER_PID, host: os.hostname(), nonce: 'live' }))
       }
       return realRename(from, to)
     })
@@ -182,6 +189,73 @@ describe('createStoreWriteLock', () => {
     expect(fs.readdirSync(path.dirname(filePath))).toEqual(['config.json.lock'])
   })
 
+  it("breaks a lock naming this process's own pid that this process does not hold", () => {
+    // A process killed mid-write and restarted under the same pid and hostname — a container's PID 1 —
+    // finds its predecessor's lock. kill(pid, 0) succeeds for oneself, so only the held-token set can
+    // tell it is stale; without it every write waits out the full stale age.
+    const filePath = tempConfigPath()
+    plantLock(filePath, { pid: process.pid }, 2_000)
+    const lock = createStoreWriteLock(filePath, { timeoutMs: 30 })
+
+    expect(lock(() => 'ran')).toBe('ran')
+  })
+
+  it('does not break a lock this process holds through another instance, however old it looks', () => {
+    // Two stores on one file in one process share nothing but the disk, as two processes do. The live
+    // holder's token is in the held set, so its lock is judged live by pid, not by age within staleMs.
+    const filePath = tempConfigPath()
+    const holder = createStoreWriteLock(filePath)
+    const waiter = createStoreWriteLock(filePath, { timeoutMs: 30 })
+
+    let refused: unknown
+    holder(() => {
+      const then = new Date(Date.now() - 2_000)
+      fs.utimesSync(`${filePath}.lock`, then, then)
+      try {
+        waiter(() => 'ran')
+      } catch (err) {
+        refused = err
+      }
+    })
+
+    expect(refused).toBeInstanceOf(StoreLockError)
+  })
+
+  it('leaves no lock behind when writing its token fails after the exclusive create', () => {
+    // Otherwise a full disk leaves an empty lock no one owns, which every MAO process waits out by age.
+    const filePath = tempConfigPath()
+    const lock = createStoreWriteLock(filePath)
+    vi.spyOn(fs, 'writeSync').mockImplementationOnce(() => {
+      throw new Error('ENOSPC: no space left on device')
+    })
+
+    expect(() => lock(() => 'ran')).toThrow(/ENOSPC/)
+    expect(fs.existsSync(`${filePath}.lock`)).toBe(false)
+    vi.restoreAllMocks()
+    expect(lock(() => 'ran')).toBe('ran')
+  })
+
+  it.skipIf(process.platform === 'win32')('is one lock for a file however it is reached', () => {
+    // The CLI pointed at the desktop app's config through a symlink must contend for the same lock.
+    const real = tempConfigPath()
+    fs.writeFileSync(real, '{}')
+    const link = path.join(path.dirname(real), 'linked.json')
+    fs.symlinkSync(real, link)
+    const viaReal = createStoreWriteLock(real)
+    const viaLink = createStoreWriteLock(link, { timeoutMs: 20 })
+
+    let refused: unknown
+    viaReal(() => {
+      try {
+        viaLink(() => 'ran')
+      } catch (err) {
+        refused = err
+      }
+    })
+
+    expect(refused).toBeInstanceOf(StoreLockError)
+  })
+
   it('leaves a lock it no longer owns in place on release', () => {
     // If this holder's lock was broken as abandoned and someone else took the slot, unlinking on release
     // would remove the other holder's lock mid-write.
@@ -189,7 +263,7 @@ describe('createStoreWriteLock', () => {
     const lock = createStoreWriteLock(filePath)
 
     lock(() => {
-      fs.writeFileSync(`${filePath}.lock`, JSON.stringify({ pid: process.pid, host: os.hostname(), nonce: 'other' }))
+      fs.writeFileSync(`${filePath}.lock`, JSON.stringify({ pid: LIVE_OTHER_PID, host: os.hostname(), nonce: 'other' }))
     })
 
     expect(JSON.parse(fs.readFileSync(`${filePath}.lock`, 'utf-8')).nonce).toBe('other')
@@ -230,6 +304,45 @@ describe('writeStoreFileAtomic', () => {
 
     expect(fs.statSync(filePath).mode & 0o777).toBe(0o600)
   })
+
+  it.skipIf(process.platform === 'win32')('writes through a symlink instead of replacing it', () => {
+    // A rename over the link would turn a shared config into a private copy, silently forking it.
+    const real = tempConfigPath()
+    fs.writeFileSync(real, '{"theme":"light"}')
+    const link = path.join(path.dirname(real), 'linked.json')
+    fs.symlinkSync(real, link)
+
+    writeStoreFileAtomic(link, '{"theme":"dark"}')
+
+    expect(fs.lstatSync(link).isSymbolicLink()).toBe(true)
+    expect(fs.readFileSync(real, 'utf-8')).toBe('{"theme":"dark"}')
+  })
+
+  it.skipIf(process.platform === 'win32')('creates the target of a dangling symlink, as an in-place write would', () => {
+    const dir = path.dirname(tempConfigPath())
+    const link = path.join(dir, 'linked.json')
+    fs.symlinkSync(path.join(dir, 'real.json'), link)
+
+    writeStoreFileAtomic(link, '{}')
+
+    expect(fs.lstatSync(link).isSymbolicLink()).toBe(true)
+    expect(fs.readFileSync(path.join(dir, 'real.json'), 'utf-8')).toBe('{}')
+  })
+
+  it.skipIf(typeof process.getuid !== 'function' || process.getuid() !== 0)(
+    "keeps the file's owner when root writes it",
+    () => {
+      // One `sudo mao …` used to leave an operator's own token file root-owned and unreadable to them.
+      const filePath = tempConfigPath()
+      fs.writeFileSync(filePath, '{}')
+      fs.chownSync(filePath, 1234, 1234)
+
+      writeStoreFileAtomic(filePath, '{"theme":"dark"}')
+
+      expect(fs.statSync(filePath).uid).toBe(1234)
+      expect(fs.statSync(filePath).gid).toBe(1234)
+    },
+  )
 
   it('creates the file and its directory when neither exists', () => {
     const filePath = path.join(path.dirname(tempConfigPath()), 'nested', 'config.json')

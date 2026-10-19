@@ -169,7 +169,7 @@ describe('App unusable stored settings', () => {
     await user.click(screen.getByRole('button', { name: 'Confirm reset' }))
 
     await waitFor(() => expect(screen.queryByText(/is an object, not a JSON array/)).toBeNull())
-    expect(stub.setRepos).toHaveBeenCalledWith([])
+    expect(stub.setRepos).toHaveBeenCalledWith([], [])
     expect(stub.storedRepos()).toEqual([])
     expect(screen.getByText(/No projects yet/)).toBeInTheDocument()
   })
@@ -297,7 +297,7 @@ describe('App unusable stored settings', () => {
     await addSettled()
 
     await waitFor(() => expect(screen.queryByText(/is an object, not a JSON array/)).toBeNull())
-    expect(stub.setRepos).toHaveBeenCalledWith([ONE])
+    expect(stub.setRepos).toHaveBeenCalledWith([ONE], [])
   })
 
   it('reports the write failure even when the diagnostic read throws', async () => {
@@ -329,7 +329,7 @@ describe('App unusable stored settings', () => {
     await user.click(screen.getByRole('button', { name: 'Reset stored list' }))
     await user.click(screen.getByRole('button', { name: 'Confirm reset' }))
 
-    await waitFor(() => expect(stub.setRepos).toHaveBeenCalledWith([]))
+    await waitFor(() => expect(stub.setRepos).toHaveBeenCalledWith([], []))
     expect(tokenField()).toBeInTheDocument()
   })
 
@@ -537,7 +537,7 @@ describe('App unusable stored settings', () => {
         fireEvent.click(screen.getByRole('button', { name: 'Add' }))
         await vi.advanceTimersByTimeAsync(0)
       })
-      expect(stub.setRepos).toHaveBeenCalledWith([ONE])
+      expect(stub.setRepos).toHaveBeenCalledWith([ONE], [])
 
       // The held read answers with the list from before that write.
       await act(async () => {
@@ -686,7 +686,7 @@ describe('App unusable stored settings', () => {
         fireEvent.change(screen.getByRole('spinbutton'), { target: { value: '45' } })
         await vi.advanceTimersByTimeAsync(0)
       })
-      expect(stub.setRepos).toHaveBeenCalledWith([{ ...ONE, pollIntervalMs: 45_000 }])
+      expect(stub.setRepos).toHaveBeenCalledWith([{ ...ONE, pollIntervalMs: 45_000 }], [ONE])
 
       // Only afterwards does the store break, and then get repaired to a different list.
       stub.storeProblems.mockResolvedValue([UNUSABLE_REPO_LIST])
@@ -731,7 +731,7 @@ describe('App project selection', () => {
     await submitAdd(user, TWO)
 
     expect(await projectHeading(TWO)).toBeInTheDocument()
-    expect(stub.setRepos).toHaveBeenCalledWith([ONE, TWO])
+    expect(stub.setRepos).toHaveBeenCalledWith([ONE, TWO], [ONE])
     expect(stub.storedRepos()).toEqual([ONE, TWO])
   })
 
@@ -777,7 +777,7 @@ describe('App project selection', () => {
 
     expect(await projectHeading(ONE)).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'acme/two' })).toBeNull()
-    expect(stub.setRepos).toHaveBeenCalledWith([ONE])
+    expect(stub.setRepos).toHaveBeenCalledWith([ONE], [ONE, TWO])
   })
 
   /**
@@ -802,7 +802,7 @@ describe('App project selection', () => {
     expect(await projectHeading(ONE)).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'acme/two' })).toBeNull()
     expect(sidebarProject(THREE)).toBeInTheDocument()
-    expect(stub.setRepos).toHaveBeenCalledWith([ONE, THREE])
+    expect(stub.setRepos).toHaveBeenCalledWith([ONE, THREE], [ONE, TWO, THREE])
   })
 
   /**
@@ -830,7 +830,7 @@ describe('App project selection', () => {
     await user.click(screen.getByRole('button', { name: 'Confirm remove' }))
 
     expect(await projectHeading(ONE)).toBeInTheDocument()
-    expect(stub.setRepos).toHaveBeenCalledWith([ONE, OTHER_TWO, THREE])
+    expect(stub.setRepos).toHaveBeenCalledWith([ONE, OTHER_TWO, THREE], [ONE, TWO, TWO_SHOUTED, OTHER_TWO, THREE])
     expect(stub.storedRepos()).toEqual([ONE, OTHER_TWO, THREE])
     expect(screen.queryByRole('button', { name: 'acme/two' })).toBeNull()
     expect(screen.queryByRole('button', { name: /ACME\/TWO/ })).toBeNull()
@@ -910,7 +910,7 @@ describe('App project selection', () => {
 
     expect(screen.getByRole('heading', { name: 'acme/three' })).toBeInTheDocument()
     expect(screen.queryByRole('heading', { name: 'acme/one' })).toBeNull()
-    expect(stub.setRepos).toHaveBeenCalledWith([ONE, THREE])
+    expect(stub.setRepos).toHaveBeenCalledWith([ONE, THREE], [ONE, TWO, THREE])
   })
 })
 
@@ -927,6 +927,42 @@ describe('App project selection', () => {
  * the starting view sees an add submitted from a sidebar form that is visible from the settings pane
  * too, where nobody moves at all.
  */
+/**
+ * Issue #73's GUI half. This window's repository list is a mirror read at mount and after its own writes,
+ * so it falls behind whenever a terminal changes the list. Each edit therefore sends the list it was
+ * computed from, and the stub applies it the way `github:setRepos` does (core's `applyRepoListEdit`), so
+ * these assert what the real stack keeps. Before the base was sent, a Remove dropped a repository added
+ * in a terminal and a settings toggle put back one removed there — re-preflighted, then polled again.
+ */
+describe('App repository edits beside another process', () => {
+  it('keeps a repository a terminal added when the window removes another one', async () => {
+    const { stub, user } = await renderApp([ONE, TWO])
+    // `mao repos add acme three` in a terminal — this window has not re-read the list since mount.
+    stub.applyRepos([ONE, TWO, THREE])
+
+    await user.click(sidebarProject(TWO))
+    await projectHeading(TWO)
+    await openSettings(user)
+    await user.click(screen.getByRole('button', { name: 'Remove acme/two' }))
+    await user.click(screen.getByRole('button', { name: 'Confirm remove' }))
+
+    expect(await screen.findByRole('button', { name: 'acme/three' })).toBeInTheDocument()
+    expect(stub.storedRepos()).toEqual([ONE, THREE])
+  })
+
+  it('does not put back a repository a terminal removed when the window edits another one', async () => {
+    const { stub, user } = await renderApp([ONE, TWO])
+    // `mao repos remove acme two` in a terminal; the window still lists it.
+    stub.applyRepos([ONE])
+
+    await openSettings(user)
+    fireEvent.change(screen.getByRole('spinbutton'), { target: { value: '45' } })
+
+    await waitFor(() => expect(stub.setRepos).toHaveBeenCalled())
+    expect(stub.storedRepos()).toEqual([{ ...ONE, pollIntervalMs: 45_000 }])
+  })
+})
+
 describe('App repository add and unsaved global settings', () => {
   /** Not token-shaped on purpose: a fixture should never look like a credential to a secret scanner. */
   const DRAFT_TOKEN = 'pasted-but-not-yet-saved'

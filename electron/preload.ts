@@ -27,8 +27,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   },
   ai: {
     list: (): Promise<AiProviderConfig[]> => ipcRenderer.invoke('ai:list'),
-    save: (providers: AiProviderConfig[]): Promise<AiProviderConfig[]> =>
-      ipcRenderer.invoke('ai:save', providers),
+    save: (providers: AiProviderConfig[], base?: AiProviderConfig[]): Promise<AiProviderConfig[]> =>
+      ipcRenderer.invoke('ai:save', providers, base),
     run: (providerId: string, prompt: string): Promise<string> =>
       ipcRenderer.invoke('ai:run', providerId, prompt),
   },
@@ -43,8 +43,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
      * preflight. Resolves with the verdict for each newly registered repo, whose `unverified` grants
      * the caller should surface — a pass is not proof of write access.
      */
-    setRepos: (repos: RepoRef[]): Promise<RepoWorkflowCapability[]> =>
-      ipcRenderer.invoke('github:setRepos', repos),
+    setRepos: (repos: RepoRef[], base?: RepoRef[]): Promise<RepoWorkflowCapability[]> =>
+      ipcRenderer.invoke('github:setRepos', repos, base),
     getRepos: (): Promise<RepoRef[]> => ipcRenderer.invoke('github:getRepos'),
     autoTriggerStatus: (owner: string, repo: string): Promise<AutoTriggerStatus> =>
       ipcRenderer.invoke('github:autoTriggerStatus', owner, repo),

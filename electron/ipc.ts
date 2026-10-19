@@ -3,7 +3,7 @@ import path from 'node:path'
 import { store } from './store.ts'
 import { createMaoApp } from '../core/app.ts'
 import { startAutoTrigger } from '../core/auto-trigger.ts'
-import { isRepoRef, sameRepoRef } from '../core/repo-registry.ts'
+import { applyRepoListEdit, isRepoRef, sameRepoRef } from '../core/repo-registry.ts'
 import { assertCanRelaunchForUpdate, checkForUpdates, countRunningWorkflowTasks } from '../core/self-update.ts'
 import { createAiProvider, type AiProviderConfig } from '../core/ai/index.ts'
 import type { RepoRef, RunOverride } from '../core/workflow-engine.ts'
@@ -51,7 +51,10 @@ export function registerIpcHandlers() {
 
   ipcMain.handle('ai:list', () => store.get('aiProviders'))
 
-  ipcMain.handle('ai:save', (_event, providers: AiProviderConfig[]) => saveProviders(providers))
+  // `base` is the list Global settings loaded, so the save refuses if the stored list moved since (#73).
+  ipcMain.handle('ai:save', (_event, providers: AiProviderConfig[], base?: AiProviderConfig[]) =>
+    saveProviders(providers, base),
+  )
 
   ipcMain.handle('ai:run', async (_event, providerId: string, prompt: string) => {
     const providers = store.get('aiProviders')
@@ -81,7 +84,13 @@ export function registerIpcHandlers() {
   // Returns the passing verdicts so the renderer can show the same "these grants are unverified"
   // caveat `mao repos add` prints. Dropping them would make a passing preflight look in the GUI like
   // proof of write access, which is exactly what core/repo-capabilities.ts exists to avoid.
-  ipcMain.handle('github:setRepos', (_event, repos: RepoRef[]) => updateRepos(() => repos))
+  //
+  // `base` is the list the renderer's edit was computed from. Core re-applies only what changed between
+  // the two to the list stored now (applyRepoListEdit), so a stale window mirror cannot put back a
+  // repository a terminal removed, or drop one it added (issue #73).
+  ipcMain.handle('github:setRepos', (_event, repos: RepoRef[], base?: RepoRef[]) =>
+    updateRepos((previous) => applyRepoListEdit(previous, base, repos)),
+  )
 
   // Filtered, not raw. `config.json` is unvalidated JSON, and the renderer draws each row as
   // `{r.owner}/{r.repo}` with no guard and no error boundary above it — so a single `null` element

@@ -469,8 +469,20 @@ export class WorkflowEngine extends EventEmitter {
     // and every listener remain untouched; there is therefore nothing for processQueue() to run or for a
     // later notifyAfterStage() to misdiagnose as a durable persistence failure.
     this.validateProspectiveQueue?.(prospective)
+    const before = this.queue
     this.queue = prospective
-    this.notify()
+    try {
+      this.notify()
+    } catch (err) {
+      // The persisting listener refused the write (another MAO host changed the queue, the write lock was
+      // held past its timeout, the disk is full), so the task exists nowhere durable and the caller is told
+      // the enqueue failed. Keeping it in memory anyway made that a lie with a cost: auto-trigger writes no
+      // `workflow-active` label after a failed enqueue, so its next poll enqueued the same issue again —
+      // and once the write path recovered, both copies were persisted and both ran, opening two branches
+      // and PRs for one issue. Rolled back before rethrowing, and before `processQueue()` could pick it up.
+      this.queue = before
+      throw err
+    }
     void this.processQueue()
     return task
   }

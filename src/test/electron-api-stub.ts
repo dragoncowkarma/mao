@@ -4,6 +4,7 @@ import type { AppUpdateCheck } from '../electron'
 import type { AiProviderConfig } from '../../core/ai/types'
 import type { GithubTask } from '../../core/github-service'
 import type { RepoWorkflowCapability } from '../../core/repo-capabilities'
+import { applyRepoListEdit } from '../../core/repo-registry'
 import type { StoredValueProblem, ThemePreference } from '../../core/store'
 import type {
   QueuedTask,
@@ -43,8 +44,10 @@ export function createElectronApiStub(initialRepos: RepoRef[] = [], initialProbl
   // Copies on the way out as well as in: the renderer holds this list in state and spreads it into new
   // arrays, and a shared reference would let a component mutation silently rewrite the "store".
   const getRepos = vi.fn(async (): Promise<RepoRef[]> => stored.map((repo) => ({ ...repo })))
-  const setRepos = vi.fn(async (next: RepoRef[]): Promise<RepoWorkflowCapability[]> => {
-    stored = next.map((repo) => ({ ...repo }))
+  const setRepos = vi.fn(async (next: RepoRef[], base?: RepoRef[]): Promise<RepoWorkflowCapability[]> => {
+    // Applied the way `github:setRepos` applies it — core's own edit rule against what is stored now — so
+    // a test that changes the "store" behind the window's back sees what the real stack would keep.
+    stored = applyRepoListEdit(stored, base, next).map((repo) => ({ ...repo }))
     // A repository-list write replaces `githubRepos` and nothing else — `store.set` writes one key, and
     // `describeStoredProblems` re-evaluates the rest — so a stub that healed every field would make the
     // natural mixed-state test fail against a *correct* renderer once a second field is guarded.

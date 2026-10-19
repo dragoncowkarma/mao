@@ -95,12 +95,15 @@ describe('createMaoApp', () => {
     // a few bytes even when it can't take the full task-list blob.
     //
     // The data write goes to a temporary file beside config.json and is renamed over it (issue #73), so
-    // the failure is injected there — and not into `config.json.lock`, which a full disk would still let
-    // through as easily as the marker.
+    // the failure is injected there, the way a full disk fails: the file is created, then the write of its
+    // bytes runs out of space — which leaves a partial temporary file for the cleanup to remove.
     const realWriteFileSync = fs.writeFileSync
     vi.spyOn(fs, 'writeFileSync').mockImplementation((file, ...rest) => {
       const name = String(file)
-      if (name.includes('config.json') && !name.endsWith('.lock')) throw new Error('ENOSPC: no space left on device')
+      if (name.includes('config.json')) {
+        realWriteFileSync(file, '', ...(rest.slice(1) as [never]))
+        throw new Error('ENOSPC: no space left on device')
+      }
       return realWriteFileSync(file, ...(rest as [never]))
     })
 
@@ -1090,6 +1093,40 @@ describe('mao run queue persistence beside another process (issue #73)', () => {
     expect(hasPersistenceBrokenMarker(dataDir)).toBe(false)
   })
 
+  it('still repairs a mixed value whose only readable tasks are its own', () => {
+    captureWarnings()
+    const { dataDir, filePath, app } = bootLongRunning({ workflowTasks: [pausedTask()] })
+    fs.writeFileSync(filePath, JSON.stringify({ ...onDisk(filePath), workflowTasks: [pausedTask(), null] }))
+
+    app.workflowEngine.setAutoAdvance('task-1', true)
+
+    expect(onDisk(filePath).workflowTasks).toEqual([{ ...pausedTask(), autoAdvance: true }])
+    expect(hasPersistenceBrokenMarker(dataDir)).toBe(false)
+  })
+
+  it("refuses to 'repair' a mixed value that holds another process's readable task", () => {
+    // Another host wrote [task-1, added-elsewhere] — which this host would refuse — and then the value went
+    // mixed (a hand-edit, or a build whose task shape this one rejects). Treating that as a late
+    // corruption of this session's own queue would delete added-elsewhere.
+    captureWarnings()
+    const { filePath, app } = bootLongRunning({ workflowTasks: [pausedTask()] })
+    const theirs = [pausedTask(), pausedTask('added-elsewhere'), null]
+    fs.writeFileSync(filePath, JSON.stringify({ ...onDisk(filePath), workflowTasks: theirs }))
+
+    expect(() => app.workflowEngine.setAutoAdvance('task-1', true)).toThrow(describeQueueWriteConflict())
+    expect(onDisk(filePath).workflowTasks).toEqual(theirs)
+  })
+
+  it('rolls back a task whose enqueue write was refused, so it cannot be persisted twice later', () => {
+    const { filePath, app } = bootLongRunning({ workflowTasks: [pausedTask()] })
+    new FileStore(filePath).set('workflowTasks', [pausedTask(), pausedTask('added-elsewhere')])
+
+    expect(() => app.workflowEngine.enqueue('Refused', { owner: 'acme', repo: 'widgets' }, false)).toThrow(
+      describeQueueWriteConflict(),
+    )
+    expect(app.workflowEngine.getTasks().map((t) => t.id)).toEqual(['task-1'])
+  })
+
   it('treats its own queue recovery as the base of its next write', () => {
     // Without recording the recovery's write as this process's own, the very next queue change would see
     // a queue it did not write and refuse — wedging the host the moment it was released.
@@ -1120,5 +1157,50 @@ describe('mao run queue persistence beside another process (issue #73)', () => {
     app.workflowEngine.setAutoAdvance('task-1', false)
 
     expect(onDisk(filePath).workflowTasks).toEqual([pausedTask()])
+  })
+})
+
+/**
+ * `MaoApp.saveProviders` with the list Global settings loaded (issue #73). The save-time observation
+ * only covers the instant of the save; what the editor's list was derived from is the load, so a
+ * provider import from a terminal in between must not be deleted — API keys and all — by the next Save.
+ */
+describe('MaoApp.saveProviders against the list the editor loaded', () => {
+  const imported: AiProviderConfig = { id: 'imported', name: 'Imported', kind: 'api', apiKey: 'sk-test-imported' }
+
+  function bootWithProviders() {
+    const { dataDir, store, filePath } = makeRealDataDirHolding({ aiProviders: [claudeProvider] })
+    const app = createMaoApp({ store, workspaceRoot: path.join(dataDir, 'workspaces'), dataDir, resume: false })
+    return { app, filePath }
+  }
+
+  it('refuses a save over a list another process changed after the editor loaded it, writing nothing', () => {
+    const { app, filePath } = bootWithProviders()
+    const loaded = [claudeProvider]
+    // `mao config import-providers` in a terminal while Global settings is open.
+    new FileStore(filePath).set('aiProviders', [claudeProvider, imported])
+
+    expect(() => app.saveProviders([{ ...claudeProvider, name: 'Renamed' }], loaded)).toThrow(
+      /changed after Global settings loaded it/,
+    )
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).aiProviders).toEqual([claudeProvider, imported])
+  })
+
+  it('saves when the stored list is still the one the editor loaded', () => {
+    const { app, filePath } = bootWithProviders()
+
+    expect(app.saveProviders([{ ...claudeProvider, name: 'Renamed' }], [claudeProvider])).toEqual([
+      { ...claudeProvider, name: 'Renamed' },
+    ])
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).aiProviders).toEqual([{ ...claudeProvider, name: 'Renamed' }])
+  })
+
+  it('keeps the save-time check alone for a caller with no editor load to compare against', () => {
+    const { app, filePath } = bootWithProviders()
+    new FileStore(filePath).set('aiProviders', [claudeProvider, imported])
+
+    app.saveProviders([claudeProvider])
+
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).aiProviders).toEqual([claudeProvider])
   })
 })

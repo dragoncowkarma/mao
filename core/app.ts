@@ -41,11 +41,12 @@ export interface MaoApp {
   workflowEngine: WorkflowEngine
   store: MaoStore
   /**
-   * Saves the complete provider editor snapshot only while the raw stored list is readable and has not
-   * moved since inspection. This prevents the GUI from overwriting a hidden invalid entry (and its
-   * apiKey) with the read guard's filtered view.
+   * Saves the complete provider editor snapshot only while the raw stored list is readable and — when
+   * `base` is given — still the list the editor loaded. This prevents the GUI from overwriting a hidden
+   * invalid entry (and its apiKey) with the read guard's filtered view, and from overwriting a list
+   * another process changed after the editor loaded it.
    */
-  saveProviders: (providers: AiProviderConfig[]) => AiProviderConfig[]
+  saveProviders: (providers: AiProviderConfig[], base?: AiProviderConfig[]) => AiProviderConfig[]
   /**
    * Replaces an unusable stored queue with its freshly observed readable tasks and releases the halt.
    * Invalid entries are discarded; valid entries survive the ordinary restart normalization.
@@ -185,6 +186,24 @@ export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOp
    */
   let persistedQueueWitness = observedQueue.witness
 
+  /**
+   * Whether every readable task in `readable` is one this process last wrote, as written.
+   *
+   * Compared through the witness — the serialization of what this process last wrote — so it costs a parse
+   * on the rare repair path and nothing on the ordinary one. A witness that is not a JSON array (nothing
+   * written yet, or the store held no list) knows of no tasks, so only a value with none left qualifies.
+   */
+  function onlyHoldsTasksThisProcessWrote(readable: QueuedTask[]): boolean {
+    let written: unknown
+    try {
+      written = persistedQueueWitness === undefined ? undefined : JSON.parse(persistedQueueWitness)
+    } catch {
+      written = undefined
+    }
+    const mine = new Set(Array.isArray(written) ? written.map((task) => JSON.stringify(task)) : [])
+    return readable.every((task) => mine.has(JSON.stringify(task)))
+  }
+
   function persistQueue(tasks: QueuedTask[]) {
     const result = store.setIfUnchanged(QUEUE_GATING_FIELD, persistedQueueWitness, tasks)
     if (result === 'written') {
@@ -200,9 +219,17 @@ export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOp
     // clean. Then this engine holds the real queue and its next write is documented to restore the file
     // from it (the Sidebar's late-corruption card says exactly that) — so repair it, conditionally on the
     // unusable value just observed. A usable value that moved is someone else's queue, and is refused.
+    //
+    // "Unusable" alone is not enough, though: a mixed array can still hold readable tasks this process
+    // never wrote — another host's queue, then hand-edited or written by a build whose task shape this one
+    // rejects — and overwriting it would delete them, which is the very loss the refusal exists to stop.
+    // So the repair is taken only when every readable task left in the stored value is one this process
+    // itself last wrote, byte for byte; anything else is a conflict.
     const current = observeStoredQueue(store)
     if (!current.readable) throw new Error(describeUnverifiableQueueWrite())
-    if (current.problem === undefined) throw new Error(describeQueueWriteConflict())
+    if (current.problem === undefined || !onlyHoldsTasksThisProcessWrote(current.value)) {
+      throw new Error(describeQueueWriteConflict())
+    }
     const repaired = store.setIfUnchanged(QUEUE_GATING_FIELD, current.witness, tasks)
     if (repaired === 'written') {
       persistedQueueWitness = storedValueWitness(tasks)
@@ -258,10 +285,18 @@ export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOp
    * `ai:list` intentionally returns only structurally valid entries so the renderer stays usable. If
    * the raw list is mixed, that means the editor does not hold everything on disk — an unconditional
    * save would permanently delete the hidden entries and any API keys they contain. Inspect once,
-   * refuse that state, then key the write to the clean observation so an external edit cannot be lost
-   * between load and save. The engine adopts the new providers only after the durable write succeeds.
+   * refuse that state, then key the write to the clean observation. The engine adopts the new providers
+   * only after the durable write succeeds.
+   *
+   * The observation is taken when Save is clicked, so on its own it only covers the instant of the save.
+   * What the editor's list was derived from is `base` — the list Global settings loaded — and an edit
+   * made from it must not land over a list that moved since: a `mao config import-providers` run in a
+   * terminal while the pane was open would otherwise be deleted by the next Save, imported API keys
+   * included, with nothing said (issue #73). So a `base` that is no longer what is stored refuses, the
+   * same way a list that moves during the save does. Without `base` (no editor load to compare with) the
+   * check is the save-time one alone, as before.
    */
-  function saveProviders(providers: AiProviderConfig[]): AiProviderConfig[] {
+  function saveProviders(providers: AiProviderConfig[], base?: AiProviderConfig[]): AiProviderConfig[] {
     let observed: StoredObservation<'aiProviders'>
     try {
       observed = store.inspect('aiProviders')
@@ -287,6 +322,13 @@ export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOp
 
     const validationProblem = store.validateWrite('aiProviders', providers)
     if (validationProblem !== undefined) throw new Error(validationProblem)
+
+    if (base !== undefined && storedValueWitness(base) !== observed.witness) {
+      throw new Error(
+        'The stored AI provider list changed after Global settings loaded it — another MAO process, or ' +
+          'an edit to the config file. Nothing was written; reopen Global settings and apply the edit again.',
+      )
+    }
 
     let result
     try {

@@ -333,15 +333,22 @@ export default function App() {
    * round trip that lands mid-typing would stomp newer keystrokes with the value it persisted.)
    *
    * Rolling back to a captured `previous` is wrong, though: that snapshot is this render's optimistic
-   * mirror, not the store, and `setRepos` writes the whole list, so several writes can be in flight at
+   * mirror, not the store, and several writes can be in flight at
    * once — an add's preflight is a multi-second network call during which the settings panel stays
    * live. Restoring a stale snapshot can then resurrect an entry the store refused, or erase one a
    * concurrent write just persisted, and since the renderer reads the list only once at mount that
    * divergence never heals. `github:getRepos` is a pure `store.get`, so asking it what actually
    * survived is both cheap and authoritative — and it is the re-fetch-after-mutation model AGENTS.md
    * prescribes for the renderer.
+   *
+   * `base` is the list `next` was computed from, and it is sent along with it. This window's list is a
+   * mirror, so it can be behind the store — a `mao repos remove` or `mao repos add` run in a terminal since
+   * the mirror was read is not in it — and sending only the result made that staleness permanent: the next
+   * settings toggle or Remove wrote the removed repository back (re-preflighted as new, then polled again)
+   * or dropped the added one. Core applies only what changed between `base` and `next` to the list stored
+   * now (`applyRepoListEdit`, issue #73), so every caller passes exactly the list it edited.
    */
-  async function persistRepos(next: RepoRef[]): Promise<RepoWorkflowCapability[]> {
+  async function persistRepos(next: RepoRef[], base: RepoRef[]): Promise<RepoWorkflowCapability[]> {
     const previous = repos
     // This window is now the newest thing to have touched the list, so any repair read already in flight
     // is describing a store that predates it — and until this settles, no new one should start.
@@ -349,7 +356,7 @@ export default function App() {
     repoListWatch.current.writesInFlight += 1
     setRepos(next)
     try {
-      return await electronApi().github.setRepos(next)
+      return await electronApi().github.setRepos(next, base)
     } catch (err) {
       // Fall back to the snapshot only if even the read fails; showing a stale list beats showing one
       // built from a write we know was refused.
@@ -413,7 +420,7 @@ export default function App() {
       }
       return []
     }
-    const checked = await persistRepos([...current, repo])
+    const checked = await persistRepos([...current, repo], current)
     // Re-read instead of deriving the selection from the optimistic copy: the fold means the stored
     // list can be shorter than the one just sent, and selecting into a list the store does not have
     // would leave the sidebar showing a row that is not there. This is the re-fetch-after-mutation
@@ -448,7 +455,7 @@ export default function App() {
     const next = repos.map((r, i) => (i === selectedIndex ? { ...r, ...patch } : r))
     setRepoError('')
     try {
-      await persistRepos(next)
+      await persistRepos(next, repos)
     } catch (err) {
       setRepoError(err instanceof Error ? err.message : String(err))
       return
@@ -573,7 +580,11 @@ export default function App() {
       await adoptRepairedRepoList().catch(() => {})
       return
     }
-    await persistRepos([])
+    // An edit of this window's mirror like any other: remove what it lists, add nothing. Against the
+    // unusable value (which reads as no repositories) that writes the empty list that heals it. If a
+    // terminal repaired the store in the instant since the re-check above, only rows this window itself
+    // lists are removed, so a repository registered there survives instead of being wiped blind.
+    await persistRepos([], repos)
     // Adopt what the store now holds, for the same reason removal does: the write is the authority.
     // Deliberately nothing else. Selection reconciles itself — the effect above clears `selectedRepo`
     // when the list empties — and forcing a view/tab here would be a navigation decision made after
@@ -599,7 +610,7 @@ export default function App() {
     setProjectTab('board')
     const fallbackGeneration = navigationGeneration.current
     try {
-      await persistRepos(next)
+      await persistRepos(next, repos)
     } catch (err) {
       setRepoError(err instanceof Error ? err.message : String(err))
       // If nothing else was selected while the write was pending, return to the repository whose

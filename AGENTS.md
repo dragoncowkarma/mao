@@ -31,7 +31,7 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
 | `core/agent-selection.ts` | Pure, renderer-importable agent routing: `resolveStageAgent()` (maker-checker + role pins + `allowedStages` + model/effort resolution), `isStageEligible()`, `eligibleAgentsForRun()`, `previewStageAgent()`, plus the `WorkflowRole`/`STAGE_ROLE`/`ProviderOverride`/`RunOverride` definitions (re-exported by `core/workflow-engine.ts`, so `core/assignment.ts` and the shells import them unchanged) |
 | `core/github-service.ts` | Octokit REST wrapper (issues, PRs, labels, reviews, merge, CI status) — plus the read-only `checkRepoWorkflowCapability()` / `assertRepoWorkflowWritable()` preflight |
 | `core/repo-capabilities.ts` | Pure verdict logic for "can this credential run the pipeline in this repo?" — `evaluateRepoCapability()`, `describeRepoCapability()`, `describeUnverifiedGrants()`, `RepoCapabilityError` |
-| `core/repo-registry.ts` | Pure, renderer-importable repository identity plus the single definition of "this repo entry is newly registered" — `repoRefKey()`/`sameRepoRef()` (case-insensitive, as GitHub resolves owner/repo), `canonicalRepoList()`, `reposNeedingCapabilityCheck()` / `assertReposRegistrable()`, and the serialized `createRepoRegistrar()` both `github:setRepos` and `mao repos add`/`remove` write through |
+| `core/repo-registry.ts` | Pure, renderer-importable repository identity plus the single definition of "this repo entry is newly registered" — `repoRefKey()`/`sameRepoRef()` (case-insensitive, as GitHub resolves owner/repo), `canonicalRepoList()`, `reposNeedingCapabilityCheck()` / `assertReposRegistrable()`, `applyRepoListEdit()` (a whole-list GUI edit re-applied to the list stored now), and the serialized `createRepoRegistrar()` both `github:setRepos` and `mao repos add`/`remove` write through |
 | `core/provider-import.ts` | CLI-only provider-file import for `mao config import-providers` (no IPC channel): reads and parses input, validates through the store write guard, persists, then logs imported IDs; rejection messages omit parser/backend errors and provider values |
 | `core/git-workspace.ts` | Local git clone/branch/commit/push via `execFile` (no shell) |
 | `core/swarm-runner.ts` | Shell-free launcher and repository/asset validation for the autonomous Swarm Orchestrator |
@@ -156,7 +156,11 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   `electron/ipc.ts`'s `github:setRepos` and `cli/index.ts`'s `repos add`/`repos remove` must all stay
   thin delegations to `createMaoApp()`'s `updateRepos`. Re-implementing the diff in either shell is how the two paths silently drift.
   A shell's update callback may match entries with core's `sameRepoRef`, but must never normalise or
-  deduplicate the list itself — `updateRepos` owns that (see the identity invariant below).
+  deduplicate the list itself — `updateRepos` owns that (see the identity invariant below). The callback
+  must be a pure function of the list it is handed, because the registrar re-applies it when another
+  process changed the list (issue #73): the CLI's are deltas, and the GUI's whole-list edit travels as
+  `github:setRepos(next, base)` and is wrapped in `applyRepoListEdit(previous, base, next)` — never as a
+  bare `() => next`, which re-plans to the same stale mirror.
   Both shells must also surface `describeUnverifiedGrants()` for the verdicts it returns — a passing
   preflight is not proof of write access, and a shell that stays silent about that claims more than
   the check established.
@@ -582,8 +586,10 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   whole file from what it read at boot on every queue change — reverting a `mao repos remove`, `set-token`,
   provider import or theme change made from another terminal, including the very `githubRepos` repair PR
   #66's report recommends. Now `FileStore.set` merges into a strict fresh read and replaces the file with
-  `writeStoreFileAtomic()` (temp file + fsync + rename, keeping the file's permission bits), under the
-  write lock; conf already re-reads before it writes and writes atomically. Same-key concurrency is an
+  `writeStoreFileAtomic()` (temp file + fsync + rename, keeping the file's permission bits and — where the
+  writer may — its owner, and writing through a symlink to the file it names rather than replacing the
+  link), under the write lock, which is keyed on that same resolved file; conf already re-reads before it
+  writes and writes atomically, though with its own default mode. Same-key concurrency is an
   explicit choice per field, never left to timing:
   - **Stated values** — `githubToken`, `theme`, `buildSha`, and `mao config import-providers`' complete
     replacement — use plain `set`: last writer wins, because the latest statement is the operator's intent.
@@ -593,18 +599,25 @@ There is no codegen — these couplings are maintained by hand and only `npm run
     `describeQueueWriteConflict()`, which the engine reads as a persistence failure — task to `'error'`,
     one retry, then `persistenceBroken` and the durable marker, i.e. the existing safeguard stops a second
     engine advancing the same queue. The one exception is a queue that went *unusable* after a clean boot,
-    which the session repairs from its own queue as the late-corruption card promises. `githubRepos` is
+    which the session repairs from its own queue as the late-corruption card promises — but only while
+    every readable task left in it is one this process last wrote (`onlyHoldsTasksThisProcessWrote`); a
+    mixed value still holding another host's task is a conflict like any other. `githubRepos` is
     written by `createRepoRegistrar` conditionally on its observation, and a moved list is **re-planned**
     (the same pure update re-applied to the fresh list, newly-new entries preflighted again) up to
-    `MAX_REPO_LIST_ATTEMPTS` — the cross-process form of its in-process queue. The provider editor
-    (`MaoApp.saveProviders`) was already conditional.
+    `MAX_REPO_LIST_ATTEMPTS` — the cross-process form of its in-process queue. A derived value's base is
+    whatever the caller derived it from, and for the GUI that is the renderer's view, not the save
+    instant: `github:setRepos` carries the list the edit was computed from (`applyRepoListEdit`), and
+    `ai:save` carries the list Global settings loaded, which `MaoApp.saveProviders(providers, base)`
+    refuses to write over once the stored list has moved. Keying either on a save-time observation alone
+    let a stale window delete a terminal's `repos add` or `import-providers`, API keys included.
   A write that cannot take the lock within `STORE_LOCK_TIMEOUT_MS` throws `StoreLockError` and writes
   nothing; a lock whose owner pid is gone from this host, or that is older than `STORE_LOCK_STALE_MS`, is
-  broken rather than left to wedge every write. Known gap — pre-existing for any refused queue write (a
-  full disk, say), and now also reachable through a conflict: a refused write inside `appendTask()` still
-  leaves the task in the in-memory queue (the listener throws after adoption), so an auto-trigger poll on a
-  host whose queue writes are refused re-adds unpersistable tasks each interval. They never run, because
-  their first stage's entry write is refused too, but fixing it (with a regression test) is welcome. `get()` on a long-running
+  broken rather than left to wedge every write (a lock naming this process's own pid counts as abandoned
+  unless its token is one this process holds — a restart under the same pid). A refused write inside
+  `appendTask()` rolls the task back out of memory before rethrowing: auto-trigger labels nothing after a
+  failed enqueue, so a task kept in memory was persisted alongside its own re-enqueue once writes
+  recovered, and both ran. Other mutators (`retry`, `advance`, `setAutoAdvance`, `clearCompleted`) still
+  keep their in-memory change when their write is refused; that duplicates nothing. `get()` on a long-running
   `FileStore` still answers from its snapshot, so `mao run` keeps polling the repositories it booted with
   until it restarts; that is read staleness, not a lost update, and no write carries it back any more.
 - **What the halt does *not* cover, so it is not read as more than it is.** A `config.json` that is not

@@ -212,6 +212,107 @@ export function reposNeedingCapabilityCheck(previous: RepoRef[], next: RepoRef[]
   )
 }
 
+/** Groups a list's usable entries by repository identity, keeping every occurrence in order. */
+function entriesByRepo(list: RepoRef[]): Map<string, RepoRef[]> {
+  const grouped = new Map<string, RepoRef[]>()
+  for (const ref of list) {
+    if (!isRepoRef(ref)) continue
+    const key = repoRefKey(ref)
+    grouped.set(key, [...(grouped.get(key) ?? []), ref])
+  }
+  return grouped
+}
+
+/** `stored`, with exactly the fields that differ between `before` and `after` set (or deleted) as in `after`. */
+function patchEntry(stored: RepoRef, before: RepoRef, after: RepoRef): RepoRef {
+  const patched: Record<string, unknown> = { ...stored }
+  const fields = new Set([...Object.keys(before), ...Object.keys(after)])
+  for (const field of fields) {
+    const was = (before as unknown as Record<string, unknown>)[field]
+    const now = (after as unknown as Record<string, unknown>)[field]
+    if (JSON.stringify(was) === JSON.stringify(now)) continue
+    if (now === undefined) delete patched[field]
+    else patched[field] = now
+  }
+  return patched as unknown as RepoRef
+}
+
+/**
+ * Re-applies a whole-list edit, made against the list `base`, to the list stored *now* — so an edit
+ * planned from a stale view changes only what it changed (issue #73).
+ *
+ * The GUI cannot send an update callback: the renderer edits its own mirror of the list (read at mount,
+ * and after this window's own writes) and sends the whole result. Persisting that as-is made the mirror's
+ * staleness everyone's problem. A repository removed by `mao repos remove` in a terminal came back with
+ * the next settings toggle in the window — re-preflighted as "new", then polled and enqueued from again by
+ * the window's own auto-trigger — and one added in a terminal vanished the same way. The registrar's
+ * conditional write cannot see that window, because it lies between the renderer's read and the IPC
+ * call, so its re-plan would only re-apply the same stale list.
+ *
+ * Sending the list the edit was based on as well turns it back into the pure function of the stored list
+ * the registrar re-plans with, with three rules that keep it conservative:
+ *
+ * - A repository the edit **removed** (in `base`, absent from `next`) is dropped from the stored list.
+ * - A repository whose entry the edit **changed** gets only the fields that changed, applied to the
+ *   stored entry, so a setting changed elsewhere in the meantime survives a toggle of another one. If it
+ *   is no longer stored, the edit is dropped: a settings edit must never re-add a repository someone
+ *   else removed, which is the resurrection this exists to prevent.
+ * - A repository the edit **added** (absent from `base`) is appended. If it is already stored, both
+ *   occurrences reach `canonicalRepoList`, which folds them by its usual rule — the stored entry keeps
+ *   its settings and `autoTrigger: false` wins — exactly as a bare Add-form submission always has.
+ *
+ * Everything the edit did not touch is kept **as stored now**. When the stored list still is `base`
+ * (the ordinary case) `next` is returned unchanged, so nothing about a window that is the only writer
+ * changes; and with no `base` at all — a caller that predates it — the edit is the whole list, as before.
+ * A repository listed more than once is replaced wholesale rather than patched field by field, since
+ * which occurrence a field edit meant is not knowable; `canonicalRepoList` then folds it as it always has.
+ */
+export function applyRepoListEdit(previous: RepoRef[], base: RepoRef[] | undefined, next: RepoRef[]): RepoRef[] {
+  if (base === undefined || !Array.isArray(base) || !Array.isArray(next) || !Array.isArray(previous)) return next
+  if (JSON.stringify(previous) === JSON.stringify(base)) return next
+
+  const before = entriesByRepo(base)
+  const after = entriesByRepo(next)
+  const removed = new Set([...before.keys()].filter((key) => !after.has(key)))
+  const changed = new Map<string, RepoRef[]>()
+  const added: RepoRef[] = []
+  for (const [key, entries] of after) {
+    const was = before.get(key)
+    if (was === undefined) added.push(...entries)
+    else if (JSON.stringify(was) !== JSON.stringify(entries)) changed.set(key, entries)
+  }
+
+  const storedCount = new Map<string, number>()
+  for (const ref of previous) {
+    if (isRepoRef(ref)) storedCount.set(repoRefKey(ref), (storedCount.get(repoRefKey(ref)) ?? 0) + 1)
+  }
+
+  const result: RepoRef[] = []
+  const replaced = new Set<string>()
+  for (const ref of previous) {
+    // Unusable entries pass through untouched, for `canonicalRepoList` to drop as it does on every path.
+    if (!isRepoRef(ref)) {
+      result.push(ref)
+      continue
+    }
+    const key = repoRefKey(ref)
+    if (removed.has(key)) continue
+    const edit = changed.get(key)
+    if (edit === undefined) {
+      result.push(ref)
+      continue
+    }
+    const was = before.get(key)!
+    if (was.length === 1 && edit.length === 1 && storedCount.get(key) === 1) {
+      result.push(patchEntry(ref, was[0]!, edit[0]!))
+    } else if (!replaced.has(key)) {
+      replaced.add(key)
+      result.push(...edit)
+    }
+  }
+  return [...result, ...added]
+}
+
 /**
  * Guards a repository-list write: throws before the caller touches the store if any newly registered
  * entry fails the non-mutating preflight (`GithubService.assertRepoWorkflowWritable()`).
@@ -289,7 +390,9 @@ function describeUnwrittenRepoList(result: Exclude<ConditionalWriteResult, 'writ
  * list still being the one read, and a list that moved is **re-planned**, not overwritten: the same
  * `update` is applied to the fresh list, anything newly new is preflighted, and the write is tried again
  * — the cross-process form of the queue's own rule. `update` must therefore be a pure function of the
- * list it is handed; both shells' callbacks are. A list that keeps moving gives up after
+ * list it is handed. The CLI's callbacks are deltas by construction; the GUI sends a whole list, so its
+ * handler wraps it in `applyRepoListEdit()` with the list the edit was based on. A list that keeps moving
+ * gives up after
  * `MAX_REPO_LIST_ATTEMPTS` rather than looping, and one that cannot be read at all refuses outright,
  * since merging into a file that could not be read would replace everything in it.
  */

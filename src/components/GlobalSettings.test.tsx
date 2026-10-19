@@ -114,6 +114,7 @@ describe('GlobalSettings saves only what it can stand behind', () => {
     render(<GlobalSettings theme="system" onThemeChange={() => {}} />)
     expect(await screen.findByText(/provider list could not be loaded/)).toBeInTheDocument()
     expect(screen.queryByText(/ghp_SENTINEL/)).toBeNull()
+    expect(screen.queryByText('No AI providers registered yet.')).toBeNull()
 
     await user.click(screen.getByRole('button', { name: '+ Add provider' }))
     await user.type(screen.getByPlaceholderText('Name'), 'New')
@@ -146,5 +147,38 @@ describe('GlobalSettings saves only what it can stand behind', () => {
     await screen.findByText('Saved')
     expect(screen.getByRole('button', { name: 'Save changes' })).toBeEnabled()
     expect(stub.api.ai.save).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps saying the load failed after a Save, and recovers through Retry', async () => {
+    // The warning used to live in the save error, so the next Save cleared it and showed "Saved" beside
+    // an empty pane — and "reopen Global settings" was impossible with no project to navigate away to.
+    const stub = createElectronApiStub()
+    stub.listProviders.mockRejectedValueOnce(new Error('EACCES')).mockResolvedValue([claude])
+    stub.api.github.setToken.mockResolvedValue(undefined as never)
+    const user = userEvent.setup()
+
+    render(<GlobalSettings theme="system" onThemeChange={() => {}} />)
+    await screen.findByText(/provider list could not be loaded/)
+    await user.type(screen.getByPlaceholderText('ghp_...'), 'ghp_test')
+    await user.click(screen.getByRole('button', { name: 'Save changes' }))
+    await screen.findByText('Saved')
+    expect(screen.getByText(/provider list could not be loaded/)).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Retry loading providers' }))
+    expect(await screen.findByDisplayValue('Claude')).toBeInTheDocument()
+    expect(screen.queryByText(/provider list could not be loaded/)).toBeNull()
+  })
+
+  it('does not claim a save when there was nothing to write', async () => {
+    const stub = createElectronApiStub()
+    stub.listProviders.mockResolvedValue([claude])
+    const user = userEvent.setup()
+
+    render(<GlobalSettings theme="system" onThemeChange={() => {}} />)
+    await screen.findByDisplayValue('Claude')
+    await user.click(screen.getByRole('button', { name: 'Save changes' }))
+
+    expect(await screen.findByText('Nothing to save')).toBeInTheDocument()
+    expect(screen.queryByText('Saved')).toBeNull()
   })
 })

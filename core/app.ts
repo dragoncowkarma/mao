@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { GithubService } from './github-service.ts'
 import { createRepoRegistrar } from './repo-registry.ts'
 import { WorkflowEngine, type QueuedTask, type QueueRecoveryOutcome } from './workflow-engine.ts'
@@ -126,12 +127,15 @@ export function describeQueueWriteConflict(): string {
   )
 }
 
-/** Why a re-save refused: the unusable stored queue still holds readable tasks this session did not write. */
+/** Why a re-save refused: the unusable stored queue holds readable tasks this session never loaded or wrote. */
 function describeForeignTasksInStoredQueue(): string {
   return (
-    '[store] The stored workflow queue is unusable, but it still holds readable tasks this session did not ' +
-    'write — another MAO host\'s — so saving this session\'s queue over it would delete them. Nothing was ' +
-    'written. Stop the other host, then recover the file deliberately (see `mao workflow confirm-queue-recovery`).'
+    '[store] The stored workflow queue is unusable, but it still holds readable tasks this session never ' +
+    'loaded or wrote — another MAO host\'s, or an edit made from a copy this session never held — so saving ' +
+    'this session\'s queue over it would delete them. Nothing was written, and this session cannot persist ' +
+    'its queue while they are there. Stop every MAO host on this config file, this one included; copy out ' +
+    'anything you need from the file; then, with no MAO host running, recover it with `mao workflow ' +
+    'confirm-queue-recovery`, which keeps every readable task.'
   )
 }
 
@@ -195,42 +199,41 @@ export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOp
    */
   let persistedQueueWitness = observedQueue.witness
   /**
-   * The tasks this process knows the stored queue held until its first write: the boot observation's,
-   * in the form the read guard hands back. Kept separately from the witness because the witness is the
-   * *raw* value, and a queue written by an older build (a task repo carrying registry settings, a task
-   * with no `autoAdvance`) differs from its own guard-normalized reading — which is what the repair check
-   * compares — so this process's own boot tasks would have read as another host's. After the first write
-   * the witness is this process's own current-schema serialization and the two forms agree.
+   * Every form of each task this process has loaded or written, by task id — as hashes of its serialization
+   * in the read guard's form, so the set stays small however large a task's prompts and output grow.
+   *
+   * What the late-corruption checks need is not "what did this process write last" but "would replacing
+   * this stored value delete anything only another host had". A stored task in a form this process itself
+   * loaded or wrote — the boot form, or an older write left behind in an editor buffer saved late — is this
+   * process's own past state, and overwriting it with the present loses nothing. Recognising only the last
+   * write made exactly that stale buffer read as another host's work, so the re-save refused, blamed a host
+   * that did not exist, and left the session with no way to persist its queue. The boot forms are the
+   * guard-normalized reading, not the raw witness, because a queue an older build wrote (a task repo with
+   * registry settings, no `autoAdvance`) reads back normalized. Pruned to the ids of each write, so a task
+   * the engine has dropped stops counting as this process's own.
    */
-  const bootTaskForms = new Set(observedQueue.value.map((task) => JSON.stringify(task)))
-  let wroteSinceBoot = false
+  const ownTaskForms = new Map<string, Set<string>>()
+  const formOf = (task: QueuedTask) => createHash('sha256').update(JSON.stringify(task)).digest('hex')
+  function rememberOwnForms(tasks: QueuedTask[]) {
+    for (const task of tasks) {
+      const forms = ownTaskForms.get(task.id) ?? new Set<string>()
+      forms.add(formOf(task))
+      ownTaskForms.set(task.id, forms)
+    }
+  }
+  rememberOwnForms(observedQueue.value)
 
   /** Records a confirmed write of `tasks` as the stored queue this process's next write is keyed on. */
   function recordQueueWrite(tasks: QueuedTask[]) {
     persistedQueueWitness = storedValueWitness(tasks)
-    wroteSinceBoot = true
+    const live = new Set(tasks.map((task) => task.id))
+    for (const id of [...ownTaskForms.keys()]) if (!live.has(id)) ownTaskForms.delete(id)
+    rememberOwnForms(tasks)
   }
 
-  /**
-   * Whether every readable task in `readable` is one this process last wrote (or, before its first write,
-   * loaded at boot), byte for byte in the guard's form.
-   *
-   * Compared through the witness — the serialization of what this process last wrote — so it costs a parse
-   * on the rare repair path and nothing on the ordinary one. A witness that is not a JSON array knows of no
-   * tasks, so only a value with none left qualifies.
-   */
+  /** Whether every readable task in `readable` is in a form this process has itself loaded or written. */
   function onlyHoldsTasksThisProcessWrote(readable: QueuedTask[]): boolean {
-    let mine = bootTaskForms
-    if (wroteSinceBoot) {
-      let written: unknown
-      try {
-        written = persistedQueueWitness === undefined ? undefined : JSON.parse(persistedQueueWitness)
-      } catch {
-        written = undefined
-      }
-      mine = new Set(Array.isArray(written) ? written.map((task) => JSON.stringify(task)) : [])
-    }
-    return readable.every((task) => mine.has(JSON.stringify(task)))
+    return readable.every((task) => ownTaskForms.get(task.id)?.has(formOf(task)) === true)
   }
 
   function persistQueue(tasks: QueuedTask[]) {

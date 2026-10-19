@@ -859,9 +859,12 @@ describe('applyRepoListEdit', () => {
     ])
   })
 
-  it('passes unusable stored entries through for canonicalRepoList to drop, as on every path', () => {
-    const junk = { owner: '' } as unknown as RepoRef
-    expect(applyRepoListEdit([junk, gadgets], [gadgets, widgets], [gadgets])).toEqual([junk, gadgets])
+  it('is the whole edit when the stored list holds entries that are not repositories', () => {
+    // A mangled row may be what is left of a repository the window still shows; diffing would read that
+    // repository as removed elsewhere and drop it from the window's edit.
+    const mangled = { ownr: 'acme', repo: 'widgets' } as unknown as RepoRef
+    const next = [gadgets, { ...widgets, pollIntervalMs: 9 }]
+    expect(applyRepoListEdit([gadgets, mangled], [gadgets, widgets], next)).toBe(next)
   })
   it('is the whole edit over a stored value that was not a list, rather than a diff against nothing', () => {
     // The guard answers an unusable value as [], which read as a list would make every repository the
@@ -889,6 +892,20 @@ describe('createRepoRegistrar with the GUI-shaped edit (issue #73)', () => {
 
     expect(new FileStore(filePathOf(store)).get('githubRepos')).toEqual(next)
     // Every entry counts as a first registration, exactly as before the base existed.
+    expect(github.assertRepoWorkflowWritable).toHaveBeenCalledTimes(2)
+  })
+
+  it('rewrites the window list when the stored list holds only entries that are not repositories', async () => {
+    // The container passes the guard, so this is "usable" to the registrar — but it names no repository.
+    silenceStoreWarnings()
+    const store = makeRealStore({ githubRepos: [null] })
+    const github = passingGithub()
+    const base = [gadgets, widgets]
+    const next = [gadgets, { ...widgets, pollIntervalMs: 60_000 }]
+
+    await createRepoRegistrar(github, store)((previous, stored) => applyRepoListEdit(previous, base, next, stored.usable))
+
+    expect(new FileStore(filePathOf(store)).get('githubRepos')).toEqual(next)
     expect(github.assertRepoWorkflowWritable).toHaveBeenCalledTimes(2)
   })
 

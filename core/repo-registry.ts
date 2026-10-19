@@ -264,7 +264,8 @@ function patchEntry(stored: RepoRef, before: RepoRef, after: RepoRef): RepoRef {
  * Everything the edit did not touch is kept **as stored now**. When the stored list still is `base`
  * (the ordinary case) `next` is returned unchanged, so nothing about a window that is the only writer
  * changes; and with no `base` at all — a caller that predates it — or a stored value that is not a list
- * (`previousUsable: false`), the edit is the whole list, as before.
+ * (`previousUsable: false`) or holds entries that are not repositories, the edit is the whole list, as
+ * before.
  * A repository listed more than once is replaced wholesale rather than patched field by field, since
  * which occurrence a field edit meant is not knowable; `canonicalRepoList` then folds it as it always has.
  */
@@ -281,6 +282,10 @@ export function applyRepoListEdit(
   // counts as a first registration and is preflighted, and Reset still writes the empty list it sends.
   if (!previousUsable) return next
   if (base === undefined || !Array.isArray(base) || !Array.isArray(next) || !Array.isArray(previous)) return next
+  // The same holds for a list with entries `isRepoRef` rejects. The guard checks only the container, so
+  // `[null]` or a mangled `{ ownr: … }` row reaches here as "usable" — and the window, whose mirror never
+  // saw those rows, would read each repository they once named as removed elsewhere and drop it.
+  if (previous.some((ref) => !isRepoRef(ref))) return next
   if (JSON.stringify(previous) === JSON.stringify(base)) return next
 
   const before = entriesByRepo(base)

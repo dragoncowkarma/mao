@@ -1142,8 +1142,38 @@ describe('mao run queue persistence beside another process (issue #73)', () => {
     const outcome = app.resaveStoredQueue()
 
     expect(outcome.kind).toBe('unverified')
-    expect(outcome.kind === 'unverified' && outcome.reason).toMatch(/readable tasks this session did not write/)
+    expect(outcome.kind === 'unverified' && outcome.reason).toMatch(/readable tasks this session never loaded or wrote/)
+    // And it does not send the operator to the discard while this session is still live.
+    expect(outcome.kind === 'unverified' && outcome.reason).toMatch(/with no MAO host running/)
     expect(onDisk(filePath).workflowTasks).toEqual(theirs)
+  })
+
+  it("recognizes a stale copy of its own task — an editor buffer saved late — as its own", () => {
+    // The third review's reproduction. The session wrote a change, then an editor holding the file from
+    // before that write saved it with a typo: [task-1 in its boot form, null]. That is this session's own
+    // past state, so the re-save repairs it and later writes go through — where recognising only the last
+    // write refused it as "another MAO host's" and left the session unable to persist at all.
+    captureWarnings()
+    const { dataDir, filePath, app } = bootLongRunning({ workflowTasks: [pausedTask()] })
+    app.workflowEngine.setAutoAdvance('task-1', true)
+    fs.writeFileSync(filePath, JSON.stringify({ ...onDisk(filePath), workflowTasks: [pausedTask(), null] }))
+
+    expect(app.resaveStoredQueue()).toEqual({ kind: 'replaced' })
+    app.workflowEngine.setAutoAdvance('task-1', false)
+
+    expect(onDisk(filePath).workflowTasks).toEqual([pausedTask()])
+    expect(hasPersistenceBrokenMarker(dataDir)).toBe(false)
+  })
+
+  it('repairs the same stale own copy automatically on its next queue write', () => {
+    captureWarnings()
+    const { filePath, app } = bootLongRunning({ workflowTasks: [pausedTask()] })
+    app.workflowEngine.setAutoAdvance('task-1', true)
+    fs.writeFileSync(filePath, JSON.stringify({ ...onDisk(filePath), workflowTasks: [pausedTask(), null] }))
+
+    app.workflowEngine.setAutoAdvance('task-1', false)
+
+    expect(onDisk(filePath).workflowTasks).toEqual([pausedTask()])
   })
 
   it('rolls back a task whose enqueue write was refused, so it cannot be persisted twice later', () => {

@@ -398,25 +398,30 @@ export default function GlobalSettings({ theme, onThemeChange }: GlobalSettingsP
    * would be refused as "another process changed the list" — by the first click's own write.
    */
   const [saving, setSaving] = useState(false)
+  /**
+   * The provider list could not be loaded. Its own state rather than `saveError`, which every Save clears:
+   * a token-only Save used to wipe the warning and leave "Saved" beside an empty pane — exactly the "no
+   * providers yet" misreading the warning exists to prevent.
+   */
+  const [loadFailed, setLoadFailed] = useState(false)
 
-  useEffect(() => {
+  function loadProviders() {
     electronApi()
       .ai.list()
       .then(
         (list) => {
           setProviders(list)
           setLoadedProviders(JSON.parse(JSON.stringify(list)) as AiProviderConfig[])
+          setLoadFailed(false)
         },
         // Said, not swallowed: an empty pane after a failed load reads exactly like "no providers yet",
         // and saving from it would replace the real list blind. The error text is not shown — a parse
         // failure can quote the config file, and the GitHub token is stored in it in plain text.
-        () =>
-          setSaveError(
-            'The AI provider list could not be loaded, so providers cannot be saved from this pane. ' +
-              'Reopen Global settings once the config file reads normally.',
-          ),
+        () => setLoadFailed(true),
       )
-  }, [])
+  }
+
+  useEffect(loadProviders, [])
 
   function updateProvider(id: string, patch: Partial<AiProviderConfig>) {
     setProviders((prev) => prev.map((p) => (p.id === id ? { ...p, ...patch } : p)))
@@ -462,7 +467,8 @@ export default function GlobalSettings({ theme, onThemeChange }: GlobalSettingsP
         setLoadedProviders(JSON.parse(JSON.stringify(providers)) as AiProviderConfig[])
       }
       if (githubToken) await electronApi().github.setToken(githubToken)
-      setSavedMessage('Saved')
+      // Only claim a save that happened.
+      setSavedMessage(providersChanged || githubToken ? 'Saved' : 'Nothing to save')
       setTimeout(() => setSavedMessage(''), 1500)
     } catch (err) {
       setSaveError(err instanceof Error ? err.message : String(err))
@@ -521,7 +527,19 @@ export default function GlobalSettings({ theme, onThemeChange }: GlobalSettingsP
             onRemove={() => removeProvider(p.id)}
           />
         ))}
-        {providers.length === 0 && <p className="text-muted">No AI providers registered yet.</p>}
+        {loadFailed ? (
+          <div className="flex flex-col items-start gap-2">
+            <p className="text-xs" style={{ color: 'var(--color-accent-700)' }}>
+              The AI provider list could not be loaded, so providers cannot be saved from this pane until it
+              is. Fix the config file, then retry.
+            </p>
+            <button onClick={loadProviders} className="btn btn-secondary text-xs">
+              Retry loading providers
+            </button>
+          </div>
+        ) : (
+          providers.length === 0 && <p className="text-muted">No AI providers registered yet.</p>
+        )}
       </div>
 
       <div className="flex items-center gap-3">

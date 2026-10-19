@@ -393,14 +393,29 @@ export default function GlobalSettings({ theme, onThemeChange }: GlobalSettingsP
   const [loadedProviders, setLoadedProviders] = useState<AiProviderConfig[] | undefined>(undefined)
   const [savedMessage, setSavedMessage] = useState('')
   const [saveError, setSaveError] = useState('')
+  /**
+   * A save is in flight. Both clicks of a double-click would otherwise carry the same base, and the second
+   * would be refused as "another process changed the list" — by the first click's own write.
+   */
+  const [saving, setSaving] = useState(false)
 
   useEffect(() => {
     electronApi()
       .ai.list()
-      .then((list) => {
-        setProviders(list)
-        setLoadedProviders(JSON.parse(JSON.stringify(list)) as AiProviderConfig[])
-      })
+      .then(
+        (list) => {
+          setProviders(list)
+          setLoadedProviders(JSON.parse(JSON.stringify(list)) as AiProviderConfig[])
+        },
+        // Said, not swallowed: an empty pane after a failed load reads exactly like "no providers yet",
+        // and saving from it would replace the real list blind. The error text is not shown — a parse
+        // failure can quote the config file, and the GitHub token is stored in it in plain text.
+        () =>
+          setSaveError(
+            'The AI provider list could not be loaded, so providers cannot be saved from this pane. ' +
+              'Reopen Global settings once the config file reads normally.',
+          ),
+      )
   }, [])
 
   function updateProvider(id: string, patch: Partial<AiProviderConfig>) {
@@ -416,6 +431,7 @@ export default function GlobalSettings({ theme, onThemeChange }: GlobalSettingsP
   }
 
   async function saveAll() {
+    if (saving) return
     setSaveError('')
 
     const errors = validateProviders(providers)
@@ -424,15 +440,34 @@ export default function GlobalSettings({ theme, onThemeChange }: GlobalSettingsP
       return
     }
 
+    // Only a provider list that was edited is written. An unchanged one has nothing to say, and writing it
+    // anyway let an unrelated change made elsewhere (an import in a terminal) refuse a token-only save.
+    const providersChanged =
+      loadedProviders === undefined
+        ? providers.length > 0
+        : JSON.stringify(providers) !== JSON.stringify(loadedProviders)
+    if (providersChanged && loadedProviders === undefined) {
+      setSaveError(
+        'The stored AI provider list was never loaded, so saving these providers would replace it blind. ' +
+          'Nothing was saved. Reopen Global settings and apply the edit again.',
+      )
+      return
+    }
+
+    setSaving(true)
     try {
-      await electronApi().ai.save(providers, loadedProviders)
-      // What is stored now is what was just saved, so it is the base the next save is derived from.
-      setLoadedProviders(JSON.parse(JSON.stringify(providers)) as AiProviderConfig[])
+      if (providersChanged) {
+        await electronApi().ai.save(providers, loadedProviders)
+        // What is stored now is what was just saved, so it is the base the next save is derived from.
+        setLoadedProviders(JSON.parse(JSON.stringify(providers)) as AiProviderConfig[])
+      }
       if (githubToken) await electronApi().github.setToken(githubToken)
       setSavedMessage('Saved')
       setTimeout(() => setSavedMessage(''), 1500)
     } catch (err) {
       setSaveError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setSaving(false)
     }
   }
 
@@ -490,7 +525,7 @@ export default function GlobalSettings({ theme, onThemeChange }: GlobalSettingsP
       </div>
 
       <div className="flex items-center gap-3">
-        <button onClick={saveAll} className="btn btn-primary">
+        <button onClick={saveAll} className="btn btn-primary" disabled={saving}>
           Save changes
         </button>
         {savedMessage && (

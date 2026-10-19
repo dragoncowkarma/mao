@@ -600,8 +600,10 @@ There is no codegen — these couplings are maintained by hand and only `npm run
     one retry, then `persistenceBroken` and the durable marker, i.e. the existing safeguard stops a second
     engine advancing the same queue. The one exception is a queue that went *unusable* after a clean boot,
     which the session repairs from its own queue as the late-corruption card promises — but only while
-    every readable task left in it is one this process last wrote (`onlyHoldsTasksThisProcessWrote`); a
-    mixed value still holding another host's task is a conflict like any other. `githubRepos` is
+    every readable task left in it is one this process last wrote, or loaded at boot in the guard's
+    normalized form (`onlyHoldsTasksThisProcessWrote`); a mixed value still holding another host's
+    *readable* task is a conflict like any other, and `resaveStoredQueue()` refuses it the same way. An
+    entry this build cannot read is indistinguishable from corruption and is discarded either way. `githubRepos` is
     written by `createRepoRegistrar` conditionally on its observation, and a moved list is **re-planned**
     (the same pure update re-applied to the fresh list, newly-new entries preflighted again) up to
     `MAX_REPO_LIST_ATTEMPTS` — the cross-process form of its in-process queue. A derived value's base is
@@ -609,7 +611,12 @@ There is no codegen — these couplings are maintained by hand and only `npm run
     instant: `github:setRepos` carries the list the edit was computed from (`applyRepoListEdit`), and
     `ai:save` carries the list Global settings loaded, which `MaoApp.saveProviders(providers, base)`
     refuses to write over once the stored list has moved. Keying either on a save-time observation alone
-    let a stale window delete a terminal's `repos add` or `import-providers`, API keys included.
+    let a stale window delete a terminal's `repos add` or `import-providers`, API keys included. The
+    registrar hands an update `{ usable }` alongside the stored list, and `applyRepoListEdit` treats an
+    unusable value (the guard's `[]` stand-in) as nothing to diff against — the edit is then the whole
+    list, preflighted as before — since diffing against it made a settings toggle write `[]`. Global
+    settings writes the provider list only when it was edited, never without a loaded base (a failed
+    load is shown, not read as "no providers"), and disables Save while one is in flight.
   A write that cannot take the lock within `STORE_LOCK_TIMEOUT_MS` throws `StoreLockError` and writes
   nothing; a lock whose owner pid is gone from this host, or that is older than `STORE_LOCK_STALE_MS`, is
   broken rather than left to wedge every write (a lock naming this process's own pid counts as abandoned

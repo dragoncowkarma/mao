@@ -46,8 +46,11 @@ export function createElectronApiStub(initialRepos: RepoRef[] = [], initialProbl
   const getRepos = vi.fn(async (): Promise<RepoRef[]> => stored.map((repo) => ({ ...repo })))
   const setRepos = vi.fn(async (next: RepoRef[], base?: RepoRef[]): Promise<RepoWorkflowCapability[]> => {
     // Applied the way `github:setRepos` applies it — core's own edit rule against what is stored now — so
-    // a test that changes the "store" behind the window's back sees what the real stack would keep.
-    stored = applyRepoListEdit(stored, base, next).map((repo) => ({ ...repo }))
+    // a test that changes the "store" behind the window's back sees what the real stack would keep. A
+    // seeded `githubRepos` problem stands for a stored value that is not a list, which the real store's
+    // read guard answers as an unusable `[]`; the stub models that rather than diffing against `stored`.
+    const usable = !problems.some((problem) => problem.field === 'githubRepos')
+    stored = applyRepoListEdit(usable ? stored : [], base, next, usable).map((repo) => ({ ...repo }))
     // A repository-list write replaces `githubRepos` and nothing else — `store.set` writes one key, and
     // `describeStoredProblems` re-evaluates the rest — so a stub that healed every field would make the
     // natural mixed-state test fail against a *correct* renderer once a second field is guarded.
@@ -143,9 +146,16 @@ export function createElectronApiStub(initialRepos: RepoRef[] = [], initialProbl
     listWorkflowTasks,
     /** What the fake store holds right now — the assertion target for "did the write land". */
     storedRepos: () => stored.map((repo) => ({ ...repo })),
-    /** For a `setRepos` override that defers: apply the write the default implementation would have. */
+    /**
+     * For a `setRepos` override that defers: store `next` wholesale — the write the default implementation
+     * makes when nothing changed the store since the edit's base, which is the case those tests stage.
+     */
     applyRepos: (next: RepoRef[]) => {
       stored = next.map((repo) => ({ ...repo }))
+    },
+    /** Replaces what the fake store reports as unusable, as a hand-edit made while the window is open would. */
+    setStoreProblems: (next: StoredValueProblem[]) => {
+      problems = next
     },
     recoveryRequired,
     confirmQueueRecovery,

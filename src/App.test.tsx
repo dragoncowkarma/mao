@@ -950,6 +950,19 @@ describe('App repository edits beside another process', () => {
     expect(stub.storedRepos()).toEqual([ONE, THREE])
   })
 
+  it('keeps the window list when a settings edit lands on a stored list that has gone unusable', async () => {
+    // The store's report may already be on screen beside rows the window loaded earlier. The edit must
+    // rewrite those rows, not be diffed against the read guard's empty stand-in and write [] over them.
+    const { stub, user } = await renderApp([ONE, TWO])
+    stub.setStoreProblems([UNUSABLE_REPO_LIST])
+
+    await openSettings(user)
+    fireEvent.change(screen.getByRole('spinbutton'), { target: { value: '45' } })
+
+    await waitFor(() => expect(stub.setRepos).toHaveBeenCalled())
+    expect(stub.storedRepos()).toEqual([{ ...ONE, pollIntervalMs: 45_000 }, TWO])
+  })
+
   it('does not put back a repository a terminal removed when the window edits another one', async () => {
     const { stub, user } = await renderApp([ONE, TWO])
     // `mao repos remove acme two` in a terminal; the window still lists it.

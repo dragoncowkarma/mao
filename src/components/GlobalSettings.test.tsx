@@ -11,13 +11,15 @@ const echoSave = (async (providers: AiProviderConfig[]) => providers) as never
 describe('GlobalSettings provider save', () => {
   it('shows a core refusal and never claims a filtered provider snapshot was saved', async () => {
     const stub = createElectronApiStub()
+    stub.listProviders.mockResolvedValue([{ id: 'claude', name: 'Claude', kind: 'cli', command: 'claude' }])
     const refusal =
       'Cannot save the filtered provider list from Global settings. Nothing was written. Repair the config file.'
     stub.api.ai.save.mockRejectedValueOnce(new Error(refusal))
     const user = userEvent.setup()
 
     render(<GlobalSettings theme="system" onThemeChange={() => {}} />)
-    await screen.findByText('No AI providers registered yet.')
+    // An edit, so there is a provider write for core to refuse — an unchanged list is not written at all.
+    await user.type(await screen.findByDisplayValue('Claude'), ' Code')
 
     await user.click(screen.getByRole('button', { name: 'Save changes' }))
 
@@ -79,5 +81,70 @@ describe('GlobalSettings provider save beside another process', () => {
     await user.click(screen.getByRole('button', { name: 'Save changes' }))
     await waitFor(() => expect(stub.api.ai.save).toHaveBeenCalledTimes(2))
     expect(stub.api.ai.save).toHaveBeenLastCalledWith([{ ...claude, name: 'Claude Code' }], [claude])
+  })
+})
+
+describe('GlobalSettings saves only what it can stand behind', () => {
+  const claude = { id: 'claude', name: 'Claude', kind: 'cli' as const, command: 'claude' }
+
+  it('saves a token without re-writing an unchanged provider list', async () => {
+    // Re-writing it would let an import made in a terminal meanwhile refuse this token-only save.
+    const stub = createElectronApiStub()
+    stub.listProviders.mockResolvedValue([claude])
+    stub.api.github.setToken.mockResolvedValue(undefined as never)
+    const user = userEvent.setup()
+
+    render(<GlobalSettings theme="system" onThemeChange={() => {}} />)
+    await screen.findByDisplayValue('Claude')
+    await user.type(screen.getByPlaceholderText('ghp_...'), 'ghp_test')
+    await user.click(screen.getByRole('button', { name: 'Save changes' }))
+
+    await screen.findByText('Saved')
+    expect(stub.api.ai.save).not.toHaveBeenCalled()
+    expect(stub.api.github.setToken).toHaveBeenCalledWith('ghp_test')
+  })
+
+  it('says when the provider list could not be loaded, and refuses to save providers over it blind', async () => {
+    // A failed load used to leave an empty pane that read as "no providers yet"; adding one and saving sent
+    // no base, and core then replaced the whole stored list — every API key with it.
+    const stub = createElectronApiStub()
+    stub.listProviders.mockRejectedValue(new Error('Unexpected token \'g\', "ghp_SENTINEL" is not valid JSON'))
+    const user = userEvent.setup()
+
+    render(<GlobalSettings theme="system" onThemeChange={() => {}} />)
+    expect(await screen.findByText(/provider list could not be loaded/)).toBeInTheDocument()
+    expect(screen.queryByText(/ghp_SENTINEL/)).toBeNull()
+
+    await user.click(screen.getByRole('button', { name: '+ Add provider' }))
+    await user.type(screen.getByPlaceholderText('Name'), 'New')
+    await user.type(screen.getByPlaceholderText('API key'), 'test-key')
+    await user.click(screen.getByRole('button', { name: 'Save changes' }))
+
+    expect(await screen.findByText(/never loaded, so saving these providers would replace it blind/)).toBeInTheDocument()
+    expect(stub.api.ai.save).not.toHaveBeenCalled()
+  })
+
+  it('disables Save while a save is in flight, so a double-click cannot refuse itself', async () => {
+    const stub = createElectronApiStub()
+    stub.listProviders.mockResolvedValue([claude])
+    let release!: () => void
+    const pending = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    stub.api.ai.save.mockImplementation((async (providers: AiProviderConfig[]) => {
+      await pending
+      return providers
+    }) as never)
+    const user = userEvent.setup()
+
+    render(<GlobalSettings theme="system" onThemeChange={() => {}} />)
+    await user.type(await screen.findByDisplayValue('Claude'), ' Code')
+    await user.click(screen.getByRole('button', { name: 'Save changes' }))
+
+    expect(screen.getByRole('button', { name: 'Save changes' })).toBeDisabled()
+    release()
+    await screen.findByText('Saved')
+    expect(screen.getByRole('button', { name: 'Save changes' })).toBeEnabled()
+    expect(stub.api.ai.save).toHaveBeenCalledTimes(1)
   })
 })

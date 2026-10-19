@@ -89,7 +89,7 @@ export function registerIpcHandlers() {
   // the two to the list stored now (applyRepoListEdit), so a stale window mirror cannot put back a
   // repository a terminal removed, or drop one it added (issue #73).
   ipcMain.handle('github:setRepos', (_event, repos: RepoRef[], base?: RepoRef[]) =>
-    updateRepos((previous) => applyRepoListEdit(previous, base, repos)),
+    updateRepos((previous, stored) => applyRepoListEdit(previous, base, repos, stored.usable)),
   )
 
   // Filtered, not raw. `config.json` is unvalidated JSON, and the renderer draws each row as

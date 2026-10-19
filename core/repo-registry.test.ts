@@ -863,10 +863,34 @@ describe('applyRepoListEdit', () => {
     const junk = { owner: '' } as unknown as RepoRef
     expect(applyRepoListEdit([junk, gadgets], [gadgets, widgets], [gadgets])).toEqual([junk, gadgets])
   })
+  it('is the whole edit over a stored value that was not a list, rather than a diff against nothing', () => {
+    // The guard answers an unusable value as [], which read as a list would make every repository the
+    // window shows look removed elsewhere — and a settings toggle would then write [] unpreflighted.
+    const next = [{ ...gadgets, pollIntervalMs: 9 }, widgets]
+    expect(applyRepoListEdit([], [gadgets, widgets], next, false)).toBe(next)
+  })
 })
 
 describe('createRepoRegistrar with the GUI-shaped edit (issue #73)', () => {
   const filePathOf = (store: FileStore) => (store as unknown as { filePath: string }).filePath
+
+  it('rewrites the window list, preflighted, when a settings edit lands on an unusable stored value', async () => {
+    // The second review's reproduction. The window still lists [gadgets{autoTrigger:false}, widgets] while
+    // a hand-edit has left githubRepos an object. Diffing against the guard's [] dropped the edit and every
+    // untouched row, so the toggle wrote [] with no preflight — losing the only usable copy of the list and
+    // gadgets' autoTrigger: false with it.
+    silenceStoreWarnings()
+    const store = makeRealStore({ githubRepos: { broken: true } })
+    const github = passingGithub()
+    const base = [{ ...gadgets, autoTrigger: false }, widgets]
+    const next = [{ ...gadgets, autoTrigger: false, pollIntervalMs: 60_000 }, widgets]
+
+    await createRepoRegistrar(github, store)((previous, stored) => applyRepoListEdit(previous, base, next, stored.usable))
+
+    expect(new FileStore(filePathOf(store)).get('githubRepos')).toEqual(next)
+    // Every entry counts as a first registration, exactly as before the base existed.
+    expect(github.assertRepoWorkflowWritable).toHaveBeenCalledTimes(2)
+  })
 
   it('does not resurrect a repository a terminal removed while a window add was preflighting', async () => {
     // `github:setRepos` hands core a whole list. Wrapped in applyRepoListEdit with the list it was computed

@@ -141,6 +141,8 @@ describe('Sidebar queue recovery', () => {
 
     expect(screen.getByText('The stored workflow queue is unreadable')).toBeInTheDocument()
     expect(screen.getByText(/This session is not halted/)).toBeInTheDocument()
+    // The rewrite is conditional (issue #73): it never deletes readable tasks another host wrote.
+    expect(screen.getByText(/which it will not delete/)).toBeInTheDocument()
     expect(screen.getByText(/\/data\/config.json/)).toBeInTheDocument()
     // And it must not claim a halt, an empty queue, or refused writes — none of which is true here. The
     // store's report asserts all three, so it must NOT be rendered verbatim in this state.

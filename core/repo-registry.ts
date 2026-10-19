@@ -263,11 +263,23 @@ function patchEntry(stored: RepoRef, before: RepoRef, after: RepoRef): RepoRef {
  *
  * Everything the edit did not touch is kept **as stored now**. When the stored list still is `base`
  * (the ordinary case) `next` is returned unchanged, so nothing about a window that is the only writer
- * changes; and with no `base` at all — a caller that predates it — the edit is the whole list, as before.
+ * changes; and with no `base` at all — a caller that predates it — or a stored value that is not a list
+ * (`previousUsable: false`), the edit is the whole list, as before.
  * A repository listed more than once is replaced wholesale rather than patched field by field, since
  * which occurrence a field edit meant is not knowable; `canonicalRepoList` then folds it as it always has.
  */
-export function applyRepoListEdit(previous: RepoRef[], base: RepoRef[] | undefined, next: RepoRef[]): RepoRef[] {
+export function applyRepoListEdit(
+  previous: RepoRef[],
+  base: RepoRef[] | undefined,
+  next: RepoRef[],
+  previousUsable = true,
+): RepoRef[] {
+  // An unusable stored value is not a list anyone wrote, so there is nothing to diff against: the guard's
+  // `[]` stand-in would make every repository the window shows look removed elsewhere, and a settings
+  // toggle or Remove would write an empty list — unpreflighted, since nothing in it is new — over the only
+  // usable copy, the window's own. The edit is then the whole list, as before base existed: every entry
+  // counts as a first registration and is preflighted, and Reset still writes the empty list it sends.
+  if (!previousUsable) return next
   if (base === undefined || !Array.isArray(base) || !Array.isArray(next) || !Array.isArray(previous)) return next
   if (JSON.stringify(previous) === JSON.stringify(base)) return next
 
@@ -342,8 +354,14 @@ export async function assertReposRegistrable(
   return capabilities
 }
 
-/** Computes the list to persist from the list currently in the store. Must be pure — it can be re-applied. */
-export type RepoListUpdate = (previous: RepoRef[]) => RepoRef[]
+/**
+ * Computes the list to persist from the list currently in the store. Must be pure — it can be re-applied.
+ *
+ * `stored.usable` is false when the stored value was not a list at all, so `previous` is the read guard's
+ * empty stand-in rather than a list anyone wrote. An update that diffs against `previous` (see
+ * `applyRepoListEdit`) must not read that `[]` as "every repository was removed".
+ */
+export type RepoListUpdate = (previous: RepoRef[], stored: { usable: boolean }) => RepoRef[]
 
 /**
  * How many times one update re-plans against a list another process keeps changing before it gives up.
@@ -416,7 +434,7 @@ export function createRepoRegistrar(
         // checked is byte-for-byte the list that gets stored. This is the single chokepoint that keeps
         // a differently capitalised duplicate from reaching the store unchecked, which is why neither
         // shell has to know the rule exists (see canonicalRepoList()).
-        const next = canonicalRepoList(previous, update(previous))
+        const next = canonicalRepoList(previous, update(previous, { usable: observed.problem === undefined }))
         const checked = await assertReposRegistrable(github, previous, next)
         const result = store.setIfUnchanged('githubRepos', observed.witness, next)
         if (result === 'written') return checked

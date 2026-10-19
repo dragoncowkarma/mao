@@ -251,8 +251,9 @@ export default function Sidebar({
                 <p className="text-muted text-[11px] leading-snug">
                   MAO cannot read the stored workflow queue in {queueStoredProblem?.source}. This session
                   is not halted — it is still holding the queue it loaded at startup, and its next queue
-                  write will rewrite the file from that. Restarting before that happens will refuse to
-                  start unattended work until the value is replaced.
+                  write will rewrite the file from that, unless the file now also holds readable tasks
+                  this session did not write (another MAO host's), which it will not delete. Restarting
+                  before that happens will refuse to start unattended work until the value is replaced.
                 </p>
                 {/* Deliberately NOT `mao workflow confirm-queue-recovery` here. That command discards
                     anything its separate process cannot validate and writes ITS startup snapshot over

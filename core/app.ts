@@ -126,6 +126,15 @@ export function describeQueueWriteConflict(): string {
   )
 }
 
+/** Why a re-save refused: the unusable stored queue still holds readable tasks this session did not write. */
+function describeForeignTasksInStoredQueue(): string {
+  return (
+    '[store] The stored workflow queue is unusable, but it still holds readable tasks this session did not ' +
+    'write — another MAO host\'s — so saving this session\'s queue over it would delete them. Nothing was ' +
+    'written. Stop the other host, then recover the file deliberately (see `mao workflow confirm-queue-recovery`).'
+  )
+}
+
 /** The report for a queue write whose compare could not read the stored queue at all. */
 function describeUnverifiableQueueWrite(): string {
   return (
@@ -185,29 +194,49 @@ export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOp
    * observation after it, so a queue change costs the compare read and no second one.
    */
   let persistedQueueWitness = observedQueue.witness
+  /**
+   * The tasks this process knows the stored queue held until its first write: the boot observation's,
+   * in the form the read guard hands back. Kept separately from the witness because the witness is the
+   * *raw* value, and a queue written by an older build (a task repo carrying registry settings, a task
+   * with no `autoAdvance`) differs from its own guard-normalized reading — which is what the repair check
+   * compares — so this process's own boot tasks would have read as another host's. After the first write
+   * the witness is this process's own current-schema serialization and the two forms agree.
+   */
+  const bootTaskForms = new Set(observedQueue.value.map((task) => JSON.stringify(task)))
+  let wroteSinceBoot = false
+
+  /** Records a confirmed write of `tasks` as the stored queue this process's next write is keyed on. */
+  function recordQueueWrite(tasks: QueuedTask[]) {
+    persistedQueueWitness = storedValueWitness(tasks)
+    wroteSinceBoot = true
+  }
 
   /**
-   * Whether every readable task in `readable` is one this process last wrote, as written.
+   * Whether every readable task in `readable` is one this process last wrote (or, before its first write,
+   * loaded at boot), byte for byte in the guard's form.
    *
    * Compared through the witness — the serialization of what this process last wrote — so it costs a parse
-   * on the rare repair path and nothing on the ordinary one. A witness that is not a JSON array (nothing
-   * written yet, or the store held no list) knows of no tasks, so only a value with none left qualifies.
+   * on the rare repair path and nothing on the ordinary one. A witness that is not a JSON array knows of no
+   * tasks, so only a value with none left qualifies.
    */
   function onlyHoldsTasksThisProcessWrote(readable: QueuedTask[]): boolean {
-    let written: unknown
-    try {
-      written = persistedQueueWitness === undefined ? undefined : JSON.parse(persistedQueueWitness)
-    } catch {
-      written = undefined
+    let mine = bootTaskForms
+    if (wroteSinceBoot) {
+      let written: unknown
+      try {
+        written = persistedQueueWitness === undefined ? undefined : JSON.parse(persistedQueueWitness)
+      } catch {
+        written = undefined
+      }
+      mine = new Set(Array.isArray(written) ? written.map((task) => JSON.stringify(task)) : [])
     }
-    const mine = new Set(Array.isArray(written) ? written.map((task) => JSON.stringify(task)) : [])
     return readable.every((task) => mine.has(JSON.stringify(task)))
   }
 
   function persistQueue(tasks: QueuedTask[]) {
     const result = store.setIfUnchanged(QUEUE_GATING_FIELD, persistedQueueWitness, tasks)
     if (result === 'written') {
-      persistedQueueWitness = storedValueWitness(tasks)
+      recordQueueWrite(tasks)
       return
     }
     if (result === 'invalid') {
@@ -232,7 +261,7 @@ export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOp
     }
     const repaired = store.setIfUnchanged(QUEUE_GATING_FIELD, current.witness, tasks)
     if (repaired === 'written') {
-      persistedQueueWitness = storedValueWitness(tasks)
+      recordQueueWrite(tasks)
       return
     }
     throw new Error(repaired === 'superseded' ? describeQueueWriteConflict() : describeUnverifiableQueueWrite())
@@ -408,6 +437,13 @@ export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOp
       }
     }
     if (observed.problem === undefined) return { kind: 'already-readable' }
+    // The re-save writes this session's queue over the stored value, so it has the same duty as the
+    // automatic repair in `persistQueue`: an unusable value can still hold readable tasks another host
+    // wrote, and replacing it would delete them. The halted discard is different — it writes the fresh
+    // observation's own readable subset, which keeps every readable task whoever wrote it.
+    if (replacementSource === 'live-engine' && !onlyHoldsTasksThisProcessWrote(observed.value)) {
+      return { kind: 'unverified', reason: describeForeignTasksInStoredQueue() }
+    }
 
     const replacement =
       replacementSource === 'fresh-subset' ? observed.value : workflowEngine.getTasks()
@@ -429,7 +465,7 @@ export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOp
     }
     // This write is now the stored queue this process's later writes are derived from — without this the
     // engine's very next change would read its own recovery as another process's and refuse it.
-    persistedQueueWitness = storedValueWitness(replacement)
+    recordQueueWrite(replacement)
 
     if (replacementSource === 'fresh-subset') {
       // `restore()` emits nothing and `resume: false` is explicit: confirmation may update the in-memory

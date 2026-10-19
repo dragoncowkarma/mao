@@ -137,8 +137,9 @@ per config file — `mao run`, the desktop app, or a one-shot `mao workflow enqu
 the target repos for work either may have repeated, run `mao config clear-persistence-broken`, and
 restart. A queue that becomes *unusable* (hand-corrupted) after a clean start is the exception — that
 session still rewrites it from the queue it holds, as described below, provided every readable task left
-in it is one that session wrote; a value still holding another host's task is refused like any other
-conflict. An enqueue whose write is refused keeps nothing: the command (or the auto-trigger poll) fails, and
+in it is one that session wrote; a value still holding another host's *readable* task is refused like
+any other conflict. (An entry no build here can read cannot be told apart from corruption, so it is
+discarded either way.) An enqueue whose write is refused keeps nothing: the command (or the auto-trigger poll) fails, and
 the issue is picked up once writes succeed again, as one task rather than two.
 
 A write that finds the lock held waits up to five seconds, then fails with "Nothing was written", the
@@ -320,7 +321,8 @@ seconds says "Nothing was written" and names the holder; retry once it has finis
 **A problem found after a clean start does not halt that session — and `confirm-queue-recovery` is the
 wrong tool for it.** The latch is decided at boot, so if the file is corrupted while MAO is already
 running, the engine is still holding the queue it loaded and its next queue write rewrites the file from
-it. The sidebar says exactly that, in its own words rather than repeating the store's "automation is
+it — unless the file now also holds readable tasks that session did not write, in which case the write is
+refused rather than deleting them (see "Several MAO processes on one config file" above). The sidebar says exactly that, in its own words rather than repeating the store's "automation is
 halted" report, which would be false there.
 
 Do **not** reach for `mao workflow confirm-queue-recovery` in that state. It discards invalid entries,
@@ -331,7 +333,9 @@ session's queue now**, which rewrites the file from the queue the running proces
 (`MaoApp.resaveStoredQueue()`). It is the *same* conditional write the discard uses — observe the store
 fresh, write only if the value has not moved, report what was established — and it refuses while that
 session is halted, because a halted session's queue is only a filtered startup subset and saving it would
-make this a silent discard. So it can also answer "nothing was written": if something repaired the file first,
+make this a silent discard. For the same reason as the automatic rewrite, it also refuses — "nothing was
+written", naming why — when the file holds readable tasks this session did not write. So it can also
+answer "nothing was written": if something repaired the file first,
 you are told rather than left assuming the click saved anything.
 With no GUI open, the safe equivalent is to let the running `mao run` reach its next queue write, or to
 stop it and then recover — not to discard from a second terminal while it is live.

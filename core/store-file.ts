@@ -133,16 +133,33 @@ function isMissing(err: unknown): boolean {
  * resolves through a dangling link if there is one, else to `filePath` itself.
  */
 export function resolveStoreFilePath(filePath: string): string {
-  try {
-    return fs.realpathSync(filePath)
-  } catch (err) {
-    if (!isMissing(err)) throw err
+  let current = filePath
+  // Bounded like the kernel's own symlink limit; a real loop fails `realpathSync` with ELOOP first.
+  for (let hop = 0; hop < 40; hop += 1) {
+    try {
+      return fs.realpathSync(current)
+    } catch (err) {
+      if (!isMissing(err)) throw err
+    }
+    // Missing. Follow it the way an in-place write would: from the directory's *real* location, since the
+    // kernel resolves a link's `..` after the directory's own links, and one hop at a time, since the
+    // target can itself be a dangling link. Resolving lexically, or one hop only, let two processes reaching
+    // one config through different paths write — and lock — two different files.
+    let dir: string
+    try {
+      dir = fs.realpathSync(path.dirname(current))
+    } catch {
+      return current
+    }
+    let link: string
+    try {
+      link = fs.readlinkSync(current)
+    } catch {
+      return path.join(dir, path.basename(current))
+    }
+    current = path.resolve(dir, link)
   }
-  try {
-    return path.resolve(path.dirname(filePath), fs.readlinkSync(filePath))
-  } catch {
-    return filePath
-  }
+  return current
 }
 
 /**

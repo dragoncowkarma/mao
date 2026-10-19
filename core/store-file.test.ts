@@ -344,6 +344,35 @@ describe('writeStoreFileAtomic', () => {
     },
   )
 
+  it.skipIf(process.platform === 'win32')('follows a chain of dangling links to the file at its end', () => {
+    const dir = path.dirname(tempConfigPath())
+    fs.symlinkSync(path.join(dir, 'middle.json'), path.join(dir, 'first.json'))
+    fs.symlinkSync(path.join(dir, 'real.json'), path.join(dir, 'middle.json'))
+
+    writeStoreFileAtomic(path.join(dir, 'first.json'), '{}')
+
+    expect(fs.readFileSync(path.join(dir, 'real.json'), 'utf-8')).toBe('{}')
+    expect(fs.lstatSync(path.join(dir, 'first.json')).isSymbolicLink()).toBe(true)
+    expect(fs.lstatSync(path.join(dir, 'middle.json')).isSymbolicLink()).toBe(true)
+  })
+
+  it.skipIf(process.platform === 'win32')("resolves a dangling link's '..' from the directory's real location", () => {
+    // The data dir is reached through a link; its config is a relative link not yet created. Reads follow
+    // the kernel's resolution, so the write must land exactly where they will look.
+    const root = path.dirname(tempConfigPath())
+    const realDir = path.join(root, 'x', 'y')
+    fs.mkdirSync(realDir, { recursive: true })
+    fs.mkdirSync(path.join(root, 'x', 'shared'))
+    const linkDir = path.join(root, 'link-dir')
+    fs.symlinkSync(realDir, linkDir)
+    fs.symlinkSync(path.join('..', 'shared', 'config.json'), path.join(realDir, 'config.json'))
+
+    writeStoreFileAtomic(path.join(linkDir, 'config.json'), '{"theme":"dark"}')
+
+    expect(fs.readFileSync(path.join(linkDir, 'config.json'), 'utf-8')).toBe('{"theme":"dark"}')
+    expect(fs.readFileSync(path.join(root, 'x', 'shared', 'config.json'), 'utf-8')).toBe('{"theme":"dark"}')
+  })
+
   it('creates the file and its directory when neither exists', () => {
     const filePath = path.join(path.dirname(tempConfigPath()), 'nested', 'config.json')
 

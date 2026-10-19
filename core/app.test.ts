@@ -1117,6 +1117,35 @@ describe('mao run queue persistence beside another process (issue #73)', () => {
     expect(onDisk(filePath).workflowTasks).toEqual(theirs)
   })
 
+  it('recognizes its own boot tasks in an older build\'s form, so a late corruption is still repaired', () => {
+    // Stored before #77: the task's repo still carries registry settings. The guard normalizes it on read,
+    // so it never matched its own raw boot serialization and the repair read it as another host's task.
+    captureWarnings()
+    const legacy = { ...pausedTask(), repo: { owner: 'acme', repo: 'widgets', autoTrigger: true } }
+    const { dataDir, filePath, app } = bootLongRunning({ workflowTasks: [legacy] })
+    fs.writeFileSync(filePath, JSON.stringify({ ...onDisk(filePath), workflowTasks: [legacy, null] }))
+
+    app.workflowEngine.setAutoAdvance('task-1', true)
+
+    expect(onDisk(filePath).workflowTasks).toEqual([{ ...pausedTask(), autoAdvance: true }])
+    expect(hasPersistenceBrokenMarker(dataDir)).toBe(false)
+  })
+
+  it("refuses to re-save this session's queue over another host's readable task", () => {
+    // "Save this session's queue now" writes this session's queue over the unusable value — the same
+    // deletion the automatic repair refuses, so it refuses too, and says why.
+    captureWarnings()
+    const { filePath, app } = bootLongRunning({ workflowTasks: [pausedTask()] })
+    const theirs = [pausedTask(), pausedTask('added-elsewhere'), null]
+    fs.writeFileSync(filePath, JSON.stringify({ ...onDisk(filePath), workflowTasks: theirs }))
+
+    const outcome = app.resaveStoredQueue()
+
+    expect(outcome.kind).toBe('unverified')
+    expect(outcome.kind === 'unverified' && outcome.reason).toMatch(/readable tasks this session did not write/)
+    expect(onDisk(filePath).workflowTasks).toEqual(theirs)
+  })
+
   it('rolls back a task whose enqueue write was refused, so it cannot be persisted twice later', () => {
     const { filePath, app } = bootLongRunning({ workflowTasks: [pausedTask()] })
     new FileStore(filePath).set('workflowTasks', [pausedTask(), pausedTask('added-elsewhere')])

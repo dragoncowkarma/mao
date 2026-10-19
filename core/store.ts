@@ -1,5 +1,4 @@
 import fs from 'node:fs'
-import path from 'node:path'
 import {
   AGENT_STAGES,
   AI_API_FORMATS,
@@ -9,6 +8,12 @@ import {
   type AiProviderConfig,
 } from './ai/types.ts'
 import { isRepoRef } from './repo-registry.ts'
+import {
+  createStoreWriteLock,
+  writeStoreFileAtomic,
+  type StoreWriteLock,
+  type StoreWriteLockOptions,
+} from './store-file.ts'
 import { WORKFLOW_ACTIVE_LABEL, WORKFLOW_TASK_STATUSES } from './workflow-engine.ts'
 import type { QueuedTask, RepoRef } from './workflow-engine.ts'
 
@@ -584,6 +589,19 @@ function witnessOf(raw: unknown): string | undefined {
   }
 }
 
+/**
+ * The witness a fresh `inspect()` will report once `value` is what is stored — for a caller that keys
+ * each conditional write on its own previous one instead of paying a whole-file read after every write.
+ *
+ * Exact rather than approximate because both backends persist through `JSON.stringify` and read through
+ * `JSON.parse`, and a JSON round trip is idempotent: re-serializing what was parsed reproduces the same
+ * text, `undefined` members dropped on both sides. `core/store.test.ts` pins that equality against a real
+ * write and read. Opaque and secret-bearing like every witness — never log or render it.
+ */
+export function storedValueWitness(value: unknown): string | undefined {
+  return witnessOf(value)
+}
+
 /** What a conditional write did. See `MaoStore.setIfUnchanged()`. */
 export type ConditionalWriteResult = 'written' | 'superseded' | 'unverifiable' | 'invalid'
 
@@ -705,7 +723,21 @@ export interface MaoStore {
   get<K extends keyof MaoStoreSchema>(key: K): MaoStoreSchema[K]
   /** Returns a value-free rejection reason for an invalid prospective write, else `undefined`. */
   validateWrite<K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]): string | undefined
-  /** Rejects an invalid provider/task list before the backend can mutate either memory or disk. */
+  /**
+   * Rejects an invalid provider/task list before the backend can mutate either memory or disk.
+   *
+   * Replaces `key` and nothing else, and that is the backend contract issue #73 added (see
+   * `StoredValueBackend.set`): a long-running process writing its queue must not put back the token,
+   * repositories, providers or theme it read at boot over what another process has stored since.
+   *
+   * For `key` itself it is **last-writer-wins**, deliberately: a plain `set` is for a value the caller
+   * states outright (`mao config set-token`, a theme, the build SHA, `mao config import-providers`'s
+   * complete replacement), where the latest statement is the operator's intent. A value *derived* from a
+   * previous read — a list edited in place, a queue advanced by an engine — must not use it, because a
+   * change landing between that read and this write would be lost without a word. Those writers use
+   * `setIfUnchanged` keyed on what they read: the queue (`core/app.ts`), the repository list
+   * (`createRepoRegistrar`) and the provider editor (`MaoApp.saveProviders`).
+   */
   set<K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]): void
   /**
    * The stored values this backend cannot use, evaluated against what it holds now (see
@@ -736,18 +768,19 @@ export interface MaoStore {
    * `'superseded'` means the raw value moved and **nothing was written**. `'unverifiable'` means the
    * current value could not be read or serialized, so whether it moved is unknown — also nothing written.
    * `'invalid'` means the replacement failed prospective shape validation before any backend read or
-   * write. Throws only if the underlying write throws.
+   * write. Throws if the underlying write throws, or with `StoreLockError` — nothing written — when the
+   * backend's cross-process write lock cannot be taken.
    *
-   * **What `'written'` actually establishes, stated narrowly because an earlier revision of this comment
+   * **What `'written'` actually establishes, stated narrowly because earlier revisions of this comment
    * promised more.** The compare and the write are one synchronous run of JavaScript with no `await`
-   * between them, so no other code *in this process* can interleave: against another caller here, the
-   * pair is atomic and `'written'` means "nothing had moved". Against another OS process it is not. The
-   * comparison narrows the window — from the whole confirm sequence down to the compare →
-   * `writeFileSync` interval — but a repair landing inside that interval is still overwritten and still
-   * reported `'written'`. Closing that needs a primitive neither backend has: an advisory lock both
-   * writers take, or `O_EXCL` + rename keyed on a stored version with a retry loop. Cross-process
-   * serialization of same-key writes is issue #73 and is deliberately **not** attempted here; do not
-   * describe this member as closing it.
+   * between them, so no other code *in this process* can interleave. Against another OS process the pair
+   * runs under the backend's write lock (`StoredValueBackend.exclusive`), which both shipped backends hold
+   * for their config file (issue #73): no other **MAO** write can land between this compare and this
+   * rename, so against every MAO process `'written'` means "nothing had moved". It is still not a claim
+   * about every writer. A hand-edit, another tool, or electron-store's constructor-time merge of its own
+   * defaults takes no lock, and a change from one of those landing inside the interval is overwritten
+   * and reported `'written'` — as is anything a lock judged abandoned (see `createStoreWriteLock`) lets
+   * through. So do not describe this member as atomic.
    */
   setIfUnchanged<K extends keyof MaoStoreSchema>(
     key: K,
@@ -765,6 +798,20 @@ export interface MaoStore {
  */
 export interface StoredValueBackend {
   get<K extends keyof MaoStoreSchema>(key: K): MaoStoreSchema[K] | undefined
+  /**
+   * Writes `key` and leaves every other key's stored value exactly as it is **on disk now** — not as this
+   * backend last read it.
+   *
+   * The distinction is issue #73. Both backends persist one JSON blob, so a write has to put every other
+   * key back too, and the question is which copy. `FileStore` once wrote its constructor snapshot, so a
+   * `mao run` that had been up for a day rewrote the whole file from what it read at boot on every queue
+   * change — undoing a `mao repos remove`, a `set-token` or a provider import made from another terminal
+   * in the meantime, including the very `githubRepos` repair PR #66's report tells the operator to run.
+   * conf already re-reads before it writes; `FileStore` now does the same.
+   *
+   * May throw when the file exists but cannot be read back: merging into a file that could not be read
+   * would replace everything in it, so refusing is the only write that loses nothing.
+   */
   set<K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]): void
   /**
    * A read that is guaranteed to reflect what is on disk *now*, for `inspect()` and the conditional
@@ -777,6 +824,37 @@ export interface StoredValueBackend {
    * but cannot be read; callers turn that into "unknown", never into "healthy".
    */
   getFresh?<K extends keyof MaoStoreSchema>(key: K): MaoStoreSchema[K] | undefined
+  /**
+   * Cross-process exclusion for one write: `createGuardedStore` runs every `set` and every
+   * `setIfUnchanged` compare-and-write inside it.
+   *
+   * A property of the *backend* because it is a property of the storage — the lock belongs to the file —
+   * and both shipped backends supply the same one through `withFileWriteLock`. Optional so an in-memory
+   * test backend needs none; without it a write is exclusive only within this process.
+   */
+  exclusive?: StoreWriteLock
+}
+
+/**
+ * Gives a backend that persists to `filePath` the cross-process write lock for that file.
+ *
+ * The one way both shipped backends get it — `FileStore` here, electron-store in `electron/store.ts` — so
+ * a CLI process and the desktop app pointed at one `config.json` serialize their writes against each
+ * other rather than each holding a lock the other never checks.
+ */
+export function withFileWriteLock(
+  backend: StoredValueBackend,
+  filePath: string,
+  options?: StoreWriteLockOptions,
+): StoredValueBackend {
+  return {
+    get: <K extends keyof MaoStoreSchema>(key: K) => backend.get(key),
+    set: <K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]) => backend.set(key, value),
+    getFresh: backend.getFresh
+      ? <K extends keyof MaoStoreSchema>(key: K) => backend.getFresh!(key)
+      : undefined,
+    exclusive: createStoreWriteLock(filePath, options),
+  }
 }
 
 /**
@@ -801,6 +879,7 @@ export function createGuardedStore(
   warn?: (message: string) => void,
 ): MaoStore {
   const guardRead = createStoredReadGuard(source, warn)
+  const exclusive: StoreWriteLock = backend.exclusive ?? ((critical) => critical())
 
   /**
    * The freshest read the backend can give, for the two members that exist to notice another process's
@@ -828,7 +907,10 @@ export function createGuardedStore(
     },
     set<K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]): void {
       assertStoredWrite(key, value, source)
-      backend.set(key, value)
+      // Under the lock even though a plain set compares nothing: the backend's own re-read and merge is a
+      // read → write pair too, and without the lock a conditional write elsewhere could pass its compare
+      // and then rename its stale copy of this key back over this one.
+      exclusive(() => backend.set(key, value))
     },
     problems(): StoredValueProblem[] {
       return describeStoredProblems(readRaw, source)
@@ -867,26 +949,50 @@ export function createGuardedStore(
     ): ConditionalWriteResult {
       if (describeInvalidStoredWrite(key, value, source) !== null) return 'invalid'
       if (witness === undefined) return 'unverifiable'
-      let current: string | undefined
-      try {
-        current = witnessOf(readRawFresh(key))
-      } catch {
-        return 'unverifiable'
-      }
-      if (current === undefined) return 'unverifiable'
-      if (current !== witness) return 'superseded'
-      // Nothing may be inserted between the compare above and the write below — not an `await`, not a
-      // callback, not a second read. That adjacency is the entire guarantee: it makes the pair atomic
-      // with respect to other callers in this process. It does NOT make it atomic against another OS
-      // process, which can still repair the value in this interval and have it overwritten (#73).
-      //
-      // No read-back afterwards either: comparing two post-write reads cannot tell "written" from
-      // "written then immediately superseded", so it would assert more than it establishes. The write
-      // either throws or it does not, and the caller is told which.
-      backend.set(key, value)
-      return 'written'
+      // The compare and the write share one hold of the cross-process lock, so another MAO process cannot
+      // write between them (issue #73). Writers that take no lock still can — see the interface doc.
+      return exclusive((): ConditionalWriteResult => {
+        let current: string | undefined
+        try {
+          current = witnessOf(readRawFresh(key))
+        } catch {
+          return 'unverifiable'
+        }
+        if (current === undefined) return 'unverifiable'
+        if (current !== witness) return 'superseded'
+        // Nothing may be inserted between the compare above and the write below — not an `await`, not a
+        // callback, not a second read. That adjacency is what makes the pair exclusive against other
+        // callers in this process; the lock around it extends that to other MAO processes.
+        //
+        // No read-back afterwards either: comparing two post-write reads cannot tell "written" from
+        // "written then immediately superseded", so it would assert more than it establishes. The write
+        // either throws or it does not, and the caller is told which.
+        backend.set(key, value)
+        return 'written'
+      })
     },
   }
+}
+
+/**
+ * The report for refusing a `FileStore` write because the file it would merge into could not be read.
+ *
+ * Value-free: the read error is not interpolated, because a JSON parse error quotes the file's opening
+ * bytes and `config.json` holds the GitHub token in plaintext.
+ */
+export function describeUnmergeableStoredWrite(field: keyof MaoStoreSchema, source: string): string {
+  return (
+    `[store] Refusing to write "${field}" to ${source}: the file exists but could not be read back. A ` +
+    `write replaces only "${field}" and carries every other setting over from the file, so writing ` +
+    'without reading it would overwrite the stored GitHub token, AI providers, tracked repositories and ' +
+    'workflow queue. Nothing was written. Its contents are not shown here, because the GitHub token is ' +
+    'stored in it in plain text. Repair the file or move it aside, then retry.'
+  )
+}
+
+export interface FileStoreOptions {
+  /** Tuning for the cross-process write lock — tests shorten the timeout rather than wait it out. */
+  lock?: StoreWriteLockOptions
 }
 
 /** JSON-file-backed MaoStore for CLI/headless environments that don't have electron-store available. */
@@ -901,7 +1007,7 @@ export class FileStore implements MaoStore {
    */
   private guarded: MaoStore
 
-  constructor(filePath: string) {
+  constructor(filePath: string, options: FileStoreOptions = {}) {
     this.filePath = filePath
     // Cloned, not spread onto. A shallow spread copies each default's *reference*, so for any key the
     // file does not set, `get()` handed out the module-level `MAO_STORE_DEFAULTS` value itself — one
@@ -910,21 +1016,61 @@ export class FileStore implements MaoStore {
     // poll. The read guard owes callers a value that is theirs; this is the other half of that.
     this.data = { ...structuredClone(MAO_STORE_DEFAULTS), ...this.load() }
     this.guarded = createGuardedStore(
-      {
-        get: <K extends keyof MaoStoreSchema>(key: K) => this.data[key],
-        set: <K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]) => {
-          this.data[key] = value
-          this.persist()
+      withFileWriteLock(
+        {
+          get: <K extends keyof MaoStoreSchema>(key: K) => this.data[key],
+          set: <K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]) => this.writeKey(key, value),
+          // Re-read from disk, because `get` above answers from the constructor snapshot and the two
+          // members that use this exist to notice another process's change. Deliberately NOT written back
+          // into `this.data`: mutating the snapshot mid-process would make `get()` answer differently
+          // depending on whether a recovery happened to have run.
+          getFresh: <K extends keyof MaoStoreSchema>(key: K) =>
+            ({ ...structuredClone(MAO_STORE_DEFAULTS), ...this.loadStrict() })[key],
         },
-        // Re-read from disk, because `get` above answers from the constructor snapshot and the two
-        // members that use this exist to notice another process's change. Deliberately NOT written back
-        // into `this.data`: mutating the snapshot mid-process would make `get()` answer differently
-        // depending on whether a recovery happened to have run.
-        getFresh: <K extends keyof MaoStoreSchema>(key: K) =>
-          ({ ...structuredClone(MAO_STORE_DEFAULTS), ...this.loadStrict() })[key],
-      },
+        filePath,
+        options.lock,
+      ),
       filePath,
     )
+  }
+
+  /**
+   * Writes one key into the file **as it is now**, never into this instance's snapshot of it — issue #73.
+   *
+   * This used to be `this.data[key] = value` followed by writing all of `this.data`, i.e. the whole file
+   * as it stood when this instance was constructed. For a one-shot command that is milliseconds old, but
+   * `mao run` constructs one store and keeps it for days, and its queue persistence rewrote everything
+   * else from that boot-time copy on every change: a `mao repos remove`, `set-token`, provider import or
+   * theme change made from another terminal was silently reverted by the next stage transition — and so
+   * was the `githubRepos` recovery PR #66's report tells the operator to run, which put the unusable value
+   * straight back.
+   *
+   * So the merge is into a strict fresh read, then an atomic replace (`writeStoreFileAtomic`): a reader in
+   * another process can never see a torn file, which is what makes merging into a fresh read sound in the
+   * first place. It runs under the file's write lock — `createGuardedStore` takes it around every write.
+   * A file that exists and cannot be read refuses the write rather than being merged into as `{}`, which
+   * would replace everything in it with schema defaults.
+   *
+   * Only this key of the snapshot is updated afterwards, and only once the write landed: the snapshot is
+   * what `get()` answers for this process, and it should say what this process wrote — not adopt other
+   * keys mid-process (see `getFresh`), and not claim a value whose write threw.
+   */
+  private writeKey<K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]) {
+    let current: Partial<MaoStoreSchema>
+    try {
+      current = this.loadStrict()
+    } catch {
+      throw new Error(describeUnmergeableStoredWrite(key, this.filePath))
+    }
+    // Valid JSON that is not a settings object — `null`, an array, a bare string such as a pasted token —
+    // has no keys to carry over, and spreading it would scatter a string into numeric index keys. It is
+    // as unmergeable as a parse failure, so it is refused the same way.
+    if (current === null || typeof current !== 'object' || Array.isArray(current)) {
+      throw new Error(describeUnmergeableStoredWrite(key, this.filePath))
+    }
+    const next = { ...structuredClone(MAO_STORE_DEFAULTS), ...current, [key]: value }
+    writeStoreFileAtomic(this.filePath, JSON.stringify(next, null, 2))
+    this.data[key] = value
   }
 
   private load(): Partial<MaoStoreSchema> {
@@ -938,10 +1084,12 @@ export class FileStore implements MaoStore {
   /**
    * `load()`, but a file that exists and cannot be read **throws** instead of reading as `{}`.
    *
-   * Only for `getFresh`. The constructor keeps the swallowing `load()` on purpose: answering schema
-   * defaults for an unparseable file is the pre-existing behaviour (and the known blind spot tracked as
-   * issue #67), and changing it here would quietly change what every boot does. What a *conditional
-   * write* needs is the opposite — an unreadable file must become "unknown", never "unchanged".
+   * For `getFresh` and for `writeKey`'s merge. The constructor keeps the swallowing `load()` on purpose:
+   * answering schema defaults for an unparseable file is the pre-existing behaviour (and the known blind
+   * spot tracked as issue #67), and changing it here would quietly change what every boot does. What a
+   * *conditional write* needs is the opposite — an unreadable file must become "unknown", never
+   * "unchanged" — and so does a merge, for which an unreadable file read as `{}` would mean "replace
+   * everything in it".
    */
   private loadStrict(): Partial<MaoStoreSchema> {
     try {
@@ -951,11 +1099,6 @@ export class FileStore implements MaoStore {
       if ((err as { code?: string }).code === 'ENOENT') return {}
       throw err
     }
-  }
-
-  private persist() {
-    fs.mkdirSync(path.dirname(this.filePath), { recursive: true })
-    fs.writeFileSync(this.filePath, JSON.stringify(this.data, null, 2))
   }
 
   get<K extends keyof MaoStoreSchema>(key: K): MaoStoreSchema[K] {

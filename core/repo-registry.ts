@@ -1,6 +1,6 @@
 import type { GithubService } from './github-service.ts'
 import type { RepoWorkflowCapability } from './repo-capabilities.ts'
-import type { MaoStore } from './store.ts'
+import type { ConditionalWriteResult, MaoStore } from './store.ts'
 import type { RepoRef } from './workflow-engine.ts'
 
 /**
@@ -241,8 +241,29 @@ export async function assertReposRegistrable(
   return capabilities
 }
 
-/** Computes the list to persist from the list currently in the store. */
+/** Computes the list to persist from the list currently in the store. Must be pure — it can be re-applied. */
 export type RepoListUpdate = (previous: RepoRef[]) => RepoRef[]
+
+/**
+ * How many times one update re-plans against a list another process keeps changing before it gives up.
+ * Each attempt can preflight over the network, so this bounds the time as well as the loop.
+ */
+export const MAX_REPO_LIST_ATTEMPTS = 3
+
+/** Why a planned repository-list write did not happen; in every case nothing was written. */
+function describeUnwrittenRepoList(result: Exclude<ConditionalWriteResult, 'written'>): string {
+  if (result === 'superseded') {
+    return (
+      'Nothing was written: another MAO process kept changing the tracked-repository list while this ' +
+      `update was being checked (${MAX_REPO_LIST_ATTEMPTS} attempts). Run \`mao repos list\` and retry.`
+    )
+  }
+  if (result === 'invalid') return 'Nothing was written: the planned tracked-repository list was rejected before writing.'
+  return (
+    'Nothing was written: the stored tracked-repository list could not be read back to check that no other ' +
+    'process had changed it. Check the config file and the permissions on it, then retry.'
+  )
+}
 
 /**
  * Serializes read -> preflight -> write of the tracked-repository list, and owns that sequence so
@@ -261,24 +282,44 @@ export type RepoListUpdate = (previous: RepoRef[]) => RepoRef[]
  * update is applied to the list read *inside* the critical section, so a queued call never plans
  * against a list that has since changed, and `assertReposRegistrable()` still preflights whatever is
  * new relative to that fresh read.
+ *
+ * That queue serializes this process only, and the list is shared by every MAO process on the config
+ * file — a `mao repos add` and a `mao repos remove` from two terminals, or either beside the desktop app,
+ * each read, preflight for a second, and write (issue #73). So the write is conditional on the stored
+ * list still being the one read, and a list that moved is **re-planned**, not overwritten: the same
+ * `update` is applied to the fresh list, anything newly new is preflighted, and the write is tried again
+ * — the cross-process form of the queue's own rule. `update` must therefore be a pure function of the
+ * list it is handed; both shells' callbacks are. A list that keeps moving gives up after
+ * `MAX_REPO_LIST_ATTEMPTS` rather than looping, and one that cannot be read at all refuses outright,
+ * since merging into a file that could not be read would replace everything in it.
  */
 export function createRepoRegistrar(
   github: Pick<GithubService, 'assertRepoWorkflowWritable'>,
-  store: Pick<MaoStore, 'get' | 'set'>,
+  store: Pick<MaoStore, 'inspect' | 'setIfUnchanged'>,
 ) {
   let queue: Promise<unknown> = Promise.resolve()
 
   return function updateRepos(update: RepoListUpdate): Promise<RepoWorkflowCapability[]> {
     const run = queue.then(async () => {
-      const previous = store.get('githubRepos')
-      // Canonicalised inside the critical section, before the preflight — so the list that gets
-      // checked is byte-for-byte the list that gets stored. This is the single chokepoint that keeps
-      // a differently capitalised duplicate from reaching the store unchecked, which is why neither
-      // shell has to know the rule exists (see canonicalRepoList()).
-      const next = canonicalRepoList(previous, update(previous))
-      const checked = await assertReposRegistrable(github, previous, next)
-      store.set('githubRepos', next)
-      return checked
+      for (let attempt = 1; ; attempt += 1) {
+        // A fresh observation, not `get()`: on `FileStore` that answers from a snapshot taken when the
+        // command started, and this read is the one the write below is keyed on.
+        const observed = store.inspect('githubRepos')
+        if (!observed.readable) {
+          throw new Error(`Nothing was written. ${observed.problem ?? 'The stored repository list could not be read.'}`)
+        }
+        const previous = observed.value
+        // Canonicalised inside the critical section, before the preflight — so the list that gets
+        // checked is byte-for-byte the list that gets stored. This is the single chokepoint that keeps
+        // a differently capitalised duplicate from reaching the store unchecked, which is why neither
+        // shell has to know the rule exists (see canonicalRepoList()).
+        const next = canonicalRepoList(previous, update(previous))
+        const checked = await assertReposRegistrable(github, previous, next)
+        const result = store.setIfUnchanged('githubRepos', observed.witness, next)
+        if (result === 'written') return checked
+        if (result === 'superseded' && attempt < MAX_REPO_LIST_ATTEMPTS) continue
+        throw new Error(describeUnwrittenRepoList(result))
+      }
     })
     // A rejected update must not wedge the queue for every update after it, and its rejection belongs
     // to its own caller — so the chain follows the settled promise while `run` keeps the error.

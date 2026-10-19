@@ -7,12 +7,13 @@ import {
   canonicalRepoList,
   isRepoRef,
   createRepoRegistrar,
+  MAX_REPO_LIST_ATTEMPTS,
   repoRefKey,
   reposNeedingCapabilityCheck,
   sameRepoRef,
 } from './repo-registry.ts'
 import { RepoCapabilityError, evaluateRepoCapability } from './repo-capabilities.ts'
-import { FileStore } from './store.ts'
+import { FileStore, type MaoStore } from './store.ts'
 import type { GithubService } from './github-service.ts'
 import type { RepoRef } from './workflow-engine.ts'
 
@@ -40,6 +41,29 @@ function makeRealStore(contents?: unknown): FileStore {
 /** The store's read guard reports an unusable list through console.warn; keep it out of test output. */
 function silenceStoreWarnings() {
   return vi.spyOn(console, 'warn').mockImplementation(() => {})
+}
+
+/**
+ * A preflight the test can hold mid-flight. `release()` also opens every *later* call, because a
+ * queued update does not even reach its preflight until the one ahead of it finishes.
+ */
+function deferredGithub() {
+  let open = false
+  const waiting: Array<() => void> = []
+  const github = {
+    assertRepoWorkflowWritable: vi.fn(
+      (owner: string, repo: string) =>
+        new Promise((resolve) => {
+          const settle = () =>
+            resolve(
+              evaluateRepoCapability({ owner, repo, repository: { has_issues: true, permissions: { push: true } } }),
+            )
+          if (open) settle()
+          else waiting.push(settle)
+        }),
+    ),
+  } as unknown as Pick<GithubService, 'assertRepoWorkflowWritable'>
+  return { github, release: () => { open = true; waiting.splice(0).forEach((settle) => settle()) } }
 }
 
 const widgets: RepoRef = { owner: 'acme', repo: 'widgets' }
@@ -379,29 +403,6 @@ describe('assertReposRegistrable', () => {
 })
 
 describe('createRepoRegistrar', () => {
-  /**
-   * A preflight the test can hold mid-flight. `release()` also opens every *later* call, because a
-   * queued update does not even reach its preflight until the one ahead of it finishes.
-   */
-  function deferredGithub() {
-    let open = false
-    const waiting: Array<() => void> = []
-    const github = {
-      assertRepoWorkflowWritable: vi.fn(
-        (owner: string, repo: string) =>
-          new Promise((resolve) => {
-            const settle = () =>
-              resolve(
-                evaluateRepoCapability({ owner, repo, repository: { has_issues: true, permissions: { push: true } } }),
-              )
-            if (open) settle()
-            else waiting.push(settle)
-          }),
-      ),
-    } as unknown as Pick<GithubService, 'assertRepoWorkflowWritable'>
-    return { github, release: () => { open = true; waiting.splice(0).forEach((settle) => settle()) } }
-  }
-
   it('does not resurrect a repo removed while its registration was still being preflighted', async () => {
     // The regression the review asked for, in the shape the GUI actually produces: the renderer sends
     // the whole list each time, computed from what it is optimistically showing. Before serialization
@@ -723,6 +724,67 @@ describe('createRepoRegistrar', () => {
     expect(new FileStore((store as unknown as { filePath: string }).filePath).get('githubRepos')).toEqual([])
     // A removal introduces nothing new, so it still never preflights — that exemption must survive here
     // too, or a repo whose access was revoked would be unremovable on top of being unreadable.
+    expect(github.assertRepoWorkflowWritable).not.toHaveBeenCalled()
+  })
+})
+
+/**
+ * The registrar beside another MAO process on the same `config.json` — issue #73.
+ *
+ * Its in-process queue serializes one process's updates. Two processes each read, preflight for a
+ * second, and write, so without a conditional write the slower one put back a repository the other had
+ * just removed — the very resurrection the queue exists to prevent, one process boundary further out.
+ */
+describe('createRepoRegistrar across processes (issue #73)', () => {
+  const filePathOf = (store: FileStore) => (store as unknown as { filePath: string }).filePath
+
+  it('re-plans against a removal another process made during its preflight, instead of undoing it', async () => {
+    const store = makeRealStore({ githubRepos: [gadgets] })
+    const { github, release } = deferredGithub()
+    const adding = createRepoRegistrar(github, store)((previous) => [...previous, widgets])
+
+    // `mao repos remove acme gadgets`, from another terminal, while the add above is still preflighting.
+    const other = new FileStore(filePathOf(store))
+    await createRepoRegistrar(passingGithub(), other)((previous) => previous.filter((r) => !sameRepoRef(r, gadgets)))
+    expect(new FileStore(filePathOf(store)).get('githubRepos')).toEqual([])
+
+    release()
+    await adding
+
+    // The add landed on the list as it is now: gadgets stays removed, widgets is added.
+    expect(new FileStore(filePathOf(store)).get('githubRepos')).toEqual([widgets])
+    // Re-planned, so the entry new relative to the fresh list was preflighted again before the write.
+    expect(github.assertRepoWorkflowWritable).toHaveBeenCalledTimes(2)
+  })
+
+  it('gives up, writing nothing, when the list keeps moving', async () => {
+    let attempts = 0
+    const store: Pick<MaoStore, 'inspect' | 'setIfUnchanged'> = {
+      inspect: () => ({ value: [], problem: undefined, readable: true, witness: '[]' }) as never,
+      setIfUnchanged: () => {
+        attempts += 1
+        return 'superseded'
+      },
+    }
+    const updateRepos = createRepoRegistrar(passingGithub(), store)
+
+    await expect(updateRepos((previous) => [...previous, widgets])).rejects.toThrow(/Nothing was written/)
+    expect(attempts).toBe(MAX_REPO_LIST_ATTEMPTS)
+  })
+
+  it('refuses outright when the stored list cannot be read, leaving the file as it was', async () => {
+    // Merging a list into a file that could not be read would replace everything in it with defaults —
+    // the token included. Removal is no exception: it is exempt from the preflight, not from this.
+    silenceStoreWarnings()
+    const store = makeRealStore({ githubRepos: [gadgets] })
+    fs.writeFileSync(filePathOf(store), '{"githubToken": "ghp_SENTINEL_SECRET", ')
+    const github = passingGithub()
+
+    const outcome = createRepoRegistrar(github, store)((previous) => previous.filter((r) => !sameRepoRef(r, gadgets)))
+
+    await expect(outcome).rejects.toThrow(/Nothing was written/)
+    await expect(outcome).rejects.not.toThrow(/ghp_SENTINEL_SECRET/)
+    expect(fs.readFileSync(filePathOf(store), 'utf-8')).toBe('{"githubToken": "ghp_SENTINEL_SECRET", ')
     expect(github.assertRepoWorkflowWritable).not.toHaveBeenCalled()
   })
 })

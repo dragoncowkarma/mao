@@ -109,6 +109,41 @@ npm run cli -- swarm --repo-root /path/to/repo --status
 npm run cli -- swarm --repo-root /path/to/repo --dry-run --once
 ```
 
+**Several MAO processes on one config file (issue #73).** A long-running `mao run` (or the desktop
+app) beside one-shot commands in other terminals is supported. Every write replaces only the key it is
+for, merged into the file **as it is now** and swapped in atomically (a temporary file renamed over
+`config.json`, keeping its permission bits), under a cross-process lock file `config.json.lock`. So a
+`mao repos remove`, `config set-token`, `import-providers` or theme change made while `mao run` is up is
+no longer reverted by its next queue write — including the `githubRepos` recovery below. What each kind
+of value does when two processes change *the same* key:
+
+| Value | Policy |
+| --- | --- |
+| `githubToken`, `theme`, `buildSha`, `import-providers` | stated outright, so the last write wins |
+| tracked repositories (`repos add`/`remove`, the GUI) | written only if unchanged since read; a list another process changed meanwhile is re-planned — your add or remove is applied to the current list and re-preflighted — up to three times, then "Nothing was written" |
+| provider list from Global settings | written only if unchanged since the pane loaded it, else "reload and apply the edit again" (unchanged) |
+| workflow queue | written only if it is still the queue this process last read or wrote |
+
+The queue is the one to plan around. Two hosts running one queue are two engines able to repeat the same
+GitHub work, so a host whose queue another process changed **refuses to overwrite it**: the stage it was
+starting goes to `error` with "another MAO process changed the stored workflow queue…", and the engine
+stops running stages and records `workflowPersistenceBroken` (`mao run` prints why). Run one queue host
+per config file — `mao run`, the desktop app, or a one-shot `mao workflow enqueue`/`retry`/`advance`
+(which process the queue in the foreground). If it happens: stop the others, check `mao workflow list` and
+the target repos for work either may have repeated, run `mao config clear-persistence-broken`, and
+restart. A queue that becomes *unusable* (hand-corrupted) after a clean start is the exception — that
+session still rewrites it from the queue it holds, as described below.
+
+A write that finds the lock held waits up to five seconds, then fails with "Nothing was written", the
+holder's pid and the lock path. A lock left by a process that died mid-write is broken automatically once
+its pid is gone from this host (or after 30 s if it cannot be identified, e.g. another host on a shared
+volume); delete `config.json.lock` by hand only if no MAO process is running. A write to a `config.json`
+that exists but cannot be read is refused rather than merged into an empty file, so the token and
+everything else in it survive.
+
+`mao run` still reads the repository list it polls and its token/providers at boot, so it keeps polling
+what it started with until it is restarted — the change is no longer *undone*, it just is not picked up.
+
 **Repository write-permission preflight.** `repos add` refuses to register a repo the current
 GitHub credential cannot run the pipeline against, leaving the stored list untouched and printing
 the repo name plus every missing capability. It is one non-mutating `GET /repos/{owner}/{repo}` —
@@ -266,12 +301,13 @@ the file immediately before it writes, and reports only what that established:
 None of those messages quotes the underlying error, because an I/O or parse failure can echo the file's
 own bytes and that file holds your GitHub token in plaintext.
 
-That check **narrows** the window; it does not close it. The comparison and the write are one
-synchronous step, so against anything else in the same process they are atomic — but another OS process
-repairing the file inside that step, or writing *after* it, still wins or still loses depending on
-timing, and the command will say `discarded` either way. That is the ordinary multi-process lost update
-every field in this single-blob config shares (issue #73). So: do not run two recoveries at once, and do
-not hand-edit the file while a recovery is running, and expect a clean winner.
+Against other MAO processes that check is exclusive: the comparison and the write run under the config
+file's write lock (`config.json.lock`, see "Several MAO processes on one config file" below), so a second
+recovery, a `mao run` or the desktop app cannot write between them. It is **not** exclusive against a
+writer that takes no lock — a hand-edit, or another tool — which can still land inside that step and be
+overwritten while the command reports success. So: do not hand-edit the file while a recovery is running
+and expect a clean winner. A recovery that finds another MAO process holding the lock for more than five
+seconds says "Nothing was written" and names the holder; retry once it has finished.
 
 **A problem found after a clean start does not halt that session — and `confirm-queue-recovery` is the
 wrong tool for it.** The latch is decided at boot, so if the file is corrupted while MAO is already
@@ -519,7 +555,14 @@ Two traps:
    shape: filter invalid existing entries on read, preserve valid entries in order, reject the entire
    invalid list on `set`/`setIfUnchanged`, and count sparse holes as invalid before JSON turns them into
    `null`. A per-shape table test in `core/store.test.ts` goes with every new rule.
-3. Renderer needs it? Add get/set IPC channels (recipe above). CLI needs it?
+3. Decide what happens when two processes change it at once (issue #73) — `MaoStore.set` already keeps
+   every *other* key intact, so this is only about the field itself. A value the operator states outright
+   (a token, a theme) can use plain `set`: last writer wins. A value **derived from a read** — a list
+   edited in place, anything an engine advances — must write with `setIfUnchanged`, keyed on the
+   `inspect()` it was derived from, and decide what `'superseded'` means for it: re-plan (as
+   `createRepoRegistrar` does) or refuse (as the queue does). A plain `set` there loses another process's
+   change without a word.
+4. Renderer needs it? Add get/set IPC channels (recipe above). CLI needs it?
    Extend `cli/index.ts` (keep `config show` redaction for anything secret).
 
 ### Add a pipeline stage
@@ -704,8 +747,10 @@ Per AGENTS.md, the reviewer should be a different agent than the implementer.
 Check, in order: architecture rules (core Electron-free? logic in shells? does the
 `core` vitest project still run with no plugins and no DOM?),
 lockstep files all updated (IPC 3-file chain, store pair, stage labels/options in all three UI copies),
-a new store-shape rule — does the field latch, and is `confirmQueueRecovery()` still the only reader
-that observes the store (every gate reads the field)?,
+a new store-shape rule — does the field latch, and are the queue's own writes (`healStoredQueue()`,
+`persistQueue()`) still the only code that observes the store (every gate reads the field)?,
+a new store write — does a value derived from a read write conditionally, and does a new backend
+merge into the file as it is now and take `withFileWriteLock`?,
 domain invariants (maker-checker, CI gate, timeouts, error-not-crash), secrets
 hygiene, then style (match surrounding code — there is no autoformatter).
 

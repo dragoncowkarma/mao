@@ -1,5 +1,11 @@
 import Store from 'electron-store'
-import { createGuardedStore, MAO_STORE_DEFAULTS, type MaoStore, type MaoStoreSchema } from '../core/store.ts'
+import {
+  createGuardedStore,
+  MAO_STORE_DEFAULTS,
+  withFileWriteLock,
+  type MaoStore,
+  type MaoStoreSchema,
+} from '../core/store.ts'
 
 const backing = new Store<MaoStoreSchema>({ defaults: MAO_STORE_DEFAULTS })
 
@@ -19,5 +25,11 @@ const backing = new Store<MaoStoreSchema>({ defaults: MAO_STORE_DEFAULTS })
  * exported: the only thing the main process may do with persistence is the core contract, and a handler
  * that reached past it would read unvalidated values with nothing to flag it. `backing.path` is
  * electron-store's resolved config file, so the report names the file the operator has to edit.
+ *
+ * `withFileWriteLock` gives it the same cross-process write lock `FileStore` takes for that path (issue
+ * #73), so the desktop app and a `mao` CLI pointed at one `config.json` serialize their writes against
+ * each other. conf already re-reads the file before every `set` and replaces it atomically, so it needs
+ * no change of its own to stop a write reverting another process's keys — the lock is what stops a
+ * conditional write's compare being overtaken by a CLI write before its rename.
  */
-export const store: MaoStore = createGuardedStore(backing, backing.path)
+export const store: MaoStore = createGuardedStore(withFileWriteLock(backing, backing.path), backing.path)

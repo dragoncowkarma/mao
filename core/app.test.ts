@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { createMaoApp } from './app.ts'
+import { createMaoApp, describeQueueWriteConflict } from './app.ts'
 import { FileStore, createGuardedStore, type MaoStoreSchema } from './store.ts'
 import { hasPersistenceBrokenMarker, writePersistenceBrokenMarker } from './persistence-guard.ts'
 import type { AiProviderConfig } from './ai/types.ts'
@@ -93,15 +93,22 @@ describe('createMaoApp', () => {
     // broken (e.g. disk full, permissions), but the marker file — a separate, independent
     // writeFileSync call to a different path — is not, because the underlying disk can still take
     // a few bytes even when it can't take the full task-list blob.
+    //
+    // The data write goes to a temporary file beside config.json and is renamed over it (issue #73), so
+    // the failure is injected there — and not into `config.json.lock`, which a full disk would still let
+    // through as easily as the marker.
     const realWriteFileSync = fs.writeFileSync
     vi.spyOn(fs, 'writeFileSync').mockImplementation((file, ...rest) => {
-      if (String(file).endsWith('config.json')) throw new Error('ENOSPC: no space left on device')
+      const name = String(file)
+      if (name.includes('config.json') && !name.endsWith('.lock')) throw new Error('ENOSPC: no space left on device')
       return realWriteFileSync(file, ...(rest as [never]))
     })
 
     expect(() => store.set('workflowTasks', [])).toThrow(/ENOSPC/)
     expect(() => workflowEngine.emit('persistence-broken', new Error('disk full'))).not.toThrow()
     expect(hasPersistenceBrokenMarker(dataDir)).toBe(true)
+    // The failed write leaves neither its lock nor its temporary file behind.
+    expect(fs.readdirSync(dataDir).filter((name) => name.includes('config.json'))).toEqual([])
   })
 
   it('an also-broken marker write does not crash the persistence-broken handler', () => {
@@ -945,5 +952,173 @@ describe('MaoApp.resaveStoredQueue', () => {
 
     expect(booted.app.resaveStoredQueue()).toEqual({ kind: 'already-readable' })
     expect(booted.writes).toEqual([])
+  })
+})
+
+/**
+ * The real `mao run` queue-persistence path against a second process on the same `config.json` — issue
+ * #73 end to end.
+ *
+ * `mao run` is `createMaoApp` over one `FileStore` kept for the life of the process, and its `'change'`
+ * listener writes the queue on every transition. These drive that listener through a real engine
+ * mutation (`setAutoAdvance`, which persists without starting a stage) while another `FileStore` — a
+ * one-shot command in another terminal — changes the same file.
+ */
+describe('mao run queue persistence beside another process (issue #73)', () => {
+  function pausedTask(id = 'task-1'): QueuedTask {
+    return { ...makePendingTask(id), status: 'paused' }
+  }
+
+  /** A long-running host booted the way `mao run` boots, over `contents`. */
+  function bootLongRunning(contents: Record<string, unknown>) {
+    const { dataDir, store, filePath } = makeRealDataDirHolding(contents)
+    const app = createMaoApp({ store, workspaceRoot: path.join(dataDir, 'workspaces'), dataDir, resume: false })
+    return { dataDir, filePath, app }
+  }
+
+  /** A one-shot command opened afterwards on the same file, as `loadApp()` opens one. */
+  function oneShot(dataDir: string, filePath: string) {
+    return createMaoApp({ store: new FileStore(filePath), workspaceRoot: path.join(dataDir, 'workspaces'), dataDir, resume: false })
+  }
+
+  const onDisk = (filePath: string) => JSON.parse(fs.readFileSync(filePath, 'utf-8'))
+
+  it("does not revert another process's settings when it persists its queue", () => {
+    const { dataDir, filePath, app } = bootLongRunning({
+      githubToken: 'ghp_original',
+      githubRepos: [{ owner: 'acme', repo: 'gadgets' }],
+      workflowTasks: [pausedTask()],
+    })
+    const other = new FileStore(filePath)
+
+    other.set('githubToken', 'ghp_rotated')
+    other.set('githubRepos', [])
+    other.set('aiProviders', [claudeProvider])
+    other.set('theme', 'dark')
+    app.workflowEngine.setAutoAdvance('task-1', true)
+
+    const stored = onDisk(filePath)
+    expect(stored.githubToken).toBe('ghp_rotated')
+    expect(stored.githubRepos).toEqual([])
+    expect(stored.aiProviders).toEqual([claudeProvider])
+    expect(stored.theme).toBe('dark')
+    expect(stored.workflowTasks[0].autoAdvance).toBe(true)
+    expect(hasPersistenceBrokenMarker(dataDir)).toBe(false)
+  })
+
+  it('keeps a `mao repos remove` recovery of an unusable githubRepos (PR #66)', async () => {
+    // The issue's second reproduction: the long-running host booted holding the object-shaped list; the
+    // recovery its own report recommends runs in another terminal and says it worked; the host's next
+    // queue change used to put the object straight back.
+    captureWarnings()
+    const { dataDir, filePath, app } = bootLongRunning({
+      githubRepos: { 'acme/widgets': { owner: 'acme', repo: 'widgets' } },
+      workflowTasks: [pausedTask()],
+    })
+
+    await oneShot(dataDir, filePath).updateRepos((previous) => previous.filter((r) => r.repo !== 'widgets'))
+    expect(onDisk(filePath).githubRepos).toEqual([])
+
+    app.workflowEngine.setAutoAdvance('task-1', true)
+
+    expect(onDisk(filePath).githubRepos).toEqual([])
+    expect(new FileStore(filePath).problems()).toEqual([])
+  })
+
+  it('chains its own writes without mistaking them for another process', () => {
+    const { dataDir, filePath, app } = bootLongRunning({ workflowTasks: [pausedTask()] })
+
+    app.workflowEngine.setAutoAdvance('task-1', true)
+    app.workflowEngine.setAutoAdvance('task-1', false)
+    app.workflowEngine.setAutoAdvance('task-1', true)
+
+    expect(onDisk(filePath).workflowTasks[0].autoAdvance).toBe(true)
+    expect(hasPersistenceBrokenMarker(dataDir)).toBe(false)
+  })
+
+  it('refuses to overwrite a queue another process changed, and writes nothing', () => {
+    // Same key, two writers: the one-shot advanced the queue after the host loaded it. Writing the host's
+    // queue would silently drop that change — the lost update the issue asks to make explicit.
+    const { filePath, app } = bootLongRunning({ githubToken: 'ghp_SENTINEL_SECRET', workflowTasks: [pausedTask()] })
+    // Written straight through another store rather than via an enqueue, which would also start that
+    // process's queue running in the background of the test.
+    new FileStore(filePath).set('workflowTasks', [pausedTask(), pausedTask('added-elsewhere')])
+    const theirs = onDisk(filePath).workflowTasks
+
+    let message = ''
+    try {
+      app.workflowEngine.setAutoAdvance('task-1', true)
+    } catch (err) {
+      message = (err as Error).message
+    }
+
+    expect(message).toBe(describeQueueWriteConflict())
+    expect(message).not.toContain('ghp_SENTINEL_SECRET')
+    expect(onDisk(filePath).workflowTasks).toEqual(theirs)
+  })
+
+  it('stops running stages — via the existing persistence-broken safeguard — before any GitHub call', async () => {
+    // What a refused write costs in practice: the stage's entry notify is the refused write, so the task
+    // parks in 'error', the retry is refused too, and persistenceBroken plus its durable marker stop this
+    // engine. A second engine on the same queue is two engines able to repeat the same GitHub work.
+    const { dataDir, filePath, app } = bootLongRunning({ workflowTasks: [makePendingTask('task-1')] })
+    const preflight = vi.spyOn(app.githubService, 'assertRepoWorkflowWritable')
+    oneShot(dataDir, filePath).workflowEngine.setAutoAdvance('task-1', true)
+    const theirs = onDisk(filePath).workflowTasks
+
+    app.workflowEngine.resumeProcessing()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(app.workflowEngine.isPersistenceBroken()).toBe(true)
+    expect(app.workflowEngine.getPersistenceError()?.message).toBe(describeQueueWriteConflict())
+    expect(hasPersistenceBrokenMarker(dataDir)).toBe(true)
+    expect(preflight).not.toHaveBeenCalled()
+    expect(onDisk(filePath).workflowTasks).toEqual(theirs)
+  })
+
+  it('still restores a queue that went unusable after a clean boot, as the late-corruption card promises', () => {
+    // An unusable value is not another writer's queue: this session holds the real one, and its next
+    // write is documented to restore the file from it. Other keys survive that repair too.
+    captureWarnings()
+    const { dataDir, filePath, app } = bootLongRunning({ githubToken: 'ghp_original', workflowTasks: [pausedTask()] })
+    fs.writeFileSync(filePath, JSON.stringify({ ...onDisk(filePath), workflowTasks: { broken: true } }))
+
+    app.workflowEngine.setAutoAdvance('task-1', true)
+
+    expect(onDisk(filePath).workflowTasks).toEqual([{ ...pausedTask(), autoAdvance: true }])
+    expect(onDisk(filePath).githubToken).toBe('ghp_original')
+    expect(hasPersistenceBrokenMarker(dataDir)).toBe(false)
+  })
+
+  it('treats its own queue recovery as the base of its next write', () => {
+    // Without recording the recovery's write as this process's own, the very next queue change would see
+    // a queue it did not write and refuse — wedging the host the moment it was released.
+    captureWarnings()
+    const { dataDir, filePath, app } = bootLongRunning({ workflowTasks: [pausedTask(), null] })
+    expect(app.workflowEngine.isQueueRecoveryLatched()).toBe(true)
+
+    expect(app.confirmQueueRecovery()).toEqual({ kind: 'replaced' })
+    app.workflowEngine.setAutoAdvance('task-1', true)
+
+    expect(onDisk(filePath).workflowTasks).toEqual([{ ...pausedTask(), autoAdvance: true }])
+    expect(hasPersistenceBrokenMarker(dataDir)).toBe(false)
+  })
+
+  it('treats its own re-save as the base of its next write', () => {
+    // Only observable when the engine is ahead of the file — otherwise the re-save writes exactly what
+    // this process last wrote. One failed write (a full disk, say) leaves it there.
+    captureWarnings()
+    const { filePath, app } = bootLongRunning({ workflowTasks: [pausedTask()] })
+    const realSetIfUnchanged = app.store.setIfUnchanged.bind(app.store)
+    vi.spyOn(app.store, 'setIfUnchanged').mockImplementationOnce(() => {
+      throw new Error('ENOSPC: no space left on device')
+    }).mockImplementation(realSetIfUnchanged)
+    expect(() => app.workflowEngine.setAutoAdvance('task-1', true)).toThrow(/ENOSPC/)
+    fs.writeFileSync(filePath, JSON.stringify({ ...onDisk(filePath), workflowTasks: { broken: true } }))
+
+    expect(app.resaveStoredQueue()).toEqual({ kind: 'replaced' })
+    app.workflowEngine.setAutoAdvance('task-1', false)
+
+    expect(onDisk(filePath).workflowTasks).toEqual([pausedTask()])
   })
 })

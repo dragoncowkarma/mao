@@ -5,9 +5,11 @@ import type { AiProviderConfig } from './ai/types.ts'
 import {
   QUEUE_GATING_FIELD,
   describeUninspectableStore,
+  storedValueWitness,
   type MaoStore,
   type StoredObservation,
 } from './store.ts'
+import { StoreLockError } from './store-file.ts'
 import { hasPersistenceBrokenMarker, writePersistenceBrokenMarker } from './persistence-guard.ts'
 
 export interface MaoAppOptions {
@@ -103,6 +105,35 @@ function observeStoredQueue(store: MaoStore): StoredObservation<typeof QUEUE_GAT
   }
 }
 
+/**
+ * The report for a queue write refused because the stored queue is no longer the one this process last
+ * read or wrote — another MAO host is writing it too (issue #73).
+ *
+ * Value-free, like every store report. It says what the refusal costs and what to do, because it is the
+ * text a halted `mao run` prints and the persistence-broken marker records: the engine reads a refused
+ * write as a persistence failure and stops running stages, which is the point — two engines advancing one
+ * queue are two engines able to repeat the same GitHub work.
+ */
+export function describeQueueWriteConflict(): string {
+  return (
+    '[store] Refusing to write "workflowTasks": another MAO process changed the stored workflow queue ' +
+    'since this one last read or wrote it, and writing this process\'s queue would discard that change. ' +
+    'Nothing was written, and this process runs no further stages. Run one MAO host per config file at a ' +
+    'time (`mao run`, the desktop app, or a one-shot `mao workflow` command that processes the queue): ' +
+    'stop the others, check `mao workflow list` and the target repos for work either may have repeated, ' +
+    'then restart this one so it loads the queue as it is stored now.'
+  )
+}
+
+/** The report for a queue write whose compare could not read the stored queue at all. */
+function describeUnverifiableQueueWrite(): string {
+  return (
+    '[store] Refusing to write "workflowTasks": the stored queue could not be read back to check that no ' +
+    'other process had changed it, so writing might discard that change. Nothing was written. Check the ' +
+    'config file and the permissions on it.'
+  )
+}
+
 export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOptions): MaoApp {
   const githubService = new GithubService()
   const workflowEngine = new WorkflowEngine(githubService, (tasks) => {
@@ -136,6 +167,50 @@ export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOp
   const observedQueue = observeStoredQueue(store)
   if (observedQueue.problem !== undefined) workflowEngine.requireQueueRecovery(observedQueue.problem)
 
+  /**
+   * Which stored queue this process's engine queue was derived from: the boot observation, then each
+   * write this process makes. Every queue write is conditional on the file still holding it.
+   *
+   * This is the same-key half of issue #73. A plain `store.set` merges into a fresh read, so the queue no
+   * longer reverts *other* keys — but the queue itself is derived state: the engine holds what it loaded
+   * plus its own changes, so writing it unconditionally silently drops anything another MAO host wrote to
+   * the queue meanwhile (a task a one-shot `mao workflow enqueue` added, a stage the desktop app advanced).
+   * Refusing makes that conflict an explicit persistence failure instead: the engine parks the task in
+   * `'error'`, retries the write once, and then trips `persistenceBroken` and the durable marker — the
+   * existing machinery for "this process can no longer persist its queue", and the right outcome when
+   * a second engine is running the same queue.
+   *
+   * Keyed on the witness of this process's own last write (`storedValueWitness`) rather than on a fresh
+   * observation after it, so a queue change costs the compare read and no second one.
+   */
+  let persistedQueueWitness = observedQueue.witness
+
+  function persistQueue(tasks: QueuedTask[]) {
+    const result = store.setIfUnchanged(QUEUE_GATING_FIELD, persistedQueueWitness, tasks)
+    if (result === 'written') {
+      persistedQueueWitness = storedValueWitness(tasks)
+      return
+    }
+    if (result === 'invalid') {
+      throw new Error(store.validateWrite(QUEUE_GATING_FIELD, tasks) ?? describeUnverifiableQueueWrite())
+    }
+    if (result === 'unverifiable') throw new Error(describeUnverifiableQueueWrite())
+
+    // Moved. One case is not another writer's work: a value that went *unusable* after this session booted
+    // clean. Then this engine holds the real queue and its next write is documented to restore the file
+    // from it (the Sidebar's late-corruption card says exactly that) — so repair it, conditionally on the
+    // unusable value just observed. A usable value that moved is someone else's queue, and is refused.
+    const current = observeStoredQueue(store)
+    if (!current.readable) throw new Error(describeUnverifiableQueueWrite())
+    if (current.problem === undefined) throw new Error(describeQueueWriteConflict())
+    const repaired = store.setIfUnchanged(QUEUE_GATING_FIELD, current.witness, tasks)
+    if (repaired === 'written') {
+      persistedQueueWitness = storedValueWitness(tasks)
+      return
+    }
+    throw new Error(repaired === 'superseded' ? describeQueueWriteConflict() : describeUnverifiableQueueWrite())
+  }
+
   workflowEngine.on('change', (tasks: QueuedTask[]) => {
     // Last-resort backstop, and a SILENT return rather than a throw: notifyAfterStage() reads a throwing
     // `'change'` listener as a persistence failure and would escalate this read-shape halt into a bogus
@@ -147,7 +222,7 @@ export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOp
     // Every public mutator already asserts the latch, so reaching this is a bug in a future emitter; it
     // exists so such a bug costs a missing persist instead of the operator's last copy.
     if (workflowEngine.isQueueRecoveryLatched()) return
-    store.set('workflowTasks', tasks)
+    persistQueue(tasks)
   })
   // Best-effort durable record of a confirmed persistence failure (see
   // WorkflowEngine.isPersistenceBroken()) — via a marker file independent of `store` (see
@@ -216,7 +291,9 @@ export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOp
     let result
     try {
       result = store.setIfUnchanged('aiProviders', observed.witness, providers)
-    } catch {
+    } catch (err) {
+      // Nothing was written while another MAO process held the lock; say that, not "unknown".
+      if (err instanceof StoreLockError) throw new Error(`Nothing was saved. ${err.message}`)
       throw new Error(
         'The AI provider write failed, so what reached the config file is unknown. Inspect the file ' +
           'before retrying; no provider value, token or API key is shown.',
@@ -273,9 +350,12 @@ export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOp
    * 5. After a confirmed halted write, restore the engine from the same readable subset and only then
    *    release the halt. It is still not resumed in this process.
    *
-   * Its limit is stated where it is implemented (`MaoStore.setIfUnchanged`) and is real: the compare and
-   * the write are atomic against other callers *in this process*, not against another OS process, which
-   * can still repair the value between them. That residue is issue #73.
+   * 6. Record the write as the queue this process's later writes are keyed on (`persistedQueueWitness`),
+   *    or the engine's next change would mistake this recovery for another process's work and refuse it.
+   *
+   * Its limit is stated where it is implemented (`MaoStore.setIfUnchanged`): the compare and the write
+   * share one hold of the config file's cross-process write lock, so no other MAO process can land a write
+   * between them (issue #73) — but a writer that takes no lock, a hand-edit included, still can.
    */
   function healStoredQueue(replacementSource: 'fresh-subset' | 'live-engine'): QueueRecoveryOutcome {
     const observed = observeStoredQueue(store)
@@ -292,7 +372,10 @@ export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOp
     let written
     try {
       written = store.setIfUnchanged(QUEUE_GATING_FIELD, observed.witness, replacement)
-    } catch {
+    } catch (err) {
+      // Another MAO process held the write lock throughout: nothing was written, which is a stronger
+      // statement than `'write-failed'` makes, and its message is value-free by construction.
+      if (err instanceof StoreLockError) return { kind: 'unverified', reason: err.message }
       // What reached the file is unknown, so any halt stands. The backend's error text is deliberately
       // not carried: it can quote a file that holds the GitHub token in plaintext.
       return { kind: 'write-failed' }
@@ -302,6 +385,9 @@ export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOp
     if (written === 'unverifiable') {
       return { kind: 'unverified', reason: describeUninspectableStore(QUEUE_GATING_FIELD, 'the config file') }
     }
+    // This write is now the stored queue this process's later writes are derived from — without this the
+    // engine's very next change would read its own recovery as another process's and refuse it.
+    persistedQueueWitness = storedValueWitness(replacement)
 
     if (replacementSource === 'fresh-subset') {
       // `restore()` emits nothing and `resume: false` is explicit: confirmation may update the in-memory

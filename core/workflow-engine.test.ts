@@ -1,7 +1,13 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { WorkflowEngine, type QueuedTask, type RepoRef } from './workflow-engine.ts'
+import {
+  QUEUE_PERSISTENCE_BROKEN,
+  QueuePersistenceError,
+  WorkflowEngine,
+  type QueuedTask,
+  type RepoRef,
+} from './workflow-engine.ts'
 import { AGENT_STAGES } from './ai/types.ts'
 import { RepoCapabilityError, evaluateRepoCapability } from './repo-capabilities.ts'
 import type { AgentStage, AiProviderConfig } from './ai/types.ts'
@@ -27,7 +33,9 @@ const git = vi.hoisted(() => ({
   ensureClone: vi.fn(async () => '/tmp/mao-test-clone'),
   checkoutBranch: vi.fn(async () => {}),
   hasChanges: vi.fn(async () => true),
-  commitAndPush: vi.fn(async () => {}),
+  commitAndPush: vi.fn(
+    async (_dir: string, _branch: string, _message: string, _beforePush?: () => void) => {},
+  ),
 }))
 
 vi.mock('./git-workspace.ts', () => git)
@@ -275,6 +283,84 @@ describe('WorkflowEngine', () => {
     expect(github.createBranch).toHaveBeenCalledTimes(2)
     expect(github.commitFile).toHaveBeenCalledTimes(2)
     expect(createPullRequest).toHaveBeenCalledTimes(2)
+  })
+
+  it('passes a live readiness guard into createBranch so its awaited reads cannot outrun a halt', async () => {
+    let engine!: WorkflowEngine
+    const createBranch = vi.fn(
+      async (_owner: string, _repo: string, _branch: string, beforeWrite?: () => void) => {
+        engine.requireQueueRecovery('queue became unsafe during branch lookup', { restartRequired: true })
+        beforeWrite?.()
+        return { base: 'main' }
+      },
+    )
+    const github = makeFakeGithub({ createBranch })
+    engine = new WorkflowEngine(github)
+    engine.setProviders([makeProvider('agent-a')])
+
+    const task = engine.enqueueFromIssue(7, 'https://github.com/acme/widgets/issues/7', 'Fix it', repo)
+    await waitFor(() => engine.getTasks().find((candidate) => candidate.id === task.id)?.status === 'error')
+
+    expect(engine.getTasks().find((candidate) => candidate.id === task.id)?.error).toBe(
+      'queue became unsafe during branch lookup',
+    )
+    expect(createBranch.mock.calls[0]?.[3]).toEqual(expect.any(Function))
+    expect(github.commitFile).not.toHaveBeenCalled()
+    expect(github.createPullRequest).not.toHaveBeenCalled()
+  })
+
+  it('passes a live readiness guard into commitFile so its content read cannot outrun a halt', async () => {
+    let engine!: WorkflowEngine
+    const commitFile = vi.fn(
+      async (
+        _owner: string,
+        _repo: string,
+        _branch: string,
+        _path: string,
+        _content: string,
+        _message: string,
+        beforeWrite?: () => void,
+      ) => {
+        engine.requireQueueRecovery('queue became unsafe during content lookup', { restartRequired: true })
+        beforeWrite?.()
+      },
+    )
+    const github = makeFakeGithub({ commitFile })
+    engine = new WorkflowEngine(github)
+    engine.setProviders([makeProvider('agent-a')])
+
+    const task = engine.enqueueFromIssue(7, 'https://github.com/acme/widgets/issues/7', 'Fix it', repo)
+    await waitFor(() => engine.getTasks().find((candidate) => candidate.id === task.id)?.status === 'error')
+
+    expect(engine.getTasks().find((candidate) => candidate.id === task.id)?.error).toBe(
+      'queue became unsafe during content lookup',
+    )
+    expect(commitFile.mock.calls[0]?.[6]).toEqual(expect.any(Function))
+    expect(github.createPullRequest).not.toHaveBeenCalled()
+  })
+
+  it('passes a live readiness guard into commitAndPush so local commit cannot outrun a remote halt', async () => {
+    let engine!: WorkflowEngine
+    git.commitAndPush.mockImplementationOnce(
+      async (_dir: string, _branch: string, _message: string, beforePush?: () => void) => {
+        engine.requireQueueRecovery('queue became unsafe before push', { restartRequired: true })
+        beforePush?.()
+      },
+    )
+    const github = makeFakeGithub()
+    engine = new WorkflowEngine(github)
+    engine.setGithubToken('test-token')
+    engine.setWorkspaceRoot('/tmp/mao-test-workspaces')
+    engine.setProviders([{ id: 'agent-cli', name: 'agent-cli', kind: 'cli', command: 'codex' }])
+
+    const task = engine.enqueueFromIssue(7, 'https://github.com/acme/widgets/issues/7', 'Fix it', repo)
+    await waitFor(() => engine.getTasks().find((candidate) => candidate.id === task.id)?.status === 'error')
+
+    expect(engine.getTasks().find((candidate) => candidate.id === task.id)?.error).toBe(
+      'queue became unsafe before push',
+    )
+    expect(git.commitAndPush.mock.calls[0]?.[3]).toEqual(expect.any(Function))
+    expect(github.createPullRequest).not.toHaveBeenCalled()
   })
 
   it('retry() rejects tasks that are not currently in an error state', () => {
@@ -1338,20 +1424,128 @@ describe('WorkflowEngine queue-recovery latch', () => {
     expect(engine.getQueueRecoveryReason()).toBe(REASON)
     expect(engine.isQueueRecoveryLatched()).toBe(true)
 
-    engine.clearQueueRecovery()
+    expect(engine.clearQueueRecovery()).toBe(true)
     expect(engine.isQueueRecoveryLatched()).toBe(false)
   })
 
+  it('upgrades a field-only halt to restart-only and never clears that origin', () => {
+    const { engine } = latchedEngine()
+
+    engine.requireQueueRecovery('later whole-file failure', { restartRequired: true })
+
+    expect(engine.getQueueRecoveryReason()).toBe('later whole-file failure')
+    expect(engine.isQueueRecoveryRestartRequired()).toBe(true)
+    expect(engine.clearQueueRecovery()).toBe(false)
+    expect(engine.isQueueRecoveryLatched()).toBe(true)
+  })
+
+  it('runs the fresh readiness probe before refusing an existing field-only latch', () => {
+    const readiness = vi.fn(() => 'whole file unreadable')
+    const engine = new WorkflowEngine(makeFakeGithub(), undefined, readiness)
+    engine.requireQueueRecovery(REASON)
+
+    expect(() => engine.enqueue('t', repo)).toThrow('whole file unreadable')
+    expect(readiness).toHaveBeenCalledTimes(1)
+    expect(engine.getQueueRecoveryReason()).toBe('whole file unreadable')
+    expect(engine.isQueueRecoveryRestartRequired()).toBe(true)
+    expect(engine.getTasks()).toEqual([])
+  })
+
   it('a refused mutation does not become a persistence failure', () => {
-    // Why notify() itself is deliberately NOT a gate point: notifyAfterStage reads a throwing `'change'`
-    // listener as a write failure, so gating there would escalate this read-shape halt into a bogus
-    // persistenceBroken — the very misdiagnosis the latch is kept separate from the marker to avoid.
+    // The public gate runs before mutation and notify, so an ordinary refused click is not a write
+    // failure. Only an in-flight stage that crosses the outage and then cannot persist needs the marker.
     const { engine } = latchedEngine()
 
     expect(() => engine.enqueue('t', repo)).toThrow()
 
     expect(engine.isPersistenceBroken()).toBe(false)
     expect(engine.getPersistenceError()).toBeUndefined()
+  })
+
+  it('rolls back every public mutation after a known pre-write persistence refusal', () => {
+    const cases: Array<{ name: string; tasks: QueuedTask[]; mutate: (engine: WorkflowEngine) => unknown }> = [
+      { name: 'enqueue', tasks: [], mutate: (engine) => engine.enqueue('new', repo) },
+      {
+        name: 'retry',
+        tasks: [{ ...makePendingQueueTask('retry'), status: 'error', error: 'failed' }],
+        mutate: (engine) => engine.retry('retry'),
+      },
+      {
+        name: 'advance',
+        tasks: [{ ...makePendingQueueTask('advance'), status: 'paused' }],
+        mutate: (engine) => engine.advance('advance'),
+      },
+      {
+        name: 'setAutoAdvance',
+        tasks: [{ ...makePendingQueueTask('auto'), autoAdvance: false }],
+        mutate: (engine) => engine.setAutoAdvance('auto', true),
+      },
+      {
+        name: 'clearCompleted',
+        tasks: [{ ...makePendingQueueTask('done'), status: 'done' }],
+        mutate: (engine) => engine.clearCompleted(),
+      },
+    ]
+
+    for (const { name, tasks, mutate } of cases) {
+      const engine = new WorkflowEngine(makeFakeGithub())
+      engine.restore(structuredClone(tasks))
+      const before = structuredClone(engine.getTasks())
+      engine.on('change', () => {
+        throw new QueuePersistenceError('known refusal', 'not-written')
+      })
+
+      expect(() => mutate(engine), name).toThrow('known refusal')
+      expect(engine.getTasks(), name).toEqual(before)
+      expect(engine.isPersistenceBroken(), name).toBe(false)
+    }
+  })
+
+  it('retains memory and marks persistence broken when the write postcondition is unknown', () => {
+    const engine = new WorkflowEngine(makeFakeGithub())
+    const broken = vi.fn()
+    const persist = vi.fn(() => {
+      throw new QueuePersistenceError('unknown write result', 'unknown')
+    })
+    engine.on('change', persist)
+    engine.on('persistence-broken', broken)
+
+    expect(() => engine.enqueue('new', repo)).toThrow('unknown write result')
+    expect(engine.getTasks()).toHaveLength(1)
+    expect(engine.isPersistenceBroken()).toBe(true)
+    expect(broken).toHaveBeenCalledTimes(1)
+
+    // The first enqueue may already exist in memory, on disk, or both. A second enqueue must not emit
+    // another write and accidentally make a duplicate durable.
+    expect(() => engine.enqueue('duplicate', repo)).toThrow(QUEUE_PERSISTENCE_BROKEN)
+    expect(engine.getTasks()).toHaveLength(1)
+    expect(persist).toHaveBeenCalledTimes(1)
+    expect(broken).toHaveBeenCalledTimes(1)
+  })
+
+  it('can carry a prior process persistence marker into the same mutation gate', () => {
+    const engine = new WorkflowEngine(makeFakeGithub())
+    const changes = vi.fn()
+    engine.on('change', changes)
+
+    engine.requirePersistenceRecovery()
+
+    expect(engine.isPersistenceBroken()).toBe(true)
+    expect(() => engine.enqueue('must wait for reconciliation', repo)).toThrow(QUEUE_PERSISTENCE_BROKEN)
+    expect(engine.getTasks()).toEqual([])
+    expect(changes).not.toHaveBeenCalled()
+  })
+
+  it('does not roll back for an unrelated observer exception after persistence succeeded', () => {
+    const engine = new WorkflowEngine(makeFakeGithub())
+    engine.on('change', () => {})
+    engine.on('change', () => {
+      throw new Error('observer failed')
+    })
+
+    expect(() => engine.enqueue('new', repo)).toThrow('observer failed')
+    expect(engine.getTasks()).toHaveLength(1)
+    expect(engine.isPersistenceBroken()).toBe(false)
   })
 
   // The `confirmQueueRecovery()` sequence moved to `createMaoApp` when its write became conditional on
@@ -1370,6 +1564,7 @@ describe('WorkflowEngine queue-recovery latch', () => {
 
     expect(engine.isQueueRecoveryLatched()).toBe(false)
     expect(engine.getQueueRecoveryReason()).toBeUndefined()
+    expect(engine.isQueueRecoveryRestartRequired()).toBe(false)
     expect(() => engine.enqueue('t', repo)).not.toThrow()
   })
 })

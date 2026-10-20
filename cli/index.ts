@@ -11,7 +11,12 @@ import { describeUnverifiedGrants } from '../core/repo-capabilities.ts'
 import { sameRepoRef } from '../core/repo-registry.ts'
 import { importProvidersFromFile } from '../core/provider-import.ts'
 import type { AiEffort } from '../core/ai/types.ts'
-import type { QueuedTask, RepoRef, RunOverride } from '../core/workflow-engine.ts'
+import {
+  QUEUE_PERSISTENCE_BROKEN,
+  type QueuedTask,
+  type RepoRef,
+  type RunOverride,
+} from '../core/workflow-engine.ts'
 import type { ThemePreference } from '../core/store.ts'
 
 function log(...args: unknown[]) {
@@ -113,6 +118,7 @@ config
       // problem as a write failure would send the operator to `clear-persistence-broken`, which cannot
       // describe or fix it.
       workflowQueueRecoveryRequired: workflowEngine.isQueueRecoveryLatched(),
+      workflowQueueRestartRequired: workflowEngine.isQueueRecoveryRestartRequired(),
       // Otherwise this command reports a value that is not in the file: a `githubRepos` the schema
       // cannot use is answered as `[]` above, and the guard's own warning goes to stderr, which
       // `config show 2>/dev/null` discards. Same list the GUI polls over `app:storeProblems`.
@@ -123,7 +129,8 @@ config
 config
   .command('clear-persistence-broken')
   .description(
-    'Clear the marker that blocks auto-resume after a confirmed queue persistence failure (see ' +
+    'Clear the marker that blocks queue mutation, polling and resume after a confirmed queue ' +
+      'persistence failure (see ' +
       'AGENTS.md). Only run this after verifying by hand — via `mao workflow list` and the target ' +
       "repo's actual GitHub state — that no queued task will duplicate work if resumed.",
   )
@@ -140,10 +147,10 @@ config
     if (!clearPersistenceBrokenMarker(dataDir)) {
       throw new Error(
         `Failed to clear workflowPersistenceBroken — the marker file is still present at ${dataDir}. ` +
-          'Auto-resume remains blocked. Check filesystem permissions and try again.',
+          'Queue mutation, polling and resume remain blocked. Check filesystem permissions and try again.',
       )
     }
-    log('Cleared workflowPersistenceBroken. Auto-resume (`mao run`) will run normally again.')
+    log('Cleared workflowPersistenceBroken. Restart MAO to reload and resume the verified queue.')
   })
 
 // --- repos ------------------------------------------------------------------
@@ -383,10 +390,16 @@ workflow
       log('The stored workflow queue reads normally — nothing was written. Restart MAO to load it.')
       return
     }
-    // Both failures say only what was established, and neither carries the backend's error text: an I/O
-    // or parse failure can quote the file, which holds the GitHub token in plaintext.
+    // Failure branches say only what was established and never carry backend error text: an I/O or
+    // parse failure can quote the file, which holds the GitHub token in plaintext.
     if (outcome.kind === 'unverified') {
       throw new Error(`Nothing was written. ${outcome.reason}`)
+    }
+    if (outcome.kind === 'restart-required') {
+      throw new Error(
+        'Nothing was written. This process observed a whole-file read failure and cannot safely write ' +
+          'its startup snapshot over the repaired settings. Repair the file if needed, then restart MAO.',
+      )
     }
     if (outcome.kind === 'superseded') {
       throw new Error(
@@ -397,7 +410,8 @@ workflow
     if (outcome.kind === 'write-failed') {
       throw new Error(
         'The replacement write failed, so what reached the config file is unknown and automation stays ' +
-          'halted. Inspect the file before salvaging anything from it, then retry.',
+          'halted. MAO recorded the persistence-broken marker; reconcile the stored queue with GitHub, ' +
+          'run `mao config clear-persistence-broken`, then start a fresh MAO process.',
       )
     }
     if (outcome.kind === 'invalid-replacement') {
@@ -426,19 +440,30 @@ program
     // attached, so `mao run` never misses a stage transition that happens synchronously on resume.
     const { store, githubService, workflowEngine } = loadApp(false)
 
-    // Before startAutoTrigger (which ticks immediately) and before resumeProcessing() below, because both
-    // are how an unreadable queue got overwritten and a pipeline started. Non-zero exit rather than
-    // idling: `mao run` is meant for cron, and a caller that sees success while nothing polls is worse
-    // than a failure it can act on.
+    // Before startAutoTrigger (which ticks immediately) and before resumeProcessing() below. A queue
+    // read halt can otherwise overwrite the only salvageable value; a persistence marker can otherwise
+    // replay stale durable work as soon as polling enqueues something. Non-zero exit rather than idling:
+    // `mao run` is meant for cron, and a caller that sees success while nothing polls is worse than a
+    // failure it can act on.
+    if (workflowEngine.isPersistenceBroken()) {
+      logErr(QUEUE_PERSISTENCE_BROKEN)
+      logErr('Nothing was started.')
+      process.exitCode = 1
+      return
+    }
     const queueBlocked = workflowEngine.getQueueRecoveryReason()
     if (queueBlocked !== undefined) {
       logErr(queueBlocked)
-      logErr('Nothing was started. Run `mao workflow confirm-queue-recovery` once you have salvaged anything you need.')
+      logErr(
+        workflowEngine.isQueueRecoveryRestartRequired()
+          ? 'Nothing was started. Repair the config file if needed, then restart MAO.'
+          : 'Nothing was started. Run `mao workflow confirm-queue-recovery` once you have salvaged anything you need.',
+      )
       process.exitCode = 1
       return
     }
 
-    const autoTrigger = startAutoTrigger(githubService, workflowEngine, () => store.get('githubRepos'))
+    const autoTrigger = startAutoTrigger(githubService, workflowEngine, () => store.inspect('githubRepos'))
     log('engine started — press Ctrl+C to stop')
 
     workflowEngine.on('change', (tasks: QueuedTask[]) => {

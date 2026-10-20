@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { GithubService } from './github-service.ts'
 
+const allowWrite = () => {}
+
 function jsonResponse(data: unknown, status = 200, headers: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(data), {
     status,
@@ -198,7 +200,7 @@ describe('GithubService request timeouts', () => {
 describe('GithubService.createBranch', () => {
   it('creates the branch and returns the default branch as base', async () => {
     const { service, octokit } = makeServiceWithFakeOctokit()
-    const result = await service.createBranch('acme', 'widgets', 'workflow/1-add-feature')
+    const result = await service.createBranch('acme', 'widgets', 'workflow/1-add-feature', allowWrite)
     expect(result).toEqual({ base: 'main' })
     expect(octokit.rest.git.createRef).toHaveBeenCalledWith({
       owner: 'acme',
@@ -206,6 +208,26 @@ describe('GithubService.createBranch', () => {
       ref: 'refs/heads/workflow/1-add-feature',
       sha: 'base-sha',
     })
+  })
+
+  it('rechecks readiness after branch reads and before createRef', async () => {
+    let blocked = false
+    const getRef = vi.fn(async () => {
+      blocked = true
+      return { data: { object: { sha: 'base-sha' } } }
+    })
+    const { service, octokit } = makeServiceWithFakeOctokit({ git: { getRef } })
+    const beforeWrite = vi.fn(() => {
+      if (blocked) throw new Error('queue persistence became unsafe')
+    })
+
+    await expect(
+      service.createBranch('acme', 'widgets', 'workflow/1-add-feature', beforeWrite),
+    ).rejects.toThrow('queue persistence became unsafe')
+
+    expect(getRef).toHaveBeenCalledTimes(1)
+    expect(beforeWrite).toHaveBeenCalledTimes(1)
+    expect(octokit.rest.git.createRef).not.toHaveBeenCalled()
   })
 
   it('treats "Reference already exists" as success so a retry after createBranch reuses the branch', async () => {
@@ -220,7 +242,7 @@ describe('GithubService.createBranch', () => {
 
     // Must not throw — a bare retry of the notes-only `pr` stage (core/workflow-engine.ts) calls
     // createBranch again after the ref was already created on a prior, partially-failed attempt.
-    await expect(service.createBranch('acme', 'widgets', 'workflow/1-add-feature')).resolves.toEqual({
+    await expect(service.createBranch('acme', 'widgets', 'workflow/1-add-feature', allowWrite)).resolves.toEqual({
       base: 'main',
     })
     expect(octokit.rest.git.createRef).toHaveBeenCalledTimes(1)
@@ -236,7 +258,7 @@ describe('GithubService.createBranch', () => {
       },
     })
 
-    await expect(service.createBranch('acme', 'widgets', 'workflow/1-add-feature')).rejects.toThrow(
+    await expect(service.createBranch('acme', 'widgets', 'workflow/1-add-feature', allowWrite)).rejects.toThrow(
       /Validation Failed/,
     )
   })
@@ -251,7 +273,7 @@ describe('GithubService.createBranch', () => {
       },
     })
 
-    await expect(service.createBranch('acme', 'widgets', 'workflow/1-add-feature')).rejects.toThrow(
+    await expect(service.createBranch('acme', 'widgets', 'workflow/1-add-feature', allowWrite)).rejects.toThrow(
       /Internal Server Error/,
     )
   })
@@ -273,10 +295,38 @@ describe('GithubService.getBranchHeadSha', () => {
 describe('GithubService.commitFile', () => {
   it('writes a new file without a sha when none exists yet', async () => {
     const { service, octokit } = makeServiceWithFakeOctokit()
-    await service.commitFile('acme', 'widgets', 'workflow/1', 'notes.md', 'body', 'Add notes')
+    await service.commitFile('acme', 'widgets', 'workflow/1', 'notes.md', 'body', 'Add notes', allowWrite)
     expect(octokit.rest.repos.createOrUpdateFileContents).toHaveBeenCalledWith(
       expect.not.objectContaining({ sha: expect.anything() }),
     )
+  })
+
+  it('rechecks readiness after the content read and before writing the file', async () => {
+    let blocked = false
+    const getContent = vi.fn(async () => {
+      blocked = true
+      return { data: { type: 'file', sha: 'old-blob-sha' } }
+    })
+    const { service, octokit } = makeServiceWithFakeOctokit({ repos: { getContent } })
+    const beforeWrite = vi.fn(() => {
+      if (blocked) throw new Error('queue persistence became unsafe')
+    })
+
+    await expect(
+      service.commitFile(
+        'acme',
+        'widgets',
+        'workflow/1',
+        'notes.md',
+        'body',
+        'Add notes',
+        beforeWrite,
+      ),
+    ).rejects.toThrow('queue persistence became unsafe')
+
+    expect(getContent).toHaveBeenCalledTimes(1)
+    expect(beforeWrite).toHaveBeenCalledTimes(1)
+    expect(octokit.rest.repos.createOrUpdateFileContents).not.toHaveBeenCalled()
   })
 
   it('reuses the existing blob sha to update the file on retry, instead of failing 422', async () => {
@@ -287,7 +337,15 @@ describe('GithubService.commitFile', () => {
     const getContent = vi.fn(async () => ({ data: { type: 'file', sha: 'old-blob-sha' } }))
     const { service, octokit } = makeServiceWithFakeOctokit({ repos: { getContent } })
 
-    await service.commitFile('acme', 'widgets', 'workflow/1', 'workflow-notes/1.md', 'updated body', 'Update notes')
+    await service.commitFile(
+      'acme',
+      'widgets',
+      'workflow/1',
+      'workflow-notes/1.md',
+      'updated body',
+      'Update notes',
+      allowWrite,
+    )
 
     expect(getContent).toHaveBeenCalledWith({
       owner: 'acme',
@@ -307,7 +365,7 @@ describe('GithubService.commitFile', () => {
     const { service } = makeServiceWithFakeOctokit({ repos: { getContent } })
 
     await expect(
-      service.commitFile('acme', 'widgets', 'workflow/1', 'notes.md', 'body', 'Add notes'),
+      service.commitFile('acme', 'widgets', 'workflow/1', 'notes.md', 'body', 'Add notes', allowWrite),
     ).rejects.toThrow(/Internal Server Error/)
   })
 })

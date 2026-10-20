@@ -78,7 +78,22 @@ export function startAutoTrigger(
     // write heals the store itself, and an unattended `mao run` never performs one — so the scheduler
     // has to stop double-polling on its own. Read-only: nothing here writes `githubRepos`, which keeps
     // `updateRepos` the single writer.
-    const repos = getRepos()
+    let repos: RepoRef[]
+    try {
+      repos = getRepos()
+    } catch {
+      // Skip the whole scheduler, exactly as the latch return above does — and for the same reason, one
+      // window later. `store.get` can throw for a `config.json` that turned unloadable *after* a clean
+      // boot: the Electron backend re-reads and re-parses the file on every `get`, and the latch is
+      // decided once at boot, so that window is precisely the one the check above cannot cover. `tick`
+      // is invoked bare and from `setInterval` (see `pollNow`'s comment), so a throw escaping here is an
+      // unhandled rejection no caller can catch — measured as one per tick on the Electron host.
+      //
+      // Nothing is logged: the error is value-free by construction, but a packaged-app operator has no
+      // console to read it in, and `MaoStore.problems()` already reports the file through the Sidebar.
+      // Not advancing `lastPolledAt` keeps "last synced" from claiming a sync that never happened.
+      return
+    }
     for (const repoRef of canonicalRepoList(repos, repos)) {
       const { owner, repo, autoTrigger = true, pollIntervalMs = DEFAULT_POLL_INTERVAL_MS } = repoRef
       if (!owner || !repo || !autoTrigger) continue

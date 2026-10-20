@@ -59,11 +59,17 @@ export function importProvidersFromFile(
   const providers = parsed as AiProviderConfig[]
   try {
     store.set('aiProviders', providers)
-  } catch {
-    throw new Error(
-      `Could not import AI providers from ${displayedPath}: the destination write failed. Inspect the ` +
-        'stored config before retrying; no provider value, token or API key is shown.',
-    )
+  } catch (error) {
+    // The store's own message is forwarded, not replaced. Every message `MaoStore.set` can throw is
+    // value-free by contract — `describeInvalidStoredWrite` reports field, destination and counts, and
+    // `describeRefusedStoredWrite` names the file, the cause and the remedy and says outright that the
+    // contents are not shown — which is the same reason the `validateWrite` branch above already
+    // forwards one verbatim. Replacing it cost this command the only per-cause explanation an operator
+    // gets: once a write can be *refused* because the file could not be read, "the destination write
+    // failed" tells them neither that nothing was written nor how to fix it, while every other write
+    // path (`config set-theme`, `repos remove`, `workflow clear-completed`) prints it in full.
+    const reported = error instanceof Error ? error.message : String(error)
+    throw new Error(`Could not import AI providers from ${displayedPath}: ${reported}`)
   }
 
   log(`Imported ${providers.length} AI provider(s): ${providers.map((provider) => provider.id).join(', ')}`)

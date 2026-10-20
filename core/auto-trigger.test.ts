@@ -247,3 +247,65 @@ describe('startAutoTrigger with a latched queue', () => {
     await expect(trigger.pollNow(repo)).resolves.toBeUndefined()
   })
 })
+
+/**
+ * A store read that fails must stop the scheduler, not escape it.
+ *
+ * `tick` is invoked bare and from `setInterval`, so a throw leaving it is an unhandled rejection no
+ * caller can catch — the hazard `pollNow`'s own comment is written against. `MaoStore.get()` became able
+ * to throw once the Electron backend's reads got the root-shape rule: conf re-reads and re-parses
+ * `config.json` on every `get`, and the queue latch above is decided at boot, so a file that goes bad
+ * after a clean boot lands in exactly the window the latch cannot cover. Measured before this guard as
+ * one rejection per 5 s tick.
+ */
+describe('startAutoTrigger when the stored repository list cannot be read', () => {
+  function unreadable(): never {
+    throw new Error('[store] /tmp/config.json could not be read. It is valid JSON, but not a JSON object.')
+  }
+
+  it('skips the tick and lets nothing escape', async () => {
+    // Asserted on a counted listener rather than left to vitest's unhandled-rejection reporter, which
+    // SKILL.md warns reads as a passing suite with a non-zero exit — that would not discriminate.
+    const rejections: unknown[] = []
+    const onRejection = (reason: unknown) => rejections.push(reason)
+    process.on('unhandledRejection', onRejection)
+
+    try {
+      const github = makeGithub()
+      const engine = makeEngine()
+
+      const trigger = startAutoTrigger(github, engine, unreadable)
+      handles.push(trigger.handle)
+      await new Promise((r) => setTimeout(r, 30))
+
+      expect(rejections).toEqual([])
+      expect(github.assertRepoWorkflowWritable).not.toHaveBeenCalled()
+      expect(github.fetchTasks).not.toHaveBeenCalled()
+      expect(github.addLabel).not.toHaveBeenCalled()
+      expect(engine.enqueueFromIssue).not.toHaveBeenCalled()
+      // Same reasoning as the latched-queue case: `lastPolledAt` is set in pollRepo's `finally`, so
+      // stopping the whole scheduler is what keeps "last synced" from claiming a sync that never
+      // happened.
+      expect(trigger.getStatus('acme', 'widgets').lastPolledAt).toBeNull()
+    } finally {
+      process.off('unhandledRejection', onRejection)
+    }
+  })
+
+  it('resumes polling once the list reads again', async () => {
+    // The skip must be per tick, not a latch: repairing the file has to be enough, with no restart.
+    let broken = true
+    const github = makeGithub()
+    const engine = makeEngine()
+
+    const trigger = startAutoTrigger(github, engine, () => (broken ? unreadable() : [repo]))
+    handles.push(trigger.handle)
+    await new Promise((r) => setTimeout(r, 20))
+    expect(github.fetchTasks).not.toHaveBeenCalled()
+
+    broken = false
+    await trigger.pollNow(repo)
+
+    expect(github.fetchTasks).toHaveBeenCalled()
+  })
+})

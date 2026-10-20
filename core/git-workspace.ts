@@ -130,8 +130,16 @@ export async function hasChanges(dir: string): Promise<boolean> {
   return stdout.trim().length > 0
 }
 
-export async function commitAndPush(dir: string, branch: string, message: string): Promise<void> {
+export async function commitAndPush(
+  dir: string,
+  branch: string,
+  message: string,
+  beforePush: () => void,
+): Promise<void> {
   await run('git', ['add', '-A'], { cwd: dir })
   await run('git', ['commit', '-m', message], { cwd: dir })
+  // add/commit mutate only the disposable local checkout. The remote push is the external write, so
+  // re-check immediately after the awaited commit and synchronously before spawning `git push`.
+  beforePush()
   await run('git', ['push', '-u', 'origin', branch, '--force'], { cwd: dir })
 }

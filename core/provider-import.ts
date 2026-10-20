@@ -1,6 +1,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import type { MaoStore } from './store.ts'
+import { operatorSafeStoreMessage, type MaoStore } from './store.ts'
 import type { AiProviderConfig } from './ai/types.ts'
 
 export type ProviderImportLogger = (message: string) => void
@@ -60,16 +60,18 @@ export function importProvidersFromFile(
   try {
     store.set('aiProviders', providers)
   } catch (error) {
-    // The store's own message is forwarded, not replaced. Every message `MaoStore.set` can throw is
-    // value-free by contract — `describeInvalidStoredWrite` reports field, destination and counts, and
-    // `describeRefusedStoredWrite` names the file, the cause and the remedy and says outright that the
-    // contents are not shown — which is the same reason the `validateWrite` branch above already
-    // forwards one verbatim. Replacing it cost this command the only per-cause explanation an operator
-    // gets: once a write can be *refused* because the file could not be read, "the destination write
-    // failed" tells them neither that nothing was written nor how to fix it, while every other write
-    // path (`config set-theme`, `repos remove`, `workflow clear-completed`) prints it in full.
-    const reported = error instanceof Error ? error.message : String(error)
-    throw new Error(`Could not import AI providers from ${displayedPath}: ${reported}`)
+    // Only the store module can mark a report as operator-safe, and it does so from structured inputs
+    // rather than backend text. `MaoStore` is injectable and an arbitrary implementation may include a
+    // provider value or API key in its thrown message, so an ordinary `Error` must retain the generic,
+    // redacted fallback. The branded path preserves the actionable per-cause refusal added by issue #67.
+    const reported = operatorSafeStoreMessage(error)
+    if (reported !== undefined) {
+      throw new Error(`Could not import AI providers from ${displayedPath}: ${reported}`)
+    }
+    throw new Error(
+      `Could not import AI providers from ${displayedPath}: the destination write failed. Inspect the ` +
+        'stored config before retrying; no provider value, token or API key is shown.',
+    )
   }
 
   log(`Imported ${providers.length} AI provider(s): ${providers.map((provider) => provider.id).join(', ')}`)

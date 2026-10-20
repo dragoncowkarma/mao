@@ -58,6 +58,8 @@ declare global {
         confirmQueueRecovery: () => Promise<QueueRecoveryOutcome>
         /** Rewrites the stored queue from the one this process holds, conditionally. See MaoApp.resaveStoredQueue. */
         resaveQueue: () => Promise<QueueRecoveryOutcome>
+        /** Clears Electron's own persistence marker after explicit operator reconciliation. Restart is still required. */
+        clearPersistenceBroken: () => Promise<void>
       }
       ui: {
         getTheme: () => Promise<ThemePreference>

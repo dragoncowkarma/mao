@@ -72,6 +72,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     confirmQueueRecovery: (): Promise<QueueRecoveryOutcome> =>
       ipcRenderer.invoke('workflow:confirmQueueRecovery'),
     resaveQueue: (): Promise<QueueRecoveryOutcome> => ipcRenderer.invoke('workflow:resaveQueue'),
+    clearPersistenceBroken: (): Promise<void> =>
+      ipcRenderer.invoke('workflow:clearPersistenceBroken'),
   },
   ui: {
     getTheme: (): Promise<ThemePreference> => ipcRenderer.invoke('ui:getTheme'),

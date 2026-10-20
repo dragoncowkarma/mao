@@ -239,6 +239,19 @@ show` reports `workflowQueueRecoveryRequired: true` — a **separate** field fro
 `workflowPersistenceBroken`, which still means only "a prior process could not *write*". Do not run
 `mao config clear-persistence-broken` for this; it cannot describe or fix it.
 
+When `workflowPersistenceBroken` itself is true, treat the durable queue as potentially older than work
+already performed on GitHub. MAO blocks queue mutations, automatic/manual repository polling and stage
+processing in both the process that observed the failure and later starts that see the marker. This is
+stronger than `resume: false`: an auto-trigger enqueue or operator click would otherwise wake every
+restored pending task. Inspect `mao workflow list` and the actual issues, branches and pull requests;
+only then run `mao config clear-persistence-broken` and start a fresh MAO process. In the GUI, use its
+two-step **Clear marker after verification** action instead: it targets Electron's actual `userData`,
+whereas the CLI's default data directory can differ and a packaged GUI may not include the CLI at all.
+The GUI refuses to clear while any stage is still active in that process. Neither route releases the
+current process; restart is required. Do not use queue recovery or **Save this session's queue** to write
+around the marker. If a queue-shape or whole-file problem is shown at the same time, repair and inspect
+that stored data too — it is independent of the marker and must not be hidden by it.
+
 To recover (this is the **halted** case — see the late-corruption note below if the session is still
 running its real queue):
 
@@ -258,10 +271,10 @@ the file immediately before it writes, and reports only what that established:
 | --- | --- |
 | recovered the stored workflow queue | the value was still unusable right before the write; its fresh readable subset was retained, invalid entries were deleted, and the write did not throw. Durable readable entries are preserved as observed; in memory, a retained `running` task is restored as `pending` with `active` cleared. Confirmation itself does not resume tasks. The one-shot CLI exits, so use `mao run`; in an already-running host, later queue activity or an auto-trigger enqueue may process retained tasks after the latch is released |
 | reads normally — nothing written | something else repaired the file first (a hand-edit, or the same command in another terminal). **Nothing is written**, because this process still holds only its filtered startup subset and writing it would destroy that repair. Restart to load the real one |
-| nothing was written (could not read) | the config file could not be read at all, so whether the unusable value is still there is unknown. Refusing beats writing on a guess — fix the file or its permissions and retry |
+| restart required — nothing written | this process observed a whole-file read failure. Even if the file is readable now, its startup snapshot cannot safely write one field without overwriting the repaired token, providers, repositories or queue. Repair the file if needed, then restart MAO |
 | the stored queue changed while confirming | the value moved between the check and the write, so the write refused and **nothing was written**. Something else is writing the file — re-check it and retry |
 | the replacement was invalid | prospective validation rejected the replacement before the comparison or backend write, so **nothing was written** and the halt remains |
-| the replacement write failed | the attempt threw, so what reached the file is unknown. Inspect it before salvaging, then retry |
+| the replacement write failed | the attempt threw, so what reached the file is unknown. MAO records the persistence-broken marker and blocks all queue work. Reconcile the stored queue with GitHub, clear the marker through the matching CLI/GUI recovery path, then restart |
 
 None of those messages quotes the underlying error, because an I/O or parse failure can echo the file's
 own bytes and that file holds your GitHub token in plaintext.
@@ -273,11 +286,11 @@ timing, and the command will say `discarded` either way. That is the ordinary mu
 every field in this single-blob config shares (issue #73). So: do not run two recoveries at once, and do
 not hand-edit the file while a recovery is running, and expect a clean winner.
 
-**A problem found after a clean start does not halt that session — and `confirm-queue-recovery` is the
-wrong tool for it.** The latch is decided at boot, so if the file is corrupted while MAO is already
-running, the engine is still holding the queue it loaded and its next queue write rewrites the file from
-it. The sidebar says exactly that, in its own words rather than repeating the store's "automation is
-halted" report, which would be false there.
+**A wrong-shaped `workflowTasks` field found after a clean start does not halt that session — and
+`confirm-queue-recovery` is the wrong tool for it.** The latch is decided at boot, so if that one field
+is changed to an unusable shape in a file MAO can still load, the engine is still holding the queue it
+loaded and its next queue write can rewrite the field from it. The sidebar says exactly that, in its own
+words rather than repeating the store's boot-time "automation is halted" report.
 
 Do **not** reach for `mao workflow confirm-queue-recovery` in that state. It discards invalid entries,
 and run in a separate process it writes **that** process's corrected startup subset over the file — often
@@ -289,8 +302,36 @@ fresh, write only if the value has not moved, report what was established — an
 session is halted, because a halted session's queue is only a filtered startup subset and saving it would
 make this a silent discard. So it can also answer "nothing was written": if something repaired the file first,
 you are told rather than left assuming the click saved anything.
-With no GUI open, the safe equivalent is to let the running `mao run` reach its next queue write, or to
-stop it and then recover — not to discard from a second terminal while it is live.
+With no GUI open, the safe equivalent for this **field-only** state is to let the running `mao run` reach
+its next queue write, or to stop it and then recover — not to discard from a second terminal while it is
+live.
+
+**A whole-file read failure discovered after startup is different.** If the JSON becomes unparseable or
+non-object, or the filesystem stops allowing reads, no setting was established by that fresh read and
+every store write is refused. Both long-lived hosts give auto-trigger a fresh `inspect('githubRepos')`
+rather than `FileStore.get()`'s boot snapshot, so repository polling latches the process before any
+GitHub call. Every public queue mutation performs the same fresh readiness check before changing memory;
+an in-flight workflow stops when it next tries to persist. Once observed, this halt is monotone even if
+the file becomes readable again: a live `FileStore` still holds its complete boot snapshot and must not
+overwrite the repair. The engine remembers that whole-file origin separately from the current problem
+shape, so repairing into a file whose `workflowTasks` alone is still malformed does not make the recovery
+button safe again. There is no usable **Save this session's queue** or
+`confirm-queue-recovery` action in that process. Stop the headless process if one is running, repair the
+JSON or permissions, and restart MAO so every setting and the complete queue are loaded together. Do not
+wait for a queue write: the write gate is specifically preventing one.
+
+The stage also passes that readiness check into composite write helpers. Branch creation and note-file
+commit recheck after their awaited GitHub reads and immediately before `createRef` / file update;
+real-checkout publication rechecks after the local commit and immediately before `git push`. Keep those
+callbacks at the helper's last synchronous pre-write boundary — checking only after a composite helper
+returns cannot stop the write it already performed.
+
+If a workflow was already in flight when that halt was discovered, its last durable state can still
+precede GitHub work that finished before the next readiness check. After restart, inspect both the queue
+and the target repository before resuming. When `mao config show` reports
+`workflowPersistenceBroken: true`, clear it with `mao config clear-persistence-broken` only after that
+inspection; in Electron use the GUI's marker-clear confirmation so the action targets Electron's own
+`userData`. The marker exists specifically to prevent automatic replay from the older durable state.
 
 Restarting before any of that *will* refuse to start unattended work until the value is replaced.
 
@@ -761,8 +802,8 @@ Per AGENTS.md, the reviewer should be a different agent than the implementer.
 Check, in order: architecture rules (core Electron-free? logic in shells? does the
 `core` vitest project still run with no plugins and no DOM?),
 lockstep files all updated (IPC 3-file chain, store pair, stage labels/options in all three UI copies),
-a new store-shape rule — does the field latch, and is `confirmQueueRecovery()` still the only reader
-that observes the store (every gate reads the field)?,
+a new store-shape rule — does the field latch, do whole-file observations upgrade it to restart-only,
+and are fresh observations limited to recovery, auto-trigger and imminent public-write boundaries?,
 domain invariants (maker-checker, CI gate, timeouts, error-not-crash), secrets
 hygiene, then style (match surrounding code — there is no autoformatter).
 

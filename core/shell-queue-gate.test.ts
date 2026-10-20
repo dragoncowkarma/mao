@@ -51,6 +51,19 @@ describe('cli run refuses before it can start anything', () => {
     expect(gate).toBeLessThan(resume)
   })
 
+  it('also rejects a persistence marker before polling can wake the stale queue', () => {
+    const gate = runAction.indexOf('isPersistenceBroken()')
+    const poller = runAction.indexOf('startAutoTrigger(')
+    const resume = runAction.indexOf('resumeProcessing()')
+
+    expect(gate, 'mao run must consult persistenceBroken').toBeGreaterThan(-1)
+    expect(gate).toBeLessThan(poller)
+    expect(gate).toBeLessThan(resume)
+    const gated = runAction.slice(gate, runAction.indexOf('getQueueRecoveryReason()'))
+    expect(gated).toContain('process.exitCode = 1')
+    expect(gated).toContain('return')
+  })
+
   it('exits non-zero rather than idling, so a cron caller can see it', () => {
     // An unattended invocation that reports success while nothing polls is worse than a failure it can
     // act on, and `mao run` exists to be called from cron.
@@ -81,6 +94,10 @@ describe('electron/ipc.ts exposes the latch and its way out', () => {
 
     expect(body).toContain('workflowEngine.isQueueRecoveryLatched()')
     expect(body).toContain('workflowEngine.getQueueRecoveryReason()')
+    expect(body).toContain('workflowEngine.isQueueRecoveryRestartRequired()')
+    expect(body).toContain('workflowEngine.isPersistenceBroken()')
+    expect(body).toContain('QUEUE_PERSISTENCE_BROKEN')
+    expect(body).toContain('persistenceBroken')
     expect(body).not.toContain('store.problems()')
   })
 
@@ -104,5 +121,25 @@ describe('electron/ipc.ts exposes the latch and its way out', () => {
     // observation at all and overwrote a repair that had landed after the last poll.
     expect(source).toMatch(/ipcMain\.handle\('workflow:resaveQueue',\s*\(\)\s*=>\s*resaveStoredQueue\(\)\)/)
     expect(source).not.toContain('persistQueue')
+  })
+
+  it('clears the Electron marker in Electron userData rather than the CLI data directory', () => {
+    const handler = source.slice(source.indexOf("ipcMain.handle('workflow:clearPersistenceBroken'"))
+    const body = handler.slice(0, handler.indexOf('ipcMain.handle', 1))
+
+    expect(body).toContain('assertCanClearPersistenceBroken(workflowEngine.getTasks())')
+    expect(body).toContain("clearPersistenceBrokenMarker(app.getPath('userData'))")
+    expect(body).not.toContain('defaultDataDir')
+    expect(body).not.toContain('MAO_DATA_DIR')
+  })
+
+  it('lets pollNow inspect and latch before refresh spends any other read or GitHub call', () => {
+    const handler = source.slice(source.indexOf("ipcMain.handle('github:refreshRepo'"))
+    const body = handler.slice(0, handler.indexOf('ipcMain.handle', 1))
+
+    expect(body).toContain('autoTrigger.pollNow({ owner, repo })')
+    expect(body).not.toContain("store.get('githubRepos')")
+    expect(body).not.toContain('assertRepoWorkflowWritable')
+    expect(body).not.toContain('githubService.fetchTasks')
   })
 })

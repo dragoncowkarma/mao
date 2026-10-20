@@ -1,5 +1,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
+import type { QueuedTask } from './workflow-engine.ts'
 
 /**
  * A durable "the queue store is confirmed broken" marker, deliberately independent of `MaoStore`.
@@ -20,11 +21,16 @@ import path from 'node:path'
  * durably record anything — that failure mode is unrecoverable by construction, not just by this
  * module.
  *
- * Presence of the file (not its contents) is the signal `createMaoApp` checks before allowing
- * auto-resume — `fs.existsSync` doesn't require successfully parsing anything, so a partially
- * written or corrupted marker still fails safely closed (blocks resume) rather than open.
+ * Presence of the file (not its contents) is the signal `createMaoApp` carries into the engine before
+ * restoring the queue. It blocks queue mutation, repository polling and resume — `fs.existsSync`
+ * doesn't require successfully parsing anything, so a partially written or corrupted marker still
+ * fails safely closed rather than open.
  */
 const MARKER_FILE_NAME = 'workflow-persistence-broken.marker'
+
+export const ACTIVE_WORKFLOW_MARKER_CLEAR_REFUSED =
+  'A workflow stage is still active in this MAO process. Wait for it to stop before clearing the ' +
+  'persistence marker; restarting while external work is still in flight could make reconciliation stale.'
 
 function markerPath(dataDir: string): string {
   return path.join(dataDir, MARKER_FILE_NAME)
@@ -58,7 +64,8 @@ export function hasPersistenceBrokenMarker(dataDir: string): boolean {
  * conversely a permission error, a concurrent recreation, or any other surprise during removal must
  * not be reported as success just because it happened to be swallowed. Re-checking presence with
  * `hasPersistenceBrokenMarker` after the attempt catches both: it's the actual postcondition the
- * caller cares about ("is auto-resume unblocked now?"), not "did rmSync avoid throwing?".
+ * caller cares about ("is queue processing unblocked on the next start?"), not "did rmSync avoid
+ * throwing?".
  */
 export function clearPersistenceBrokenMarker(dataDir: string): boolean {
   try {
@@ -69,4 +76,15 @@ export function clearPersistenceBrokenMarker(dataDir: string): boolean {
     // gone. The re-check is the authoritative answer either way.
   }
   return !hasPersistenceBrokenMarker(dataDir)
+}
+
+/**
+ * The GUI clears its own marker from the same process that may still have a provider/GitHub operation
+ * in flight. Refuse until that stage settles: otherwise the operator can reconcile one snapshot, clear
+ * the only restart guard, and restart while the old stage is still changing external state.
+ */
+export function assertCanClearPersistenceBroken(tasks: QueuedTask[]): void {
+  if (tasks.some((task) => task.status === 'running' || task.active !== undefined)) {
+    throw new Error(ACTIVE_WORKFLOW_MARKER_CLEAR_REFUSED)
+  }
 }

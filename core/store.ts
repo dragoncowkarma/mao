@@ -460,6 +460,48 @@ function usableStoredValue<K extends keyof MaoStoreSchema>(
 }
 
 /**
+ * A store diagnostic whose operator-facing text was built entirely from structured, value-free inputs.
+ *
+ * The class stays private so another module cannot bless an arbitrary backend error as safe. The
+ * original message is kept in a private slot too: `Error.message` is mutable, so checking the nominal
+ * type and then returning that public property would let a caller replace a safe report with a token
+ * after construction.
+ */
+class OperatorSafeStoreError extends Error {
+  readonly #safeMessage: string
+
+  protected constructor(message: string) {
+    super(message)
+    this.#safeMessage = message
+  }
+
+  static messageOf(error: unknown): string | undefined {
+    return error instanceof OperatorSafeStoreError ? error.#safeMessage : undefined
+  }
+}
+
+/** Returns only diagnostics this module constructed without stored values or backend error text. */
+export function operatorSafeStoreMessage(error: unknown): string | undefined {
+  return OperatorSafeStoreError.messageOf(error)
+}
+
+/** Internal wrapper for the value-free reports produced by the write guards below. */
+class StoredWriteGuardError extends OperatorSafeStoreError {
+  readonly restartRequired: boolean
+
+  constructor(message: string, { restartRequired = false }: { restartRequired?: boolean } = {}) {
+    super(message)
+    this.name = 'StoredWriteGuardError'
+    this.restartRequired = restartRequired
+  }
+}
+
+/** True only for this module's value-free refusal caused by a whole-file read failure. */
+export function storeWriteRequiresRestart(error: unknown): boolean {
+  return error instanceof StoredWriteGuardError && error.restartRequired
+}
+
+/**
  * A value a caller tried to persist but which would violate the schema after a JSON round trip.
  *
  * Read recovery filters because the bad bytes already exist and callers need a way back. Writes have
@@ -496,7 +538,7 @@ function assertStoredWrite<K extends keyof MaoStoreSchema>(
   source: string,
 ): void {
   const problem = describeInvalidStoredWrite(key, value, source)
-  if (problem !== null) throw new Error(problem)
+  if (problem !== null) throw new StoredWriteGuardError(problem)
 }
 
 /** A stored value the schema cannot use, in the form a shell can show an operator. */
@@ -515,7 +557,7 @@ export interface StoredValueProblem {
    * the next write of that field, while a file that did not load establishes nothing and **refuses** every
    * write. `src/components/Sidebar.tsx` branches on this — it used to promise that "its next queue write
    * will rewrite the file from that" and offer a Save button, which for an unloadable file is a sentence
-   * that is false and a button that can only answer `'unverifiable'`. Keyed on a flag rather than on the
+   * that is false and a button that can only answer `'restart-required'`. Keyed on a flag rather than on the
    * message text, which no UI should parse.
    */
   wholeFile?: true
@@ -555,6 +597,11 @@ export function describeStoredProblems(
  * `describeUnusableProviderList()` for why an unusable `aiProviders` must not.
  */
 export const QUEUE_GATING_FIELD = 'workflowTasks' as const
+
+/** Fixed, value-free guidance after this process observes a whole-file read failure. */
+export const STORE_RESTART_REQUIRED =
+  '[store] The stored settings file could not be read. This process cannot safely write its startup ' +
+  'snapshot over a repair. Repair the file if needed, then restart MAO; no stored value is shown.'
 
 /** The unusable-queue problem among a backend's problems, or `undefined` when the queue reads normally. */
 export function findStoredQueueProblem(problems: StoredValueProblem[]): StoredValueProblem | undefined {
@@ -1142,7 +1189,9 @@ export function createGuardedStore(
     try {
       readRawFresh(key)
     } catch (error) {
-      throw new Error(describeRefusedStoredWrite(key, source, storeReadFailureOf(error)))
+      throw new StoredWriteGuardError(describeRefusedStoredWrite(key, source, storeReadFailureOf(error)), {
+        restartRequired: true,
+      })
     }
   }
 

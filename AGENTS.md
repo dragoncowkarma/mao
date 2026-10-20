@@ -470,28 +470,58 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   the next boot re-derives. That is also why the persistence-broken marker must **not** be reused: it
   records a confirmed *write* failure, so `mao config show` would answer `workflowPersistenceBroken: true`
   while persistence is fine, and it is sticky and operator-gated where this heals itself. The two are
-  reported as separate fields.
-- **Only the recovery writes observe the store; every gate reads the field.** `assertQueueWritable()`,
-  `processQueue`'s two checks, `safeToResume` and `core/app.ts`'s `'change'` backstop all read
-  `queueRecoveryReason` / `isQueueRecoveryLatched()` and nothing else. The fresh observation belongs to
-  `healStoredQueue()`, which **both** operator actions go through — `confirmQueueRecovery()` (discard
-  while halted) and `resaveStoredQueue()` (rewrite from the live queue after a clean start). Do **not** add a per-gate probe:
-  each observation is a whole-config read and parse on conf, the gates sit on operator actions and the
-  queue-write path, and a transient read failure there would latch a healthy host. (An earlier revision
-  justified the field-only rule by a *healing emit* — `confirmQueueRecovery()` clearing the field and then
-  notifying, so the write went through the listener. That is no longer how it works: the recovery writes
-  conditionally through `store.setIfUnchanged` and clears the latch afterwards, so there is no emit to
-  re-latch inside. The two reasons above are the ones that survive, and a deadlock of that shape is now
-  impossible by construction rather than merely ordered around.)
-  The backstop is also a **silent return, never a throw**: `notifyAfterStage`
-  reads a throwing `'change'` listener as a persistence failure and would escalate this read-shape halt
-  into a bogus `persistenceBroken`. For the same reason `notify()` itself is deliberately not a gate —
-  gate its callers. And the latch is decided **once at boot**: a corruption appearing after a *clean* boot
-  is harmless for that session, because the engine holds the true queue and its next write restores the
-  file faithfully. The GUI still has to *say* so — `src/components/Sidebar.tsx` renders a late-discovered
-  `workflowTasks` problem with its own wording, because the store's report asserts a halt that has not
-  happened in that state, and filtering the report out while the halted card did not render hid it
-  entirely.
+  reported as separate fields. A real persistence marker is carried into `WorkflowEngine` before
+  restore and blocks public queue mutation, auto-trigger/manual polling and stage processing until the
+  operator reconciles GitHub with the durable queue, clears the marker and starts a fresh process. The
+  CLI clears its own data directory with `mao config clear-persistence-broken`; the GUI has a two-step
+  **Clear marker after verification** action wired to Electron's actual `userData` directory. These are
+  deliberately separate because a packaged GUI need not ship the CLI and their default directories can
+  differ. The GUI refuses while any stage is still active in that process, so reconciliation cannot go
+  stale while a provider or GitHub operation is still in flight. Clearing never releases the current
+  engine — restart is still required.
+- **Fresh observations live only at recovery and imminent public-write boundaries.** `processQueue`'s
+  checks, `safeToResume` and `core/app.ts`'s `'change'` backstop read `queueRecoveryReason` /
+  `isQueueRecoveryLatched()` and nothing else. The recovery observation belongs to `healStoredQueue()`,
+  which **both** operator actions go through — `confirmQueueRecovery()` (discard while halted) and
+  `resaveStoredQueue()` (rewrite from the live queue after a clean start). Separately, every public queue
+  mutator already calls `assertQueueWritable()` immediately before changing memory and synchronously
+  emitting the persistence write; that method runs one fresh whole-file readiness probe supplied by
+  `createMaoApp`. It probes before returning even an existing field-only latch, so a later whole-file
+  outage upgrades that latch to restart-only. Auto-trigger likewise keeps making only this fresh
+  observation while a field-only latch blocks polling. A failure latches before mutation. This is required
+  for snapshot-backed `FileStore`: if a repaired process continued, its next write would replace the
+  complete repair with its startup token, providers, repositories and queue. `runStage()` repeats the
+  same readiness assertion after long awaits and before each external write, so auto-trigger or the stage
+  itself can stop an in-flight run before its next side effect. Composite helpers must preserve that last
+  boundary internally: `GithubService.createBranch()` and `commitFile()` invoke the engine's guard after
+  their awaited reads and immediately before the REST write, while `commitAndPush()` invokes it after the
+  local commit and before spawning `git push`. A caller-side check only after those helpers return is too
+  late. Do **not** move the probe into `notify()`:
+  recovery writes do not emit, and a generic emitter cannot distinguish storage from other observers.
+  The composition root's `'change'` listener reads the monotone field and throws a nominal,
+  value-free `QueuePersistenceError` while halted. Public mutators roll back only a guard refusal known
+  to occur before the backend write; an arbitrary backend throw has an unknown postcondition, so memory
+  is retained and `persistenceBroken` is recorded instead. For an in-flight stage, the throwing listener
+  makes `notifyAfterStage()` record that same marker. A silent return is unsafe: it leaves durable
+  `running`, which restart normalizes to `pending` and can replay. `notify()` itself is deliberately not a
+  gate — the listener and gated callers preserve the write-postcondition distinction. Once set,
+  `persistenceBroken` is also an input to every public queue gate and auto-trigger: otherwise the first
+  failed enqueue remains in memory but skips its best-effort label, and the next poll can append the same
+  issue again and later persist both. `createMaoApp()` rehydrates the same block from the durable marker;
+  `resume: false` alone is not enough because a later enqueue invokes `processQueue()` and wakes restored
+  pending tasks. A wrong-shaped
+  `workflowTasks` **field** is latched only when observed at boot; after a
+  clean boot the engine holds the true queue and can restore that field. A whole-file read failure is
+  different: the first fresh observation by auto-trigger, a public queue mutation, or either recovery
+  action latches the process monotonically and records `restartRequired`, before a GitHub call, memory
+  mutation or recovery write. That harder state also replaces any earlier field-only reason with fixed
+  restart guidance, so refused actions cannot keep recommending recovery. The origin survives a repair
+  which leaves only a field-level problem;
+  otherwise the now-readable shape would reopen recovery and let `FileStore` serialize its stale startup
+  snapshot over the repair. `clearQueueRecovery()` refuses that state. Only restart can load the complete
+  repaired snapshot. The GUI has to distinguish both late states in its own wording: the field-only state
+  can offer to save the live queue, while a whole-file-origin state offers no write action. Filtering
+  either report out while the halted card did not render hid it entirely.
 - **`inspect()` and `setIfUnchanged()` read fresh; `get()` may not.** conf re-reads and re-parses the whole
   config file on every `get`, so for Electron the two are the same call. `FileStore` answers `get` from the
   snapshot taken in its constructor, so it supplies `StoredValueBackend.getFresh` — without it a CLI
@@ -535,19 +565,21 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   it did nothing. Pinned by a renderer test that empties the list after the action.
 - **`confirmQueueRecovery()` lives on `MaoApp`, owns its own postcondition, and writes conditionally.** It
   returns a typed `QueueRecoveryOutcome` so the CLI command and the GUI button cannot disagree about whether
-  confirmation worked — a bare boolean had the CLI re-deriving success while the GUI reported it. **Six**
+  confirmation worked — a bare boolean had the CLI re-deriving success while the GUI reported it. **Seven**
   kinds, each saying only what was established: `'replaced'` (still unusable at the conditional write's
   compare, and the write did not throw), `'already-readable'` (readable again, so **nothing is written** —
   the latch is monotone, so after a repair made outside this process the store reads clean while this
   process still holds only its filtered startup subset, and persisting it would overwrite that repair
-  with exactly the loss the latch exists to prevent; the operator has to restart), `'superseded'` (the
-  value moved
+  with exactly the loss the latch exists to prevent; the operator has to restart), `'restart-required'`
+  (this process observed a whole-file read failure, so it writes nothing and cannot release the halt even
+  if the current file has become readable), `'superseded'` (the value moved
   between the observation and the compare, so the write refused and nothing was written),
-  `'unverified'` (the store could not be read or compared, so nothing is written rather than written on a
-  guess), `'invalid-replacement'` (prospective validation rejected the replacement before any backend
-  read or write, so nothing was written) and `'write-failed'` (the attempt threw, so what reached the file
-  is unknown and the halt stands). The write itself goes through `store.setIfUnchanged`, and the latch is cleared **after** it is
-  confirmed — not before, and not through an emit. None interpolates the backend's error text:
+  `'unverified'` (the requested action could not establish a safe replacement, so nothing is written),
+  `'invalid-replacement'` (prospective validation rejected the replacement before any backend read or
+  write, so nothing was written) and `'write-failed'` (the attempt threw, so what reached the file is
+  unknown; the engine records the independent persistence-broken marker and requires reconciliation plus
+  restart). The write itself goes through `store.setIfUnchanged`, and the latch is
+  cleared **after** it is confirmed — not before, and not through an emit. None interpolates the backend's error text:
   an I/O or parse failure can quote the file's own bytes and that file holds `githubToken` in plaintext,
   so the reasons come from a closed set.
 - **Observing before writing is not the same as writing conditionally, and only the second is safe.** An
@@ -608,12 +640,17 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   carries `wholeFile: true`, and `src/components/Sidebar.tsx` must branch on it rather than on the report
   text: a wrong-shaped *field* in a file that loaded really is healed by this session's next queue write,
   so the card offers to save now, while a file that did not load refuses every write — there the same copy
-  promises a rewrite that cannot happen and the button can only answer `'unverifiable'`.
+  promises a rewrite that cannot happen and the button can only answer `'restart-required'`.
   A read that fails must not escape a caller that cannot catch it, either. `core/auto-trigger.ts`'s
-  `tick()` reads the repository list through `store.get()` and is invoked bare and from `setInterval`, so
-  it guards that read and skips the tick — measured as one unhandled rejection per tick on the Electron
-  host before it did, because conf re-reads and re-parses on every `get` while the queue latch is decided
-  once at boot. Any new long-lived consumer of `get()` owes the same guard.
+  `tick()` is invoked bare and from `setInterval`, so both long-lived hosts pass a fresh
+  `store.inspect('githubRepos')` observation and the scheduler guards it before polling. This is also
+  required for `FileStore`, whose ordinary `get()` is a constructor snapshot and therefore cannot see a
+  late whole-file failure. The fixed, deduplicated headless diagnostic never interpolates the caught
+  error. Any new long-lived consumer of a fresh store read owes the same guard.
+  Manual `pollNow()` owns current tracked-list membership, that fresh read/latch and the repository
+  capability preflight in that order, and propagates its recorded poll error to the caller. Shells must
+  not read the repository list or preflight before it: either operation would bypass the latch on a late
+  whole-file failure, or spend a GitHub call for a repository the current list no longer tracks.
   Never interpolate the underlying read error into any of these reports, and never give
   `UnreadableStoreError` a `cause`. V8 puts the input's first ten characters into `SyntaxError.message`
   (`Unexpected token 'g', "ghp_SENTIN"... is not valid JSON`), and a `config.json` clobbered down to a bare

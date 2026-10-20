@@ -40,6 +40,18 @@ const MAX_FINISHED_TASKS = 50
 /** Applied to every issue that enters the workflow, so the auto-trigger poller never processes it twice. */
 export const WORKFLOW_ACTIVE_LABEL = 'workflow-active'
 
+/**
+ * Fixed, value-free refusal once queue persistence has an unknown postcondition.
+ *
+ * The original backend error is deliberately not reused: an injected backend may include stored values
+ * or credentials in its message. This text is shared by public mutations and auto-trigger so neither can
+ * widen the uncertain state before the operator verifies it.
+ */
+export const QUEUE_PERSISTENCE_BROKEN =
+  'Workflow queue persistence has an unresolved write outcome. No further queue mutation or repository ' +
+  'polling is allowed. Verify the stored queue and GitHub state, clear the persistence-broken marker ' +
+  'only after that check, then restart MAO.'
+
 /** The repository identity a queued task needs after registry-only polling settings are left behind. */
 export interface RepoIdentity {
   owner: string
@@ -150,7 +162,7 @@ function slugify(text: string): string {
  * What `createMaoApp`'s `confirmQueueRecovery()` actually did, decided in `core/` so both shells render one
  * answer instead of each re-deriving "did that work?" for themselves.
  *
- * Six kinds, because each says something different about what was actually established:
+ * Seven kinds, because each says something different about what was actually established:
  *
  * - `'replaced'` — the stored value was still unusable, the conditional write confirmed it had not moved
  *   since it was observed, and the write did not throw.
@@ -159,18 +171,22 @@ function slugify(text: string): string {
  *   while this process stayed halted; this process's in-memory queue is only the validated,
  *   restart-normalized subset, so persisting it would overwrite that repair with the very loss the
  *   latch exists to prevent. The operator has to restart to load it.
+ * - `'restart-required'` — this process observed a whole-file read failure. Even if the file is readable
+ *   now, a snapshot-backed store cannot safely write one field without serializing every startup setting
+ *   over the repair. Nothing is written and this process cannot release the halt.
  * - `'superseded'` — the stored value changed between the observation and the write, so the conditional
  *   write refused and **nothing was written**. This is the kind that makes the previous one mean anything:
  *   observing immediately before an *unconditional* write still destroys a repair landing in between,
  *   which is what review of this design found.
- * - `'unverified'` — the store could not be read, or its value could not be serialized to compare, so
- *   whether it is still the unusable one is **unknown**. Nothing is written rather than written on a
- *   guess: a transient read failure, or a repair this process cannot see, would otherwise be overwritten.
+ * - `'unverified'` — the requested action could not establish a safe replacement (for example, trying
+ *   the live-session re-save while a field-only recovery halt stands). Nothing is written rather than
+ *   written on a guess.
  * - `'invalid-replacement'` — the proposed replacement failed shape validation before the stored value
  *   was compared or the backend write was attempted. Nothing was written, and any queue-recovery halt
  *   stands until the replacement itself is corrected.
- * - `'write-failed'` — the write was attempted and threw, so what reached the file is unknown. The halt
- *   stands and the operator is told to inspect the file before salvaging.
+ * - `'write-failed'` — the write was attempted and threw, so what reached the file is unknown. The
+ *   engine records the independent persistence-broken marker, all queue work stays halted, and the
+ *   operator must reconcile the stored queue and GitHub state before clearing that marker and restarting.
  *
  * No kind asserts a file state the code did not establish, and none interpolates the backend's error
  * text: an I/O or parse error is free to quote the file's own bytes and `config.json` holds
@@ -185,25 +201,55 @@ function slugify(text: string): string {
 export interface QueueRecoveryState {
   required: boolean
   reason: string | undefined
+  /** True when this process observed a whole-file read failure and only a restart can safely reload it. */
+  restartRequired: boolean
+  /** True when queue persistence has an unresolved write outcome that requires operator reconciliation. */
+  persistenceBroken: boolean
 }
 
 export type QueueRecoveryOutcome =
   | { kind: 'replaced' }
   | { kind: 'already-readable' }
+  | { kind: 'restart-required' }
   | { kind: 'superseded' }
   | { kind: 'unverified'; reason: string }
   | { kind: 'invalid-replacement' }
   | { kind: 'write-failed' }
 
 /**
+ * Value-free signal from the composition root that the queue persistence listener, specifically, failed.
+ * Public mutators use the nominal type to roll back memory without mistaking an unrelated observer's
+ * exception for a failed durable write.
+ */
+export class QueuePersistenceError extends Error {
+  readonly writeState: 'not-written' | 'unknown'
+
+  constructor(message: string, writeState: 'not-written' | 'unknown') {
+    super(message)
+    this.name = 'QueuePersistenceError'
+    this.writeState = writeState
+  }
+}
+
+/**
  * Checks a complete candidate queue before the engine adopts or announces it.
  *
  * The composition root supplies the store's shared write-shape check. A rejection throws synchronously,
- * before the task enters the in-memory queue and before the `'change'` persistence listener runs, so a
- * caller mistake cannot leave behind a task that every later queue write rejects. Optional because the
- * engine's isolated unit tests and non-persisting consumers do not own a store.
+ * before the task enters the in-memory queue and before the `'change'` persistence listener runs, so an
+ * invalid candidate cannot leave behind a task that every later queue write rejects. Whole-file
+ * readiness is the separate `QueueWriteReadinessProbe` below. Optional because the engine's isolated
+ * unit tests and non-persisting consumers do not own a store.
  */
 export type ProspectiveQueueValidator = (tasks: QueuedTask[]) => void
+
+/**
+ * Fresh preflight for public queue mutations that are about to emit a persistence write.
+ *
+ * `undefined` means the whole settings file was readable. A string is a value-free operator report for
+ * a whole-file failure; the engine latches it before any in-memory mutation, because continuing after a
+ * later repair would let a snapshot-backed store overwrite that repair with its startup state.
+ */
+export type QueueWriteReadinessProbe = () => string | undefined
 
 function repoIdentity(repo: RepoIdentity): RepoIdentity {
   return { owner: repo.owner, repo: repo.repo }
@@ -215,49 +261,54 @@ export class WorkflowEngine extends EventEmitter {
   private processing = false
   private github: GithubService
   private validateProspectiveQueue: ProspectiveQueueValidator | undefined
+  private queueWriteReadinessProbe: QueueWriteReadinessProbe | undefined
   private githubToken = ''
   private workspaceRoot = ''
   /**
-   * Set when a `'change'` listener (e.g. createMaoApp's synchronous store.set) throws on every
-   * attempt to persist a task's new status, including the guarded retry in `runStage()`. At that
-   * point the in-memory queue and the on-disk store have diverged with no way to reconcile them
-   * from here, and continuing to process more tasks would only widen the gap — most dangerously,
-   * a restart with `resume: true` could reload the last *durably persisted* (stale) state and
-   * re-run GitHub work that already happened. `processQueue()` refuses to run any further stages
-   * once this is set; callers should surface `isPersistenceBroken()` / `getPersistenceError()` to
-   * an operator rather than silently retrying.
+   * Set when a `'change'` listener cannot durably record queue state, or rehydrated from the independent
+   * marker a prior process wrote for that condition. At that point memory, disk and GitHub
+   * may disagree, and continuing would only widen the gap — most dangerously, a restart could reload
+   * stale state and re-run GitHub work that already happened. Queue mutation, polling and
+   * `processQueue()` all refuse once this is set; callers should surface `isPersistenceBroken()` /
+   * `getPersistenceError()` to an operator rather than silently retrying.
    */
   private persistenceBroken: Error | undefined
   /**
    * The store's own operator-facing report for an unreadable `workflowTasks`, held verbatim — not a
    * boolean, so every refused mutation, `mao run`'s refusal and the GUI's card say the same words.
    *
-   * Set once by `createMaoApp()` (the only boot path) before it subscribes the `'change'` →
-   * `store.set('workflowTasks', …)` listener and before `restore()`, so nothing can write over the
-   * unreadable value in between. Released only by `clearQueueRecovery()`, which `createMaoApp`'s
-   * `confirmQueueRecovery()` calls *after* its conditional write has been confirmed. **Monotone**: it
-   * never downgrades and no later check clears it, because this process's in-memory queue contains only
-   * the validated, restart-normalized subset rather than everything the file holds — un-latching on an
-   * out-of-band repair would run the wrong queue and then persist it over the real one.
+   * A field-level queue problem is set by `createMaoApp()` before it subscribes the persistence listener
+   * and before `restore()`. A late whole-file failure is set by auto-trigger or by the fresh readiness
+   * probe every public queue mutator runs before changing memory. Both are monotone for this process.
+   * Boot recovery may clear the first only after its conditional replacement lands. The second requires
+   * restart: a snapshot-backed FileStore cannot safely write after an external repair because it would
+   * restore every other setting from its startup snapshot too.
    *
-   * Deliberately *not* re-derived from the store at gate time. Review of PR #69 showed the boot case is
-   * the dangerous one (both hosts tick auto-trigger immediately after boot). Probing per gate would
-   * instead have put three whole-config reads on the `'change'` path and, worse, let a transient read
-   * failure latch a healthy host forever.
-   *
-   * What a corruption appearing after a *clean* boot does is no longer "harmless because the next write
-   * restores the file faithfully" — that was true only while an unreadable file was silently overwritten.
-   * Since issue #67 the next write is **refused** (`createGuardedStore.set`), so the engine keeps the true
-   * queue in memory and the file keeps whatever it holds. Nothing is lost either way, but the honest
-   * statement is that this latch covers the boot case while a post-boot corruption surfaces as a refused
-   * write — see `notifyAfterStage`, which reports a throwing `'change'` listener as a persistence failure.
+   * The stage loop and `'change'` backstop still read this field only. An in-flight task that meets a
+   * whole-file failure at its entry notification reaches `notifyAfterStage`, which records the separate
+   * persistence-broken state; probing again inside notify would misclassify recovery writes and add a
+   * whole-config parse to every stage transition.
    */
   private queueRecoveryReason: string | undefined
+  /**
+   * Monotone companion to `queueRecoveryReason` for a whole-file read failure.
+   *
+   * A snapshot-backed store cannot safely write again after an external repair: even a field-scoped
+   * write serializes the process's complete startup snapshot over the repaired settings. Remembering
+   * the origin separately matters when the repaired file is readable but its queue field is still
+   * malformed — the current store problem alone would otherwise make recovery look safe again.
+   */
+  private queueRecoveryRestartRequired = false
 
-  constructor(github: GithubService, validateProspectiveQueue?: ProspectiveQueueValidator) {
+  constructor(
+    github: GithubService,
+    validateProspectiveQueue?: ProspectiveQueueValidator,
+    queueWriteReadinessProbe?: QueueWriteReadinessProbe,
+  ) {
     super()
     this.github = github
     this.validateProspectiveQueue = validateProspectiveQueue
+    this.queueWriteReadinessProbe = queueWriteReadinessProbe
   }
 
   setProviders(providers: AiProviderConfig[]) {
@@ -278,36 +329,93 @@ export class WorkflowEngine extends EventEmitter {
     this.emit('change', this.queue)
   }
 
+  /**
+   * Roll back only a persistence refusal known to precede the backend write. An arbitrary backend throw
+   * has an unknown postcondition: it may have durably written and then failed, so retain memory and set
+   * the persistence-broken marker instead of choosing either side as truth.
+   */
+  private notifyPublicMutation(rollback: () => void) {
+    try {
+      this.notify()
+    } catch (error) {
+      if (error instanceof QueuePersistenceError) {
+        if (error.writeState === 'not-written') rollback()
+        else this.recordPersistenceBroken(error)
+      }
+      throw error
+    }
+  }
+
+  private recordPersistenceBroken(error: Error) {
+    this.persistenceBroken = error
+    try {
+      this.emit('persistence-broken', error)
+    } catch {
+      // The in-memory flag above is authoritative for this process even if the independent marker write
+      // also fails or another listener throws.
+    }
+  }
+
   getTasks(): QueuedTask[] {
     return this.queue
   }
 
-  /** True once a `'change'` listener has failed to persist a task even after the guarded retry (see `persistenceBroken`). */
+  /** True while current or prior-process queue persistence needs operator reconciliation. */
   isPersistenceBroken(): boolean {
     return this.persistenceBroken !== undefined
   }
 
-  /** The error from the persistence failure that tripped `isPersistenceBroken()`, if any. */
+  /** The safe current-process failure or fixed prior-marker diagnostic behind the block, if any. */
   getPersistenceError(): Error | undefined {
     return this.persistenceBroken
   }
 
   /**
-   * Latches the queue as unreadable. Idempotent and one-way — the first reason wins, so a second call
-   * cannot soften or replace what the operator was already told.
+   * Carries a prior process's durable marker into this engine without emitting the marker event again.
+   * The block is monotone for this process: clearing the file in another process is followed by a fresh
+   * MAO start, which is the only way to reload and reconcile the durable queue safely.
    */
-  requireQueueRecovery(reason: string) {
+  requirePersistenceRecovery() {
+    if (this.persistenceBroken === undefined) {
+      this.persistenceBroken = new QueuePersistenceError(QUEUE_PERSISTENCE_BROKEN, 'unknown')
+    }
+  }
+
+  /**
+   * Records a newly discovered queue write with an unknown postcondition.
+   *
+   * Unlike `requirePersistenceRecovery()`, which rehydrates a marker that already exists, this emits
+   * `'persistence-broken'` so the composition root can create that marker. Recovery's conditional write
+   * goes through `MaoStore` directly rather than the normal `'change'` listener, so its catch has to use
+   * this explicit bridge or a successful-looking restart could resume from an indeterminate queue.
+   */
+  markPersistenceBroken() {
+    if (this.persistenceBroken === undefined) {
+      this.recordPersistenceBroken(new QueuePersistenceError(QUEUE_PERSISTENCE_BROKEN, 'unknown'))
+    }
+  }
+
+  /**
+   * Latches the queue as unreadable. Reasons are stable within one severity; a first whole-file outage
+   * upgrades both the flag and the operator guidance so a stale field-only recovery instruction cannot
+   * survive after restart becomes mandatory.
+   */
+  requireQueueRecovery(reason: string, { restartRequired = false }: { restartRequired?: boolean } = {}) {
+    if (restartRequired && !this.queueRecoveryRestartRequired) {
+      this.queueRecoveryReason = reason
+      this.queueRecoveryRestartRequired = true
+      return
+    }
     if (this.queueRecoveryReason === undefined) this.queueRecoveryReason = reason
   }
 
   /**
    * Whether unattended work is halted, read from the field alone and **never** by probing the store.
    *
-   * The field-only contract is load-bearing, not a micro-optimisation. Two independent reasons: each
-   * store observation is a whole-config read and parse on conf, and this is read on the queue-write path;
-   * and a transient read failure there would latch a healthy host for the rest of its life. It also keeps
-   * the recovery possible — the replacing write goes through `createMaoApp`, and a backstop that
-   * re-inspected the store while that write was in flight would refuse it.
+   * The field-only contract here is load-bearing, not a micro-optimisation: this query is used by the
+   * processing loop and the persistence backstop, where observing the store would either add a full-file
+   * parse to every stage or deadlock the recovery write. Public mutators do their one fresh preflight in
+   * `assertQueueWritable()` instead, immediately before the persistence write they already imply.
    */
   isQueueRecoveryLatched(): boolean {
     return this.queueRecoveryReason !== undefined
@@ -316,6 +424,11 @@ export class WorkflowEngine extends EventEmitter {
   /** The operator-facing reason unattended work is halted, or `undefined` when it is not. */
   getQueueRecoveryReason(): string | undefined {
     return this.queueRecoveryReason
+  }
+
+  /** True once this process has observed a whole-file read failure; monotone until process restart. */
+  isQueueRecoveryRestartRequired(): boolean {
+    return this.queueRecoveryRestartRequired
   }
 
   /**
@@ -328,20 +441,40 @@ export class WorkflowEngine extends EventEmitter {
    * misdiagnosis this latch is kept separate from the persistence-broken marker to avoid.
    */
   private assertQueueWritable() {
+    // An unknown write result may already have adopted this very mutation in memory or on disk. Any
+    // later mutation can persist it a second time (auto-trigger is especially dangerous because its
+    // best-effort label was skipped when the first enqueue threw). Stop before probing or changing
+    // anything; recovery requires operator reconciliation and a fresh process.
+    if (this.persistenceBroken !== undefined) throw new Error(QUEUE_PERSISTENCE_BROKEN)
+
+    // Probe before returning an existing field-only latch. A process can boot with a recoverable queue
+    // field problem and later lose the whole file; that later failure must upgrade the latch to
+    // restart-only or a repaired-but-still-malformed queue could reopen the stale-snapshot write path.
+    if (!this.queueRecoveryRestartRequired) {
+      const newlyBlocked = this.queueWriteReadinessProbe?.()
+      if (newlyBlocked !== undefined) {
+        // Monotone for this process. A FileStore still holds its constructor snapshot; letting the
+        // process continue after an external repair would rewrite that complete snapshot over the
+        // repaired file. Only a restart can load the complete repaired settings and queue together.
+        this.requireQueueRecovery(newlyBlocked, { restartRequired: true })
+      }
+    }
     if (this.queueRecoveryReason !== undefined) throw new Error(this.queueRecoveryReason)
   }
 
   /**
-   * Releases the halt. Called by `createMaoApp`'s `confirmQueueRecovery()` and **only** after it has
-   * confirmed the replacing write actually landed.
+   * Releases a field-only halt. Called by `createMaoApp`'s `confirmQueueRecovery()` and **only** after
+   * it has confirmed the replacing write actually landed. A whole-file-origin halt cannot be cleared.
    *
    * Deliberately not a method that writes: the write must be conditional on the stored value not having
    * moved since it was observed, which needs the store, and the engine holds none (architecture rule 3).
    * Clearing is therefore the *last* step of that sequence — clearing first and writing after would leave
    * a released engine over a queue that was never replaced.
    */
-  clearQueueRecovery() {
+  clearQueueRecovery(): boolean {
+    if (this.queueRecoveryRestartRequired) return false
     this.queueRecoveryReason = undefined
+    return true
   }
 
   /** Removes all finished (done/error) tasks immediately. */
@@ -349,8 +482,11 @@ export class WorkflowEngine extends EventEmitter {
     // Gated even though the in-memory queue is harmless: it emits `'change'`, so leaving it open would
     // let a GUI "Clear completed" click replace the unreadable stored value with no confirmation at all.
     this.assertQueueWritable()
+    const previous = this.queue
     this.queue = this.queue.filter((t) => t.status !== 'done' && t.status !== 'error')
-    this.notify()
+    this.notifyPublicMutation(() => {
+      this.queue = previous
+    })
   }
 
   /** Keeps only the most recent MAX_FINISHED_TASKS done/error tasks, dropping older ones. */
@@ -427,10 +563,19 @@ export class WorkflowEngine extends EventEmitter {
     if (!task) throw new Error(`Unknown task: ${taskId}`)
     if (task.status !== 'error') throw new Error(`Task is not in an error state: ${task.status}`)
 
+    const previous = {
+      status: task.status,
+      error: task.error,
+      nextRunOverride: task.nextRunOverride,
+    }
     this.armRunOverride(task, runOverride)
     task.status = 'pending'
     task.error = undefined
-    this.notify()
+    this.notifyPublicMutation(() => {
+      task.status = previous.status
+      task.error = previous.error
+      task.nextRunOverride = previous.nextRunOverride
+    })
     void this.processQueue()
     return task
   }
@@ -445,9 +590,16 @@ export class WorkflowEngine extends EventEmitter {
     if (!task) throw new Error(`Unknown task: ${taskId}`)
     if (task.status !== 'paused') throw new Error(`Task is not paused: ${task.status}`)
 
+    const previous = {
+      status: task.status,
+      nextRunOverride: task.nextRunOverride,
+    }
     this.armRunOverride(task, runOverride)
     task.status = 'pending'
-    this.notify()
+    this.notifyPublicMutation(() => {
+      task.status = previous.status
+      task.nextRunOverride = previous.nextRunOverride
+    })
     void this.processQueue()
     return task
   }
@@ -457,8 +609,11 @@ export class WorkflowEngine extends EventEmitter {
     this.assertQueueWritable()
     const task = this.queue.find((t) => t.id === taskId)
     if (!task) throw new Error(`Unknown task: ${taskId}`)
+    const previous = task.autoAdvance
     task.autoAdvance = autoAdvance
-    this.notify()
+    this.notifyPublicMutation(() => {
+      task.autoAdvance = previous
+    })
     return task
   }
 
@@ -475,8 +630,11 @@ export class WorkflowEngine extends EventEmitter {
     // and every listener remain untouched; there is therefore nothing for processQueue() to run or for a
     // later notifyAfterStage() to misdiagnose as a durable persistence failure.
     this.validateProspectiveQueue?.(prospective)
+    const previous = this.queue
     this.queue = prospective
-    this.notify()
+    this.notifyPublicMutation(() => {
+      this.queue = previous
+    })
     void this.processQueue()
     return task
   }
@@ -599,6 +757,7 @@ export class WorkflowEngine extends EventEmitter {
       // stage, so retry() re-runs it unchanged once the grant is restored. Transient lookup failures
       // (rate limit, 5xx, the 60s request deadline) surface the same way rather than hanging.
       await this.github.assertRepoWorkflowWritable(task.repo.owner, task.repo.repo)
+      this.assertQueueWritable()
 
       const agentConfig = this.selectAgent(task, oneShot)
       const usesCodeEdits = task.stage === 'pr' && agentConfig.kind === 'cli' && !!this.workspaceRoot
@@ -623,6 +782,7 @@ export class WorkflowEngine extends EventEmitter {
         prompt = buildPromptForStage(task)
         const provider = createAiProvider(agentConfig)
         output = await provider.run(prompt, { model: agentConfig.model, effort: agentConfig.effort })
+        this.assertQueueWritable()
         await this.applyGithubAction(task, output)
       }
 
@@ -663,9 +823,9 @@ export class WorkflowEngine extends EventEmitter {
    * restart-with-resume replaying GitHub work that already happened. Record it via
    * `persistenceBroken` (surfaced through `isPersistenceBroken()`/`getPersistenceError()`) so
    * `processQueue()` stops running further stages instead of silently continuing — and emit
-   * `'persistence-broken'` so a host with independent durable storage (createMaoApp writes
-   * `workflowPersistenceBroken` to the MaoStore) can record that fact even though the *normal*
-   * queue-persisting write path is the one that just failed twice.
+   * `'persistence-broken'` so a host can record that fact in independent durable storage
+   * (`createMaoApp` writes a marker file outside `MaoStore`) even though the *normal* queue-persisting
+   * write path is the one that just failed twice.
    */
   private notifyAfterStage(task: QueuedTask) {
     try {
@@ -679,14 +839,7 @@ export class WorkflowEngine extends EventEmitter {
       this.notify()
     } catch (err) {
       const persistErr = err instanceof Error ? err : new Error(String(err))
-      this.persistenceBroken = persistErr
-      try {
-        this.emit('persistence-broken', persistErr)
-      } catch {
-        // A throwing 'persistence-broken' listener must not escape notifyAfterStage — the
-        // in-memory persistenceBroken flag above is already set regardless of whether any
-        // listener could act on the event.
-      }
+      this.recordPersistenceBroken(persistErr)
     }
   }
 
@@ -699,9 +852,13 @@ export class WorkflowEngine extends EventEmitter {
     const { owner, repo } = task.repo
 
     const branch = `workflow/${task.github.issueNumber ?? task.id.slice(0, 8)}-${slugify(task.title)}`
+    this.assertQueueWritable()
     const dir = await ensureClone(this.workspaceRoot, owner, repo, this.githubToken)
+    this.assertQueueWritable()
     const base = await this.github.getDefaultBranch(owner, repo)
+    this.assertQueueWritable()
     await checkoutBranch(dir, base, branch)
+    this.assertQueueWritable()
 
     const prompt =
       `You are working inside a real local git checkout of ${owner}/${repo}, currently on a ` +
@@ -717,14 +874,24 @@ export class WorkflowEngine extends EventEmitter {
       model: agentConfig.model,
       effort: agentConfig.effort,
     })
+    this.assertQueueWritable()
 
-    if (await hasChanges(dir)) {
-      await commitAndPush(dir, branch, `feat(workflow): ${task.title}`)
+    const changed = await hasChanges(dir)
+    this.assertQueueWritable()
+    if (changed) {
+      await commitAndPush(
+        dir,
+        branch,
+        `feat(workflow): ${task.title}`,
+        () => this.assertQueueWritable(),
+      )
+      this.assertQueueWritable()
       const body = task.github.issueNumber ? `${output}\n\nCloses #${task.github.issueNumber}` : output
       const pr = await this.github.createPullRequest(owner, repo, branch, base, task.title, body)
       task.github.branch = branch
       task.github.prNumber = pr.number
       task.github.prUrl = pr.html_url
+      this.assertQueueWritable()
     } else {
       // Agent made no real edits (declined, or nothing to change) — fall back to a notes-only PR.
       await this.applyGithubAction(task, output)
@@ -735,18 +902,27 @@ export class WorkflowEngine extends EventEmitter {
 
   private async applyGithubAction(task: QueuedTask, output: string) {
     const { owner, repo } = task.repo
+    this.assertQueueWritable()
 
     switch (task.stage) {
       case 'issue': {
         const issue = await this.github.createIssue(owner, repo, task.title, output)
         task.github.issueNumber = issue.number
         task.github.issueUrl = issue.html_url
+        this.assertQueueWritable()
         await this.github.addLabel(owner, repo, issue.number, WORKFLOW_ACTIVE_LABEL).catch(() => {})
+        this.assertQueueWritable()
         break
       }
       case 'pr': {
         const branch = `workflow/${task.github.issueNumber ?? task.id.slice(0, 8)}-${slugify(task.title)}`
-        const { base } = await this.github.createBranch(owner, repo, branch)
+        const { base } = await this.github.createBranch(
+          owner,
+          repo,
+          branch,
+          () => this.assertQueueWritable(),
+        )
+        this.assertQueueWritable()
         await this.github.commitFile(
           owner,
           repo,
@@ -754,28 +930,35 @@ export class WorkflowEngine extends EventEmitter {
           `workflow-notes/${task.github.issueNumber ?? task.id}.md`,
           output,
           `docs(workflow): Add implementation notes for ${task.title}`,
+          () => this.assertQueueWritable(),
         )
+        this.assertQueueWritable()
         const body = task.github.issueNumber ? `${output}\n\nCloses #${task.github.issueNumber}` : output
         const pr = await this.github.createPullRequest(owner, repo, branch, base, task.title, body)
         task.github.branch = branch
         task.github.prNumber = pr.number
         task.github.prUrl = pr.html_url
+        this.assertQueueWritable()
         break
       }
       case 'review': {
         if (!task.github.prNumber) throw new Error('No pull request to review')
         await this.github.reviewPullRequest(owner, repo, task.github.prNumber, output)
+        this.assertQueueWritable()
         break
       }
       case 'merge': {
         if (!task.github.prNumber) throw new Error('No pull request to merge')
 
         const checksStatus = await this.github.getChecksStatus(owner, repo, task.github.prNumber)
+        this.assertQueueWritable()
         if (checksStatus === 'pending') throw new Error('CI checks are still running — retry once they complete')
         if (checksStatus === 'failure') throw new Error('CI checks failed — merge blocked')
 
         await this.github.mergePullRequest(owner, repo, task.github.prNumber, `Merge: ${task.title}`)
+        this.assertQueueWritable()
         await this.github.commentOnIssue(owner, repo, task.github.prNumber, output).catch(() => {})
+        this.assertQueueWritable()
         break
       }
     }

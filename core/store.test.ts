@@ -19,6 +19,7 @@ import {
   loadStoredFileStrict,
   parseStoredSettings,
   createStoredFileParser,
+  operatorSafeStoreMessage,
   type MaoStoreSchema,
   type StoredValueBackend,
 } from './store.ts'
@@ -1061,6 +1062,50 @@ describe('cli config import-providers', () => {
     expect(fs.readFileSync(configPath, 'utf-8')).toBe('{ "aiProviders": ')
   })
 
+  it('redacts an arbitrary backend error instead of trusting its message', () => {
+    const secret = 'sk-provider-value-that-must-not-escape'
+    const { store } = storeHolding({ aiProviders: [] })
+    const inputPath = rawConfigFile(JSON.stringify([claude]))
+    const log = vi.fn()
+    vi.spyOn(store, 'set').mockImplementation(() => {
+      throw new Error(`backend rejected apiKey=${secret}`)
+    })
+
+    let message = ''
+    try {
+      importProvidersFromFile(inputPath, store, log)
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error)
+    }
+
+    expect(message).toContain('the destination write failed')
+    expect(message).not.toContain(secret)
+    expect(message).not.toContain('backend rejected')
+    expect(log).not.toHaveBeenCalled()
+  })
+
+  it('does not trust a publicly constructible store-read error as a safe backend report', () => {
+    const secret = 'sk-forged-store-source-must-not-escape'
+    const { store } = storeHolding({ aiProviders: [] })
+    const inputPath = rawConfigFile(JSON.stringify([claude]))
+    const log = vi.fn()
+    vi.spyOn(store, 'set').mockImplementation(() => {
+      throw new UnreadableStoreError(`apiKey=${secret}`, 'unparseable')
+    })
+
+    let message = ''
+    try {
+      importProvidersFromFile(inputPath, store, log)
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error)
+    }
+
+    expect(message).toContain('the destination write failed')
+    expect(message).not.toContain(secret)
+    expect(message).not.toContain('apiKey=')
+    expect(log).not.toHaveBeenCalled()
+  })
+
   it('keeps Windows path separators readable in a quoted rejection path', () => {
     const inputPath = String.raw`C:\Users\mao\missing-providers.json`
     const resolvedPath = path.resolve(inputPath)
@@ -1669,7 +1714,7 @@ describe('MaoStore.problems for a file that could not be loaded', () => {
     expect(problems[0]!.message).not.toContain('ghp_x')
     // The flag the Sidebar branches on. Without it the late-corruption card falls back to wording that
     // promises "its next queue write will rewrite the file from that" — which the write gate refuses —
-    // and offers a Save button `resaveStoredQueue` can only answer 'unverifiable' for.
+    // and offers a Save button `resaveStoredQueue` can only answer 'restart-required' for.
     expect(problems[0]!.wholeFile).toBe(true)
   })
 
@@ -1725,6 +1770,13 @@ describe('UnreadableStoreError', () => {
     // V8 embeds a prefix of the input in `SyntaxError.message`, Node prints the `[cause]` chain for an
     // uncaught throw, and any handler may log it — so attaching it would publish a plaintext token.
     expect(new UnreadableStoreError('/tmp/config.json', 'unparseable').cause).toBeUndefined()
+  })
+
+  it('does not brand its public constructor as an operator-safe backend report', () => {
+    const error = new UnreadableStoreError('apiKey=ghp_forged_source', 'unparseable')
+
+    expect(operatorSafeStoreMessage(error)).toBeUndefined()
+    expect(operatorSafeStoreMessage(new Error('ghp_arbitrary_secret'))).toBeUndefined()
   })
 })
 

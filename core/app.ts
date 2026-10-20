@@ -1,10 +1,19 @@
 import { GithubService } from './github-service.ts'
 import { createRepoRegistrar } from './repo-registry.ts'
-import { WorkflowEngine, type QueuedTask, type QueueRecoveryOutcome } from './workflow-engine.ts'
+import {
+  QUEUE_PERSISTENCE_BROKEN,
+  QueuePersistenceError,
+  WorkflowEngine,
+  type QueuedTask,
+  type QueueRecoveryOutcome,
+} from './workflow-engine.ts'
 import type { AiProviderConfig } from './ai/types.ts'
 import {
   QUEUE_GATING_FIELD,
+  STORE_RESTART_REQUIRED,
   describeUninspectableStore,
+  operatorSafeStoreMessage,
+  storeWriteRequiresRestart,
   type MaoStore,
   type StoredObservation,
 } from './store.ts'
@@ -55,9 +64,10 @@ export interface MaoApp {
    */
   confirmQueueRecovery: () => QueueRecoveryOutcome
   /**
-   * Rewrites an unusable stored queue from the one this session holds, for a value that went unusable
-   * after a clean start. Same conditional write as `confirmQueueRecovery()`, and refuses while halted —
-   * see the implementation for why sharing that sequence is the point.
+   * Rewrites a wrong-shaped stored queue field from the one this session holds, after a clean start.
+   * Same conditional write as `confirmQueueRecovery()`, and refuses while halted — a whole-file failure
+   * cannot use this path and requires restart. See the implementation for why sharing the sequence is
+   * the point.
    */
   resaveStoredQueue: () => QueueRecoveryOutcome
   /**
@@ -105,10 +115,23 @@ function observeStoredQueue(store: MaoStore): StoredObservation<typeof QUEUE_GAT
 
 export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOptions): MaoApp {
   const githubService = new GithubService()
-  const workflowEngine = new WorkflowEngine(githubService, (tasks) => {
-    const problem = store.validateWrite('workflowTasks', tasks)
-    if (problem !== undefined) throw new Error(problem)
-  })
+  const workflowEngine = new WorkflowEngine(
+    githubService,
+    (tasks) => {
+      const problem = store.validateWrite('workflowTasks', tasks)
+      if (problem !== undefined) throw new Error(problem)
+    },
+    () => {
+      // Every public queue mutation is immediately followed by a synchronous persistence emit. Probe
+      // the same fresh whole-file state before mutation so a refused write cannot leave hidden in-memory
+      // state. Unlike a wrong-shaped field, which the live queue can heal, a whole-file failure means a
+      // snapshot-backed FileStore must remain halted until restart or it can overwrite an external repair.
+      const observed = observeStoredQueue(store)
+      return observed.readable ? undefined : STORE_RESTART_REQUIRED
+    },
+  )
+  const persistenceRecoveryRequired = hasPersistenceBrokenMarker(dataDir)
+  if (persistenceRecoveryRequired) workflowEngine.requirePersistenceRecovery()
 
   const token = store.get('githubToken')
   if (token) {
@@ -134,20 +157,42 @@ export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOp
   // was overwritten while unattended work began — exactly what the latch exists to prevent. There is
   // now no second read to disagree with.
   const observedQueue = observeStoredQueue(store)
-  if (observedQueue.problem !== undefined) workflowEngine.requireQueueRecovery(observedQueue.problem)
+  if (observedQueue.problem !== undefined) {
+    workflowEngine.requireQueueRecovery(observedQueue.readable ? observedQueue.problem : STORE_RESTART_REQUIRED, {
+      restartRequired: !observedQueue.readable,
+    })
+  }
 
   workflowEngine.on('change', (tasks: QueuedTask[]) => {
-    // Last-resort backstop, and a SILENT return rather than a throw: notifyAfterStage() reads a throwing
-    // `'change'` listener as a persistence failure and would escalate this read-shape halt into a bogus
-    // persistenceBroken. Reads the field only — never the store — for the two reasons that survive: each
-    // observation is a whole-config read and parse on conf, and this sits on the queue-write path; and a
-    // transient read failure here would latch a healthy host. (It is NOT justified by a healing emit any
-    // more: the recovery writes conditionally through `store.setIfUnchanged` and clears the latch
-    // afterwards, so there is no emit for a store-reading backstop to deadlock inside.)
-    // Every public mutator already asserts the latch, so reaching this is a bug in a future emitter; it
-    // exists so such a bug costs a missing persist instead of the operator's last copy.
-    if (workflowEngine.isQueueRecoveryLatched()) return
-    store.set('workflowTasks', tasks)
+    // Public mutators are gated before mutation and roll back if this listener throws. Reaching this
+    // while latched therefore means an in-flight stage crossed the outage during an await (or a future
+    // emitter missed its gate). Throwing is load-bearing: runStage's guarded exit records
+    // persistenceBroken, preventing restart from replaying external work whose final state could not be
+    // stored. A silent return leaves durable `running` behind and turns it back into `pending` on boot.
+    if (workflowEngine.isPersistenceBroken()) {
+      throw new QueuePersistenceError(QUEUE_PERSISTENCE_BROKEN, 'not-written')
+    }
+    const blocked = workflowEngine.getQueueRecoveryReason()
+    if (blocked !== undefined) throw new QueuePersistenceError(blocked, 'not-written')
+    try {
+      store.set('workflowTasks', tasks)
+    } catch (error) {
+      // Close the preflight -> write TOCTOU when the store's own fresh write guard is what detected the
+      // whole-file outage. Upgrade before rethrowing so a repaired snapshot-backed process cannot try a
+      // later mutation and serialize its startup settings over the repair.
+      if (storeWriteRequiresRestart(error)) {
+        workflowEngine.requireQueueRecovery(
+          STORE_RESTART_REQUIRED,
+          { restartRequired: true },
+        )
+      }
+      const safeMessage = operatorSafeStoreMessage(error)
+      throw new QueuePersistenceError(
+        safeMessage ??
+          'The workflow queue could not be persisted. No stored value or backend error is shown.',
+        safeMessage === undefined ? 'unknown' : 'not-written',
+      )
+    }
   })
   // Best-effort durable record of a confirmed persistence failure (see
   // WorkflowEngine.isPersistenceBroken()) — via a marker file independent of `store` (see
@@ -165,15 +210,16 @@ export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOp
 
   // A prior process confirmed it could no longer durably persist queue state (see above) and may
   // have advanced a task's stage in memory — including real GitHub writes — without that advance
-  // reaching workflowTasks. The on-disk snapshot can therefore predate work that already happened;
-  // auto-resuming from it risks re-running (duplicating) that work. Refuse to auto-resume — no
-  // matter what the caller asked for — until an operator has verified the queue and explicitly
-  // cleared the marker (`mao config clear-persistence-broken`).
+  // reaching workflowTasks. The on-disk snapshot can therefore predate work that already happened.
+  // Carry the marker into persistenceBroken before restore: merely setting resume=false is insufficient,
+  // because auto-trigger's immediate enqueue (or a later click) calls processQueue and would wake every
+  // restored pending task. Mutation, polling and resume all stay blocked until an operator verifies the
+  // queue, clears the marker (`mao config clear-persistence-broken`) and starts a fresh process.
   // Two independent facts, deliberately not conflated: the marker means a prior process could no longer
   // *write*, the latch means this process cannot *read* the queue. `mao config show` reports them
   // separately so neither is diagnosed as the other.
   const safeToResume =
-    resume && !hasPersistenceBrokenMarker(dataDir) && !workflowEngine.isQueueRecoveryLatched()
+    resume && !persistenceRecoveryRequired && !workflowEngine.isQueueRecoveryLatched()
   // The value from the same observation the latch was decided on — never a second `store.get`.
   workflowEngine.restore(observedQueue.value, { resume: safeToResume })
 
@@ -260,8 +306,9 @@ export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOp
    *
    * Step order, each step for a failure that was reproduced:
    *
-   * 1. Observe once, fresh. A store that cannot be read answers `'unverified'` and writes nothing — a
-   *    transient failure, or a repair this process cannot see, must not be overwritten on a guess.
+   * 1. Observe once, fresh. A store that cannot be read upgrades the process to `'restart-required'`
+   *    and writes nothing — a transient failure, or a repair this process cannot see, must not be
+   *    overwritten on a guess or reconsidered later from a stale startup snapshot.
    * 2. Already readable? Write nothing. Something healed the file; writing would replace it with this
    *    process's queue, which for a halted session is filtered/normalized and for a clean one may be
    *    stale.
@@ -278,12 +325,20 @@ export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOp
    * can still repair the value between them. That residue is issue #73.
    */
   function healStoredQueue(replacementSource: 'fresh-subset' | 'live-engine'): QueueRecoveryOutcome {
+    // A persistence-broken marker means the durable queue may predate GitHub work that already happened.
+    // Neither recovery action may rewrite that uncertain baseline before the operator reconciles it.
+    if (workflowEngine.isPersistenceBroken()) {
+      return { kind: 'unverified', reason: QUEUE_PERSISTENCE_BROKEN }
+    }
+    // Once this process has observed a whole-file failure, even a now-readable field-only problem is
+    // unsafe to heal: FileStore would serialize every other setting from its startup snapshot. Keep the
+    // origin, not merely the current problem shape, as the authority.
+    if (workflowEngine.isQueueRecoveryRestartRequired()) return { kind: 'restart-required' }
+
     const observed = observeStoredQueue(store)
     if (!observed.readable) {
-      return {
-        kind: 'unverified',
-        reason: observed.problem ?? describeUninspectableStore(QUEUE_GATING_FIELD, 'the config file'),
-      }
+      workflowEngine.requireQueueRecovery(STORE_RESTART_REQUIRED, { restartRequired: true })
+      return { kind: 'restart-required' }
     }
     if (observed.problem === undefined) return { kind: 'already-readable' }
 
@@ -293,14 +348,18 @@ export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOp
     try {
       written = store.setIfUnchanged(QUEUE_GATING_FIELD, observed.witness, replacement)
     } catch {
-      // What reached the file is unknown, so any halt stands. The backend's error text is deliberately
-      // not carried: it can quote a file that holds the GitHub token in plaintext.
+      // What reached the file is unknown. Promote this to the same durable persistence block as a
+      // failed ordinary queue write: a restart must not normalize and resume a queue whose recovery
+      // write may or may not have landed. The backend's error text is deliberately not carried because
+      // it can quote a file that holds the GitHub token in plaintext.
+      workflowEngine.markPersistenceBroken()
       return { kind: 'write-failed' }
     }
     if (written === 'superseded') return { kind: 'superseded' }
     if (written === 'invalid') return { kind: 'invalid-replacement' }
     if (written === 'unverifiable') {
-      return { kind: 'unverified', reason: describeUninspectableStore(QUEUE_GATING_FIELD, 'the config file') }
+      workflowEngine.requireQueueRecovery(STORE_RESTART_REQUIRED, { restartRequired: true })
+      return { kind: 'restart-required' }
     }
 
     if (replacementSource === 'fresh-subset') {
@@ -310,7 +369,9 @@ export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOp
       // finished history; the durable replacement above preserves every structurally valid entry.
       workflowEngine.restore(observed.value, { resume: false })
     }
-    if (workflowEngine.isQueueRecoveryLatched()) workflowEngine.clearQueueRecovery()
+    if (workflowEngine.isQueueRecoveryLatched() && !workflowEngine.clearQueueRecovery()) {
+      return { kind: 'restart-required' }
+    }
     return { kind: 'replaced' }
   }
 
@@ -323,7 +384,11 @@ export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOp
    * describe confirmation as keeping that host paused until restart.
    */
   function confirmQueueRecovery(): QueueRecoveryOutcome {
+    if (workflowEngine.isPersistenceBroken()) {
+      return { kind: 'unverified', reason: QUEUE_PERSISTENCE_BROKEN }
+    }
     if (!workflowEngine.isQueueRecoveryLatched()) return { kind: 'already-readable' }
+    if (workflowEngine.isQueueRecoveryRestartRequired()) return { kind: 'restart-required' }
     return healStoredQueue('fresh-subset')
   }
 
@@ -336,8 +401,17 @@ export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOp
    * entries with none of the confirmation `confirmQueueRecovery()` requires.
    */
   function resaveStoredQueue(): QueueRecoveryOutcome {
+    if (workflowEngine.isPersistenceBroken()) {
+      return { kind: 'unverified', reason: QUEUE_PERSISTENCE_BROKEN }
+    }
+    if (workflowEngine.isQueueRecoveryRestartRequired()) return { kind: 'restart-required' }
     if (workflowEngine.isQueueRecoveryLatched()) {
-      return { kind: 'unverified', reason: describeUninspectableStore(QUEUE_GATING_FIELD, 'the config file') }
+      return {
+        kind: 'unverified',
+        reason:
+          'This session cannot save its live queue while workflow recovery is halted. Nothing was ' +
+          'written; use the confirmed recovery action for a field-only problem.',
+      }
     }
     return healStoredQueue('live-engine')
   }

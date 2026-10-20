@@ -3,10 +3,15 @@ import os from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createMaoApp } from './app.ts'
-import { FileStore, createGuardedStore, type MaoStoreSchema } from './store.ts'
+import {
+  FileStore,
+  STORE_RESTART_REQUIRED,
+  createGuardedStore,
+  type MaoStoreSchema,
+} from './store.ts'
 import { hasPersistenceBrokenMarker, writePersistenceBrokenMarker } from './persistence-guard.ts'
 import type { AiProviderConfig } from './ai/types.ts'
-import type { QueuedTask } from './workflow-engine.ts'
+import { QUEUE_PERSISTENCE_BROKEN, type QueuedTask } from './workflow-engine.ts'
 
 const tmpDirs: string[] = []
 
@@ -115,12 +120,151 @@ describe('createMaoApp', () => {
     expect(() => workflowEngine.emit('persistence-broken', new Error('disk full'))).not.toThrow()
   })
 
+  it('marks an unknown queue-write outcome without leaking the backend error or rolling memory back', () => {
+    const { dataDir } = makeRealDataDir()
+    const data: Partial<MaoStoreSchema> = { workflowTasks: [] }
+    const secret = 'ghp_backend_error_must_not_escape'
+    const store = createGuardedStore(
+      {
+        get: <K extends keyof MaoStoreSchema>(key: K) => data[key],
+        set: <K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]) => {
+          data[key] = value
+          if (key === 'workflowTasks') throw new Error(`write completed then failed: ${secret}`)
+        },
+      },
+      '/tmp/config.json',
+    )
+    const app = createMaoApp({
+      store,
+      workspaceRoot: path.join(dataDir, 'workspaces'),
+      dataDir,
+      resume: false,
+    })
+
+    let message = ''
+    try {
+      app.workflowEngine.enqueue('new', { owner: 'acme', repo: 'widgets' })
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error)
+    }
+
+    expect(message).toContain('could not be persisted')
+    expect(message).not.toContain(secret)
+    expect(app.workflowEngine.getTasks()).toHaveLength(1)
+    expect(data.workflowTasks).toHaveLength(1)
+    expect(app.workflowEngine.isPersistenceBroken()).toBe(true)
+    expect(hasPersistenceBrokenMarker(dataDir)).toBe(true)
+  })
+
+  it('does not let an in-flight stage write the queue again after another mutation breaks persistence', async () => {
+    const { dataDir } = makeRealDataDir()
+    const data: Partial<MaoStoreSchema> = { workflowTasks: [] }
+    let workflowTaskWrites = 0
+    let failWorkflowTaskWrites = false
+    const store = createGuardedStore(
+      {
+        get: <K extends keyof MaoStoreSchema>(key: K) => data[key],
+        set: <K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]) => {
+          data[key] = value
+          if (key !== 'workflowTasks') return
+          workflowTaskWrites += 1
+          if (failWorkflowTaskWrites) {
+            throw new Error('write may already have landed: ghp_must_not_escape')
+          }
+        },
+      },
+      '/tmp/config.json',
+    )
+    const app = createMaoApp({
+      store,
+      workspaceRoot: path.join(dataDir, 'workspaces'),
+      dataDir,
+      resume: false,
+    })
+    let releasePreflight!: () => void
+    vi.spyOn(app.githubService, 'assertRepoWorkflowWritable').mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          releasePreflight = () => resolve(undefined as never)
+        }),
+    )
+
+    const task = app.workflowEngine.enqueue('already in flight', { owner: 'acme', repo: 'widgets' })
+    await vi.waitFor(() => expect(app.githubService.assertRepoWorkflowWritable).toHaveBeenCalledTimes(1))
+    expect(workflowTaskWrites).toBe(2) // pending enqueue, then the stage's running entry
+
+    failWorkflowTaskWrites = true
+    expect(() => app.workflowEngine.setAutoAdvance(task.id, false)).toThrow(/could not be persisted/)
+    expect(app.workflowEngine.isPersistenceBroken()).toBe(true)
+    expect(workflowTaskWrites).toBe(3)
+
+    // The backend is writable again only to make a forbidden second attempt observable. The in-flight
+    // stage must see the latched persistence failure when its preflight settles; neither exit notify may
+    // call the backend, because memory/disk/GitHub already have an unknown relationship.
+    failWorkflowTaskWrites = false
+    releasePreflight()
+    await vi.waitFor(() =>
+      expect(app.workflowEngine.getTasks().find((candidate) => candidate.id === task.id)?.status).toBe('error'),
+    )
+
+    expect(workflowTaskWrites).toBe(3)
+    expect(app.workflowEngine.getTasks().find((candidate) => candidate.id === task.id)?.error).toBe(
+      QUEUE_PERSISTENCE_BROKEN,
+    )
+    expect(app.workflowEngine.getPersistenceError()?.message).toBe(QUEUE_PERSISTENCE_BROKEN)
+    expect(app.workflowEngine.getPersistenceError()?.message).not.toContain('ghp_must_not_escape')
+    expect(hasPersistenceBrokenMarker(dataDir)).toBe(true)
+  })
+
+  it('marks persistence broken when an in-flight stage crosses a whole-file halt', async () => {
+    const { dataDir, store } = makeRealDataDir()
+    const app = createMaoApp({
+      store,
+      workspaceRoot: path.join(dataDir, 'workspaces'),
+      dataDir,
+      resume: false,
+    })
+    let releasePreflight!: () => void
+    vi.spyOn(app.githubService, 'assertRepoWorkflowWritable').mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          releasePreflight = () => resolve(undefined as never)
+        }),
+    )
+
+    const task = app.workflowEngine.enqueue('in flight', { owner: 'acme', repo: 'widgets' })
+    await vi.waitFor(() => expect(app.githubService.assertRepoWorkflowWritable).toHaveBeenCalledTimes(1))
+    const durableTasks = JSON.parse(
+      fs.readFileSync(path.join(dataDir, 'config.json'), 'utf-8'),
+    ).workflowTasks as QueuedTask[]
+    expect(durableTasks.find((candidate) => candidate.id === task.id)?.status).toBe('running')
+
+    app.workflowEngine.requireQueueRecovery(STORE_RESTART_REQUIRED, { restartRequired: true })
+    releasePreflight()
+    await vi.waitFor(() => expect(app.workflowEngine.isPersistenceBroken()).toBe(true))
+
+    expect(app.workflowEngine.getTasks().find((candidate) => candidate.id === task.id)?.status).toBe('error')
+    // The exit state could not be written. Keeping durable `running` is acceptable only because the
+    // independent marker now blocks restart from normalizing and auto-resuming it as pending.
+    const tasksOnDisk = JSON.parse(
+      fs.readFileSync(path.join(dataDir, 'config.json'), 'utf-8'),
+    ).workflowTasks as QueuedTask[]
+    expect(tasksOnDisk.find((candidate) => candidate.id === task.id)?.status).toBe('running')
+    expect(hasPersistenceBrokenMarker(dataDir)).toBe(true)
+  })
+
   it('refuses to auto-resume — even when the caller asks for resume: true — once the marker file is present', async () => {
     const { dataDir, store } = makeRealDataDir()
     store.set('workflowTasks', [makePendingTask('leftover-task')])
     writePersistenceBrokenMarker(dataDir, new Error('disk full'))
 
-    const { workflowEngine } = createMaoApp({ store, workspaceRoot: path.join(dataDir, 'workspaces'), dataDir, resume: true })
+    const app = createMaoApp({
+      store,
+      workspaceRoot: path.join(dataDir, 'workspaces'),
+      dataDir,
+      resume: true,
+    })
+    const { workflowEngine } = app
 
     // Give any (incorrectly) auto-started processing a chance to run — with no AI providers
     // registered, a resumed task would immediately flip to 'error'. It must stay untouched instead.
@@ -128,6 +272,19 @@ describe('createMaoApp', () => {
 
     const task = workflowEngine.getTasks().find((t) => t.id === 'leftover-task')!
     expect(task.status).toBe('pending')
+    expect(workflowEngine.isPersistenceBroken()).toBe(true)
+    expect(() =>
+      workflowEngine.enqueue('must not wake the stale queue', { owner: 'acme', repo: 'widgets' }),
+    ).toThrow(QUEUE_PERSISTENCE_BROKEN)
+    expect(workflowEngine.getTasks()).toHaveLength(1)
+    expect(app.confirmQueueRecovery()).toEqual({
+      kind: 'unverified',
+      reason: QUEUE_PERSISTENCE_BROKEN,
+    })
+    expect(app.resaveStoredQueue()).toEqual({
+      kind: 'unverified',
+      reason: QUEUE_PERSISTENCE_BROKEN,
+    })
   })
 
   it('still auto-resumes normally when no marker file is present', async () => {
@@ -173,6 +330,57 @@ describe('createMaoApp', () => {
     expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).workflowTasks).toEqual([])
     expect(workflowEngine.isPersistenceBroken()).toBe(false)
     expect(hasPersistenceBrokenMarker(dataDir)).toBe(false)
+  })
+
+  it('rejects a new task before adoption when the config becomes unreadable after boot', () => {
+    const { dataDir, store, filePath } = makeRealDataDirHolding({ workflowTasks: [] })
+    const app = createMaoApp({
+      store,
+      workspaceRoot: path.join(dataDir, 'workspaces'),
+      dataDir,
+      resume: false,
+    })
+    const persist = vi.spyOn(store, 'set')
+    const secret = 'ghp_late_corruption_must_stay_in_the_file'
+    fs.writeFileSync(filePath, secret)
+
+    expect(() =>
+      app.workflowEngine.enqueueFromIssue(
+        7,
+        'https://github.com/acme/widgets/issues/7',
+        'Must not remain pending in memory',
+        { owner: 'acme', repo: 'widgets' },
+      ),
+    ).toThrow(/could not (?:be )?read/)
+
+    expect(app.workflowEngine.getTasks()).toEqual([])
+    expect(app.workflowEngine.isQueueRecoveryLatched()).toBe(true)
+    expect(persist).not.toHaveBeenCalled()
+    expect(fs.readFileSync(filePath, 'utf-8')).toBe(secret)
+    expect(app.workflowEngine.isPersistenceBroken()).toBe(false)
+    expect(hasPersistenceBrokenMarker(dataDir)).toBe(false)
+  })
+
+  it('latches before an existing task mutation can change memory after a late whole-file failure', () => {
+    const task = { ...makePendingTask('existing-task'), autoAdvance: false }
+    const { dataDir, store, filePath } = makeRealDataDirHolding({ workflowTasks: [task] })
+    const app = createMaoApp({
+      store,
+      workspaceRoot: path.join(dataDir, 'workspaces'),
+      dataDir,
+      resume: false,
+    })
+    const persist = vi.spyOn(store, 'set')
+    const secret = 'ghp_existing_task_mutation_must_not_escape'
+    fs.writeFileSync(filePath, secret)
+
+    expect(() => app.workflowEngine.setAutoAdvance(task.id, true)).toThrow(/could not (?:be )?read/)
+
+    expect(app.workflowEngine.getTasks()[0]?.autoAdvance).toBe(false)
+    expect(app.workflowEngine.isQueueRecoveryLatched()).toBe(true)
+    expect(persist).not.toHaveBeenCalled()
+    expect(fs.readFileSync(filePath, 'utf-8')).toBe(secret)
+    expect(app.workflowEngine.isPersistenceBroken()).toBe(false)
   })
 
   it('persists a task from a full registry entry using repository identity only', async () => {
@@ -379,7 +587,7 @@ describe('createMaoApp with an unreadable stored queue', () => {
     expect(workflowEngine.getTasks()).toEqual([])
   })
 
-  it('latches before the change listener is subscribed, so nothing can write in between', () => {
+  it('latches before the change listener is subscribed, so an ungated emit is rejected', () => {
     // Ordering inside createMaoApp. If the latch were set after the subscription (or after restore()),
     // any emission in that window would persist an array over the unreadable value.
     captureWarnings()
@@ -394,11 +602,10 @@ describe('createMaoApp with an unreadable stored queue', () => {
       dataDir,
       resume: true,
     })
-    // Force the listener directly — this is what a future ungated emitter would do. The backstop must
-    // swallow it silently rather than persist, and must not escalate to a persistence failure. (It is no
-    // longer the recovery's own write path: that goes through `store.setIfUnchanged`, so there is no
-    // healing emit here to protect.)
-    workflowEngine.emit('change', [makePendingTask('sneaky')])
+    // Force the listener directly — this is what a future ungated emitter would do. It must reject rather
+    // than silently skip persistence. A real runStage catches that rejection at its guarded exit and sets
+    // persistenceBroken; a raw EventEmitter call has no such stage context and simply propagates it.
+    expect(() => workflowEngine.emit('change', [makePendingTask('sneaky')])).toThrow()
 
     expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).workflowTasks).toEqual(corruptQueue)
     expect(workflowEngine.isPersistenceBroken()).toBe(false)
@@ -602,26 +809,27 @@ describe('core/app.ts and the engine, as source order', () => {
   })
 
   it('reads the field, not the store, in the change backstop', () => {
-    // Two reasons, neither of them a healing emit — there is no longer one, because `healStoredQueue()`
-    // writes through `store.setIfUnchanged` and clears the latch afterwards. What survives: each
-    // observation is a whole-config read and parse on conf, and this sits on the queue-write path; and a
-    // transient read failure here would latch a healthy host for the rest of its life.
+    // Recovery writes through `store.setIfUnchanged` and emits nothing. The listener therefore needs
+    // only the monotone engine state; re-observing here would add a whole-config read to every emission.
     const listener = appSource.slice(appSource.indexOf("workflowEngine.on('change'"))
     const body = listener.slice(0, listener.indexOf('})') + 2)
 
-    expect(body).toContain('isQueueRecoveryLatched()')
+    expect(body).toContain('getQueueRecoveryReason()')
     expect(body).not.toContain('describeUnreadableQueue(')
     expect(body).not.toContain('problems()')
   })
 
-  it('ands the latch into safeToResume', () => {
-    // Also unobservable on its own — restore(resume: true) reaches processQueue, which is gated anyway —
-    // so this is the second line of defence, not the first. Pinned so a refactor cannot quietly make the
-    // boot path depend on processQueue's check alone.
+  it('carries the durable marker into the engine and ands both blocks into safeToResume', () => {
+    // resume=false alone is not a persistence-marker gate: a later enqueue calls processQueue. The
+    // marker must seed the engine before restore, while safeToResume remains a second line of defence.
     const normalized = appSource.replace(/\s+/g, ' ')
 
     expect(normalized).toContain(
-      'const safeToResume = resume && !hasPersistenceBrokenMarker(dataDir) && ' +
+      'const persistenceRecoveryRequired = hasPersistenceBrokenMarker(dataDir) ' +
+        'if (persistenceRecoveryRequired) workflowEngine.requirePersistenceRecovery()',
+    )
+    expect(normalized).toContain(
+      'const safeToResume = resume && !persistenceRecoveryRequired && ' +
         '!workflowEngine.isQueueRecoveryLatched()',
     )
   })
@@ -638,8 +846,9 @@ describe('core/app.ts and the engine, as source order', () => {
   })
 
   it('does not gate notify() itself', () => {
-    // notifyAfterStage reads a throwing `'change'` listener as a persistence failure, so a gate here
-    // would escalate this read-shape halt into a bogus persistenceBroken.
+    // The composition root's persistence listener throws a nominal QueuePersistenceError, which lets a
+    // public mutation roll back and an in-flight stage record a real persistence break. A generic gate in
+    // notify() would erase that distinction and make unrelated observers look like failed storage.
     const notify = engineSource.slice(engineSource.indexOf('  private notify() {'))
     const body = notify.slice(0, notify.indexOf('\n  }') + 4)
 
@@ -793,17 +1002,51 @@ describe('MaoApp.confirmQueueRecovery', () => {
 
     const outcome = app.confirmQueueRecovery()
 
-    expect(outcome.kind).toBe('unverified')
+    expect(outcome).toEqual({ kind: 'restart-required' })
     expect(set).not.toHaveBeenCalled()
-    expect(outcome.kind === 'unverified' && outcome.reason).not.toContain('EACCES')
-    expect(outcome.kind === 'unverified' && outcome.reason).not.toContain('ghp_secretish')
+    expect(app.workflowEngine.isQueueRecoveryLatched()).toBe(true)
+    expect(app.workflowEngine.isQueueRecoveryRestartRequired()).toBe(true)
+  })
+
+  it('never writes after a whole-file outage, even when repair leaves only a field problem', () => {
+    // Exact stale-snapshot regression: FileStore boots with theme=light and a recoverable queue field,
+    // then loses the whole file. An external repair changes theme to dark but leaves workflowTasks
+    // malformed. Looking only at the current field problem made confirm write the empty boot queue and
+    // serialize theme=light over that repair.
+    captureWarnings()
+    const { dataDir, store, filePath } = makeRealDataDirHolding({
+      theme: 'light',
+      workflowTasks: corrupt,
+    })
+    const app = createMaoApp({
+      store,
+      workspaceRoot: path.join(dataDir, 'workspaces'),
+      dataDir,
+      resume: false,
+    })
+    expect(app.workflowEngine.isQueueRecoveryRestartRequired()).toBe(false)
+
+    fs.writeFileSync(filePath, 'not-json ghp_must_not_escape')
+    expect(app.confirmQueueRecovery()).toEqual({ kind: 'restart-required' })
+    expect(app.workflowEngine.isQueueRecoveryRestartRequired()).toBe(true)
+
+    const repaired = { theme: 'dark', workflowTasks: { still: 'invalid' } }
+    fs.writeFileSync(filePath, JSON.stringify(repaired))
+    expect(app.confirmQueueRecovery()).toEqual({ kind: 'restart-required' })
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8'))).toEqual(repaired)
     expect(app.workflowEngine.isQueueRecoveryLatched()).toBe(true)
   })
 
   it('writes nothing, and stays halted, when the write throws', () => {
     captureWarnings()
     const racing = racingStore()
-    const app = bootWith(racing.store)
+    const { dataDir } = makeRealDataDir()
+    const app = createMaoApp({
+      store: racing.store,
+      workspaceRoot: path.join(dataDir, 'workspaces'),
+      dataDir,
+      resume: false,
+    })
     vi.spyOn(racing.store, 'setIfUnchanged').mockImplementation(() => {
       throw new Error('ENOSPC: no space left on device')
     })
@@ -813,6 +1056,12 @@ describe('MaoApp.confirmQueueRecovery', () => {
     // No `reason` field at all, so there is nowhere for the backend's text to be carried.
     expect(outcome).toEqual({ kind: 'write-failed' })
     expect(app.workflowEngine.isQueueRecoveryLatched()).toBe(true)
+    expect(app.workflowEngine.isPersistenceBroken()).toBe(true)
+    expect(app.workflowEngine.getPersistenceError()?.message).toBe(QUEUE_PERSISTENCE_BROKEN)
+    expect(hasPersistenceBrokenMarker(dataDir)).toBe(true)
+    expect(() => app.workflowEngine.enqueue('blocked', { owner: 'acme', repo: 'widgets' })).toThrow(
+      QUEUE_PERSISTENCE_BROKEN,
+    )
   })
 
   it('writes nothing when the queue was already repaired before the observation', () => {
@@ -878,7 +1127,7 @@ describe('MaoApp.resaveStoredQueue', () => {
       dataDir,
       resume: false,
     })
-    return { ...external, app }
+    return { ...external, app, dataDir }
   }
 
   it('writes nothing when something else repaired the file before the click', () => {
@@ -935,9 +1184,26 @@ describe('MaoApp.resaveStoredQueue', () => {
 
     const outcome = booted.app.resaveStoredQueue()
 
-    expect(outcome.kind).toBe('unverified')
+    expect(outcome).toEqual({ kind: 'restart-required' })
     expect(booted.writes).toEqual([])
-    expect(outcome.kind === 'unverified' && outcome.reason).not.toContain('EACCES')
+    expect(booted.app.workflowEngine.isQueueRecoveryRestartRequired()).toBe(true)
+  })
+
+  it('records an independent persistence block when the conditional save throws', () => {
+    captureWarnings()
+    const booted = bootClean()
+    booted.data.workflowTasks = corrupt
+    vi.spyOn(booted.store, 'setIfUnchanged').mockImplementation(() => {
+      throw new Error('write completed then failed: ghp_must_not_escape')
+    })
+
+    expect(booted.app.resaveStoredQueue()).toEqual({ kind: 'write-failed' })
+    expect(booted.app.workflowEngine.isPersistenceBroken()).toBe(true)
+    expect(booted.app.workflowEngine.getPersistenceError()?.message).toBe(QUEUE_PERSISTENCE_BROKEN)
+    expect(hasPersistenceBrokenMarker(booted.dataDir)).toBe(true)
+    expect(() =>
+      booted.app.workflowEngine.enqueue('must reconcile first', { owner: 'acme', repo: 'widgets' }),
+    ).toThrow(QUEUE_PERSISTENCE_BROKEN)
   })
 
   it('is a no-op on a healthy store', () => {

@@ -3,10 +3,13 @@ import os from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
+  ACTIVE_WORKFLOW_MARKER_CLEAR_REFUSED,
+  assertCanClearPersistenceBroken,
   clearPersistenceBrokenMarker,
   hasPersistenceBrokenMarker,
   writePersistenceBrokenMarker,
 } from './persistence-guard.ts'
+import type { QueuedTask } from './workflow-engine.ts'
 
 const tmpDirs: string[] = []
 
@@ -55,5 +58,23 @@ describe('persistence-guard', () => {
 
     vi.restoreAllMocks()
     expect(hasPersistenceBrokenMarker(dataDir)).toBe(true)
+  })
+
+  it('refuses to clear while this process still has an active workflow stage', () => {
+    const running = {
+      id: 'running',
+      title: 'Running task',
+      repo: { owner: 'acme', repo: 'widgets' },
+      stage: 'pr',
+      history: [],
+      status: 'running',
+      autoAdvance: true,
+      github: {},
+    } satisfies QueuedTask
+
+    expect(() => assertCanClearPersistenceBroken([running])).toThrow(
+      ACTIVE_WORKFLOW_MARKER_CLEAR_REFUSED,
+    )
+    expect(() => assertCanClearPersistenceBroken([{ ...running, status: 'pending' }])).not.toThrow()
   })
 })

@@ -533,6 +533,59 @@ describe('startAutoTrigger when the stored repository list cannot be read', () =
     expect(consoleError).toHaveBeenCalledTimes(1)
   })
 
+  it('does not label an issue when the complete store becomes unreadable immediately after enqueue', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mao-auto-trigger-label-test-'))
+    tmpDirs.push(dataDir)
+    const filePath = path.join(dataDir, 'config.json')
+    const tracked = { ...repo, autoTrigger: false }
+    fs.writeFileSync(filePath, JSON.stringify({ githubRepos: [tracked], workflowTasks: [] }))
+    const store = new FileStore(filePath)
+    const app = createMaoApp({
+      store,
+      workspaceRoot: path.join(dataDir, 'workspaces'),
+      dataDir,
+      resume: false,
+    })
+    let releaseStagePreflight!: () => void
+    vi.spyOn(app.githubService, 'assertRepoWorkflowWritable')
+      .mockResolvedValueOnce(verdict(true))
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            releaseStagePreflight = () => resolve(verdict(true))
+          }),
+      )
+    vi.spyOn(app.githubService, 'fetchTasks').mockResolvedValue([openIssue(7)])
+    const addLabel = vi.spyOn(app.githubService, 'addLabel').mockResolvedValue()
+    const enqueueFromIssue = app.workflowEngine.enqueueFromIssue.bind(app.workflowEngine)
+    const secret = 'ghp_corrupted_after_enqueue_must_not_escape'
+    vi.spyOn(app.workflowEngine, 'enqueueFromIssue').mockImplementation((...args) => {
+      const task = enqueueFromIssue(...args)
+      // The task reached the durable queue, then an external writer damaged the complete file before
+      // auto-trigger's duplicate-protection label write. Existing engine latches are still clear here.
+      fs.writeFileSync(filePath, secret)
+      return task
+    })
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    const trigger = startAutoTrigger(
+      app.githubService,
+      app.workflowEngine,
+      () => store.inspect('githubRepos'),
+      60_000,
+    )
+    handles.push(trigger.handle)
+
+    await expect(trigger.pollNow(repo)).rejects.toThrow(/cannot safely write its startup snapshot over a repair/)
+    releaseStagePreflight()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(addLabel).not.toHaveBeenCalled()
+    expect(app.workflowEngine.isQueueRecoveryRestartRequired()).toBe(true)
+    expect(trigger.getStatus('acme', 'widgets').lastError).not.toContain(secret)
+    expect(fs.readFileSync(filePath, 'utf-8')).toBe(secret)
+  })
+
   it('keeps a real FileStore halted so its startup snapshot cannot overwrite a repair', async () => {
     const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mao-auto-trigger-test-'))
     tmpDirs.push(dataDir)

@@ -70,6 +70,27 @@ export function startAutoTrigger(
     if (blocked !== undefined) throw new Error(blocked)
   }
 
+  /**
+   * Re-observe the complete settings file immediately before auto-trigger's GitHub label write.
+   *
+   * `enqueueFromIssue()` persists synchronously, but another process can make the file unreadable as
+   * soon as that call returns. Checking only the engine's existing latches would then allow the
+   * workflow-active label to land for a queue this host can no longer read, permanently suppressing a
+   * safe re-enqueue after repair. `inspectRepos` parses the whole file on both shipped backends, so this
+   * probe discovers that outage and upgrades even a field-only halt to restart-only before the write.
+   */
+  const assertLabelWriteAllowed = () => {
+    if (workflowEngine.isPersistenceBroken()) throw new Error(QUEUE_PERSISTENCE_BROKEN)
+    if (!workflowEngine.isQueueRecoveryRestartRequired()) {
+      try {
+        readReposFresh()
+      } catch {
+        latchUnreadableStore()
+      }
+    }
+    assertPollingAllowed()
+  }
+
   const pollRepo = async (
     { owner, repo }: RepoRef,
   ): Promise<{ tasks: GithubTask[]; error: string | undefined }> => {
@@ -103,8 +124,9 @@ export function startAutoTrigger(
         workflowEngine.enqueueFromIssue(task.number, task.url, task.title, { owner, repo }, true, providerOverride)
         // enqueueFromIssue starts processQueue synchronously. Its stage-entry persistence can fail and
         // latch an unknown write outcome before this call returns even though the enqueue itself did not
-        // throw; do not add the duplicate-protection label after the host has entered that state.
-        assertPollingAllowed()
+        // throw. The file can also become unreadable immediately after the successful enqueue write, so
+        // re-observe it at this final external-write boundary rather than consulting only existing latches.
+        assertLabelWriteAllowed()
         await githubService.addLabel(owner, repo, task.number, WORKFLOW_ACTIVE_LABEL).catch(() => {})
         assertPollingAllowed()
       }

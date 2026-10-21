@@ -85,7 +85,13 @@ Additionally, because CI does **not** cover them:
   (`contextBridge.exposeInMainWorld` takes `any` — before that annotation tsc checked the
   bridge against nothing at all.) The channel **strings** stay untypeable, and
   `src/electron-ipc-surface.test.ts` covers them: same set in `ipc.ts` and `preload.ts`,
-  each registered and exposed once, each named `<namespace>:<method>`.
+  each registered and exposed once, each named `<namespace>:<method>`, plus the global the
+  bridge is installed under — `exposeInMainWorld`'s first argument must equal both the
+  `Window` member in `src/electron.d.ts` and the property `src/main.tsx` reads, with exactly
+  one install. It parses the TypeScript AST and **fails closed**: a channel that is not a
+  plain string literal (a template, a shared constant, a variable), or an `invoke` outside
+  every namespace, fails by file and line rather than being skipped. Quote style, a quoted
+  namespace key, an ES method shorthand and a multi-line call are all just syntax to it.
   Still not covered, so still worth `npm run dev`: whether the handler actually *does* the
   right thing, and anything the renderer swallows. A renderer that catches a rejected
   `invoke` — several do, deliberately — turns a broken channel into a feature that silently
@@ -610,7 +616,11 @@ Two traps:
    with `satisfies ElectronApi`, so `npm run lint` fails until you do; stub it as
    `notStubbed('<domain>.<action>')` unless a test actually needs it to answer.
 6. If the CLI should have parity, add the matching subcommand in `cli/index.ts`.
-7. `npm run lint` and `npm run test` now catch a missing file or a mistyped channel. Still
+7. Write the channel as a plain single-quoted literal on both sides. The surface test
+   parses the AST and fails closed, so a template literal or a channel hoisted into a shared
+   constant is rejected by name and line — it would take the comparison's protection away
+   rather than extend it.
+8. `npm run lint` and `npm run test` now catch a missing file or a mistyped channel. Still
    smoke-test in `npm run dev`: neither proves the handler does the right thing, and a
    renderer that swallows a rejected `invoke` shows a broken channel as a feature that
    simply never appears.

@@ -162,6 +162,23 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   channel registered and exposed exactly once, and every channel named
   `<namespace>:<method>` after the bridge method that invokes it. Keep that naming — it is
   what turns a typo into a message naming the offending method rather than two sorted lists.
+  It also pins the **global the bridge is installed under**, which is the one string whose
+  being wrong removes the entire bridge: `exposeInMainWorld`'s first argument has to equal
+  the member `src/electron.d.ts` declares on `Window` *and* the property `src/main.tsx`
+  reads back off it, and there has to be exactly one install (a second one for the same key
+  is not additive — the renderer gets one of them). Pinned against those two files rather
+  than a literal in the test, so a rename has to land everywhere or the suite says which
+  side was missed.
+  That test reads the **TypeScript AST**, not the source text, and keep it that way. Regex
+  collectors recognised exactly one spelling and silently skipped the rest, which is worse
+  than not checking: both sides of a channel rewritten as `handle("x")`/`invoke("x_typo")`
+  left both collections together, the set comparison still balanced, and a runtime-broken
+  bridge shipped green. So the parser now **fails closed** — every `ipcMain.handle` and
+  `ipcRenderer.invoke` must name its channel as a plain string literal, and every `invoke`
+  must sit inside a namespace object, or the suite names the file and line. A channel moved
+  into a shared constant or built from a template is refused there for that reason: not
+  because it would not work, but because it would remove this protection without telling
+  anyone.
 - **Repository registration** → the add-vs-update rule lives ONLY in `core/repo-registry.ts`;
   `electron/ipc.ts`'s `github:setRepos` and `cli/index.ts`'s `repos add`/`repos remove` must all stay
   thin delegations to `createMaoApp()`'s `updateRepos`. Re-implementing the diff in either shell is how the two paths silently drift.

@@ -1,5 +1,5 @@
-import { readFileSync, readdirSync } from 'node:fs'
-import { basename, join } from 'node:path'
+import { existsSync, readFileSync, statSync } from 'node:fs'
+import { dirname, join, relative } from 'node:path'
 import ts from 'typescript'
 import { describe, expect, it } from 'vitest'
 
@@ -48,31 +48,88 @@ const REPO_ROOT = join((import.meta as unknown as { dirname?: string }).dirname 
  * so without it every line number in a failure message points at the preceding comment block instead
  * of the code.
  */
-function parse(...segments: string[]): ts.SourceFile {
-  const path = join(REPO_ROOT, ...segments)
+function parseFile(path: string): ts.SourceFile {
   return ts.createSourceFile(path, readFileSync(path, 'utf-8'), ts.ScriptTarget.Latest, true)
 }
 
+function parse(...segments: string[]): ts.SourceFile {
+  return parseFile(join(REPO_ROOT, ...segments))
+}
+
 /**
- * Every `electron/*.ts`, rather than `ipc.ts` and `preload.ts` by name.
+ * The specifiers of imports that still exist at runtime.
  *
- * "The channels the main process registers" is the left-hand side of the comparison below, and naming
- * one file made that side quietly incomplete the moment a registration moved anywhere else — a
- * `ipcMain.handle` in `main.ts`, or a second bridge install in a helper, is invisible to a reader that
- * never opens the file. Enumerating the directory means splitting `ipc.ts` up is just a refactor
- * instead of a silent hole, and there is no list here to keep in sync.
+ * `import type` is erased, so a module reached only that way never executes and cannot register a
+ * handler — following those edges would put dead code back into the surface, which is the thing the
+ * traversal below exists to keep out. A bare `import './x.ts'` has no clause at all and does run.
  */
-const MAIN_PROCESS = readdirSync(join(REPO_ROOT, 'electron'))
-  .filter((entry) => entry.endsWith('.ts'))
-  .sort()
-  .map((entry) => parse('electron', entry))
+function runtimeImportSpecifiers(source: ts.SourceFile): string[] {
+  return descendants(source)
+    .filter((node): node is ts.ImportDeclaration | ts.ExportDeclaration => ts.isImportDeclaration(node) || ts.isExportDeclaration(node))
+    .filter((node) => (ts.isImportDeclaration(node) ? node.importClause?.isTypeOnly !== true : !node.isTypeOnly))
+    .map((node) => node.moduleSpecifier)
+    .filter((specifier): specifier is ts.StringLiteral => specifier !== undefined && ts.isStringLiteral(specifier))
+    .map((specifier) => specifier.text)
+}
+
+/** A relative specifier resolved to a real file, or `null` for a package this repo does not own. */
+function resolveImport(fromFile: string, specifier: string): string | null {
+  if (!specifier.startsWith('.')) return null
+  const base = join(dirname(fromFile), specifier)
+  // Node-side code in this repo writes explicit `.ts` extensions, so `base` itself is normally the
+  // file; the rest are here so a future extensionless or directory import still resolves.
+  for (const candidate of [base, `${base}.ts`, `${base}.tsx`, join(base, 'index.ts')]) {
+    if (existsSync(candidate) && statSync(candidate).isFile()) return candidate
+  }
+  return null
+}
+
+/**
+ * The modules that actually run, reached by following runtime imports from the real entry points.
+ *
+ * Reachability rather than a directory listing, because "the channels the main process registers" is
+ * the left-hand side of the comparison below and a directory is not a statement about what executes.
+ * Listing `electron/*.ts` was wrong in both directions: an **unimported** `electron/dead-ipc.ts` was
+ * parsed as live, so moving a registration there left every assertion green while production
+ * registered nothing — and an **imported** nested module like `electron/ipc-parts/theme.ts` was
+ * outside the flat scan, so a real refactor failed for no reason. Naming the two files by hand was
+ * worse again: a registration moved anywhere else simply left the comparison.
+ *
+ * Both roots are genuine entry points — Electron loads `preload.ts` through `webPreferences`, so
+ * nothing imports it, and `vite.config.ts` builds each separately. The walk crosses into `core/`
+ * because that code runs too; architecture rule 1 says it may not touch `electron`, and the
+ * binding-use test below is what would notice if it did.
+ */
+function reachableFrom(entries: string[]): ts.SourceFile[] {
+  const seen = new Map<string, ts.SourceFile>()
+  const queue = entries.map((entry) => join(REPO_ROOT, entry))
+  while (queue.length > 0) {
+    const path = queue.pop()!
+    if (seen.has(path)) continue
+    const source = parseFile(path)
+    seen.set(path, source)
+    for (const specifier of runtimeImportSpecifiers(source)) {
+      const resolved = resolveImport(path, specifier)
+      if (resolved !== null) queue.push(resolved)
+    }
+  }
+  return [...seen.values()]
+}
+
+const MAIN_PROCESS_ENTRIES = ['electron/main.ts', 'electron/preload.ts']
+const MAIN_PROCESS = reachableFrom(MAIN_PROCESS_ENTRIES)
 
 const DECLARATION = parse('src', 'electron.d.ts')
 const RENDERER_ENTRY = parse('src', 'main.tsx')
 
-/** `file.ts:12`, so a failure names the line to open rather than only the thing that is wrong. */
+/** Repo-relative, because the walk now spans `electron/` and `core/` and a basename is ambiguous. */
+function relativeName(source: ts.SourceFile): string {
+  return relative(REPO_ROOT, source.fileName)
+}
+
+/** `electron/ipc.ts:12`, so a failure names the line to open rather than only what is wrong. */
 function at(source: ts.SourceFile, node: ts.Node): string {
-  return `${basename(source.fileName)}:${source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1}`
+  return `${relativeName(source)}:${source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1}`
 }
 
 function descendants(root: ts.Node): ts.Node[] {
@@ -85,19 +142,44 @@ function descendants(root: ts.Node): ts.Node[] {
   return all
 }
 
-/** True for a call written exactly `<object>.<method>(…)`, e.g. `ipcMain.handle(…)`. */
-function isCallTo(node: ts.Node, object: string, method: string): node is ts.CallExpression {
-  return (
-    ts.isCallExpression(node) &&
-    ts.isPropertyAccessExpression(node.expression) &&
-    ts.isIdentifier(node.expression.expression) &&
-    node.expression.expression.text === object &&
-    node.expression.name.text === method
-  )
-}
+/**
+ * The three `electron` exports this file models, each with the one method it understands.
+ *
+ * Recognition is tied to the **import**, not to an identifier spelling, which is what lets an alias
+ * (`import { ipcMain as main }`) be read rather than refused, and keeps an unrelated local called
+ * `ipcMain` from being mistaken for electron's.
+ */
+const MODELLED: ReadonlyArray<{ imported: string; method: string }> = [
+  { imported: 'ipcMain', method: 'handle' },
+  { imported: 'ipcRenderer', method: 'invoke' },
+  { imported: 'contextBridge', method: 'exposeInMainWorld' },
+]
 
-function callsTo(root: ts.Node, object: string, method: string): ts.CallExpression[] {
-  return descendants(root).filter((node): node is ts.CallExpression => isCallTo(node, object, method))
+const localsBySource = new Map<ts.SourceFile, Map<string, string>>()
+
+/** Local name → the `electron` export it is bound to, for the modelled exports only. */
+function electronLocals(source: ts.SourceFile): Map<string, string> {
+  const memoized = localsBySource.get(source)
+  if (memoized !== undefined) return memoized
+  const locals = new Map<string, string>()
+  const modelled = new Set(MODELLED.map((entry) => entry.imported))
+  for (const node of descendants(source)) {
+    if (!ts.isImportDeclaration(node)) continue
+    if (!ts.isStringLiteral(node.moduleSpecifier) || node.moduleSpecifier.text !== 'electron') continue
+    const bindings = node.importClause?.namedBindings
+    if (bindings === undefined || !ts.isNamedImports(bindings)) {
+      // A namespace import (`import * as electron from 'electron'`) reaches the same functions through
+      // a shape this file does not read. Recorded under its own local name so the use test refuses it.
+      if (bindings !== undefined && ts.isNamespaceImport(bindings)) locals.set(bindings.name.text, '*')
+      continue
+    }
+    for (const specifier of bindings.elements) {
+      const imported = (specifier.propertyName ?? specifier.name).text
+      if (modelled.has(imported)) locals.set(specifier.name.text, imported)
+    }
+  }
+  localsBySource.set(source, locals)
+  return locals
 }
 
 /** A call found somewhere in the main process, carrying the file it was found in for locations. */
@@ -106,13 +188,86 @@ interface Located {
   source: ts.SourceFile
 }
 
-function mainProcessCallsTo(object: string, method: string): Located[] {
-  return MAIN_PROCESS.flatMap((source) => callsTo(source, object, method).map((call) => ({ call, source })))
+/**
+ * Every modelled call in the running main process, in the one form this file can read:
+ * `<local>.<method>(…)` where `<local>` is bound to the matching `electron` export.
+ */
+function modelledCalls(imported: string): Located[] {
+  const method = MODELLED.find((entry) => entry.imported === imported)!.method
+  return MAIN_PROCESS.flatMap((source) => {
+    const locals = electronLocals(source)
+    return descendants(source)
+      .filter(
+        (node): node is ts.CallExpression =>
+          ts.isCallExpression(node) &&
+          ts.isPropertyAccessExpression(node.expression) &&
+          ts.isIdentifier(node.expression.expression) &&
+          locals.get(node.expression.expression.text) === imported &&
+          node.expression.name.text === method,
+      )
+      .map((call) => ({ call, source }))
+  })
 }
 
-const handleCalls = (): Located[] => mainProcessCallsTo('ipcMain', 'handle')
-const invokeCalls = (): Located[] => mainProcessCallsTo('ipcRenderer', 'invoke')
-const bridgeInstalls = (): Located[] => mainProcessCallsTo('contextBridge', 'exposeInMainWorld')
+/** True when this identifier is the declaration of a name rather than a use of one. */
+function isBindingOccurrence(identifier: ts.Identifier): boolean {
+  const parent = identifier.parent
+  return (
+    parent !== undefined &&
+    (ts.isImportSpecifier(parent) || ts.isImportClause(parent) || ts.isNamespaceImport(parent))
+  )
+}
+
+/**
+ * Every use of a modelled `electron` binding that is **not** a form this file can read.
+ *
+ * The companion to reading channels as literals, and the half that was missing. Making the argument
+ * fail closed does nothing for a call the matcher never recognises: `ipcMain['handle'](…)` is
+ * type-valid and simply never entered the collection, so pairing it with a mistyped
+ * `ipcRenderer['invoke'](…)` left both sides balanced and every assertion green over a channel with
+ * no handler. Destructuring the method out, aliasing the binding into a local, passing it as a value,
+ * a namespace import, and `ipcMain.on` (a send/on channel, which this file does not model at all)
+ * are the same shape of hole.
+ *
+ * So the rule is inverted: rather than hunting for shapes to reject, every *reference* to one of
+ * these bindings must be the object of a recognised direct call, and anything else is reported by
+ * file and line. An alias is read, not refused — the binding is resolved through the import.
+ */
+function unsupportedBindingUses(): string[] {
+  return MAIN_PROCESS.flatMap((source) => {
+    const locals = electronLocals(source)
+    if (locals.size === 0) return []
+    return descendants(source)
+      .filter((node): node is ts.Identifier => ts.isIdentifier(node) && locals.has(node.text))
+      .filter((identifier) => !isBindingOccurrence(identifier))
+      .filter((identifier) => {
+        const imported = locals.get(identifier.text)!
+        if (imported === '*') return true
+        const method = MODELLED.find((entry) => entry.imported === imported)!.method
+        const access = identifier.parent
+        if (access === undefined || !ts.isPropertyAccessExpression(access)) return true
+        if (access.expression !== identifier || access.name.text !== method) return true
+        const call = access.parent
+        return call === undefined || !ts.isCallExpression(call) || call.expression !== access
+      })
+      .map((identifier) => {
+        const imported = locals.get(identifier.text)!
+        const expected = imported === '*' ? 'a named import of ipcMain/ipcRenderer/contextBridge' : `${identifier.text}.${MODELLED.find((entry) => entry.imported === imported)!.method}(…)`
+        return `${at(source, identifier)} uses '${identifier.text}' in a form this test cannot read — expected ${expected}`
+      })
+  })
+}
+
+// Collected once. The parsed sources are immutable, and `bridgeCalls()` consults the invoke set for
+// every namespace property, which re-walked the whole reachable graph each time.
+const HANDLE_CALLS = modelledCalls('ipcMain')
+const INVOKE_CALLS = modelledCalls('ipcRenderer')
+const BRIDGE_INSTALLS = modelledCalls('contextBridge')
+const INVOKE_NODES = new Set(INVOKE_CALLS.map(({ call }) => call))
+
+const handleCalls = (): Located[] => HANDLE_CALLS
+const invokeCalls = (): Located[] => INVOKE_CALLS
+const bridgeInstalls = (): Located[] => BRIDGE_INSTALLS
 
 /**
  * The string a call's first argument names — or `null` when that argument is not a plain string
@@ -197,7 +352,7 @@ function bridgeCalls(): BridgeCall[] {
     if (!ts.isObjectLiteralExpression(namespaceObject)) return []
     return namespaceObject.properties.flatMap((methodProperty) =>
       descendants(methodProperty)
-        .filter((node): node is ts.CallExpression => isCallTo(node, 'ipcRenderer', 'invoke'))
+        .filter((node): node is ts.CallExpression => ts.isCallExpression(node) && INVOKE_NODES.has(node))
         .map((call) => ({
           namespace,
           method: nameOf(methodProperty) ?? '<computed>',
@@ -253,6 +408,14 @@ describe('the IPC surface', () => {
    * have to stay impossible for the parsers to be reading nothing at all.
    */
   it('actually parses the surface it is about to compare', () => {
+    // The traversal is now part of what can silently produce nothing, so pin that it reached both
+    // entry points and more than them — a resolver that returned null for every specifier would
+    // otherwise leave two files and a vacuously balanced comparison.
+    const reached = MAIN_PROCESS.map(relativeName)
+    expect(reached).toEqual(expect.arrayContaining(MAIN_PROCESS_ENTRIES))
+    expect(reached.length).toBeGreaterThan(MAIN_PROCESS_ENTRIES.length)
+    expect(reached).toContain('electron/ipc.ts')
+
     expect(handleCalls().length).toBeGreaterThanOrEqual(20)
     expect(invokeCalls().length).toBeGreaterThanOrEqual(20)
     expect(bridgeCalls().length).toBeGreaterThanOrEqual(20)
@@ -297,6 +460,19 @@ describe('the IPC surface', () => {
     ).toEqual([])
 
     expect(bridgeCalls().filter((call) => call.method === '<computed>')).toEqual([])
+  })
+
+  /**
+   * The other half of failing closed, and the half that was missing.
+   *
+   * Reading a channel as a literal protects nothing for a call the matcher never recognised.
+   * `ipcMain['handle']('ui:getTheme', …)` is type-valid and simply never entered the collection, so
+   * pairing it with a mistyped `ipcRenderer['invoke']('ui:getTheem')` kept both sides balanced and
+   * every assertion green over a channel with no handler. Rather than enumerate bad shapes, every
+   * reference to one of these bindings has to be the object of a recognised direct call.
+   */
+  it("reads every use of electron's IPC bindings, or refuses it", () => {
+    expect(unsupportedBindingUses()).toEqual([])
   })
 
   /**

@@ -88,10 +88,16 @@ Additionally, because CI does **not** cover them:
   each registered and exposed once, each named `<namespace>:<method>`, plus the global the
   bridge is installed under — `exposeInMainWorld`'s first argument must equal both the
   `Window` member in `src/electron.d.ts` and the property `src/main.tsx` reads, with exactly
-  one install. It parses the TypeScript AST and **fails closed**: a channel that is not a
-  plain string literal (a template, a shared constant, a variable), or an `invoke` outside
-  every namespace, fails by file and line rather than being skipped. Quote style, a quoted
-  namespace key, an ES method shorthand and a multi-line call are all just syntax to it.
+  one install. It parses the TypeScript AST and **fails closed** on both the channel and the
+  call form: a channel that is not a plain string literal (a template, a shared constant, a
+  variable), an `invoke` outside every namespace, or any use of `ipcMain`/`ipcRenderer`/
+  `contextBridge` that is not a recognised direct call (`ipcMain['handle'](…)`, a destructured
+  method, an aliased local, a namespace import, `ipcMain.on`) fails by file and line rather
+  than being skipped. An `import { ipcMain as main }` alias is read, not refused — recognition
+  resolves the import. Quote style, a quoted namespace key, an ES method shorthand, a
+  multi-line call and a unicode escape are all just syntax to it. The surface comes from the
+  runtime import graph rooted at `electron/main.ts` and `electron/preload.ts`, so an
+  unimported file does not count as registered and an imported nested module does.
   Still not covered, so still worth `npm run dev`: whether the handler actually *does* the
   right thing, and anything the renderer swallows. A renderer that catches a rejected
   `invoke` — several do, deliberately — turns a broken channel into a feature that silently

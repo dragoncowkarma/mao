@@ -1,6 +1,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import type { MaoStore } from './store.ts'
+import { operatorSafeStoreMessage, type MaoStore } from './store.ts'
 import type { AiProviderConfig } from './ai/types.ts'
 
 export type ProviderImportLogger = (message: string) => void
@@ -59,7 +59,15 @@ export function importProvidersFromFile(
   const providers = parsed as AiProviderConfig[]
   try {
     store.set('aiProviders', providers)
-  } catch {
+  } catch (error) {
+    // Only the store module can mark a report as operator-safe, and it does so from structured inputs
+    // rather than backend text. `MaoStore` is injectable and an arbitrary implementation may include a
+    // provider value or API key in its thrown message, so an ordinary `Error` must retain the generic,
+    // redacted fallback. The branded path preserves the actionable per-cause refusal added by issue #67.
+    const reported = operatorSafeStoreMessage(error)
+    if (reported !== undefined) {
+      throw new Error(`Could not import AI providers from ${displayedPath}: ${reported}`)
+    }
     throw new Error(
       `Could not import AI providers from ${displayedPath}: the destination write failed. Inspect the ` +
         'stored config before retrying; no provider value, token or API key is shown.',

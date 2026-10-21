@@ -70,23 +70,34 @@ export function createElectronApiStub(initialRepos: RepoRef[] = [], initialProbl
   // the store's `workflowTasks` problem, so a test that seeds that problem gets a halted host for free —
   // and, because the latch is monotone, healing the store does NOT clear it. Only the confirm call does.
   let queueLatched = initialProblems.find((problem) => problem.field === 'workflowTasks')?.message
+  let queueRestartRequired =
+    initialProblems.find((problem) => problem.field === 'workflowTasks')?.wholeFile === true
   const recoveryRequired = vi.fn(
-    async (): Promise<QueueRecoveryState> => ({ required: queueLatched !== undefined, reason: queueLatched }),
+    async (): Promise<QueueRecoveryState> => ({
+      required: queueLatched !== undefined,
+      reason: queueLatched,
+      restartRequired: queueRestartRequired,
+      persistenceBroken: false,
+    }),
   )
   // Models MaoApp.resaveStoredQueue: observes the store, then rewrites it from the queue this process
   // holds — conditionally, so a repair that landed first answers `already-readable` and writes nothing.
   const resaveQueue = vi.fn(async (): Promise<QueueRecoveryOutcome> => {
+    if (queueRestartRequired) return { kind: 'restart-required' }
     if (!problems.some((problem) => problem.field === 'workflowTasks')) return { kind: 'already-readable' }
     problems = problems.filter((problem) => problem.field !== 'workflowTasks')
     return { kind: 'replaced' }
   })
   const confirmQueueRecovery = vi.fn(async (): Promise<QueueRecoveryOutcome> => {
     if (queueLatched === undefined) return { kind: 'already-readable' }
+    if (queueRestartRequired) return { kind: 'restart-required' }
     if (!problems.some((problem) => problem.field === 'workflowTasks')) return { kind: 'already-readable' }
     queueLatched = undefined
+    queueRestartRequired = false
     problems = problems.filter((problem) => problem.field !== 'workflowTasks')
     return { kind: 'replaced' }
   })
+  const clearPersistenceBroken = vi.fn(async (): Promise<void> => {})
 
   const api = {
     platform: 'test',
@@ -120,6 +131,7 @@ export function createElectronApiStub(initialRepos: RepoRef[] = [], initialProbl
       recoveryRequired,
       confirmQueueRecovery,
       resaveQueue,
+      clearPersistenceBroken,
     },
     ui: {
       getTheme,
@@ -147,5 +159,6 @@ export function createElectronApiStub(initialRepos: RepoRef[] = [], initialProbl
     recoveryRequired,
     confirmQueueRecovery,
     resaveQueue,
+    clearPersistenceBroken,
   }
 }

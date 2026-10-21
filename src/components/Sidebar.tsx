@@ -50,8 +50,8 @@ interface SidebarProps {
   /** Discards the unusable stored value by writing an empty list. Rejects if even that write fails. */
   onResetRepoList: () => Promise<void>
   /**
-   * Whether unattended work is halted because the stored workflow queue is unreadable, and the store's
-   * own report saying why.
+   * Whether unattended work is halted because the stored workflow queue is unreadable or persistence
+   * has an unresolved write outcome, and the fixed, value-free report saying why.
    *
    * Driven by the engine rather than by `storeProblems`, because the latch is monotone: after a repair
    * made outside this window the store reads clean while this process stays halted, and the operator
@@ -69,11 +69,14 @@ interface SidebarProps {
   /**
    * Rewrites the stored queue from the one this session is holding.
    *
-   * Offered only in the late case — the value went unusable after a clean start, so this session still
-   * has the real queue. A *discard* there would be wrong twice over: there is no latch to release, and
-   * run in another process it would put that process's independently filtered snapshot in the file.
+   * Offered only for a late, field-level shape problem — this session still has the real queue and the
+   * file itself remains writable. A whole-file failure latches on observation and requires restart. A
+   * *discard* in the field-only case would be wrong twice over: there is no latch to release, and run in
+   * another process it would put that process's independently filtered snapshot in the file.
    */
   onResaveQueue: () => Promise<void>
+  /** Clears Electron's own durable marker after the operator confirms reconciliation. */
+  onClearPersistenceBroken: () => Promise<void>
   view: 'project' | 'global-settings'
   onViewChange: (view: 'project' | 'global-settings') => void
 }
@@ -89,6 +92,7 @@ export default function Sidebar({
   queueStoredStillUnreadable,
   onRecoverQueue,
   onResaveQueue,
+  onClearPersistenceBroken,
   view,
   onViewChange,
 }: SidebarProps) {
@@ -104,6 +108,9 @@ export default function Sidebar({
   const [confirmingRecovery, setConfirmingRecovery] = useState(false)
   const [recovering, setRecovering] = useState(false)
   const [resaving, setResaving] = useState(false)
+  const [confirmingPersistenceClear, setConfirmingPersistenceClear] = useState(false)
+  const [clearingPersistence, setClearingPersistence] = useState(false)
+  const [persistenceMarkerCleared, setPersistenceMarkerCleared] = useState(false)
   const [queueError, setQueueError] = useState('')
 
   /**
@@ -119,12 +126,15 @@ export default function Sidebar({
   /**
    * Whether the stored queue is unusable *right now*, which is not the same as this session being halted.
    *
-   * The latch is decided once at boot, so a file corrupted after a clean boot leaves `queueRecovery`
-   * false while the 30s `app:storeProblems` poll finds the problem. Both facts have to reach the
-   * operator, and they say different things — see the card below.
+   * A field-only problem is latched only at boot. A whole-file failure also latches when auto-trigger or
+   * the next public queue mutation observes it, but the 30s diagnostic poll can render first. The card
+   * therefore needs the current problem as well as the engine's monotone state.
    */
   const queueStoredProblem = storeProblems.find((problem) => problem.field === 'workflowTasks')
-  const showQueueCard = queueRecovery.required || queueStoredProblem !== undefined
+  const wholeFileQueueProblem = queueStoredProblem?.wholeFile === true
+  const persistenceBroken = queueRecovery.persistenceBroken
+  const restartOnlyQueueRecovery = queueRecovery.restartRequired || wholeFileQueueProblem
+  const showQueueCard = queueRecovery.required || persistenceBroken || queueStoredProblem !== undefined
 
   /**
    * The queue's report is filtered out of the generic list only when the dedicated card below actually
@@ -157,6 +167,21 @@ export default function Sidebar({
       setQueueError(readableIpcError(err))
     } finally {
       setRecovering(false)
+    }
+  }
+
+  async function submitPersistenceClear() {
+    if (clearingPersistence) return
+    setClearingPersistence(true)
+    setQueueError('')
+    try {
+      await onClearPersistenceBroken()
+      setPersistenceMarkerCleared(true)
+      setConfirmingPersistenceClear(false)
+    } catch (err) {
+      setQueueError(readableIpcError(err))
+    } finally {
+      setClearingPersistence(false)
     }
   }
 
@@ -232,38 +257,138 @@ export default function Sidebar({
         {showQueueCard && (
           <div className="card mb-2 gap-1.5 p-2">
             <p className="card-title text-[13px]">
-              {queueRecovery.required ? 'Workflow automation is halted' : 'The stored workflow queue is unreadable'}
+              {queueRecovery.required || persistenceBroken
+                ? 'Workflow automation is halted'
+                : 'The stored workflow queue is unreadable'}
             </p>
-            {/* When this session is halted, the store's own report verbatim — the same words `mao run`
-                prints and every refused queue action throws, so an operator reading one has read them
-                all. When it is NOT halted, that report would be false: the latch is decided at boot, so
-                a file corrupted afterwards leaves this session running the real queue it already loaded.
-                Saying "halted" there would send the operator looking for a stoppage that has not
-                happened, so the late case gets its own wording. */}
-            {queueRecovery.required ? (
-              <p className="text-muted text-[11px] leading-snug">{queueRecovery.reason}</p>
+            {/* A field-only boot problem uses the latched reason verbatim. A whole-file problem found
+                while already latched must use the CURRENT report instead: recovery cannot verify a write
+                in that state. After a clean boot, field-only and whole-file failures differ again — the
+                former can be healed from the live queue, while the latter pauses polling/new mutations
+                and refuses every write. The branches below state those distinct consequences. */}
+            {persistenceBroken ? (
+              <>
+                <p className="text-muted text-[11px] leading-snug">{queueRecovery.reason}</p>
+                {queueStoredProblem ? (
+                  <p className="text-muted text-[11px] leading-snug">
+                    {queueStoredProblem.wholeFile
+                      ? `MAO also cannot read ${queueStoredProblem.source} at all, so every stored setting is affected. `
+                      : `MAO also cannot use the stored workflow queue in ${queueStoredProblem.source}. `}
+                    This is independent of the persistence marker. Repair and inspect the stored data as
+                    part of reconciliation before clearing the marker; queue recovery writes remain
+                    unavailable while the durable result is uncertain.
+                  </p>
+                ) : null}
+              </>
+            ) : queueRecovery.required ? (
+              restartOnlyQueueRecovery ? (
+                <p className="text-muted text-[11px] leading-snug">
+                  {wholeFileQueueProblem ? `${queueStoredProblem.message} ` : ''}
+                  This process observed a whole-file read failure, so workflow automation remains halted
+                  even if the file is readable now. Its startup snapshot cannot safely write over a
+                  repair. Repair the file if needed, then restart MAO to load the complete stored state.
+                </p>
+              ) : (
+                <p className="text-muted text-[11px] leading-snug">{queueRecovery.reason}</p>
+              )
             ) : (
-              /* Deliberately NOT the store's report. That text is written for the halted case and says
-                 MAO will not start unattended work and every queue write is refused — both false here.
-                 Rendering it beside "this session is not halted" gave the operator two opposite
-                 instructions at once. The field and the file are what they need. */
+              /* Deliberately NOT the field report. Its halted/empty claims are false after a clean boot.
+                 The whole-file branch may truthfully say writes are refused, but still needs live-session
+                 wording rather than the boot-latch report. */
+              /* Two different late states, and conflating them was the defect. A wrong-shaped FIELD in a
+                 file that loaded really is healed by this session's next queue write, so offering to save
+                 now is the right affordance. A file that did not load at all establishes nothing and
+                 REFUSES every write (issue #67), so for it the promise below would be false and the
+                 button could only ever answer 'restart-required' — `resaveStoredQueue` fails closed on an
+                 unreadable observation. The flag comes from core; no UI parses the report text. */
+              queueStoredProblem?.wholeFile ? (
+                <p className="text-muted text-[11px] leading-snug">
+                  MAO could not read {queueStoredProblem.source} at all, so it established neither the
+                  stored workflow queue nor any other setting. Repository polling and new queue mutations
+                  are paused, every write is refused, and any running workflow will stop when it next tries
+                  to persist. The file still holds everything it held. Repair the file, then restart MAO.
+                </p>
+              ) : (
+                <>
+                  <p className="text-muted text-[11px] leading-snug">
+                    MAO cannot read the stored workflow queue in {queueStoredProblem?.source}. This session
+                    is not halted — it is still holding the queue it loaded at startup, and its next queue
+                    write will rewrite the file from that. Restarting before that happens will refuse to
+                    start unattended work until the value is replaced.
+                  </p>
+                  {/* Deliberately NOT `mao workflow confirm-queue-recovery` here. That command discards
+                      anything its separate process cannot validate and writes ITS startup snapshot over
+                      the file — so this session's real queue could be lost when it next restarts. Saving
+                      from this session writes the queue it is actually holding. */}
+                  <button
+                    onClick={submitResave}
+                    className="btn btn-secondary self-start text-xs"
+                    disabled={resaving}
+                  >
+                    {resaving ? 'Saving…' : 'Save this session’s queue now'}
+                  </button>
+                </>
+              )
+            )}
+            {persistenceBroken ? (
               <>
                 <p className="text-muted text-[11px] leading-snug">
-                  MAO cannot read the stored workflow queue in {queueStoredProblem?.source}. This session
-                  is not halted — it is still holding the queue it loaded at startup, and its next queue
-                  write will rewrite the file from that. Restarting before that happens will refuse to
-                  start unattended work until the value is replaced.
+                  Queue recovery and live-session Save are unavailable while the durable result is
+                  uncertain. Check the stored queue and target repositories before clearing the marker.
                 </p>
-                {/* Deliberately NOT `mao workflow confirm-queue-recovery` here. That command discards
-                    anything its separate process cannot validate and writes ITS startup snapshot over
-                    the file — so this session's real queue could be lost when it next restarts. Saving
-                    from this session writes the queue it is actually holding. */}
-                <button onClick={submitResave} className="btn btn-secondary self-start text-xs" disabled={resaving}>
-                  {resaving ? 'Saving…' : 'Save this session’s queue now'}
-                </button>
+                {persistenceMarkerCleared ? (
+                  <p className="text-[11px] leading-snug" style={{ color: 'var(--color-accent-700)' }}>
+                    The marker is cleared. This process remains halted; restart MAO to load the verified
+                    queue.
+                  </p>
+                ) : confirmingPersistenceClear ? (
+                  <div className="flex flex-col gap-2">
+                    <p className="text-muted text-[11px] leading-snug">
+                      Confirm only after comparing the stored queue with the target repositories and
+                      resolving any half-finished issue, branch or pull request. Wait for any active stage
+                      in this process to stop. Clearing the marker does not change this running process;
+                      restart is required before automation can resume.
+                    </p>
+                    <div className="flex gap-2">
+                      <button
+                        onClick={submitPersistenceClear}
+                        className="btn btn-primary text-xs"
+                        disabled={clearingPersistence}
+                      >
+                        {clearingPersistence ? 'Clearing…' : 'Confirm marker clear'}
+                      </button>
+                      <button
+                        onClick={() => {
+                          setConfirmingPersistenceClear(false)
+                          setQueueError('')
+                        }}
+                        className="btn btn-secondary text-xs"
+                        disabled={clearingPersistence}
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <button
+                    onClick={() => setConfirmingPersistenceClear(true)}
+                    className="btn btn-secondary self-start text-xs"
+                  >
+                    Clear marker after verification
+                  </button>
+                )}
               </>
-            )}
-            {queueRecovery.required && queueStoredStillUnreadable ? (
+            ) : restartOnlyQueueRecovery ? (
+              <p className="text-muted text-[11px] leading-snug">
+                If a workflow was already running, verify its queue and GitHub state after restart. If
+                MAO reports an unresolved persistence outcome, use the marker recovery shown here only
+                after that check.
+              </p>
+            ) : null}
+            {queueRecovery.required &&
+            queueStoredStillUnreadable &&
+            !restartOnlyQueueRecovery &&
+            !persistenceBroken ? (
               confirmingRecovery ? (
                 <div className="flex flex-col gap-2">
                   <p className="text-muted text-[11px] leading-snug">
@@ -302,7 +427,7 @@ export default function Sidebar({
                   Recover readable tasks
                 </button>
               )
-            ) : queueRecovery.required ? (
+            ) : queueRecovery.required && !restartOnlyQueueRecovery && !persistenceBroken ? (
               /* Something outside this window already repaired the file. Offering recovery here
                  would overwrite that repair with this process's filtered, restart-normalized subset,
                  so the way out is a restart — only a fresh boot can load the complete repaired queue. */

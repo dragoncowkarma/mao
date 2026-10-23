@@ -76,11 +76,36 @@ Additionally, because CI does **not** cover them:
   `scripts/build-cli.mjs`, `npm run build:cli` is the required execution check.
 - Touched `.agents/workflows/swarm_orchestrator.py`? → `npm run test` must run its
   Python worktree-safety matrix; also smoke-test the bundled `mao swarm --status`.
-- Touched the IPC surface? → **nothing automated** checks that
-  `electron/preload.ts` and `src/electron.d.ts` stay consistent (`contextBridge`
-  takes an untyped object, so tsc checks each file only against core types, not
-  against each other). Diff the two by eye and smoke-test with `npm run dev` —
-  channel-string typos and preload/d.ts drift both fail only at runtime.
+- Touched the IPC surface? → focused run:
+  `npx vitest run --project renderer src/electron-ipc-surface.test.ts`, and read what it
+  does **not** cover before trusting a green run.
+  `electron/preload.ts` ↔ `src/electron.d.ts` consistency is now a **lint** error, not an
+  eyeball exercise: the bridge carries `satisfies Window['electronAPI']`, so a method
+  missing from either file, an extra one, or a disagreeing signature fails `npm run lint`.
+  (`contextBridge.exposeInMainWorld` takes `any` — before that annotation tsc checked the
+  bridge against nothing at all.) The channel **strings** stay untypeable, and
+  `src/electron-ipc-surface.test.ts` covers them: same set in `ipc.ts` and `preload.ts`,
+  each registered and exposed once, each named `<namespace>:<method>`, plus the global the
+  bridge is installed under — `exposeInMainWorld`'s first argument must equal both the
+  `Window` member in `src/electron.d.ts` and the property `src/main.tsx` reads, with exactly
+  one install. It parses the TypeScript AST and **fails closed** on both the channel and the
+  call form: a channel that is not a plain string literal (a template, a shared constant, a
+  variable), an `invoke` outside every namespace, or any use of `ipcMain`/`ipcRenderer`/
+  `contextBridge` that is not a recognised direct call (`ipcMain['handle'](…)`, a destructured
+  method, an aliased local, a namespace import, `ipcMain.on`) fails by file and line rather
+  than being skipped. An `import { ipcMain as main }` alias is read, not refused — recognition
+  resolves the import; a **default** or namespace `electron` import is refused instead, since
+  `electron.ipcMain.handle(…)` is a shape it does not read. Quote style, a quoted namespace
+  key, an ES method shorthand, a multi-line call and a unicode escape are all just syntax to
+  it. The surface comes from the runtime import graph rooted at `electron/main.ts` and
+  `electron/preload.ts`, so an unimported file does not count as registered and an imported
+  nested module does — where "imported" means a non-erased edge: an import whose every named
+  specifier is `type` is elided and does not count, while `import()` does, and a computed
+  specifier is refused. Paths are POSIX-normalised so the suite also runs on Windows.
+  Still not covered, so still worth `npm run dev`: whether the handler actually *does* the
+  right thing, and anything the renderer swallows. A renderer that catches a rejected
+  `invoke` — several do, deliberately — turns a broken channel into a feature that silently
+  never appears, which no amount of static checking will show you.
 
 ## Headless CLI usage
 
@@ -590,14 +615,25 @@ Two traps:
 
 1. Implement the logic in `core/` (engine/service method), not in the shell.
 2. `electron/ipc.ts` — `ipcMain.handle('<domain>:<camelCaseAction>', …)` as a
-   one-line delegation (domains: `ai`, `github`, `workflow`).
-3. `electron/preload.ts` — same channel string, same namespace, positional args.
-4. `src/electron.d.ts` — mirror the method signature.
+   one-line delegation (domains: `app`, `ai`, `github`, `workflow`, `ui`).
+3. `electron/preload.ts` — same channel string, same namespace, positional args. The
+   channel must be exactly `<namespace>:<method>` for the method you add it to;
+   `src/electron-ipc-surface.test.ts` asserts that, and it is what makes a typo report the
+   method rather than a diff of two sorted lists.
+4. `src/electron.d.ts` — mirror the method signature. `npm run lint` fails until it
+   matches: the bridge is pinned with `satisfies Window['electronAPI']`.
 5. `src/test/electron-api-stub.ts` — add the channel to the fake bridge. It is written
    with `satisfies ElectronApi`, so `npm run lint` fails until you do; stub it as
    `notStubbed('<domain>.<action>')` unless a test actually needs it to answer.
 6. If the CLI should have parity, add the matching subcommand in `cli/index.ts`.
-7. `npm run lint`, then smoke-test in `npm run dev` (typos fail only at runtime).
+7. Write the channel as a plain single-quoted literal on both sides. The surface test
+   parses the AST and fails closed, so a template literal or a channel hoisted into a shared
+   constant is rejected by name and line — it would take the comparison's protection away
+   rather than extend it.
+8. `npm run lint` and `npm run test` now catch a missing file or a mistyped channel. Still
+   smoke-test in `npm run dev`: neither proves the handler does the right thing, and a
+   renderer that swallows a rejected `invoke` shows a broken channel as a feature that
+   simply never appears.
 
 ### Add a store field
 

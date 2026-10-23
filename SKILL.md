@@ -94,10 +94,14 @@ Additionally, because CI does **not** cover them:
   `contextBridge` that is not a recognised direct call (`ipcMain['handle'](…)`, a destructured
   method, an aliased local, a namespace import, `ipcMain.on`) fails by file and line rather
   than being skipped. An `import { ipcMain as main }` alias is read, not refused — recognition
-  resolves the import. Quote style, a quoted namespace key, an ES method shorthand, a
-  multi-line call and a unicode escape are all just syntax to it. The surface comes from the
-  runtime import graph rooted at `electron/main.ts` and `electron/preload.ts`, so an
-  unimported file does not count as registered and an imported nested module does.
+  resolves the import; a **default** or namespace `electron` import is refused instead, since
+  `electron.ipcMain.handle(…)` is a shape it does not read. Quote style, a quoted namespace
+  key, an ES method shorthand, a multi-line call and a unicode escape are all just syntax to
+  it. The surface comes from the runtime import graph rooted at `electron/main.ts` and
+  `electron/preload.ts`, so an unimported file does not count as registered and an imported
+  nested module does — where "imported" means a non-erased edge: an import whose every named
+  specifier is `type` is elided and does not count, while `import()` does, and a computed
+  specifier is refused. Paths are POSIX-normalised so the suite also runs on Windows.
   Still not covered, so still worth `npm run dev`: whether the handler actually *does* the
   right thing, and anything the renderer swallows. A renderer that catches a rejected
   `invoke` — several do, deliberately — turns a broken channel into a feature that silently

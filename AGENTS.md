@@ -188,14 +188,28 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   destructuring the method out, aliasing the binding into a local, a namespace import, and
   `ipcMain.on` (a send/on channel this test does not model) are all reported by file and line.
   Recognition resolves the **import**, not an identifier spelling, so `import { ipcMain as
-  main }` is read rather than refused.
+  main }` is read rather than refused — while a **default** (`import electron from
+  'electron'`) or namespace import reaches the same functions through a shape this file does
+  not read, and is refused on use for that reason. Ignoring the default binding let a channel
+  be split across two `electron.ipcMain`/`electron.ipcRenderer` helpers with mismatched
+  strings that the built bundles kept.
   The surface is built from the modules that **actually run** — the runtime import graph from
   `electron/main.ts` and `electron/preload.ts` — never from a directory listing, which is not
   a statement about what executes. A listing was wrong both ways: an unimported
   `electron/dead-ipc.ts` was parsed as live, so moving a registration there left the suite
   green while production registered nothing, and an imported `electron/ipc-parts/theme.ts`
-  was outside the flat scan, so a real refactor failed for no reason. `import type` edges are
-  not followed, because an erased import runs nothing.
+  was outside the flat scan, so a real refactor failed for no reason.
+  Which edges count is the subtle part, and it is wrong in opposite directions if you take
+  the easy reading. An import is erased when its clause says `type` **or when every named
+  specifier does** — `import { type Marker } from './x.ts'` leaves the clause flag false
+  while eliding the whole module (this repo sets neither `verbatimModuleSyntax` nor
+  `importsNotUsedAsValues`), and following it counted a module whose handler never reached
+  `dist-electron/`. Conversely `import()` **is** a real edge: it emits and loads a chunk, so a
+  duplicate registration behind `void import('./late-handler.ts')` was invisible while
+  Electron would throw at startup. An edge whose specifier is not a literal is refused, not
+  guessed. Paths are compared POSIX-normalised, because `node:path.relative()` answers
+  `electron\main.ts` on Windows — a platform this repo ships to — and the reachability
+  assertions hard-code forward slashes.
 - **Repository registration** → the add-vs-update rule lives ONLY in `core/repo-registry.ts`;
   `electron/ipc.ts`'s `github:setRepos` and `cli/index.ts`'s `repos add`/`repos remove` must all stay
   thin delegations to `createMaoApp()`'s `updateRepos`. Re-implementing the diff in either shell is how the two paths silently drift.

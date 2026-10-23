@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, statSync } from 'node:fs'
-import { dirname, join, relative } from 'node:path'
+import { dirname, join, relative, sep } from 'node:path'
 import ts from 'typescript'
 import { describe, expect, it } from 'vitest'
 
@@ -57,19 +57,74 @@ function parse(...segments: string[]): ts.SourceFile {
 }
 
 /**
- * The specifiers of imports that still exist at runtime.
+ * Whether a static import/export is erased before it runs.
  *
- * `import type` is erased, so a module reached only that way never executes and cannot register a
- * handler — following those edges would put dead code back into the surface, which is the thing the
- * traversal below exists to keep out. A bare `import './x.ts'` has no clause at all and does run.
+ * The clause flag alone is not the question, which is where this was wrong: `import { type Marker }
+ * from './x.ts'` has `isTypeOnly === false` on the clause while its only specifier is type-only, so
+ * the whole import is elided (this repo sets neither `verbatimModuleSyntax` nor
+ * `importsNotUsedAsValues`). Following that edge put a module that never executes back into the
+ * surface — a handler moved there counted as registered while `dist-electron/main.js` contained none
+ * of it. A default or namespace binding is a value, and a clause-less `import './x.ts'` is a side
+ * effect, so both run.
  */
-function runtimeImportSpecifiers(source: ts.SourceFile): string[] {
-  return descendants(source)
-    .filter((node): node is ts.ImportDeclaration | ts.ExportDeclaration => ts.isImportDeclaration(node) || ts.isExportDeclaration(node))
-    .filter((node) => (ts.isImportDeclaration(node) ? node.importClause?.isTypeOnly !== true : !node.isTypeOnly))
-    .map((node) => node.moduleSpecifier)
-    .filter((specifier): specifier is ts.StringLiteral => specifier !== undefined && ts.isStringLiteral(specifier))
-    .map((specifier) => specifier.text)
+function isErasedEdge(node: ts.ImportDeclaration | ts.ExportDeclaration): boolean {
+  if (ts.isImportDeclaration(node)) {
+    const clause = node.importClause
+    if (clause === undefined) return false
+    if (clause.isTypeOnly) return true
+    if (clause.name !== undefined) return false
+    const bindings = clause.namedBindings
+    if (bindings === undefined || !ts.isNamedImports(bindings)) return false
+    return bindings.elements.length > 0 && bindings.elements.every((element) => element.isTypeOnly)
+  }
+  if (node.isTypeOnly) return true
+  const clause = node.exportClause
+  if (clause === undefined || !ts.isNamedExports(clause)) return false
+  return clause.elements.length > 0 && clause.elements.every((element) => element.isTypeOnly)
+}
+
+/** One module edge, with the node to name in a failure when its target cannot be read. */
+interface ImportEdge {
+  specifier: string | null
+  node: ts.Node
+}
+
+/**
+ * Every edge that still exists at runtime — static imports and re-exports that are not erased, plus
+ * `import()`.
+ *
+ * Dynamic imports are edges too, and skipping them was the mirror image of the erasure bug: a
+ * `void import('./late-handler.ts')` really does emit and load a chunk, so a duplicate registration
+ * inside it was invisible here while Electron would throw "Attempted to register a second handler" at
+ * startup. A specifier that is not a literal cannot be followed at all; it is carried as `null` and
+ * refused by name rather than quietly dropped.
+ */
+function runtimeImportEdges(source: ts.SourceFile): ImportEdge[] {
+  const edges: ImportEdge[] = []
+  for (const node of descendants(source)) {
+    if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
+      // `export { a }` with no `from` is not an edge at all.
+      if (node.moduleSpecifier === undefined || isErasedEdge(node)) continue
+      edges.push({
+        specifier: ts.isStringLiteral(node.moduleSpecifier) ? node.moduleSpecifier.text : null,
+        node,
+      })
+      continue
+    }
+    if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+      edges.push({ specifier: literalArgument(node), node })
+    }
+  }
+  return edges
+}
+
+/** Runtime edges whose target this file cannot determine statically, so reachability stays honest. */
+function unreadableImportEdges(): string[] {
+  return MAIN_PROCESS.flatMap((source) =>
+    runtimeImportEdges(source)
+      .filter((edge) => edge.specifier === null)
+      .map((edge) => `${at(source, edge.node)} imports a module this test cannot resolve statically`),
+  )
 }
 
 /** A relative specifier resolved to a real file, or `null` for a package this repo does not own. */
@@ -99,6 +154,11 @@ function resolveImport(fromFile: string, specifier: string): string | null {
  * nothing imports it, and `vite.config.ts` builds each separately. The walk crosses into `core/`
  * because that code runs too; architecture rule 1 says it may not touch `electron`, and the
  * binding-use test below is what would notice if it did.
+ *
+ * What counts as an edge is `runtimeImportEdges`, and the two halves of that are easy to get wrong in
+ * opposite directions: an import whose every specifier is type-only is erased even though the clause
+ * is not marked `type`, and an `import()` is a real edge even though it is a call rather than a
+ * declaration. An edge whose specifier is not a literal is refused rather than guessed.
  */
 function reachableFrom(entries: string[]): ts.SourceFile[] {
   const seen = new Map<string, ts.SourceFile>()
@@ -108,8 +168,9 @@ function reachableFrom(entries: string[]): ts.SourceFile[] {
     if (seen.has(path)) continue
     const source = parseFile(path)
     seen.set(path, source)
-    for (const specifier of runtimeImportSpecifiers(source)) {
-      const resolved = resolveImport(path, specifier)
+    for (const edge of runtimeImportEdges(source)) {
+      if (edge.specifier === null) continue
+      const resolved = resolveImport(path, edge.specifier)
       if (resolved !== null) queue.push(resolved)
     }
   }
@@ -122,9 +183,17 @@ const MAIN_PROCESS = reachableFrom(MAIN_PROCESS_ENTRIES)
 const DECLARATION = parse('src', 'electron.d.ts')
 const RENDERER_ENTRY = parse('src', 'main.tsx')
 
-/** Repo-relative, because the walk now spans `electron/` and `core/` and a basename is ambiguous. */
+/**
+ * Repo-relative and always POSIX-separated, because the walk spans `electron/` and `core/` and a
+ * basename is ambiguous.
+ *
+ * `relative()` answers `electron\\main.ts` on Windows, which matched neither `MAIN_PROCESS_ENTRIES`
+ * nor the reachability assertions below — so the first sanity test failed on a platform this repo
+ * ships to (`electron-builder` builds for it) before it ever looked at the IPC surface. Normalising
+ * here keeps every comparison and every failure message on one spelling.
+ */
 function relativeName(source: ts.SourceFile): string {
-  return relative(REPO_ROOT, source.fileName)
+  return relative(REPO_ROOT, source.fileName).split(sep).join('/')
 }
 
 /** `electron/ipc.ts:12`, so a failure names the line to open rather than only what is wrong. */
@@ -149,6 +218,9 @@ function descendants(root: ts.Node): ts.Node[] {
  * (`import { ipcMain as main }`) be read rather than refused, and keeps an unrelated local called
  * `ipcMain` from being mistaken for electron's.
  */
+/** Marks a local bound to `electron` through a shape this file cannot read, so its uses are refused. */
+const UNSUPPORTED_SHAPE = '<unsupported import shape>'
+
 const MODELLED: ReadonlyArray<{ imported: string; method: string }> = [
   { imported: 'ipcMain', method: 'handle' },
   { imported: 'ipcRenderer', method: 'invoke' },
@@ -166,14 +238,24 @@ function electronLocals(source: ts.SourceFile): Map<string, string> {
   for (const node of descendants(source)) {
     if (!ts.isImportDeclaration(node)) continue
     if (!ts.isStringLiteral(node.moduleSpecifier) || node.moduleSpecifier.text !== 'electron') continue
-    const bindings = node.importClause?.namedBindings
-    if (bindings === undefined || !ts.isNamedImports(bindings)) {
-      // A namespace import (`import * as electron from 'electron'`) reaches the same functions through
-      // a shape this file does not read. Recorded under its own local name so the use test refuses it.
-      if (bindings !== undefined && ts.isNamespaceImport(bindings)) locals.set(bindings.name.text, '*')
+    const clause = node.importClause
+    // `import type { IpcMainInvokeEvent } from 'electron'` binds no runtime value, so there is nothing
+    // here to use in a call and nothing to refuse.
+    if (clause === undefined || clause.isTypeOnly) continue
+    // A default import (`import electron from 'electron'`) reaches the same functions as
+    // `electron.ipcMain.handle(…)`, a shape this file does not read. It was silently ignored rather
+    // than refused, so splitting a channel across two such helpers left every assertion green while
+    // the built bundles kept the mismatched strings. Recorded as unsupported, like a namespace import.
+    if (clause.name !== undefined) locals.set(clause.name.text, UNSUPPORTED_SHAPE)
+    const bindings = clause.namedBindings
+    if (bindings === undefined) continue
+    if (ts.isNamespaceImport(bindings)) {
+      locals.set(bindings.name.text, UNSUPPORTED_SHAPE)
       continue
     }
+    if (!ts.isNamedImports(bindings)) continue
     for (const specifier of bindings.elements) {
+      if (specifier.isTypeOnly) continue
       const imported = (specifier.propertyName ?? specifier.name).text
       if (modelled.has(imported)) locals.set(specifier.name.text, imported)
     }
@@ -242,7 +324,7 @@ function unsupportedBindingUses(): string[] {
       .filter((identifier) => !isBindingOccurrence(identifier))
       .filter((identifier) => {
         const imported = locals.get(identifier.text)!
-        if (imported === '*') return true
+        if (imported === UNSUPPORTED_SHAPE) return true
         const method = MODELLED.find((entry) => entry.imported === imported)!.method
         const access = identifier.parent
         if (access === undefined || !ts.isPropertyAccessExpression(access)) return true
@@ -252,7 +334,10 @@ function unsupportedBindingUses(): string[] {
       })
       .map((identifier) => {
         const imported = locals.get(identifier.text)!
-        const expected = imported === '*' ? 'a named import of ipcMain/ipcRenderer/contextBridge' : `${identifier.text}.${MODELLED.find((entry) => entry.imported === imported)!.method}(…)`
+        const expected =
+          imported === UNSUPPORTED_SHAPE
+            ? 'a named import of ipcMain/ipcRenderer/contextBridge'
+            : `${identifier.text}.${MODELLED.find((entry) => entry.imported === imported)!.method}(…)`
         return `${at(source, identifier)} uses '${identifier.text}' in a form this test cannot read — expected ${expected}`
       })
   })
@@ -473,6 +558,17 @@ describe('the IPC surface', () => {
    */
   it("reads every use of electron's IPC bindings, or refuses it", () => {
     expect(unsupportedBindingUses()).toEqual([])
+  })
+
+  /**
+   * Reachability is only as honest as the edges it can read.
+   *
+   * `import()` with a computed specifier is a module this file cannot name, and silently skipping it
+   * would put the surface back to guessing which code runs — the same failure as scanning a directory,
+   * just harder to see. Refused by name instead, so the choice lands on whoever wrote it.
+   */
+  it('resolves every runtime module edge it follows, or refuses it', () => {
+    expect(unreadableImportEdges()).toEqual([])
   })
 
   /**

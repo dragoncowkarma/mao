@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, statSync } from 'node:fs'
-import { dirname, join, relative, sep } from 'node:path'
+import { join, relative, sep } from 'node:path'
 import ts from 'typescript'
 import { describe, expect, it } from 'vitest'
 
@@ -42,6 +42,15 @@ import { describe, expect, it } from 'vitest'
  * hosting it costs nothing.
  */
 const REPO_ROOT = join((import.meta as unknown as { dirname?: string }).dirname ?? join(process.cwd(), 'src'), '..')
+const TSCONFIG_PATH = join(REPO_ROOT, 'tsconfig.json')
+const TSCONFIG_FILE = ts.readConfigFile(TSCONFIG_PATH, ts.sys.readFile)
+if (TSCONFIG_FILE.error !== undefined) {
+  throw new Error(ts.flattenDiagnosticMessageText(TSCONFIG_FILE.error.messageText, '\n'))
+}
+const TSCONFIG = ts.parseJsonConfigFileContent(TSCONFIG_FILE.config, ts.sys, REPO_ROOT)
+if (TSCONFIG.errors.length > 0) {
+  throw new Error(TSCONFIG.errors.map((error) => ts.flattenDiagnosticMessageText(error.messageText, '\n')).join('\n'))
+}
 
 /**
  * `setParentNodes: true` is load-bearing: `getStart()` walks the parent chain to skip leading trivia,
@@ -59,28 +68,17 @@ function parse(...segments: string[]): ts.SourceFile {
 /**
  * Whether a static import/export is erased before it runs.
  *
- * The clause flag alone is not the question, which is where this was wrong: `import { type Marker }
- * from './x.ts'` has `isTypeOnly === false` on the clause while its only specifier is type-only, so
- * the whole import is elided (this repo sets neither `verbatimModuleSyntax` nor
- * `importsNotUsedAsValues`). Following that edge put a module that never executes back into the
- * surface — a handler moved there counted as registered while `dist-electron/main.js` contained none
- * of it. A default or namespace binding is a value, and a clause-less `import './x.ts'` is a side
- * effect, so both run.
+ * `verbatimModuleSyntax` is deliberately pinned below: an import stays in the bundle unless its whole
+ * clause says `type`. Without that compiler option, `import { Marker } from './x.ts'` can disappear
+ * merely because every use is in a type position, which syntax alone cannot classify honestly.
+ * Per-specifier `import { type Marker }` emits `import {}` and therefore still executes the module;
+ * only `import type { Marker }` erases the edge. The equivalent distinction applies to re-exports.
  */
 function isErasedEdge(node: ts.ImportDeclaration | ts.ExportDeclaration): boolean {
   if (ts.isImportDeclaration(node)) {
-    const clause = node.importClause
-    if (clause === undefined) return false
-    if (clause.isTypeOnly) return true
-    if (clause.name !== undefined) return false
-    const bindings = clause.namedBindings
-    if (bindings === undefined || !ts.isNamedImports(bindings)) return false
-    return bindings.elements.length > 0 && bindings.elements.every((element) => element.isTypeOnly)
+    return node.importClause?.isTypeOnly === true
   }
-  if (node.isTypeOnly) return true
-  const clause = node.exportClause
-  if (clause === undefined || !ts.isNamedExports(clause)) return false
-  return clause.elements.length > 0 && clause.elements.every((element) => element.isTypeOnly)
+  return node.isTypeOnly
 }
 
 /** One module edge, with the node to name in a failure when its target cannot be read. */
@@ -90,14 +88,10 @@ interface ImportEdge {
 }
 
 /**
- * Every edge that still exists at runtime — static imports and re-exports that are not erased, plus
- * `import()`.
- *
- * Dynamic imports are edges too, and skipping them was the mirror image of the erasure bug: a
- * `void import('./late-handler.ts')` really does emit and load a chunk, so a duplicate registration
- * inside it was invisible here while Electron would throw "Attempted to register a second handler" at
- * startup. A specifier that is not a literal cannot be followed at all; it is carried as `null` and
- * refused by name rather than quietly dropped.
+ * Every static edge that still exists at runtime. Dynamic imports are deliberately not edges here:
+ * their presence in the AST proves neither that the containing branch/function runs nor that an
+ * asynchronously loaded handler is registered before the renderer invokes it. They are refused by
+ * `unreadableImportEdges()` instead of being mistaken for unconditional startup execution.
  */
 function runtimeImportEdges(source: ts.SourceFile): ImportEdge[] {
   const edges: ImportEdge[] = []
@@ -111,32 +105,40 @@ function runtimeImportEdges(source: ts.SourceFile): ImportEdge[] {
       })
       continue
     }
-    if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
-      edges.push({ specifier: literalArgument(node), node })
-    }
   }
   return edges
 }
 
-/** Runtime edges whose target this file cannot determine statically, so reachability stays honest. */
-function unreadableImportEdges(): string[] {
-  return MAIN_PROCESS.flatMap((source) =>
-    runtimeImportEdges(source)
-      .filter((edge) => edge.specifier === null)
+/** Runtime edges whose startup execution or target this file cannot prove, so reachability stays honest. */
+function unreadableImportEdges(sources: ts.SourceFile[] = MAIN_PROCESS): string[] {
+  return sources.flatMap((source) => [
+    ...runtimeImportEdges(source)
+      .filter(
+        (edge) =>
+          edge.specifier === null ||
+          (edge.specifier.startsWith('.') && resolveImport(source.fileName, edge.specifier) === null),
+      )
       .map((edge) => `${at(source, edge.node)} imports a module this test cannot resolve statically`),
-  )
+    ...descendants(source)
+      .filter(
+        (node): node is ts.CallExpression =>
+          ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword,
+      )
+      .map(
+        (node) =>
+          `${at(source, node)} uses dynamic import, whose startup execution and ordering this test cannot prove`,
+      ),
+  ])
 }
 
 /** A relative specifier resolved to a real file, or `null` for a package this repo does not own. */
 function resolveImport(fromFile: string, specifier: string): string | null {
   if (!specifier.startsWith('.')) return null
-  const base = join(dirname(fromFile), specifier)
-  // Node-side code in this repo writes explicit `.ts` extensions, so `base` itself is normally the
-  // file; the rest are here so a future extensionless or directory import still resolves.
-  for (const candidate of [base, `${base}.ts`, `${base}.tsx`, join(base, 'index.ts')]) {
-    if (existsSync(candidate) && statSync(candidate).isFile()) return candidate
-  }
-  return null
+  const resolved = ts.resolveModuleName(specifier, fromFile, TSCONFIG.options, ts.sys).resolvedModule
+  if (resolved === undefined) return null
+  return existsSync(resolved.resolvedFileName) && statSync(resolved.resolvedFileName).isFile()
+    ? resolved.resolvedFileName
+    : null
 }
 
 /**
@@ -155,10 +157,11 @@ function resolveImport(fromFile: string, specifier: string): string | null {
  * because that code runs too; architecture rule 1 says it may not touch `electron`, and the
  * binding-use test below is what would notice if it did.
  *
- * What counts as an edge is `runtimeImportEdges`, and the two halves of that are easy to get wrong in
- * opposite directions: an import whose every specifier is type-only is erased even though the clause
- * is not marked `type`, and an `import()` is a real edge even though it is a call rather than a
- * declaration. An edge whose specifier is not a literal is refused rather than guessed.
+ * What counts as an edge is `runtimeImportEdges`: with `verbatimModuleSyntax` pinned, only explicitly
+ * type-only static imports disappear. Dynamic imports are refused because their syntax cannot prove
+ * startup execution/order, and unresolved relative imports are refused instead of being mistaken for
+ * external packages. Resolution goes through TypeScript so valid substitutions such as `./ipc.js` →
+ * `./ipc.ts` stay in the graph.
  */
 function reachableFrom(entries: string[]): ts.SourceFile[] {
   const seen = new Map<string, ts.SourceFile>()
@@ -262,6 +265,43 @@ function electronLocals(source: ts.SourceFile): Map<string, string> {
   }
   localsBySource.set(source, locals)
   return locals
+}
+
+/** Electron bindings acquired through a form this test cannot trace to their eventual uses. */
+function unsupportedElectronAcquisitions(sources: ts.SourceFile[] = MAIN_PROCESS): string[] {
+  return sources.flatMap((source) =>
+    descendants(source).flatMap((node) => {
+      if (
+        ts.isExportDeclaration(node) &&
+        !isErasedEdge(node) &&
+        node.moduleSpecifier !== undefined &&
+        ts.isStringLiteral(node.moduleSpecifier) &&
+        node.moduleSpecifier.text === 'electron'
+      ) {
+        return [`${at(source, node)} uses a runtime re-export from electron that this test cannot trace`]
+      }
+
+      if (
+        ts.isImportEqualsDeclaration(node) &&
+        ts.isExternalModuleReference(node.moduleReference) &&
+        node.moduleReference.expression !== undefined &&
+        ts.isStringLiteralLike(node.moduleReference.expression) &&
+        node.moduleReference.expression.text === 'electron'
+      ) {
+        return [`${at(source, node)} acquires electron through import-equals instead of a direct named import`]
+      }
+
+      if (!ts.isCallExpression(node)) return []
+      const isRequire =
+        (ts.isIdentifier(node.expression) && node.expression.text === 'require') ||
+        (ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === 'require')
+      const target = node.arguments[0]
+      if (!isRequire || target === undefined || !ts.isStringLiteralLike(target) || target.text !== 'electron') {
+        return []
+      }
+      return [`${at(source, node)} acquires electron through require() instead of a direct named import`]
+    }),
+  )
 }
 
 /** A call found somewhere in the main process, carrying the file it was found in for locations. */
@@ -556,19 +596,58 @@ describe('the IPC surface', () => {
    * every assertion green over a channel with no handler. Rather than enumerate bad shapes, every
    * reference to one of these bindings has to be the object of a recognised direct call.
    */
-  it("reads every use of electron's IPC bindings, or refuses it", () => {
-    expect(unsupportedBindingUses()).toEqual([])
+  it("reads every acquisition and use of electron's IPC bindings, or refuses it", () => {
+    expect([...unsupportedElectronAcquisitions(), ...unsupportedBindingUses()]).toEqual([])
   })
 
   /**
    * Reachability is only as honest as the edges it can read.
    *
-   * `import()` with a computed specifier is a module this file cannot name, and silently skipping it
-   * would put the surface back to guessing which code runs — the same failure as scanning a directory,
-   * just harder to see. Refused by name instead, so the choice lands on whoever wrote it.
+   * A dynamic import proves neither execution nor ordering, and an unresolved relative edge may be a
+   * valid compiler substitution the hand-written resolver missed. Silently skipping either would put
+   * the surface back to guessing which code runs — the same failure as scanning a directory, just
+   * harder to see. Refused by name instead, so the choice lands on whoever wrote it.
    */
   it('resolves every runtime module edge it follows, or refuses it', () => {
     expect(unreadableImportEdges()).toEqual([])
+  })
+
+  it('pins the runtime graph assumptions that make static reachability sound', () => {
+    expect(TSCONFIG.options.verbatimModuleSyntax).toBe(true)
+    const substituted = resolveImport(join(REPO_ROOT, 'electron', 'main.ts'), './ipc.js')
+    expect(substituted?.replaceAll('\\', '/')).toMatch(/\/electron\/ipc\.ts$/)
+
+    const explicitTypes = ts.createSourceFile(
+      join(REPO_ROOT, 'electron', 'type-edge-fixture.ts'),
+      ["import { type Marker } from './runtime.ts'", "import type { Marker as Gone } from './erased.ts'"].join(
+        '\n',
+      ),
+      ts.ScriptTarget.Latest,
+      true,
+    )
+    expect(runtimeImportEdges(explicitTypes).map((edge) => edge.specifier)).toEqual(['./runtime.ts'])
+
+    const fixture = ts.createSourceFile(
+      join(REPO_ROOT, 'electron', 'module-policy-fixture.ts'),
+      [
+        "import './does-not-exist.js'",
+        "if (false) void import('./dead-ipc.ts')",
+        "export { ipcMain } from 'electron'",
+        "const electron = require('electron')",
+        "import electronEquals = require('electron')",
+      ].join('\n'),
+      ts.ScriptTarget.Latest,
+      true,
+    )
+    expect(unreadableImportEdges([fixture])).toEqual([
+      'electron/module-policy-fixture.ts:1 imports a module this test cannot resolve statically',
+      'electron/module-policy-fixture.ts:2 uses dynamic import, whose startup execution and ordering this test cannot prove',
+    ])
+    expect(unsupportedElectronAcquisitions([fixture])).toEqual([
+      'electron/module-policy-fixture.ts:3 uses a runtime re-export from electron that this test cannot trace',
+      'electron/module-policy-fixture.ts:4 acquires electron through require() instead of a direct named import',
+      'electron/module-policy-fixture.ts:5 acquires electron through import-equals instead of a direct named import',
+    ])
   })
 
   /**

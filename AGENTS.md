@@ -192,24 +192,26 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   'electron'`) or namespace import reaches the same functions through a shape this file does
   not read, and is refused on use for that reason. Ignoring the default binding let a channel
   be split across two `electron.ipcMain`/`electron.ipcRenderer` helpers with mismatched
-  strings that the built bundles kept.
+  strings that the built bundles kept. Runtime re-exports from `electron`, import-equals and
+  `require('electron')` are refused too; otherwise a local facade can rename a binding before
+  the scanner ever sees its import.
   The surface is built from the modules that **actually run** — the runtime import graph from
   `electron/main.ts` and `electron/preload.ts` — never from a directory listing, which is not
   a statement about what executes. A listing was wrong both ways: an unimported
   `electron/dead-ipc.ts` was parsed as live, so moving a registration there left the suite
   green while production registered nothing, and an imported `electron/ipc-parts/theme.ts`
   was outside the flat scan, so a real refactor failed for no reason.
-  Which edges count is the subtle part, and it is wrong in opposite directions if you take
-  the easy reading. An import is erased when its clause says `type` **or when every named
-  specifier does** — `import { type Marker } from './x.ts'` leaves the clause flag false
-  while eliding the whole module (this repo sets neither `verbatimModuleSyntax` nor
-  `importsNotUsedAsValues`), and following it counted a module whose handler never reached
-  `dist-electron/`. Conversely `import()` **is** a real edge: it emits and loads a chunk, so a
-  duplicate registration behind `void import('./late-handler.ts')` was invisible while
-  Electron would throw at startup. An edge whose specifier is not a literal is refused, not
-  guessed. Paths are compared POSIX-normalised, because `node:path.relative()` answers
-  `electron\main.ts` on Windows — a platform this repo ships to — and the reachability
-  assertions hard-code forward slashes.
+  Which edges count is the subtle part. `verbatimModuleSyntax: true` is load-bearing and
+  pinned by the suite: ordinary imports stay in the bundle even when used only as types, so
+  the syntax walk cannot disagree with Vite about them. Only a whole-clause `import type` or
+  `export type` erases an edge; `import { type Marker }` emits an empty side-effect import and
+  still executes the module. Dynamic `import()` is refused even with a literal target,
+  because its presence proves neither that its branch/function runs nor that an asynchronously
+  loaded handler registers before the renderer invokes it. Static relative edges resolve
+  through TypeScript (including `./x.js` → `./x.ts` substitution), and an unresolved one is
+  refused rather than mistaken for an external package. Paths are compared POSIX-normalised,
+  because `node:path.relative()` answers `electron\main.ts` on Windows — a platform this repo
+  ships to — and the reachability assertions hard-code forward slashes.
 - **Repository registration** → the add-vs-update rule lives ONLY in `core/repo-registry.ts`;
   `electron/ipc.ts`'s `github:setRepos` and `cli/index.ts`'s `repos add`/`repos remove` must all stay
   thin delegations to `createMaoApp()`'s `updateRepos`. Re-implementing the diff in either shell is how the two paths silently drift.

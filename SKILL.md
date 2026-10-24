@@ -99,9 +99,14 @@ Additionally, because CI does **not** cover them:
   key, an ES method shorthand, a multi-line call and a unicode escape are all just syntax to
   it. The surface comes from the runtime import graph rooted at `electron/main.ts` and
   `electron/preload.ts`, so an unimported file does not count as registered and an imported
-  nested module does — where "imported" means a non-erased edge: an import whose every named
-  specifier is `type` is elided and does not count, while `import()` does, and a computed
-  specifier is refused. Paths are POSIX-normalised so the suite also runs on Windows.
+  nested module does. `verbatimModuleSyntax: true` is pinned so every ordinary static import
+  stays a runtime edge even when its binding is used only as a type; only whole-clause
+  `import type` / `export type` edges disappear (`import { type Marker }` still emits a
+  side-effect edge). Dynamic `import()` is refused because neither execution nor registration
+  ordering can be proven, unresolved relative imports are refused, and TypeScript resolution
+  preserves valid substitutions such as `./x.js` → `./x.ts`. Runtime `electron` re-exports,
+  import-equals and `require('electron')` are refused rather than allowed to hide a binding.
+  Paths are POSIX-normalised so the suite also runs on Windows.
   Still not covered, so still worth `npm run dev`: whether the handler actually *does* the
   right thing, and anything the renderer swallows. A renderer that catches a rejected
   `invoke` — several do, deliberately — turns a broken channel into a feature that silently

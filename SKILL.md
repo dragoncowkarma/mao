@@ -220,28 +220,59 @@ is preflighted, and because the unusable value names no tracked repository every
 registration — so `repos add` needs a working GitHub token, and fails leaving the bad value in place
 without one.
 
+A real array holding **unusable entries** is reported but *not* substituted — `isRepoRef` /
+`canonicalRepoList` still own entry validity, and answering `[]` here would delete the rows that work.
+The message counts them instead:
+
+```
+[store] "githubRepos" in /path/to/config.json contains 1 invalid entry out of 2 — ignoring it in
+memory and keeping 1 tracked repository. No stored value is shown in this report. The invalid entry is
+still in the file, and the next repository-list write — adding or removing any repository is one —
+drops it for good, so repair it in /path/to/config.json first if it was meant to name a repository.
+The sidebar's Reset stored list is withheld while usable entries remain, because writing an empty list
+would delete the repositories that still work.
+```
+
+Only the **count** is ever printed, never entry contents: the GitHub token lives in the same JSON blob,
+and these messages reach piped output, agent logs and a possibly screen-shared window. The count is the
+point — the sidebar and `mao repos list` show only the survivors, so nothing else tells you whether one
+row or twelve are about to be overwritten. When *no* entry is usable the message says `and no usable
+entry` and carries the same whole-list recovery as a wrong-typed value, because that state is the same
+dead end: `github:getRepos` filters it to `[]`, so the GUI has no row, no Settings tab and no Remove
+button, and without a working token Add is refused too.
+
 Because stderr is easy to miss (`2>/dev/null` discards it), the same thing is queryable. `mao config
 show` reports it as `storeProblems` — one entry per field, each with the field name, the config file and
-the message — so a diagnostic command never reports a value that is not in the file. The GUI polls the
-same list over `app:storeProblems` and the sidebar shows it in place of "No projects yet", with a
-**Reset stored list** button (two-step) that discards the unusable value by writing an empty list. That
-is the GUI's only always-available recovery: with no usable list there is no project row, so no Settings
-tab and no Remove button, and Add can be refused by the preflight. The button re-checks before it
-writes — heal the store from a terminal while the window is open and confirming the reset picks up the
-repaired list instead of wiping it — and it appears only when `githubRepos` itself is the unusable
-value. A hand-edit made while the window is open is picked up by the sidebar's 30s poll, so the notice
+the message, plus a `nothingUsable` flag when none of the value is usable — so a diagnostic command
+never reports a value that is not in the file. The GUI polls the same list over `app:storeProblems` and
+the sidebar shows every entry of it in place of "No projects yet".
+
+**The report and the destructive recovery are separate, and the recovery is gated on `nothingUsable`.**
+The **Reset stored list** button (two-step) discards the stored value by writing an empty list, and it
+appears only when `githubRepos` itself is what is unusable *and* nothing in it is still usable. That is
+the GUI's only always-available recovery for those dead ends: with no usable list there is no project
+row, so no Settings tab and no Remove button, and Add can be refused by the preflight. For a list that
+still holds working entries the notice appears and the button does **not** — an empty list would delete
+the repositories you can see in the sidebar; recover that case from `config.json` by hand, or accept the
+loss, since any repository-list write drops the bad entries and keeps the good ones. The button also
+re-checks before it writes — heal the store from a terminal while the window is open, or repair it into
+the partly-usable state, and confirming the reset adopts what the store now holds instead of wiping
+it. A hand-edit made while the window is open is picked up by the sidebar's 30s poll, so the notice
 does not wait for the next write to appear — and when that poll finds the list repaired (by `mao repos
 add` in a terminal, say), the GUI re-reads the list too, so the projects appear instead of the sidebar
 going quiet but staying empty. If that re-read fails, the repair stays pending and the next poll
 retries rather than leaving the window stuck until it is restarted, and a read overtaken by a newer
 observation or by a write from the window itself is discarded rather than applied — so a settings edit
-saved while a repair is being picked up is not quietly rolled back to the pre-edit value. `mao repos remove` also says which unusable value it
-replaced — without that line the command that always heals prints only `No tracked repo matches …`
-and reads like a no-op.
+saved while a repair is being picked up is not quietly rolled back to the pre-edit value. `mao repos
+remove` also says what it healed — `Replaced the unusable "githubRepos" value in …` when the whole
+value went, `Dropped the unusable "githubRepos" entries from …` when only entries did — because
+without that line the command that always heals prints only `No tracked repo matches …` and reads
+like a no-op.
 
 **Recovering an unreadable `workflowTasks` — the one field that halts automation.** The other two are
-reported and safely corrected for readers and nothing else: `mao repos list` prints `[]`, `mao config
-show` stays parseable, and an unusable `aiProviders` keeps any valid entries (or leaves none, so every
+reported and safely corrected for readers and nothing else: `mao repos list` prints `[]` for a wrong
+container (and the raw list, junk entries included, for a wrong *entry* — `canonicalRepoList` drops
+those on the next write), `mao config show` stays parseable, and an unusable `aiProviders` keeps any valid entries (or leaves none, so every
 stage fails with the existing retryable "No AI providers registered"). A queue with a wrong container
 or even one invalid entry is different, and deliberately fails closed:
 

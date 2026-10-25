@@ -102,7 +102,13 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
    `import type`, so nothing Node-side is pulled into the bundle. Importing a value
    from any other `core/` module is not allowed; re-implementing one of these rules
    in `src/` instead is worse, and is what let the board and the registry disagree
-   about whether two spellings were the same repository. Imports stay extensionless. There are no IPC push events — the
+   about whether two spellings were the same repository. Imports stay extensionless.
+   The "all `import type`" half of this is load-bearing in a second direction that is easy to miss:
+   `core/store.ts` **value**-imports `isRepoRef` from `core/repo-registry.ts`, because a dropped-entry
+   report must count with the same predicate that actually drops the entries (`canonicalRepoList()`,
+   `github:getRepos`) or it tells the operator two vanished while three did. That edge is safe only
+   because `repo-registry.ts` imports nothing from `core/` at runtime; drop a `type` keyword there and
+   the pair becomes a module-initialisation cycle. `core/repo-registry.test.ts` asserts it. There are no IPC push events — the
    UI polls and re-fetches after each mutation; keep that pull model.
 7. **Electron security posture.** `webPreferences` set only `preload` so Electron 33
    defaults apply (contextIsolation on, nodeIntegration off, sandbox on) — never
@@ -671,7 +677,32 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   "the file is fine".
   Element-level validation covers the complete declared `aiProviders` and `workflowTasks` shapes, but
   deliberately does not add semantic policy such as requiring non-empty credentials, known models, or a
-  PR number at a particular stage; those remain the owning settings/engine paths' errors. `mao swarm`
+  PR number at a particular stage; those remain the owning settings/engine paths' errors.
+  **`githubRepos` is reported at entry level but never filtered or replaced there (issue #72).** Entry
+  validity is `isRepoRef`/`canonicalRepoList`'s policy and they need to *see* the junk in order to drop
+  it, so `usableStoredValue()` has an explicit pass-through arm for it: without that arm the function's
+  fallthrough replaces the value with `[]` the moment a report exists, turning PR #57's recovery — a
+  list write drops the junk while keeping the good rows — into "delete every tracked repository".
+  `github:getRepos` still filters for render. Reporting it is the other half: the drop used to be
+  silent, which is the same dead end for an operator as the unguarded crash was — a `config.json`
+  holding `[null]`, a half-written `[{"owner":"acme"}]` or a bare `["acme/widgets"]` left the sidebar
+  reading *"No projects yet"* and `mao repos list` printing `[]` on a clean stderr, and with no token
+  (or revoked access) even Add was refused by the registration preflight, so there was no in-app
+  recovery at all.
+  **A report and a destructive recovery are separate things.** `StoredValueProblem.nothingUsable`
+  (optional and only-ever-`true`, like `wholeFile`) is the gate a shell must hang a
+  "replace this with the schema default" control off — never the report's mere existence.
+  `[null, {owner:'acme',repo:'one'}]` is worth reporting, because the next list write erases that entry
+  from the file for good, while acme/one is on screen and working: writing an empty list to clear the
+  notice would delete the operator's own data. So the sidebar shows every report and withholds **Reset
+  stored list** unless nothing usable would be lost, and `resetRepoList` re-checks the same flag before
+  it writes, because a hand-edit can make a list partly usable after the card rendered. The flag is
+  judged per field by `storedValueNothingUsable()`, with that field's *own* entry predicate, so a value
+  kept in memory can never be reported as nothing-usable. Entry reports stay **counted and value-free**
+  — how many entries of how many, never their contents: `githubToken` lives in the same JSON blob, and
+  these messages reach piped output, agent logs, an IPC payload and a possibly screen-shared window.
+  The count is the one fact the operator cannot get elsewhere, since the sidebar and `github:getRepos`
+  show only the survivors. `mao swarm`
   reads none of this: it is a separate
   Python engine with a separate credential, so "the queue is latched" must never be read as "this host
   performs no unattended GitHub writes".

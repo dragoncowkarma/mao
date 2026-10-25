@@ -33,9 +33,24 @@ const OTHER_TWO: RepoRef = { owner: 'other', repo: 'two' }
 const UNUSABLE_REPO_LIST: StoredValueProblem = {
   field: 'githubRepos',
   source: '/data/config.json',
+  nothingUsable: true,
   message:
     '[store] "githubRepos" in /data/config.json is an object, not a JSON array of { owner, repo } ' +
     'entries — ignoring it, so no repositories are tracked until it is replaced.',
+}
+
+/**
+ * A repository list that is a real array and still holds a usable entry, with junk beside it —
+ * `[null, { owner: 'acme', repo: 'one' }]` on disk. `github:getRepos` filters the junk out, so the
+ * renderer is handed a list that looks perfectly healthy; the absent `nothingUsable` is the only thing
+ * that says otherwise, and it is what has to keep the destructive reset off the screen (issue #72).
+ */
+const DROPPED_REPO_ENTRIES: StoredValueProblem = {
+  field: 'githubRepos',
+  source: '/data/config.json',
+  message:
+    '[store] "githubRepos" in /data/config.json contains 1 invalid entry out of 2 — ignoring it in ' +
+    'memory and keeping 1 tracked repository.',
 }
 
 /**
@@ -220,6 +235,42 @@ describe('App unusable stored settings', () => {
     await waitFor(() => expect(screen.queryByText(/is an object, not a JSON array/)).toBeNull())
     expect(stub.setRepos).not.toHaveBeenCalled()
     expect(await screen.findByRole('button', { name: 'acme/one' })).toBeInTheDocument()
+  })
+
+  it('reports dropped entries without offering to delete the ones that still work', async () => {
+    // The card issue #72 separates from the unusable-value one. `[null, { owner: 'acme', repo: 'one' }]`
+    // on disk: `github:getRepos` filters the null away, so the sidebar looks entirely healthy and the
+    // operator has no way to learn that an entry is sitting in the file waiting to be overwritten. So the
+    // notice has to appear — and the destructive reset must NOT, because it writes an empty list, which
+    // would delete acme/one. The notice and the recovery are different things.
+    await renderApp([ONE], [DROPPED_REPO_ENTRIES])
+
+    expect(await screen.findByText(/contains 1 invalid entry out of 2/)).toBeInTheDocument()
+    expect(screen.getByText(/could not be read/)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Reset stored list' })).toBeNull()
+    // And the repository that survived is still reachable — a notice must not cost the operator the rows.
+    expect(sidebarProject(ONE)).toBeInTheDocument()
+  })
+
+  it('refuses a reset when a hand-edit made the list partly usable after the card rendered', async () => {
+    // The same protection at the moment of the write rather than of the render. The card can be minutes
+    // old — the report itself sends the operator to `config.json` — so repairing one of two junk entries
+    // in a terminal leaves the button on screen while an empty list would now destroy what that edit
+    // rescued. Fail closed: adopt what the store says and write nothing.
+    const { stub, user } = await renderApp([], [UNUSABLE_REPO_LIST])
+    await screen.findByText(/is an object, not a JSON array/)
+    stub.storeProblems.mockResolvedValue([DROPPED_REPO_ENTRIES])
+    stub.applyRepos([ONE])
+
+    await user.click(screen.getByRole('button', { name: 'Reset stored list' }))
+    await user.click(screen.getByRole('button', { name: 'Confirm reset' }))
+
+    await waitFor(() => expect(screen.getByText(/contains 1 invalid entry out of 2/)).toBeInTheDocument())
+    expect(stub.setRepos).not.toHaveBeenCalled()
+    expect(stub.storedRepos()).toEqual([ONE])
+    expect(await screen.findByRole('button', { name: 'acme/one' })).toBeInTheDocument()
+    // The button is gone with the verdict it hung off, so the operator cannot simply click again.
+    expect(screen.queryByRole('button', { name: 'Reset stored list' })).toBeNull()
   })
 
   it('offers no reset for a report about a field the reset does not touch', async () => {

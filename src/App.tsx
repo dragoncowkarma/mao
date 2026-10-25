@@ -135,8 +135,11 @@ export default function App() {
    * repaired since the last one.
    *
    * That transition is the only thing worth acting on. While the list is unusable the renderer holds
-   * `[]` — the guard's answer, not a list — so it is not stale, it is correct; and once a repair has
-   * been adopted there is nothing further to take. Re-reading on *every* poll instead would reintroduce
+   * what `github:getRepos` answered — `[]` for a value the guard replaced, the surviving entries for a
+   * list whose invalid ones were filtered — so it is not stale, it is correct; and once a repair has
+   * been adopted there is nothing further to take. Keyed on *any* `githubRepos` report rather than on
+   * `nothingUsable`: repairing one junk entry of two changes which repositories exist, so the list has
+   * to be re-read then too, even though the report itself stays up. Re-reading on *every* poll instead would reintroduce
    * the hazard `persistRepos`' success path avoids: a round trip landing mid-typing stomps newer
    * keystrokes in the settings pane.
    *
@@ -601,7 +604,12 @@ export default function App() {
     // deletes the healthy list they just built. Fail closed: a read that throws aborts the reset.
     const current = await electronApi().app.storeProblems()
     applyStoreProblems(current)
-    if (!current.some((problem) => problem.field === 'githubRepos')) {
+    // `nothingUsable`, not merely "a githubRepos report exists". A hand-edit between this card
+    // rendering and the click can leave the list *partly* usable — repair one of two junk entries and
+    // the report stays, but an empty list would now delete the repository that edit just rescued. The
+    // button is not offered in that state either (see Sidebar's `canResetRepoList`); this is the
+    // re-read that makes the judgement true at the moment of the write rather than of the render.
+    if (!current.some((problem) => problem.field === 'githubRepos' && problem.nothingUsable)) {
       await adoptRepairedRepoList().catch(() => {})
       return
     }

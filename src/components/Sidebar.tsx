@@ -121,7 +121,23 @@ export default function Sidebar({
    * and third fields this now has to be distinguished from, so the check is load-bearing rather than
    * merely prospective.
    */
-  const repoListUnusable = storeProblems.some((problem) => problem.field === 'githubRepos')
+  const repoListProblem = storeProblems.find((problem) => problem.field === 'githubRepos')
+
+  /**
+   * Whether the destructive reset may be offered — the repository list is what is reported **and**
+   * nothing it holds is still usable.
+   *
+   * The second half is new with issue #72, and it is the whole reason a report and a recovery are
+   * separate controls here. A `githubRepos` of `[null, { owner: 'acme', repo: 'one' }]` is reported —
+   * an entry vanished, and the next list write erases it from the file for good — while acme/one is in
+   * the rows below, working. The reset writes an *empty* list, so offering it there would delete the
+   * repository the operator can see. So the notice always appears and the destructive button is
+   * withheld unless it would cost nothing.
+   *
+   * Read from core's verdict rather than from `repos.length`: that list is this window's optimistic
+   * mirror and can disagree with the store mid-write.
+   */
+  const canResetRepoList = repoListProblem?.nothingUsable === true
 
   /**
    * Whether the stored queue is unusable *right now*, which is not the same as this session being halted.
@@ -466,7 +482,7 @@ export default function Sidebar({
                 {problem.message}
               </p>
             ))}
-            {repoListUnusable &&
+            {canResetRepoList &&
               (confirmingReset ? (
                 <div className="flex gap-2">
                   <button onClick={submitReset} className="btn btn-primary text-xs" disabled={resetting}>
@@ -539,7 +555,11 @@ export default function Sidebar({
               {r.autoTrigger === false && <span className="text-[10px] opacity-70">off</span>}
             </button>
           ))}
-          {repos.length === 0 && !adding && !repoListUnusable && (
+          {/* Suppressed for any repository-list report, not only the resettable ones: "No projects yet"
+              is the sentence that made a discarded list indistinguishable from an empty one, and acting
+              on it is what destroys the file. (A partly usable list leaves rows, so this branch is
+              unreachable for it — the condition says what it means, not what is currently reachable.) */}
+          {repos.length === 0 && !adding && !repoListProblem && (
             <p className="text-muted text-xs px-2">No projects yet — add a repository to get started.</p>
           )}
         </nav>

@@ -212,11 +212,15 @@ repos
     // It heals only a file that LOADED: when the file itself could not be read, the write is refused
     // before it happens (issue #67), this command exits non-zero with that report, and nothing below
     // runs — which is the point, because the write would have destroyed the token along with the list.
+    //
+    // Which of the two it healed is core's verdict, not this shell's inference: a partly usable list had
+    // only its invalid *entries* dropped while every tracked repository stayed, and calling that
+    // "replaced the unusable value" would describe a destructive write that did not happen.
     const remaining = store.problems()
     for (const before of problemsBefore) {
-      if (!remaining.some((problem) => problem.field === before.field)) {
-        log(`Replaced the unusable "${before.field}" value in ${before.source}.`)
-      }
+      if (remaining.some((problem) => problem.field === before.field)) continue
+      if (before.nothingUsable) log(`Replaced the unusable "${before.field}" value in ${before.source}.`)
+      else log(`Dropped the unusable "${before.field}" entries from ${before.source}.`)
     }
   })
 

@@ -225,14 +225,31 @@ describe('FileStore githubRepos read guard', () => {
     expect(MAO_STORE_DEFAULTS.githubRepos).toEqual([])
   })
 
-  it('leaves element-level validity to repo-registry', () => {
-    // The boundary PR #57 drew: `isRepoRef`/`canonicalRepoList` own which *entries* are usable, and they
-    // need to see the junk to drop it. This guard owns the *container* only — the gap issue #60 found.
-    captureWarnings()
+  it('reports entries it cannot use, and still hands the usable ones through', () => {
+    // Both halves together, because separating them is the bug. `isRepoRef`/`canonicalRepoList` own which
+    // *entries* are usable and need to see the junk in order to drop it — so the guard must not filter or
+    // substitute here, or a list write would delete acme/widgets along with the null. But the drop was
+    // also completely silent, which is the dead end issue #72 is about: nothing on stdout, nothing on
+    // stderr, nothing in the sidebar.
+    const warn = captureWarnings()
     const { store } = storeHolding({ githubRepos: [null, widgets] })
 
     expect(store.get('githubRepos')).toEqual([null, widgets])
     expect(canonicalRepoList(store.get('githubRepos'), store.get('githubRepos'))).toEqual([widgets])
+    expect(warn).toHaveBeenCalledTimes(1)
+    expect(warn.mock.calls[0]![0] as string).toContain('contains 1 invalid entry out of 2')
+  })
+
+  it('substitutes nothing for a list whose entries are all unusable either', () => {
+    // `[null]` has nothing worth keeping, so coercing it would be harmless — which is exactly why it must
+    // not be special-cased into the substitution branch. The rule is "the value's own type decides
+    // whether it is replaced", and a rule that also inspected entries is one edit from replacing
+    // `[null, widgets]` too. `canonicalRepoList` already yields `[]` here.
+    captureWarnings()
+    const { store } = storeHolding({ githubRepos: [null, 'acme/widgets'] })
+
+    expect(store.get('githubRepos')).toEqual([null, 'acme/widgets'])
+    expect(canonicalRepoList(store.get('githubRepos'), store.get('githubRepos'))).toEqual([])
   })
 
   it('returns a value the expression auto-trigger runs per tick can consume', () => {
@@ -595,6 +612,71 @@ describe('MaoStore.problems', () => {
     expect(store.problems()).toEqual([])
   })
 
+  it('reports dropped repo entries and withholds the nothing-usable flag', () => {
+    // The gap this closes: `problems()` only ever described the *container*, so `[null]` and
+    // `[null, widgets]` both reported clean. The sidebar read "No projects yet" for the first and showed
+    // acme/widgets for the second, and in neither case was anything said about the entry that was gone.
+    const warn = captureWarnings()
+    const { store, filePath } = storeHolding({ githubRepos: [null, widgets] })
+
+    const problems = store.problems()
+
+    expect(problems).toHaveLength(1)
+    expect(problems[0]!.field).toBe('githubRepos')
+    expect(problems[0]!.source).toBe(filePath)
+    // The whole point of separating the notice from the recovery: acme/widgets is still tracked, so
+    // writing the schema default over this value would delete data the operator can see working.
+    expect(problems[0]!.nothingUsable).toBeUndefined()
+    expect(problems[0]!.message).toContain('contains 1 invalid entry out of 2')
+    // Still a query, not a read — polling it must not consume the guard's one stderr line.
+    expect(warn).not.toHaveBeenCalled()
+  })
+
+  it('flags nothing-usable when a repo list holds no usable entry at all', () => {
+    // The case the operator has no other way out of: `github:getRepos` filters it to `[]`, so there is no
+    // row, so no project is selected, so the Settings tab's Remove never renders — and with no token (or
+    // revoked access) Add is refused by the registration preflight. The destructive reset is the only
+    // recovery left, and it costs nothing here, so it has to be offered.
+    captureWarnings()
+    const { store } = storeHolding({ githubRepos: [null, { owner: 'acme' }] })
+
+    expect(store.problems()[0]!.nothingUsable).toBe(true)
+  })
+
+  it('flags a non-list repo value too, so the two dead ends recover the same way', () => {
+    captureWarnings()
+    const { store } = storeHolding({ githubRepos: { 'acme/widgets': widgets } })
+
+    expect(store.problems()[0]!.nothingUsable).toBe(true)
+  })
+
+  it('judges the flag per field with that field\'s own entry predicate', () => {
+    // The flag must never contradict what was kept in memory, for any guarded field — a value a reader
+    // can still use being reported as nothing-usable is an offer to delete live data. `aiProviders`
+    // filters, so one surviving provider means the flag stays off; its all-invalid sibling turns it on.
+    captureWarnings()
+    const provider = { id: 'p1', name: 'p1', kind: 'api', apiFormat: 'anthropic', apiKey: 'k', model: 'm' }
+    const mixed = storeHolding({ aiProviders: [null, provider] }).store.problems()
+    const allBad = storeHolding({ aiProviders: [null, { id: 'p1' }] }).store.problems()
+
+    expect(mixed[0]!.field).toBe('aiProviders')
+    expect(mixed[0]!.nothingUsable).toBeUndefined()
+    expect(allBad[0]!.nothingUsable).toBe(true)
+  })
+
+  it('stops reporting once a list write has dropped the unusable entries', () => {
+    // The recovery for the partial case, and why its message says the next write destroys them: any
+    // repository-list write runs the value through `canonicalRepoList()`, which keeps the good rows.
+    captureWarnings()
+    const { store, filePath } = storeHolding({ githubRepos: [null, widgets] })
+
+    expect(store.problems()).toHaveLength(1)
+    store.set('githubRepos', canonicalRepoList(store.get('githubRepos'), store.get('githubRepos')))
+
+    expect(store.problems()).toEqual([])
+    expect(new FileStore(filePath).get('githubRepos')).toEqual([widgets])
+  })
+
   it('answers without needing the field to have been read first', () => {
     // The property the GUI depends on. The guard only learns about a field when something reads it, so
     // a list recorded as reads happen would answer "no problems" until `github:getRepos` had run — and
@@ -706,9 +788,62 @@ describe('describeStoredProblems', () => {
 })
 
 describe('describeUnusableRepoList', () => {
-  it('reports nothing for a list', () => {
+  it('reports nothing for a list of usable entries', () => {
     expect(describeUnusableRepoList([], '/tmp/config.json')).toBeNull()
     expect(describeUnusableRepoList([widgets], '/tmp/config.json')).toBeNull()
+    expect(describeUnusableRepoList([widgets, gadgets], '/tmp/config.json')).toBeNull()
+  })
+
+  it('counts the dropped entries and names no stored value', () => {
+    // The count is the one fact an operator cannot get anywhere else: the sidebar and `github:getRepos`
+    // show the survivors, so "three of your repositories are in the file and about to be overwritten" is
+    // invisible without it. Nothing from the value may appear — `config.json` holds githubToken in the
+    // same blob, and this message reaches piped output, agent logs, an IPC payload and a shared screen.
+    const halfWritten = { owner: 'sekrit-owner' }
+
+    const message = describeUnusableRepoList([null, null, halfWritten, widgets], '/tmp/config.json')
+
+    expect(message).toContain('contains 3 invalid entries out of 4')
+    expect(message).toContain('keeping 1 tracked repository')
+    expect(message).toContain('/tmp/config.json')
+    expect(message).not.toContain('sekrit-owner')
+  })
+
+  it('counts with isRepoRef itself, so the report matches what actually gets dropped', () => {
+    // Deliberately the shapes `isRepoRef` rejects rather than a list of guesses: the report has to count
+    // what `canonicalRepoList()` and `github:getRepos` really drop, or it tells an operator two entries
+    // vanished while three did. `{repo}` and `{owner:''}` are the half-written cases; the nested array is
+    // what an object spread would have turned into `{"0":"acme","1":"widgets"}` junk.
+    const rejected = [null, 'acme/widgets', 42, true, ['a', 'b'], {}, { owner: 'acme' }, { owner: '', repo: 'x' }]
+
+    const message = describeUnusableRepoList([...rejected, widgets], '/tmp/config.json')
+
+    expect(message).toContain(`contains ${rejected.length} invalid entries out of ${rejected.length + 1}`)
+    expect(canonicalRepoList([], [...rejected, widgets] as RepoRef[])).toEqual([widgets])
+  })
+
+  it('stays grammatical and singular at one of each', () => {
+    const message = describeUnusableRepoList([null, widgets], '/tmp/config.json')
+
+    expect(message).toContain('contains 1 invalid entry out of 2')
+    expect(message).toContain('ignoring it in memory and keeping 1 tracked repository')
+    expect(message).toContain('The invalid entry is still in the file')
+  })
+
+  it('offers the whole-list recovery only when nothing usable is left', () => {
+    // `mao repos remove` / Reset stored list heal by *replacing the list*, which is the right advice only
+    // when there is nothing in it to lose. Printed under a partly usable list it would read as an
+    // instruction to delete the repositories that still work.
+    const allBad = describeUnusableRepoList([null, { owner: 'acme' }], '/tmp/config.json')
+    const someBad = describeUnusableRepoList([null, widgets], '/tmp/config.json')
+
+    expect(allBad).toContain('no usable entry')
+    expect(allBad).toContain('mao repos remove')
+    expect(allBad).toContain('Reset stored list')
+    expect(someBad).not.toContain('mao repos remove')
+    // What it says instead: the entries are still on disk and the next write is what destroys them.
+    expect(someBad).toContain('drops it for good')
+    expect(someBad).toContain('withheld while usable entries remain')
   })
 
   it('distinguishes null from an object', () => {

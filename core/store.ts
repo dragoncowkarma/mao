@@ -250,13 +250,25 @@ function describeStoredType(value: unknown): string {
 }
 
 /**
- * The actionable report for a stored `githubRepos` that is not a list — or `null` when it is one and
- * there is nothing to report.
+ * The actionable report for a stored `githubRepos` the schema cannot fully use — or `null` when every
+ * part of it is usable.
+ *
+ * Covers the container **and** its entries. PR #57 made individual entries safe by having
+ * `canonicalRepoList()` drop anything `isRepoRef` rejects, and `github:getRepos` filter the same way —
+ * but the drop was silent, which left `[null]`, a half-written `[{"owner":"acme"}]`, or a bare
+ * `["acme/widgets"]` at a dead end: the sidebar read *"No projects yet"*, identical to a genuinely
+ * empty list, and `mao repos list` printed `[]` on a clean stderr. With no token configured (or access
+ * revoked) even Add is refused by the registration preflight, so there was no in-app recovery at all
+ * (issue #72). Entry-level validity is still `isRepoRef`/`canonicalRepoList`'s policy — this reports it
+ * rather than taking it over, and `usableStoredValue()` deliberately does not filter the list.
  *
  * Names the field, what the file actually holds, and the file itself, because none of those were
- * recoverable from what the operator used to get (`store.get(...).filter is not a function`). It also
- * states the recovery explicitly: the unusable value stays on disk, so the next list write is what
- * replaces it, and anything the operator wants to salvage has to be copied out first.
+ * recoverable from what the operator used to get (`store.get(...).filter is not a function`, or in the
+ * entry case: silence). It also states the recovery explicitly: the unusable value stays on disk, so the
+ * next list write is what replaces it, and anything the operator wants to salvage has to be copied out
+ * first. Only the **count** of dropped entries is ever printed, never their contents — `config.json`
+ * holds `githubToken` in the same JSON blob, and the count is the one fact the operator cannot get
+ * elsewhere, since the sidebar and `github:getRepos` show only the survivors.
  *
  * The recovery it names first registers nothing, and that ordering is load-bearing. Any list write heals
  * the file, but only a write that registers nothing new is exempt from the write-permission preflight
@@ -266,20 +278,62 @@ function describeStoredType(value: unknown): string {
  * remove` heals regardless. Recommending the blockable path first would send an operator whose token is
  * the reason they were editing `config.json` straight back into the wall.
  *
- * It names the GUI's **Reset stored list**, not its Remove, for a reason that is easy to get wrong: an
- * unusable list leaves the sidebar with no row, so no project is selected, so the Settings tab and the
- * Remove button inside it never render. Naming an action the operator cannot reach is worse than naming
- * none. Reset is the sidebar control this report itself is shown next to, and it writes an empty list.
+ * It names the GUI's **Reset stored list**, not its Remove, for a reason that is easy to get wrong: a
+ * list with nothing usable in it leaves the sidebar with no row, so no project is selected, so the
+ * Settings tab and the Remove button inside it never render. Naming an action the operator cannot reach
+ * is worse than naming none. Reset is the sidebar control this report itself is shown next to, and it
+ * writes an empty list.
+ *
+ * Shared by the two states that reach it — a value that is not a list at all, and a list no entry of
+ * which names a repository — because for an operator they are one dead end. Deliberately *not* reused
+ * for a partly usable list: there the sidebar has rows, Remove is reachable, and Reset is withheld, so
+ * every sentence here would be wrong or dangerous advice.
  */
+function repoListRecovery(source: string): string {
+  return (
+    'any repository-list write overwrites it. `mao repos remove <owner> <repo>`, or the ' +
+    "sidebar's Reset stored list, always works — neither registers anything, so neither is checked " +
+    "for write access. `mao repos add` and the sidebar's Add are, so they need a working GitHub " +
+    `token. Copy any repositories you still need out of ${source} first.`
+  )
+}
+
 export function describeUnusableRepoList(value: unknown, source: string): string | null {
-  if (Array.isArray(value)) return null
+  if (Array.isArray(value)) {
+    // Counted with `isRepoRef` itself, not a restatement of it: `canonicalRepoList()` drops entries with
+    // that predicate and `github:getRepos` filters the sidebar's rows with it, so a second definition
+    // here would tell an operator two entries vanished while three did.
+    const invalid = countInvalidEntries(value, isRepoRef)
+    if (invalid === 0) return null
+    const valid = value.length - invalid
+    const invalidCount = countPhrase(invalid, 'invalid entry', 'invalid entries')
+    const subject = invalid === 1 ? 'The invalid entry is' : 'The invalid entries are'
+    const them = invalid === 1 ? 'it' : 'them'
+    // No usable entry left is the same dead end as a wrong-typed value — `github:getRepos` filters this
+    // to `[]`, so there is no row, no Settings tab and no Remove button, and without a working token Add
+    // is refused too — so it gets the same whole-list recovery.
+    if (valid === 0) {
+      return (
+        `[store] "githubRepos" in ${source} contains ${invalidCount} out of ${value.length} and no ` +
+        'usable entry — so no repositories are tracked, exactly as if the value were not a list at all. ' +
+        `No stored value is shown in this report. ${subject} still in the file; ` +
+        repoListRecovery(source)
+      )
+    }
+    return (
+      `[store] "githubRepos" in ${source} contains ${invalidCount} out of ${value.length} — ignoring ` +
+      `${them} in memory and keeping ${countPhrase(valid, 'tracked repository', 'tracked repositories')}. ` +
+      `No stored value is shown in this report. ${subject} still in the file, and the next ` +
+      `repository-list write — adding or removing any repository is one — drops ${them} for good, so ` +
+      `repair ${them} in ${source} first if ${invalid === 1 ? 'it was' : 'they were'} meant to name ` +
+      "repositories. The sidebar's Reset stored list is withheld while usable entries remain, because " +
+      'writing an empty list would delete the repositories that still work.'
+    )
+  }
   return (
     `[store] "githubRepos" in ${source} is ${describeStoredType(value)}, not a JSON array of ` +
     '{ owner, repo } entries — ignoring it, so no repositories are tracked until it is replaced. The ' +
-    'unusable value is still in the file; any repository-list write overwrites it. `mao repos remove ' +
-    "<owner> <repo>`, or the sidebar's Reset stored list, always works — neither registers anything, so " +
-    'neither is checked for write access. `mao repos add` and the sidebar\'s Add are, so they need a ' +
-    `working GitHub token. Copy any repositories you still need out of ${source} first.`
+    `unusable value is still in the file; ${repoListRecovery(source)}`
   )
 }
 
@@ -442,12 +496,19 @@ function unusableStoredValue<K extends keyof MaoStoreSchema>(
  * A wrong container has no readable entries, so it still becomes the cloned schema default. For the
  * two issue #75 lists, however, a mixed array is not all-or-nothing: keep each entry whose complete
  * declared shape is safe and leave the invalid entries only on disk until an explicit list write.
+ *
+ * `githubRepos` is a third case: reported (issue #72) but neither filtered nor replaced. Its entry
+ * policy belongs to `isRepoRef`/`canonicalRepoList`, which need to *see* the junk in order to drop it,
+ * and the fallthrough below would hand `[]` to every caller the moment a report existed — turning PR
+ * #57's recovery (a list write drops the junk while keeping the good rows) into "delete every tracked
+ * repository". The array is passed through unchanged; `github:getRepos` filters it for render.
  */
 function usableStoredValue<K extends keyof MaoStoreSchema>(
   key: K,
   raw: MaoStoreSchema[K],
   problem: string | null,
 ): MaoStoreSchema[K] {
+  if (key === 'githubRepos' && Array.isArray(raw)) return raw
   if (key === 'aiProviders' && Array.isArray(raw)) {
     return Array.from(raw as unknown[]).filter(isAiProviderConfig) as MaoStoreSchema[K]
   }
@@ -457,6 +518,27 @@ function usableStoredValue<K extends keyof MaoStoreSchema>(
       .map(normalizeRestorableTask) as MaoStoreSchema[K]
   }
   return problem === null ? raw : structuredClone(MAO_STORE_DEFAULTS[key])
+}
+
+/**
+ * Whether nothing the field holds is usable — see `StoredValueProblem.nothingUsable`.
+ *
+ * Field-specific and sitting beside `usableStoredValue()` for the same reason that one is: the answer is
+ * "does this field's own entry predicate accept anything here", and each field has a different predicate.
+ * Reusing those exact predicates is what keeps this from disagreeing with the filter — a value kept in
+ * memory must never be reported as nothing-usable, or a shell would offer to delete it.
+ *
+ * A non-array answers `true` for every field: the container is replaced wholesale by the schema default,
+ * so there is nothing in it to lose. A field with no entry predicate also answers `true`, which is the
+ * conservative direction only because reaching here at all means its whole value was unusable.
+ */
+function storedValueNothingUsable<K extends keyof MaoStoreSchema>(key: K, raw: MaoStoreSchema[K]): boolean {
+  if (!Array.isArray(raw)) return true
+  const entries = raw as unknown[]
+  if (key === 'githubRepos') return !entries.some(isRepoRef)
+  if (key === 'aiProviders') return !entries.some(isAiProviderConfig)
+  if (key === 'workflowTasks') return !entries.some(isRestorableQueuedTask)
+  return true
 }
 
 /**
@@ -561,6 +643,23 @@ export interface StoredValueProblem {
    * message text, which no UI should parse.
    */
   wholeFile?: true
+  /**
+   * True when **nothing** the field holds is usable, so replacing its stored value with the schema
+   * default would discard nothing that works.
+   *
+   * The gate a shell must hang a destructive "reset this to the default" control off, and the reason a
+   * report and that recovery are separate things. A `githubRepos` of
+   * `[null, { owner: 'acme', repo: 'one' }]` is worth reporting — an entry vanished, and the next list
+   * write erases it from the file for good — while acme/one is on screen and working, so writing an
+   * empty list to clear the notice would delete the operator's own data (issue #72).
+   *
+   * A flag rather than something a UI infers from `field`, the message text, or a row count: `src/` may
+   * not value-import this module (architecture rule 6 — it reads `node:fs`), the renderer's `repos` is
+   * an optimistic mirror that can disagree with the store mid-write, and no UI should parse a message.
+   * Optional and only-ever-`true`, like `wholeFile` above, so a shell that does not know about it keeps
+   * its existing behaviour rather than silently reading `false` as permission.
+   */
+  nothingUsable?: true
 }
 
 /**
@@ -582,8 +681,17 @@ export function describeStoredProblems(
 ): StoredValueProblem[] {
   const problems: StoredValueProblem[] = []
   for (const field of Object.keys(STORED_SHAPE_RULES) as Array<keyof MaoStoreSchema>) {
-    const message = unusableStoredValue(field, readRaw(field), source)
-    if (message !== null) problems.push({ field, source, message })
+    // Read once into a local. For Electron every `readRaw` is a fresh whole-config read and
+    // `JSON.parse`, and `config.json` carries up to `MAX_FINISHED_TASKS` finished tasks with their full
+    // prompts and AI output — so asking twice per field would double the cost of every `problems()` call.
+    const raw = readRaw(field)
+    const message = unusableStoredValue(field, raw, source)
+    if (message === null) continue
+    const problem: StoredValueProblem = { field, source, message }
+    // Set, never cleared to `false`: the flag is optional so a shell that does not read it keeps its
+    // existing behaviour (see `StoredValueProblem.nothingUsable`).
+    if (storedValueNothingUsable(field, raw)) problem.nothingUsable = true
+    problems.push(problem)
   }
   return problems
 }

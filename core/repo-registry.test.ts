@@ -726,3 +726,37 @@ describe('createRepoRegistrar', () => {
     expect(github.assertRepoWorkflowWritable).not.toHaveBeenCalled()
   })
 })
+
+/**
+ * This module's directory, anchored to this file rather than to whatever directory vitest was started
+ * in — a guard that fails with ENOENT because someone narrowed a run from a subdirectory is a guard
+ * people learn to dismiss. Mirrors the anchoring in core/store.test.ts and src/electron-api.test.ts.
+ */
+const MODULE_DIR = (import.meta as unknown as { dirname?: string }).dirname ?? path.join(process.cwd(), 'core')
+
+/**
+ * Architecture rule 6's "renderer-importable" claim about this module, as a checked invariant.
+ *
+ * The rule is that `src/` may value-import this module because its own `core/` imports are *all*
+ * `import type` — so nothing Node-side is pulled into the renderer bundle. Nothing in the toolchain
+ * says so: dropping the `type` keyword from `import type { MaoStore } from './store.ts'` compiles
+ * cleanly, every other test stays green, and `node:fs` lands in the renderer bundle by way of
+ * `core/store.ts`.
+ *
+ * It also pins the other direction, which is why this is a test rather than prose. `core/store.ts`
+ * value-imports `isRepoRef` from here, because `describeUnusableRepoList()` has to count dropped
+ * entries with the same predicate that actually drops them (`canonicalRepoList()`, `github:getRepos`)
+ * or it tells an operator two entries vanished while three did. That edge is safe *only* because the
+ * reverse one is erased at compile time; turn an `import type` below into a value import and the pair
+ * becomes a genuine module-initialisation cycle, whose symptom is an `undefined` in whichever of the
+ * two loads second.
+ */
+describe('core/repo-registry.ts, imported by the renderer', () => {
+  const source = fs.readFileSync(path.join(MODULE_DIR, 'repo-registry.ts'), 'utf-8')
+
+  it('takes no value import from anywhere', () => {
+    const valueImports = [...source.matchAll(/^import\s+(?!type\b)[^\n]*?from\s+'([^']+)'/gm)].map((m) => m[1])
+
+    expect(valueImports).toEqual([])
+  })
+})

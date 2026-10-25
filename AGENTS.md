@@ -52,6 +52,7 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
 | `.agents/workflows/swarm_orchestrator.py` | Autonomous Worker/Reviewer/Maintainer lifecycle, credential-aligned write preflight, origin fetch/push identity binding, isolated worktrees, process registry, retry/cooldown, and safe merged-task cleanup; copied beside the CLI bundle by `scripts/build-cli.mjs` |
 | `.agents/workflows/swarm_orchestrator_test.py` | Standalone Python preflight, credential non-disclosure, dry-run, and worktree-safety regressions, included in `npm run test` |
 | `core/node-environment.test.ts` | Architecture rule 8 as a test: asserts the `core` vitest project still runs with no DOM in scope |
+| `src/electron-ipc-surface.test.ts` | The IPC lockstep's untypeable half as a test: channel strings in `electron/ipc.ts` and `electron/preload.ts` must be the same set, registered and exposed once each, and each named after the bridge method that calls it — plus a pin that the bridge still carries `satisfies Window['electronAPI']` |
 | `scripts/test-workflow.ts` | Standalone e2e harness against a real (throwaway) repo |
 | `scripts/check-origin.mjs` | Publish-preflight guard: validates every effective `origin` fetch/push URL against an expected host/owner/repo; failure output is fixed-category-only, never remote-derived strings (see SKILL.md) |
 | `scripts/check-origin.test.mjs` | Committed negative/positive matrix for the guard incl. its no-leak contract — `npm run test:origin`, also run in CI |
@@ -144,13 +145,73 @@ There is no codegen — these couplings are maintained by hand and only `npm run
 (tsc) catches part of the drift:
 
 - **New IPC channel** → 3 files in lockstep: `electron/ipc.ts`
-  (`ipcMain.handle('<domain>:<camelCaseAction>', …)`, domains `ai`/`github`/`workflow`),
-  `electron/preload.ts` (same channel string, same namespace), `src/electron.d.ts`
-  (mirror the signature). Channel strings are duplicated literals; a typo surfaces
-  only at runtime. A fourth file follows automatically:
-  `src/test/electron-api-stub.ts` builds its fake bridge with `satisfies ElectronApi`,
-  so tsc refuses to compile until the new channel is stubbed there too — that one you
-  find at lint time rather than at runtime.
+  (`ipcMain.handle('<domain>:<camelCaseAction>', …)`, domains
+  `app`/`ai`/`github`/`workflow`/`ui`), `electron/preload.ts` (same channel string, same
+  namespace), `src/electron.d.ts` (mirror the signature). Two more files follow
+  automatically, and between them most of this is no longer maintained by eye:
+  `src/test/electron-api-stub.ts` builds its fake bridge with `satisfies ElectronApi`, and
+  the bridge in `electron/preload.ts` itself carries `satisfies Window['electronAPI']` —
+  `contextBridge.exposeInMainWorld` takes `any`, so without that annotation tsc checked the
+  bridge against nothing at all. With it, a method missing from either side, an extra one,
+  or a signature that disagrees is a lint error. **Never remove it**; a test pins that it is
+  still there, because deleting it would silence every check it performs without anything
+  going red.
+  What no type can reach is the channel **strings** — `invoke('app:storeProblms')` is a
+  valid `string`, and `ipcMain.handle` is keyed by the same untyped literal in another file.
+  `src/electron-ipc-surface.test.ts` owns that half: the two sets must be equal, each
+  channel registered and exposed exactly once, and every channel named
+  `<namespace>:<method>` after the bridge method that invokes it. Keep that naming — it is
+  what turns a typo into a message naming the offending method rather than two sorted lists.
+  It also pins the **global the bridge is installed under**, which is the one string whose
+  being wrong removes the entire bridge: `exposeInMainWorld`'s first argument has to equal
+  the member `src/electron.d.ts` declares on `Window` *and* the property `src/main.tsx`
+  reads back off it, and there has to be exactly one install (a second one for the same key
+  is not additive — the renderer gets one of them). Pinned against those two files rather
+  than a literal in the test, so a rename has to land everywhere or the suite says which
+  side was missed.
+  That test reads the **TypeScript AST**, not the source text, and keep it that way. Regex
+  collectors recognised exactly one spelling and silently skipped the rest, which is worse
+  than not checking: both sides of a channel rewritten as `handle("x")`/`invoke("x_typo")`
+  left both collections together, the set comparison still balanced, and a runtime-broken
+  bridge shipped green. So the parser now **fails closed** — every `ipcMain.handle` and
+  `ipcRenderer.invoke` must name its channel as a plain string literal, and every `invoke`
+  must sit inside a namespace object, or the suite names the file and line. A channel moved
+  into a shared constant or built from a template is refused there for that reason: not
+  because it would not work, but because it would remove this protection without telling
+  anyone.
+  Failing closed on the *argument* is only half of it, so the **call form** fails closed
+  too. A shape the matcher did not recognise never entered the collection at all, which made
+  the literal check vacuous for it: `ipcMain['handle'](…)` paired with a mistyped
+  `ipcRenderer['invoke'](…)` is type-valid and left every assertion green over a channel with
+  no handler. The rule is therefore inverted — every *reference* to `ipcMain`,
+  `ipcRenderer` or `contextBridge` must be the object of a recognised direct call, so
+  destructuring the method out, aliasing the binding into a local, a namespace import, and
+  `ipcMain.on` (a send/on channel this test does not model) are all reported by file and line.
+  Recognition resolves the **import**, not an identifier spelling, so `import { ipcMain as
+  main }` is read rather than refused — while a **default** (`import electron from
+  'electron'`) or namespace import reaches the same functions through a shape this file does
+  not read, and is refused on use for that reason. Ignoring the default binding let a channel
+  be split across two `electron.ipcMain`/`electron.ipcRenderer` helpers with mismatched
+  strings that the built bundles kept. Runtime re-exports from `electron`, import-equals and
+  `require('electron')` are refused too; otherwise a local facade can rename a binding before
+  the scanner ever sees its import.
+  The surface is built from the modules that **actually run** — the runtime import graph from
+  `electron/main.ts` and `electron/preload.ts` — never from a directory listing, which is not
+  a statement about what executes. A listing was wrong both ways: an unimported
+  `electron/dead-ipc.ts` was parsed as live, so moving a registration there left the suite
+  green while production registered nothing, and an imported `electron/ipc-parts/theme.ts`
+  was outside the flat scan, so a real refactor failed for no reason.
+  Which edges count is the subtle part. `verbatimModuleSyntax: true` is load-bearing and
+  pinned by the suite: ordinary imports stay in the bundle even when used only as types, so
+  the syntax walk cannot disagree with Vite about them. Only a whole-clause `import type` or
+  `export type` erases an edge; `import { type Marker }` emits an empty side-effect import and
+  still executes the module. Dynamic `import()` is refused even with a literal target,
+  because its presence proves neither that its branch/function runs nor that an asynchronously
+  loaded handler registers before the renderer invokes it. Static relative edges resolve
+  through TypeScript (including `./x.js` → `./x.ts` substitution), and an unresolved one is
+  refused rather than mistaken for an external package. Paths are compared POSIX-normalised,
+  because `node:path.relative()` answers `electron\main.ts` on Windows — a platform this repo
+  ships to — and the reachability assertions hard-code forward slashes.
 - **Repository registration** → the add-vs-update rule lives ONLY in `core/repo-registry.ts`;
   `electron/ipc.ts`'s `github:setRepos` and `cli/index.ts`'s `repos add`/`repos remove` must all stay
   thin delegations to `createMaoApp()`'s `updateRepos`. Re-implementing the diff in either shell is how the two paths silently drift.

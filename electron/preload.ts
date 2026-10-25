@@ -1,6 +1,7 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import type { AiProviderConfig } from '../core/ai/types.ts'
 import type { GithubTask, GithubTaskDetail } from '../core/github-service.ts'
+import type { CommitGraphData } from '../core/commit-graph.ts'
 import type { RepoWorkflowCapability } from '../core/repo-capabilities.ts'
 import type {
   QueuedTask,
@@ -62,6 +63,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.invoke('github:fetchTasks', owner, repo),
     fetchTaskDetail: (owner: string, repo: string, number: number): Promise<GithubTaskDetail> =>
       ipcRenderer.invoke('github:fetchTaskDetail', owner, repo, number),
+    fetchCommitGraph: (owner: string, repo: string): Promise<CommitGraphData> =>
+      ipcRenderer.invoke('github:fetchCommitGraph', owner, repo),
     /**
      * Rejects (leaving the stored list untouched) when a newly added repo fails the write-permission
      * preflight. Resolves with the verdict for each newly registered repo, whose `unverified` grants

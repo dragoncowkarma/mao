@@ -248,6 +248,16 @@ github
     printJson(await githubService.fetchTaskDetail(owner, repo, parseInt(number, 10)))
   })
 
+github
+  .command('graph <owner> <repo>')
+  .description(
+    'Show recent commit history across branches as JSON (read-only, bounded — the GUI Graph tab\'s data)',
+  )
+  .action(async (owner: string, repo: string) => {
+    const { githubService } = loadApp()
+    printJson(await githubService.fetchCommitGraph(owner, repo))
+  })
+
 // --- workflow -----------------------------------------------------------------
 
 const workflow = program.command('workflow').description('Drive the issue -> PR -> review -> merge pipeline')

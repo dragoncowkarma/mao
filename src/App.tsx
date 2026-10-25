@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import Sidebar from './components/Sidebar'
 import KanbanBoard from './components/KanbanBoard'
 import WorkflowQueue from './components/WorkflowQueue'
+import CommitGraph from './components/CommitGraph'
 import ProjectSettings from './components/ProjectSettings'
 import GlobalSettings from './components/GlobalSettings'
 import UpdateBanner from './components/UpdateBanner'
@@ -15,7 +16,7 @@ import type { AppUpdateCheck } from './electron'
 /** Matches the board's own listing poll: this is a background diagnostic, not something to spin on. */
 const STORE_PROBLEM_POLL_MS = 30_000
 
-type ProjectTab = 'board' | 'queue' | 'settings'
+type ProjectTab = 'board' | 'queue' | 'graph' | 'settings'
 type View = 'project' | 'global-settings'
 
 /**
@@ -724,6 +725,12 @@ export default function App() {
                 Queue
               </button>
               <button
+                className={`tab ${projectTab === 'graph' ? 'active' : ''}`}
+                onClick={() => selectProjectTab('graph')}
+              >
+                Graph
+              </button>
+              <button
                 className={`tab ${projectTab === 'settings' ? 'active' : ''}`}
                 onClick={() => selectProjectTab('settings')}
               >
@@ -733,6 +740,7 @@ export default function App() {
 
             {projectTab === 'board' && <KanbanBoard repo={selected} />}
             {projectTab === 'queue' && <WorkflowQueue repo={selected} />}
+            {projectTab === 'graph' && <CommitGraph repo={selected} />}
             {projectTab === 'settings' && (
               <ProjectSettings repo={selected} onChange={updateSelectedRepo} onRemove={removeSelectedRepo} />
             )}

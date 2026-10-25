@@ -29,7 +29,8 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
 | --- | --- |
 | `core/workflow-engine.ts` | The state machine: queue, stage progression, CI gate, pause/advance/retry (agent routing itself lives in `core/agent-selection.ts`) |
 | `core/agent-selection.ts` | Pure, renderer-importable agent routing: `resolveStageAgent()` (maker-checker + role pins + `allowedStages` + model/effort resolution), `isStageEligible()`, `eligibleAgentsForRun()`, `previewStageAgent()`, plus the `WorkflowRole`/`STAGE_ROLE`/`ProviderOverride`/`RunOverride` definitions (re-exported by `core/workflow-engine.ts`, so `core/assignment.ts` and the shells import them unchanged) |
-| `core/github-service.ts` | Octokit REST wrapper (issues, PRs, labels, reviews, merge, CI status) — plus the read-only `checkRepoWorkflowCapability()` / `assertRepoWorkflowWritable()` preflight |
+| `core/commit-graph.ts` | Pure, renderer-importable commit-graph model for the Graph tab and `mao github graph`: `CommitGraphData`, `COMMIT_GRAPH_LIMITS` (the per-load REST call budget), `sortCommitsTopologically()` and the lane layout `layoutCommitGraph()` |
+| `core/github-service.ts` | Octokit REST wrapper (issues, PRs, labels, reviews, merge, CI status, the bounded read-only `fetchCommitGraph()`) — plus the read-only `checkRepoWorkflowCapability()` / `assertRepoWorkflowWritable()` preflight |
 | `core/repo-capabilities.ts` | Pure verdict logic for "can this credential run the pipeline in this repo?" — `evaluateRepoCapability()`, `describeRepoCapability()`, `describeUnverifiedGrants()`, `RepoCapabilityError` |
 | `core/repo-registry.ts` | Pure, renderer-importable repository identity plus the single definition of "this repo entry is newly registered" — `repoRefKey()`/`sameRepoRef()` (case-insensitive, as GitHub resolves owner/repo), `canonicalRepoList()`, `reposNeedingCapabilityCheck()` / `assertReposRegistrable()`, and the serialized `createRepoRegistrar()` both `github:setRepos` and `mao repos add`/`remove` write through |
 | `core/provider-import.ts` | CLI-only provider-file import for `mao config import-providers` (no IPC channel): reads and parses input, validates through the store write guard, persists, then logs imported IDs; rejection messages omit parser/backend errors and provider values |
@@ -97,8 +98,8 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
    component wired to the global is a component no renderer test can hand a fake. From
    `core/` it imports
    types, plus values from the modules marked *renderer-importable* in the
-   architecture map above — `core/agent-selection.ts`, `core/ai/provider-options.ts`
-   and `core/repo-registry.ts`, which are pure and whose own `core/` imports are all
+   architecture map above — `core/agent-selection.ts`, `core/ai/provider-options.ts`,
+   `core/commit-graph.ts` and `core/repo-registry.ts`, which are pure and whose own `core/` imports are all
    `import type`, so nothing Node-side is pulled into the bundle. Importing a value
    from any other `core/` module is not allowed; re-implementing one of these rules
    in `src/` instead is worse, and is what let the board and the registry disagree

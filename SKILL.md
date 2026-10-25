@@ -126,6 +126,7 @@ npm run cli -- repos add <owner> <repo> [--no-auto-trigger] [--poll-interval-ms 
 npm run cli -- repos list
 npm run cli -- github check <owner> <repo>       # open issues/PRs as JSON
 npm run cli -- github view <owner> <repo> <number>  # full body + comments for one issue/PR as JSON
+npm run cli -- github graph <owner> <repo>       # recent commits across branches as JSON (read-only, bounded)
 npm run cli -- workflow enqueue "<title>" --owner <o> --repo <r> [--no-auto-advance]
 npm run cli -- workflow enqueue "<title>" --owner <o> --repo <r> \
   --worker <providerId> --reviewer <providerId> --maintainer <providerId>  # pin specific agents per role

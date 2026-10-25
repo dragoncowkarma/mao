@@ -1,5 +1,6 @@
 import type { AiProviderConfig } from '../core/ai/types'
 import type { GithubTask, GithubTaskDetail } from '../core/github-service'
+import type { CommitGraphData } from '../core/commit-graph'
 import type { RepoWorkflowCapability } from '../core/repo-capabilities'
 import type { QueueRecoveryOutcome, QueueRecoveryState, QueuedTask, RepoRef, RunOverride } from '../core/workflow-engine'
 import type { AutoTriggerStatus } from '../core/auto-trigger'
@@ -29,6 +30,8 @@ declare global {
         setToken: (token: string) => Promise<void>
         fetchTasks: (owner: string, repo: string) => Promise<GithubTask[]>
         fetchTaskDetail: (owner: string, repo: string, number: number) => Promise<GithubTaskDetail>
+        /** A bounded, read-only window onto the repo's branch history. Laid out by core/commit-graph.ts. */
+        fetchCommitGraph: (owner: string, repo: string) => Promise<CommitGraphData>
         /**
          * Rejects (leaving the stored list untouched) when a newly added repo fails the write-permission
          * preflight. Resolves with the verdict for each newly registered repo, whose `unverified` grants

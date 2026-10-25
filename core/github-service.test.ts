@@ -672,3 +672,97 @@ describe('GithubService.assertRepoWorkflowWritable', () => {
     )
   })
 })
+
+describe('GithubService.fetchCommitGraph', () => {
+  function apiCommit(sha: string, parents: string[], message = `msg ${sha}\n\nbody`) {
+    return {
+      sha,
+      parents: parents.map((parent) => ({ sha: parent })),
+      html_url: `https://github.com/acme/widgets/commit/${sha}`,
+      author: { login: 'octocat' },
+      commit: {
+        message,
+        author: { name: 'Octo Cat', date: '2026-01-01T00:00:00Z' },
+        committer: { date: '2026-01-02T00:00:00Z' },
+      },
+    }
+  }
+
+  function branch(name: string, sha: string) {
+    return { name, commit: { sha } }
+  }
+
+  function makeGraphService(branches: ReturnType<typeof branch>[], pages: Record<string, ReturnType<typeof apiCommit>[]>) {
+    const listCommits = vi.fn(async ({ sha }: { sha: string }) => ({ data: pages[sha] ?? [] }))
+    const listBranches = vi.fn(async () => ({ data: branches }))
+    const { service, octokit } = makeServiceWithFakeOctokit({ repos: { listCommits, listBranches } })
+    return { service, octokit, listCommits, listBranches }
+  }
+
+  it('rejects without a request when no token is set', async () => {
+    await expect(new GithubService().fetchCommitGraph('acme', 'widgets')).rejects.toThrow('GitHub token is not set')
+  })
+
+  it('merges every branch page by SHA, default branch first, and keeps only the first message line', async () => {
+    const { service, listCommits } = makeGraphService(
+      [branch('feature', 'f1'), branch('main', 'm2')],
+      {
+        main: [apiCommit('m2', ['m1']), apiCommit('m1', [])],
+        feature: [apiCommit('f1', ['m1']), apiCommit('m1', [])],
+      },
+    )
+    const graph = await service.fetchCommitGraph('acme', 'widgets')
+
+    expect(graph.defaultBranch).toBe('main')
+    expect(graph.branches.map((b) => b.name)).toEqual(['main', 'feature'])
+    expect(graph.commits.map((c) => c.sha).sort()).toEqual(['f1', 'm1', 'm2'])
+    expect(graph.commits.find((c) => c.sha === 'm2')).toEqual({
+      sha: 'm2',
+      parents: ['m1'],
+      message: 'msg m2',
+      author: 'Octo Cat',
+      date: '2026-01-02T00:00:00Z',
+      url: 'https://github.com/acme/widgets/commit/m2',
+    })
+    expect(listCommits).toHaveBeenCalledWith(expect.objectContaining({ sha: 'main', per_page: 100 }))
+    expect(listCommits).toHaveBeenCalledWith(expect.objectContaining({ sha: 'feature', per_page: 30 }))
+    expect(graph).toMatchObject({ omittedBranches: 0, branchListComplete: true })
+  })
+
+  it('does not fetch a branch whose head is already among the commits read', async () => {
+    const { service, listCommits } = makeGraphService(
+      [branch('main', 'm2'), branch('workflow/7-merged', 'm1')],
+      { main: [apiCommit('m2', ['m1']), apiCommit('m1', [])] },
+    )
+    const graph = await service.fetchCommitGraph('acme', 'widgets')
+    expect(listCommits).toHaveBeenCalledTimes(1)
+    expect(graph.branches.map((b) => b.name)).toEqual(['main', 'workflow/7-merged'])
+  })
+
+  it('caps the branches it reads and reports the ones it left out', async () => {
+    const others = Array.from({ length: 30 }, (_, i) => branch(`b${String(i).padStart(2, '0')}`, `h${i}`))
+    const { service, listCommits } = makeGraphService([...others, branch('main', 'm')], {})
+    const graph = await service.fetchCommitGraph('acme', 'widgets')
+
+    expect(graph.branches).toHaveLength(20)
+    expect(graph.branches[0].name).toBe('main')
+    expect(graph.omittedBranches).toBe(11)
+    // One page per drawn branch and never more: the call budget is the point of the limit.
+    expect(listCommits).toHaveBeenCalledTimes(20)
+  })
+
+  it('flags a full branch-list page as possibly incomplete', async () => {
+    const full = Array.from({ length: 100 }, (_, i) => branch(`b${i}`, `h${i}`))
+    const { service } = makeGraphService(full, {})
+    const graph = await service.fetchCommitGraph('acme', 'widgets')
+    expect(graph.branchListComplete).toBe(false)
+  })
+
+  it('performs no write', async () => {
+    const { service, octokit } = makeGraphService([branch('main', 'm')], { main: [apiCommit('m', [])] })
+    await service.fetchCommitGraph('acme', 'widgets')
+    expect(octokit.rest.repos.createOrUpdateFileContents).not.toHaveBeenCalled()
+    expect(octokit.rest.git.createRef).not.toHaveBeenCalled()
+    expect(octokit.rest.pulls.create).not.toHaveBeenCalled()
+  })
+})

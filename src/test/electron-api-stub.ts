@@ -3,6 +3,7 @@ import { setElectronApi, type ElectronApi } from '../electron-api'
 import type { AppUpdateCheck } from '../electron'
 import type { AiProviderConfig } from '../../core/ai/types'
 import type { GithubTask } from '../../core/github-service'
+import type { CommitGraphData } from '../../core/commit-graph'
 import type { RepoWorkflowCapability } from '../../core/repo-capabilities'
 import type { StoredValueProblem, ThemePreference } from '../../core/store'
 import type {
@@ -63,6 +64,15 @@ export function createElectronApiStub(initialRepos: RepoRef[] = [], initialProbl
     }),
   )
   const fetchTasks = vi.fn(async (): Promise<GithubTask[]> => [])
+  const fetchCommitGraph = vi.fn(
+    async (): Promise<CommitGraphData> => ({
+      defaultBranch: 'main',
+      branches: [],
+      commits: [],
+      omittedBranches: 0,
+      branchListComplete: true,
+    }),
+  )
   const listProviders = vi.fn(async (): Promise<AiProviderConfig[]> => [])
   const listWorkflowTasks = vi.fn(async (): Promise<QueuedTask[]> => [])
 
@@ -115,6 +125,7 @@ export function createElectronApiStub(initialRepos: RepoRef[] = [], initialProbl
       setToken: notStubbed('github.setToken'),
       fetchTasks,
       fetchTaskDetail: notStubbed('github.fetchTaskDetail'),
+      fetchCommitGraph,
       setRepos,
       getRepos,
       autoTriggerStatus: notStubbed('github.autoTriggerStatus'),
@@ -148,6 +159,7 @@ export function createElectronApiStub(initialRepos: RepoRef[] = [], initialProbl
     checkUpdate,
     storeProblems,
     fetchTasks,
+    fetchCommitGraph,
     listProviders,
     listWorkflowTasks,
     /** What the fake store holds right now — the assertion target for "did the write land". */

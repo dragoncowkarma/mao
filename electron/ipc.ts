@@ -78,6 +78,12 @@ export function registerIpcHandlers() {
     return githubService.fetchTaskDetail(owner, repo, number)
   })
 
+  // Read-only and bounded in core (see GithubService.fetchCommitGraph); the renderer lays it out itself
+  // through core/commit-graph.ts, so this channel carries data, never pixels.
+  ipcMain.handle('github:fetchCommitGraph', (_event, owner: string, repo: string) => {
+    return githubService.fetchCommitGraph(owner, repo)
+  })
+
   // Newly registered repos are preflighted in core before anything is persisted; updates, removals
   // and reordering are not, so a repo whose access was revoked can still be turned off or removed.
   // The rule itself lives in core/repo-registry.ts — shared verbatim with `mao repos add`.

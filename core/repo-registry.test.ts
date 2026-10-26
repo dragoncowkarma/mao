@@ -10,6 +10,7 @@ import {
   repoRefKey,
   reposNeedingCapabilityCheck,
   sameRepoRef,
+  usableRepoList,
 } from './repo-registry.ts'
 import { RepoCapabilityError, evaluateRepoCapability } from './repo-capabilities.ts'
 import { FileStore } from './store.ts'
@@ -727,36 +728,84 @@ describe('createRepoRegistrar', () => {
   })
 })
 
-/**
- * This module's directory, anchored to this file rather than to whatever directory vitest was started
- * in — a guard that fails with ENOENT because someone narrowed a run from a subdirectory is a guard
- * people learn to dismiss. Mirrors the anchoring in core/store.test.ts and src/electron-api.test.ts.
- */
-const MODULE_DIR = (import.meta as unknown as { dirname?: string }).dirname ?? path.join(process.cwd(), 'core')
+describe('usableRepoList', () => {
+  it('keeps the repositories and drops everything that cannot name one', () => {
+    // The same predicate `canonicalRepoList` drops entries with, so what an operator is shown and what
+    // a write would keep cannot disagree.
+    const stored = [null, 'acme/widgets', 42, ['acme', 'widgets'], {}, { owner: 'acme' }, widgets, gadgets]
+
+    expect(usableRepoList(stored as RepoRef[])).toEqual([widgets, gadgets])
+  })
+
+  it('never passes a stored value through for a junk entry', () => {
+    // The exposure this exists to close. `mao config show` promises redaction and `mao repos list` is a
+    // diagnostic, and both used to serialize the raw array — so an operator who pasted a token into the
+    // wrong array while hand-editing `config.json` saw it echoed back on stdout.
+    const leaked = 'ghp_SHOULD_NOT_APPEAR'
+
+    const shown = JSON.stringify(usableRepoList([leaked, null, widgets] as unknown as RepoRef[]))
+
+    expect(shown).not.toContain(leaked)
+    expect(shown).toContain('widgets')
+  })
+
+  it('answers an empty list rather than throwing for a value that is not an array', () => {
+    // Total for `repoRefKey`'s reason: the read guard substitutes `[]` for a wrong container today, but
+    // a caller that hands this something else must get nothing back, not a crash on `.filter`.
+    expect(usableRepoList(undefined as unknown as RepoRef[])).toEqual([])
+    expect(usableRepoList({ 'acme/widgets': widgets } as unknown as RepoRef[])).toEqual([])
+  })
+
+  it('leaves a healthy list untouched', () => {
+    expect(usableRepoList([widgets, gadgets])).toEqual([widgets, gadgets])
+    expect(usableRepoList([])).toEqual([])
+  })
+})
 
 /**
- * Architecture rule 6's "renderer-importable" claim about this module, as a checked invariant.
+ * The two shells' *serializing* call sites, pinned as text.
  *
- * The rule is that `src/` may value-import this module because its own `core/` imports are *all*
- * `import type` — so nothing Node-side is pulled into the renderer bundle. Nothing in the toolchain
- * says so: dropping the `type` keyword from `import type { MaoStore } from './store.ts'` compiles
- * cleanly, every other test stays green, and `node:fs` lands in the renderer bundle by way of
- * `core/store.ts`.
+ * A mixed repository list reaches readers raw by design, so every surface that prints or renders it has
+ * to filter — and nothing in the compiler says so. `usableRepoList`'s own tests above prove the helper
+ * is right; they prove nothing about whether `mao config show` still calls it. The CLI is also outside
+ * what vitest collects (issue #83), and `electron/ipc.ts` cannot be imported from `core/` at all
+ * (architecture rule 1), so source text is the available instrument — the same one
+ * `core/store.test.ts` uses on `electron/store.ts`, for the same reason.
  *
- * It also pins the other direction, which is why this is a test rather than prose. `core/store.ts`
- * value-imports `isRepoRef` from here, because `describeUnusableRepoList()` has to count dropped
- * entries with the same predicate that actually drops them (`canonicalRepoList()`, `github:getRepos`)
- * or it tells an operator two entries vanished while three did. That edge is safe *only* because the
- * reverse one is erased at compile time; turn an `import type` below into a value import and the pair
- * becomes a genuine module-initialisation cycle, whose symptom is an `undefined` in whichever of the
- * two loads second.
+ * Deliberately only the sites that *serialize*. The other readers of `store.get('githubRepos')` must
+ * keep seeing the raw list: `repos add`/`repos remove` match with `sameRepoRef` to report the tracked
+ * spelling, and `startAutoTrigger` hands the list to `canonicalRepoList`, which needs the junk in order
+ * to drop it. A blanket "every read must be wrapped" rule would be wrong, not merely stricter.
  */
-describe('core/repo-registry.ts, imported by the renderer', () => {
-  const source = fs.readFileSync(path.join(MODULE_DIR, 'repo-registry.ts'), 'utf-8')
+describe('the surfaces that print the repository list', () => {
+  const REPO_ROOT = path.join(
+    (import.meta as unknown as { dirname?: string }).dirname ?? path.join(process.cwd(), 'core'),
+    '..',
+  )
 
-  it('takes no value import from anywhere', () => {
-    const valueImports = [...source.matchAll(/^import\s+(?!type\b)[^\n]*?from\s+'([^']+)'/gm)].map((m) => m[1])
+  /** Whitespace-insensitive, so reformatting a call site does not read as a regression. */
+  function squashed(file: string): string {
+    return fs.readFileSync(path.join(REPO_ROOT, file), 'utf-8').replace(/\s+/g, '')
+  }
 
-    expect(valueImports).toEqual([])
+  it('route every print of githubRepos through usableRepoList', () => {
+    const cli = squashed('cli/index.ts')
+    const ipc = squashed('electron/ipc.ts')
+
+    // `mao config show` — the command that promises secrets are redacted.
+    expect(cli).toContain("githubRepos:usableRepoList(store.get('githubRepos'))")
+    // `mao repos list`.
+    expect(cli).toContain("printJson(usableRepoList(store.get('githubRepos')))")
+    // The GUI's only read of the list, which the sidebar renders without a guard or an error boundary.
+    expect(ipc).toContain("ipcMain.handle('github:getRepos',()=>usableRepoList(store.get('githubRepos')))")
+  })
+
+  it('never hand a raw stored list straight to the printer', () => {
+    // The specific regression: dropping the wrapper leaves a bare read feeding `printJson`, which is how
+    // a credential-like junk entry reached stdout.
+    const cli = squashed('cli/index.ts')
+
+    expect(cli).not.toContain("printJson(store.get('githubRepos'))")
+    expect(cli).not.toContain("githubRepos:store.get('githubRepos')")
   })
 })

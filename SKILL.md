@@ -234,7 +234,11 @@ would delete the repositories that still work.
 ```
 
 Only the **count** is ever printed, never entry contents: the GitHub token lives in the same JSON blob,
-and these messages reach piped output, agent logs and a possibly screen-shared window. The count is the
+and these messages reach piped output, agent logs and a possibly screen-shared window. The same rule
+covers the *list* itself, not only the diagnostic — `mao config show`, `mao repos list` and the GUI
+sidebar all print it through `usableRepoList()` (`core/repo-registry.ts`), so an operator who pasted a
+token into the wrong array while hand-editing never sees it echoed back. The report still says how many
+entries were dropped, so filtering hides the values, never the fault. The count is the
 point — the sidebar and `mao repos list` show only the survivors, so nothing else tells you whether one
 row or twelve are about to be overwritten. When *no* entry is usable the message says `and no usable
 entry` and carries the same whole-list recovery as a wrong-typed value, because that state is the same
@@ -270,9 +274,10 @@ without that line the command that always heals prints only `No tracked repo mat
 like a no-op.
 
 **Recovering an unreadable `workflowTasks` — the one field that halts automation.** The other two are
-reported and safely corrected for readers and nothing else: `mao repos list` prints `[]` for a wrong
-container (and the raw list, junk entries included, for a wrong *entry* — `canonicalRepoList` drops
-those on the next write), `mao config show` stays parseable, and an unusable `aiProviders` keeps any valid entries (or leaves none, so every
+reported and safely corrected for readers and nothing else: `mao repos list` prints the repositories
+that are actually tracked — `[]` for a wrong container, and the surviving entries for a wrong *entry*
+(the invalid ones stay on disk until a write; `canonicalRepoList` drops them then), `mao config show`
+stays parseable, and an unusable `aiProviders` keeps any valid entries (or leaves none, so every
 stage fails with the existing retryable "No AI providers registered"). A queue with a wrong container
 or even one invalid entry is different, and deliberately fails closed:
 

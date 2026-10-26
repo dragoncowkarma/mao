@@ -460,6 +460,92 @@ describe('App unusable stored settings', () => {
     }
   })
 
+  it('adopts a partial repair that leaves the report standing, before an edit can destroy it', async () => {
+    // The data-loss bug the review caught. `[valid1, junkA, junkB]` on disk: the renderer holds
+    // `[valid1]` and a report is up. Repairing `junkA` into `valid2` leaves one invalid entry, so the
+    // report does NOT disappear — and keying the re-read on "does a report exist" makes that a
+    // `true -> true` non-transition. The mirror then still holds `[valid1]`, and the next settings edit
+    // submits that whole stale list, which `canonicalRepoList` honours: `valid2` is gone from disk for
+    // good. The fix re-reads while a report stands, so the mirror is current before any edit.
+    vi.useFakeTimers()
+    try {
+      const stub = createElectronApiStub([ONE], [DROPPED_REPO_ENTRIES])
+      render(
+        <StrictMode>
+          <App />
+        </StrictMode>,
+      )
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(screen.getByRole('button', { name: 'acme/one' })).toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'acme/two' })).toBeNull()
+
+      // A hand-edit in `config.json` repairs ONE of the two junk entries. The store now yields both
+      // repositories, and the report stays up because an invalid entry remains.
+      stub.applyRepos([ONE, TWO])
+      stub.storeProblems.mockResolvedValue([DROPPED_REPO_ENTRIES])
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+
+      // The repair is visible even though the report is still showing — the two are independent.
+      expect(screen.getByRole('button', { name: 'acme/two' })).toBeInTheDocument()
+      expect(screen.getByText(/contains 1 invalid entry out of 2/)).toBeInTheDocument()
+
+      // And the edit that used to destroy valid2 now carries it. Driven with fireEvent, not userEvent,
+      // because fake timers and userEvent deadlock (SKILL.md).
+      fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+      fireEvent.change(screen.getByRole('spinbutton'), { target: { value: '45' } })
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+
+      expect(stub.storedRepos().map((r) => `${r.owner}/${r.repo}`)).toEqual(['acme/one', 'acme/two'])
+      expect(stub.storedRepos()[0]!.pollIntervalMs).toBe(45_000)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('re-reads on every poll while a report stands, without disturbing the operator', async () => {
+    // The other half of the fix: the re-read is unconditional while a report is up, not once per
+    // transition — a second repair has to be picked up as readily as the first. And it must be
+    // harmless, so this also pins that an adoption which finds nothing changed leaves the operator's
+    // selection and the report exactly where they were.
+    vi.useFakeTimers()
+    try {
+      const stub = createElectronApiStub([ONE, TWO], [DROPPED_REPO_ENTRIES])
+      render(
+        <StrictMode>
+          <App />
+        </StrictMode>,
+      )
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      fireEvent.click(screen.getByRole('button', { name: 'acme/two' }))
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(screen.getByRole('heading', { name: 'acme/two' })).toBeInTheDocument()
+
+      const readsBefore = stub.getRepos.mock.calls.length
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+
+      // It really did re-read — otherwise this test would pass for a renderer that never polls at all.
+      expect(stub.getRepos.mock.calls.length).toBeGreaterThan(readsBefore)
+      // ...and the operator's selection survived it.
+      expect(screen.getByRole('heading', { name: 'acme/two' })).toBeInTheDocument()
+      expect(screen.getByText(/contains 1 invalid entry out of 2/)).toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('retries the repaired list on the next poll when the first read fails', async () => {
     // The repair transition is observable exactly once, so consuming it before the list is actually in
     // hand spends it: one transient rejection and the sidebar is stuck on "No projects yet" until the

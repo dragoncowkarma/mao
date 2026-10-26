@@ -52,6 +52,7 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
 | `.agents/workflows/swarm_orchestrator.py` | Autonomous Worker/Reviewer/Maintainer lifecycle, credential-aligned write preflight, origin fetch/push identity binding, isolated worktrees, process registry, retry/cooldown, and safe merged-task cleanup; copied beside the CLI bundle by `scripts/build-cli.mjs` |
 | `.agents/workflows/swarm_orchestrator_test.py` | Standalone Python preflight, credential non-disclosure, dry-run, and worktree-safety regressions, included in `npm run test` |
 | `core/node-environment.test.ts` | Architecture rule 8 as a test: asserts the `core` vitest project still runs with no DOM in scope |
+| `core/renderer-importable.test.ts` | Architecture rule 6's other half as a test: bundles each module `src/` may value-import and asserts its real import graph stays inside that allowlist (esbuild + `verbatimModuleSyntax`, no DOM, ~30ms) |
 | `src/electron-ipc-surface.test.ts` | The IPC lockstep's untypeable half as a test: channel strings in `electron/ipc.ts` and `electron/preload.ts` must be the same set, registered and exposed once each, and each named after the bridge method that calls it — plus a pin that the bridge still carries `satisfies Window['electronAPI']` |
 | `scripts/test-workflow.ts` | Standalone e2e harness against a real (throwaway) repo |
 | `scripts/check-origin.mjs` | Publish-preflight guard: validates every effective `origin` fetch/push URL against an expected host/owner/repo; failure output is fixed-category-only, never remote-derived strings (see SKILL.md) |
@@ -108,7 +109,11 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
    report must count with the same predicate that actually drops the entries (`canonicalRepoList()`,
    `github:getRepos`) or it tells the operator two vanished while three did. That edge is safe only
    because `repo-registry.ts` imports nothing from `core/` at runtime; drop a `type` keyword there and
-   the pair becomes a module-initialisation cycle. `core/repo-registry.test.ts` asserts it. There are no IPC push events — the
+   the pair becomes a module-initialisation cycle. `core/renderer-importable.test.ts` asserts it for all
+   three modules, by bundling each with esbuild and checking the real import graph — a regex over
+   import statements is not fail-closed (it misses double quotes, multiline clauses, side-effect
+   imports, `export … from` and dynamic `import()`), and `tsc` stays green for every one of them.
+   There are no IPC push events — the
    UI polls and re-fetches after each mutation; keep that pull model.
 7. **Electron security posture.** `webPreferences` set only `preload` so Electron 33
    defaults apply (contextIsolation on, nodeIntegration off, sandbox on) — never
@@ -683,7 +688,12 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   it, so `usableStoredValue()` has an explicit pass-through arm for it: without that arm the function's
   fallthrough replaces the value with `[]` the moment a report exists, turning PR #57's recovery — a
   list write drops the junk while keeping the good rows — into "delete every tracked repository".
-  `github:getRepos` still filters for render. Reporting it is the other half: the drop used to be
+  Every surface that prints or renders the list therefore filters, through the single
+  `usableRepoList()` in `core/repo-registry.ts` — `github:getRepos`, `mao config show` and `mao repos
+  list`. That is a secrets rail, not tidiness: `config show` promises redaction, and a `githubRepos`
+  holding a pasted token printed it verbatim on stdout before this. Filtering never hides the fault,
+  only the values; the report still carries the count. The other guarded fields need no such rule
+  because `usableStoredValue()` filters *them*, so their readers never see a junk entry at all. Reporting it is the other half: the drop used to be
   silent, which is the same dead end for an operator as the unguarded crash was — a `config.json`
   holding `[null]`, a half-written `[{"owner":"acme"}]` or a bare `["acme/widgets"]` left the sidebar
   reading *"No projects yet"* and `mao repos list` printing `[]` on a clean stderr, and with no token

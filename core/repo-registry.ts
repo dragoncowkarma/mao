@@ -38,6 +38,32 @@ export function isRepoRef(ref: unknown): ref is RepoRef {
 }
 
 /**
+ * The rows of a stored repository list that are safe to show an operator — the one definition of that,
+ * shared by every surface that prints or renders the list.
+ *
+ * `MaoStore.get('githubRepos')` deliberately hands back a mixed array unchanged: `isRepoRef` /
+ * `canonicalRepoList` own entry validity and need to see the junk in order to drop it, and replacing
+ * the value would delete the rows that still work (see `usableStoredValue()` in core/store.ts). The
+ * cost is that every *reader* then has to filter, and a reader that forgets prints whatever the file
+ * holds. That was a real exposure, not a tidiness point: `mao config show` promises secrets are
+ * redacted, and a `githubRepos` of `["ghp_…", null, {owner,repo}]` — an operator pasting a token into
+ * the wrong array while hand-editing is exactly the kind of edit that produces junk entries — printed
+ * the credential verbatim on stdout, as did `mao repos list`.
+ *
+ * So it lives here rather than being spelled out at each call site: `github:getRepos` (whose renderer
+ * draws `{r.owner}/{r.repo}` with no guard and no error boundary, so one `null` blanks the window),
+ * `mao config show` and `mao repos list` all go through this. Filtering never hides the problem — the
+ * guard's stderr report and `MaoStore.problems()` still say how many entries were dropped — it only
+ * keeps the dropped *values* off every operator-facing surface.
+ *
+ * Total rather than trusting, for `repoRefKey`'s reason: the guard substitutes `[]` for a wrong
+ * container today, but a caller handing this something else must get an empty list rather than a throw.
+ */
+export function usableRepoList(stored: RepoRef[]): RepoRef[] {
+  return Array.isArray(stored) ? stored.filter(isRepoRef) : []
+}
+
+/**
  * The identity of a repository entry, as GitHub itself resolves it: owner and repo compared without
  * regard to case. `GET /repos/DragonCowKarma/MAO` and `GET /repos/dragoncowkarma/mao` address one
  * repository, so treating the two spellings as different entries produced a duplicate registration

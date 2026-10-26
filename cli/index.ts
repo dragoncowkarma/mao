@@ -8,7 +8,7 @@ import { defaultDataDir } from '../core/paths.ts'
 import { clearPersistenceBrokenMarker, hasPersistenceBrokenMarker } from '../core/persistence-guard.ts'
 import { runSwarm, SwarmRepositoryPathError } from '../core/swarm-runner.ts'
 import { describeUnverifiedGrants } from '../core/repo-capabilities.ts'
-import { sameRepoRef } from '../core/repo-registry.ts'
+import { sameRepoRef, usableRepoList } from '../core/repo-registry.ts'
 import { importProvidersFromFile } from '../core/provider-import.ts'
 import type { AiEffort } from '../core/ai/types.ts'
 import {
@@ -109,7 +109,11 @@ config
     const { store, workflowEngine } = loadApp()
     printJson({
       githubToken: store.get('githubToken') ? '[set]' : '[unset]',
-      githubRepos: store.get('githubRepos'),
+      // Filtered, like the GUI's `github:getRepos`. A mixed list reaches readers raw by design, and
+      // this command promises redaction — an operator who pasted a token into the array while
+      // hand-editing `config.json` would otherwise see it echoed back on stdout. `storeProblems`
+      // below still reports how many entries were dropped, so this hides the values, never the fault.
+      githubRepos: usableRepoList(store.get('githubRepos')),
       aiProviders: store.get('aiProviders').map((p) => ({ ...p, apiKey: p.apiKey ? '[set]' : undefined })),
       theme: store.get('theme'),
       workflowPersistenceBroken: hasPersistenceBrokenMarker(resolveDataDir()),
@@ -229,7 +233,9 @@ repos
   .description('List tracked repos')
   .action(() => {
     const { store } = loadApp()
-    printJson(store.get('githubRepos'))
+    // The repositories actually tracked, not the raw stored array — same rule as `config show` and the
+    // GUI sidebar. The guard's stderr report says how many entries were unusable.
+    printJson(usableRepoList(store.get('githubRepos')))
   })
 
 // --- github -----------------------------------------------------------------

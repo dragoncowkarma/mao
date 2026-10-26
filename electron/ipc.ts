@@ -3,7 +3,7 @@ import path from 'node:path'
 import { store } from './store.ts'
 import { createMaoApp } from '../core/app.ts'
 import { startAutoTrigger } from '../core/auto-trigger.ts'
-import { isRepoRef } from '../core/repo-registry.ts'
+import { usableRepoList } from '../core/repo-registry.ts'
 import { assertCanRelaunchForUpdate, checkForUpdates, countRunningWorkflowTasks } from '../core/self-update.ts'
 import { createAiProvider, type AiProviderConfig } from '../core/ai/index.ts'
 import { QUEUE_PERSISTENCE_BROKEN, type RepoRef, type RunOverride } from '../core/workflow-engine.ts'
@@ -92,7 +92,11 @@ export function registerIpcHandlers() {
   // throws during render and blanks the whole window, taking with it the Remove button that would have
   // healed the store. Dropping unusable entries here costs nothing (they can be neither polled nor
   // named) and the next list write persists the same list core would have canonicalised anyway.
-  ipcMain.handle('github:getRepos', () => store.get('githubRepos').filter(isRepoRef))
+  //
+  // Through core's `usableRepoList` rather than a local `.filter(isRepoRef)`, so this channel and the
+  // CLI's `config show` / `repos list` cannot disagree about which rows are safe to show an operator.
+  // That the drop happened travels separately, over `app:storeProblems`.
+  ipcMain.handle('github:getRepos', () => usableRepoList(store.get('githubRepos')))
 
   ipcMain.handle('github:autoTriggerStatus', (_event, owner: string, repo: string) =>
     autoTrigger.getStatus(owner, repo),

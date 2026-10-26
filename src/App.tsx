@@ -19,6 +19,12 @@ type ProjectTab = 'board' | 'queue' | 'settings'
 type View = 'project' | 'global-settings'
 
 /**
+ * Why the repository list has to be re-read: a `githubRepos` report has gone away, or one is still up
+ * and the entries behind it may have moved. See `applyStoreProblems()`.
+ */
+type RepoListReread = 'healed' | 'pending'
+
+/**
  * Prefer the exact legacy row while it still exists, then follow its canonical repository identity
  * after a write folds case-variant duplicates into one entry.
  */
@@ -131,24 +137,33 @@ export default function App() {
    * place, which is precisely when the notice has to stay up.
    */
   /**
-   * Stores a report and answers whether the repository list still has to be re-read because it was
-   * repaired since the last one.
+   * Stores a report and answers whether the repository list has to be re-read — `'healed'` once a
+   * report has gone away, `'pending'` while one is still up, `null` when there is nothing to watch.
    *
-   * That transition is the only thing worth acting on. While the list is unusable the renderer holds
-   * what `github:getRepos` answered — `[]` for a value the guard replaced, the surviving entries for a
-   * list whose invalid ones were filtered — so it is not stale, it is correct; and once a repair has
-   * been adopted there is nothing further to take. Keyed on *any* `githubRepos` report rather than on
-   * `nothingUsable`: repairing one junk entry of two changes which repositories exist, so the list has
-   * to be re-read then too, even though the report itself stays up. Re-reading on *every* poll instead would reintroduce
-   * the hazard `persistRepos`' success path avoids: a round trip landing mid-typing stomps newer
-   * keystrokes in the settings pane.
+   * **Two occasions, not one.** The disappearance of a report is the obvious one. The other is a
+   * repair that leaves a report standing, and missing it was a data-loss bug: with
+   * `[valid1, junkA, junkB]` on disk the renderer holds `[valid1]`, and repairing `junkA` into
+   * `valid2` leaves one invalid entry — so a boolean "does a report exist" goes `true -> true`, no
+   * transition fires, and the mirror keeps just `[valid1]`. The next settings edit submits that whole
+   * stale list, `canonicalRepoList` honours it, and `valid2` is gone from disk for good. Keying on the
+   * report's mere *presence* is what this function used to do, and its comment claimed the opposite of
+   * what it did.
    *
-   * Deliberately does **not** clear the flag when it answers `true`: the transition is observable once,
-   * and clearing it here would spend it on a read that has not happened yet. `adoptRepairedRepoList()`
-   * clears it, and only once the list is in hand — so a transient failure leaves the repair pending and
-   * the next poll tries again, instead of stranding the sidebar on "No projects yet" until a restart.
+   * So while a report stands the list is re-read on each poll. The hazard that argued against
+   * re-reading — a round trip landing mid-typing stomps newer keystrokes, which is why
+   * `persistRepos`' success path does not re-read — does not reach here: `adoptRepairedRepoList()`
+   * returns early while this window has a write in flight, and the settings inputs are controlled and
+   * persist on every keystroke, so typing *is* a write in flight. Between keystrokes the stored value
+   * is the one on screen, so adopting it changes nothing the operator can see. Deliberately not keyed
+   * on `nothingUsable` either: `[valid1, junk]` never sets that flag, and it is the exact case above.
+   *
+   * Deliberately does **not** clear `repairOwed` when it answers `'healed'`: the transition is
+   * observable once, and clearing it here would spend it on a read that has not happened yet.
+   * `adoptRepairedRepoList()` clears it, and only once the list is in hand — so a transient failure
+   * leaves the repair pending and the next poll tries again, instead of stranding the sidebar on
+   * "No projects yet" until a restart.
    */
-  function applyStoreProblems(next: StoredValueProblem[]): boolean {
+  function applyStoreProblems(next: StoredValueProblem[]): RepoListReread | null {
     const watch = repoListWatch.current
     const unusable = next.some((problem) => problem.field === 'githubRepos')
     if (unusable !== watch.lastUnusable) {
@@ -159,18 +174,23 @@ export default function App() {
     if (!healed) watch.repairOwed = unusable
     setStoreProblems(next)
     setStoreProblemsRead(true)
-    return healed
+    return healed ? 'healed' : unusable ? 'pending' : null
   }
 
   /**
-   * Takes the repaired list, and only then treats the repair as done.
+   * Takes the repaired list, and — only for a report that has actually gone away — treats the repair
+   * as done.
    *
    * Throws if the read fails, which every caller swallows — on purpose. The renderer's current list is
    * left exactly as it was rather than replaced with an empty one, and because the flag is still set the
    * next poll re-enters here. Adopting `[]` on failure would look identical to "there really are no
    * projects", which is the one thing this whole path exists to stop the operator being told.
+   *
+   * `'pending'` must not clear `repairOwed`: the report is still up, so the heal has not happened and
+   * the disappearance still has to be observed later. It is otherwise the same read — a list whose
+   * usable entries changed under a standing report is just as stale as one whose report went away.
    */
-  async function adoptRepairedRepoList(): Promise<void> {
+  async function adoptRepairedRepoList(reread: RepoListReread): Promise<void> {
     const watch = repoListWatch.current
     // Not while this window is writing: the store is about to hold whatever the write is sending, so a
     // read now can only produce a list to be discarded — and its generation, captured after the write
@@ -183,7 +203,7 @@ export default function App() {
     // later adoption that has already answered. The list is dropped rather than applied, and
     // `repairOwed` is left standing so the next report reads whatever exists then.
     if (watch.generation !== startedAt || watch.adoption !== request) return
-    watch.repairOwed = false
+    if (reread === 'healed') watch.repairOwed = false
     setRepos(repaired)
   }
 
@@ -200,7 +220,8 @@ export default function App() {
         // ever re-read the list. Taking only the diagnostic down would leave the card gone and the
         // sidebar still insisting there are no projects, which is worse than either alone. Selection
         // reconciles itself: the identity effect above adopts the first entry once one exists.
-        if (applyStoreProblems(next)) await adoptRepairedRepoList()
+        const reread = applyStoreProblems(next)
+        if (reread) await adoptRepairedRepoList(reread)
       })
       .catch(() => {})
   }
@@ -603,14 +624,16 @@ export default function App() {
     // read at mount and after writes, keeps offering a button that writes an empty list. Blind, that
     // deletes the healthy list they just built. Fail closed: a read that throws aborts the reset.
     const current = await electronApi().app.storeProblems()
-    applyStoreProblems(current)
+    const reread = applyStoreProblems(current)
     // `nothingUsable`, not merely "a githubRepos report exists". A hand-edit between this card
     // rendering and the click can leave the list *partly* usable — repair one of two junk entries and
     // the report stays, but an empty list would now delete the repository that edit just rescued. The
     // button is not offered in that state either (see Sidebar's `canResetRepoList`); this is the
     // re-read that makes the judgement true at the moment of the write rather than of the render.
     if (!current.some((problem) => problem.field === 'githubRepos' && problem.nothingUsable)) {
-      await adoptRepairedRepoList().catch(() => {})
+      // `?? 'healed'` for the case where the re-read found no report at all: there is nothing left to
+      // observe the disappearance of, so clearing `repairOwed` is both correct and already true.
+      await adoptRepairedRepoList(reread ?? 'healed').catch(() => {})
       return
     }
     await persistRepos([])
@@ -619,7 +642,7 @@ export default function App() {
     // when the list empties — and forcing a view/tab here would be a navigation decision made after
     // two awaits, which is exactly what `navigationGeneration` exists to stop: the sidebar is visible
     // from Global settings too, so a reset started there would otherwise yank the operator away from it.
-    await adoptRepairedRepoList().catch(() => {})
+    await adoptRepairedRepoList('healed').catch(() => {})
   }
 
   async function removeSelectedRepo() {

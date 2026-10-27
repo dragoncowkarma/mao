@@ -113,6 +113,12 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
    three modules, by bundling each with esbuild and checking the real import graph — a regex over
    import statements is not fail-closed (it misses double quotes, multiline clauses, side-effect
    imports, `export … from` and dynamic `import()`), and `tsc` stays green for every one of them.
+   Two esbuild settings there are load-bearing and were each verified in both directions:
+   `verbatimModuleSyntax` (without it esbuild elides `import { type X } from './y'`, the exact form that
+   defeated the regex) and `platform: 'neutral'` (under `'node'` a reach for `node:fs` is merely
+   *external*, so it never appears among the metafile inputs and a planted `import 'node:fs'` left the
+   suite green). Graph paths are normalised to `/`, since `path.relative()` yields backslashes on
+   Windows and `package.json` declares a Windows ZIP target that CI does not cover.
    There are no IPC push events — the
    UI polls and re-fetches after each mutation; keep that pull model.
 7. **Electron security posture.** `webPreferences` set only `preload` so Electron 33
@@ -688,11 +694,18 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   it, so `usableStoredValue()` has an explicit pass-through arm for it: without that arm the function's
   fallthrough replaces the value with `[]` the moment a report exists, turning PR #57's recovery — a
   list write drops the junk while keeping the good rows — into "delete every tracked repository".
-  Every surface that prints or renders the list therefore filters, through the single
-  `usableRepoList()` in `core/repo-registry.ts` — `github:getRepos`, `mao config show` and `mao repos
-  list`. That is a secrets rail, not tidiness: `config show` promises redaction, and a `githubRepos`
-  holding a pasted token printed it verbatim on stdout before this. Filtering never hides the fault,
-  only the values; the report still carries the count. The other guarded fields need no such rule
+  Every surface that prints or renders the list therefore goes through the single `usableRepoList()` in
+  `core/repo-registry.ts` — `github:getRepos`, `mao config show` and `mao repos list`. That is a secrets
+  rail, not tidiness: `config show` promises redaction, and a `githubRepos` holding a pasted token
+  printed it verbatim on stdout before this. It **projects** rather than filters, and the difference is
+  a second exposure: `isRepoRef` only asks that `owner` and `repo` are non-empty strings, so a row
+  carrying `{..., credentialFragment: "ghp_…"}` passes it, and handing that row back put the property
+  on stdout with `storeProblems: []` — nothing was wrong with it by the schema's lights. Each row is
+  rebuilt from the fields `RepoRef` declares and nothing else. The two optional settings are
+  type-checked in the directions their failures point: `autoTrigger` present but not exactly `true`
+  becomes `false` (the same asymmetry `mergeOccurrences` applies — a stored `"false"` must not read as
+  "poll"), and a `pollIntervalMs` that is not a finite positive number is dropped so the global default
+  applies. Filtering never hides the fault, only the values; the report still carries the count. The other guarded fields need no such rule
   because `usableStoredValue()` filters *them*, so their readers never see a junk entry at all. Reporting it is the other half: the drop used to be
   silent, which is the same dead end for an operator as the unguarded crash was — a `config.json`
   holding `[null]`, a half-written `[{"owner":"acme"}]` or a bare `["acme/widgets"]` left the sidebar

@@ -56,11 +56,46 @@ export function isRepoRef(ref: unknown): ref is RepoRef {
  * guard's stderr report and `MaoStore.problems()` still say how many entries were dropped — it only
  * keeps the dropped *values* off every operator-facing surface.
  *
+ * **Projected, not merely filtered**, and that distinction is the whole of the second half of this.
+ * `isRepoRef` only asks that `owner` and `repo` are non-empty strings, so a row carrying arbitrary extra
+ * properties passes it — and returning that row unchanged put them straight back on stdout. A
+ * `githubRepos` of `[{owner, repo, credentialFragment: "ghp_…"}]` printed the fragment from both
+ * commands with `storeProblems: []`, because by the schema's lights nothing was wrong with it. So each
+ * row is rebuilt from the fields `RepoRef` declares and nothing else; an undeclared property cannot
+ * reach an operator-facing surface even when the entry around it is perfectly valid.
+ *
+ * The two optional settings are type-checked on the way through, in the directions their failures point:
+ *
+ * - `autoTrigger` present but not exactly `true` becomes `false`. The asymmetry is AGENTS.md's, and it
+ *   is the same one `mergeOccurrences` applies: guessing wrong towards polling resumes a pipeline that
+ *   opens branches, PRs and merges unattended, while guessing wrong the other way leaves polling off
+ *   until the operator turns it back on. A stored `"false"` must not read as "poll". (An absent value
+ *   still means poll, which is the documented default and is left alone.)
+ * - `pollIntervalMs` is kept only when it is a finite positive number, and otherwise dropped so the
+ *   global default applies — a `0` or a `NaN` shown as a repository's interval is worse than none.
+ *
+ * Note this projection governs what is *shown* and what the GUI sends back on a write, not what
+ * auto-trigger polls: `startAutoTrigger` reads the stored list directly. Dropping an undeclared property
+ * on a GUI round trip is deliberate — nothing validates it, so nothing should persist it — and identity
+ * is untouched, so `reposNeedingCapabilityCheck` still sees a tracked repository as tracked rather than
+ * as a new registration needing a preflight.
+ *
  * Total rather than trusting, for `repoRefKey`'s reason: the guard substitutes `[]` for a wrong
  * container today, but a caller handing this something else must get an empty list rather than a throw.
  */
 export function usableRepoList(stored: RepoRef[]): RepoRef[] {
-  return Array.isArray(stored) ? stored.filter(isRepoRef) : []
+  if (!Array.isArray(stored)) return []
+  const rows: RepoRef[] = []
+  for (const entry of stored) {
+    if (!isRepoRef(entry)) continue
+    const row: RepoRef = { owner: entry.owner, repo: entry.repo }
+    if (entry.autoTrigger !== undefined) row.autoTrigger = entry.autoTrigger === true
+    if (typeof entry.pollIntervalMs === 'number' && Number.isFinite(entry.pollIntervalMs) && entry.pollIntervalMs > 0) {
+      row.pollIntervalMs = entry.pollIntervalMs
+    }
+    rows.push(row)
+  }
+  return rows
 }
 
 /**

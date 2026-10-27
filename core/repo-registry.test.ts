@@ -749,6 +749,62 @@ describe('usableRepoList', () => {
     expect(shown).toContain('widgets')
   })
 
+  it('emits only the fields RepoRef declares, even from a row that is otherwise valid', () => {
+    // Filtering entries was not enough, which is the follow-up review's finding. `isRepoRef` only asks
+    // that owner and repo are non-empty strings, so a row carrying extra properties passes it — and
+    // returning that row unchanged put them back on stdout with `storeProblems: []`, because by the
+    // schema's lights nothing was wrong with it.
+    const sneaky = {
+      owner: 'acme',
+      repo: 'one',
+      autoTrigger: false,
+      pollIntervalMs: 60_000,
+      credentialFragment: 'ghp_SENTINEL_MUST_NOT_PRINT',
+      nested: { apiKey: 'sk-ALSO_NOT' },
+    }
+
+    const [row, ...rest] = usableRepoList([sneaky] as unknown as RepoRef[])
+
+    expect(rest).toEqual([])
+    expect(Object.keys(row!).sort()).toEqual(['autoTrigger', 'owner', 'pollIntervalMs', 'repo'])
+    expect(row).toEqual({ owner: 'acme', repo: 'one', autoTrigger: false, pollIntervalMs: 60_000 })
+    const shown = JSON.stringify(usableRepoList([sneaky] as unknown as RepoRef[]))
+    expect(shown).not.toContain('ghp_SENTINEL_MUST_NOT_PRINT')
+    expect(shown).not.toContain('sk-ALSO_NOT')
+    expect(shown).not.toContain('credentialFragment')
+  })
+
+  it('fails autoTrigger closed, so a malformed value never reads as "poll"', () => {
+    // The direction matters and it is AGENTS.md's, not a preference: guessing wrong towards polling
+    // resumes a pipeline that opens branches, PRs and merges unattended. A stored `"false"` is truthy, so
+    // anything present that is not exactly `true` has to come out as `false`.
+    const shown = usableRepoList([
+      { owner: 'a', repo: 'one', autoTrigger: 'false' },
+      { owner: 'a', repo: 'two', autoTrigger: 1 },
+      { owner: 'a', repo: 'three', autoTrigger: true },
+      { owner: 'a', repo: 'four' },
+    ] as unknown as RepoRef[])
+
+    expect(shown.map((r) => r.autoTrigger)).toEqual([false, false, true, undefined])
+    // The absent case stays absent rather than becoming `true`: that is the documented default, and
+    // writing it back explicitly would change what the store holds.
+    expect(Object.keys(shown[3]!).sort()).toEqual(['owner', 'repo'])
+  })
+
+  it('drops a pollIntervalMs that is not a usable number', () => {
+    // Dropped rather than coerced, so the global default applies — a `0` shown as a repository's interval
+    // is worse than showing none, and a `0` sent back on a write would be a hot poll loop.
+    const shown = usableRepoList([
+      { owner: 'a', repo: 'one', pollIntervalMs: 0 },
+      { owner: 'a', repo: 'two', pollIntervalMs: -5 },
+      { owner: 'a', repo: 'three', pollIntervalMs: Number.NaN },
+      { owner: 'a', repo: 'four', pollIntervalMs: '60000' },
+      { owner: 'a', repo: 'five', pollIntervalMs: 60_000 },
+    ] as unknown as RepoRef[])
+
+    expect(shown.map((r) => r.pollIntervalMs)).toEqual([undefined, undefined, undefined, undefined, 60_000])
+  })
+
   it('answers an empty list rather than throwing for a value that is not an array', () => {
     // Total for `repoRefKey`'s reason: the read guard substitutes `[]` for a wrong container today, but
     // a caller that hands this something else must get nothing back, not a crash on `.filter`.

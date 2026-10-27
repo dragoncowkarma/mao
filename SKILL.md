@@ -237,7 +237,10 @@ Only the **count** is ever printed, never entry contents: the GitHub token lives
 and these messages reach piped output, agent logs and a possibly screen-shared window. The same rule
 covers the *list* itself, not only the diagnostic — `mao config show`, `mao repos list` and the GUI
 sidebar all print it through `usableRepoList()` (`core/repo-registry.ts`), so an operator who pasted a
-token into the wrong array while hand-editing never sees it echoed back. The report still says how many
+token into the wrong array while hand-editing never sees it echoed back. That helper **projects** each
+row onto the fields `RepoRef` declares rather than just filtering entries, because an otherwise-valid
+row carrying an extra property passes `isRepoRef` and would print it. A malformed `autoTrigger` comes
+out `false` (never "poll"), and an unusable `pollIntervalMs` is dropped so the global default applies. The report still says how many
 entries were dropped, so filtering hides the values, never the fault. The count is the
 point — the sidebar and `mao repos list` show only the survivors, so nothing else tells you whether one
 row or twelve are about to be overwritten. When *no* entry is usable the message says `and no usable

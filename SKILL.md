@@ -66,7 +66,11 @@ Additionally, because CI does **not** cover them:
 - Touched `cli/` or `core/`? → also run `npm run build:cli` and smoke-test
   `node dist-cli/index.cjs --help` (CLI bundle breakage is invisible to CI).
 - Iterating on the engine? → focused run: `npx vitest run core/workflow-engine.test.ts`.
-- Touched `src/`? → focused run: `npx vitest run --project renderer`. Nothing else in
+- Touched `src/`? → focused run: `npx vitest run --project renderer`. It includes
+  `src/i18n/no-hardcoded-text.test.ts`, which names the file and line of literal text in the shapes it
+  reads — JSX text, display attributes, literals rendered through `{…}`, option `label`s and
+  `new Error`/`confirm`/`alert` text. A literal handed to a setter or a helper looks like any other
+  argument and is a review item, as are dates and state-held wording. Nothing else in
   the matrix sees renderer *behaviour*: `tsc --noEmit` reads types, `npx vite build`
   proves the bundle links, and both stay green for code that stack-overflows the moment
   a project is clicked (issue #58). A renderer change with no test under `src/` is an
@@ -122,6 +126,7 @@ State lives at `$MAO_DATA_DIR/config.json` (default: the platform data dir from
 npm run cli -- config set-token <token>          # store GitHub token
 npm run cli -- config import-providers <file>    # JSON array of AiProviderConfig
 npm run cli -- config show                       # secrets redacted as '[set]'
+npm run cli -- config set-language <system|en|ko> # GUI display language; 'system' follows the OS
 npm run cli -- repos add <owner> <repo> [--no-auto-trigger] [--poll-interval-ms <ms>]  # preflights write access
 npm run cli -- repos list
 npm run cli -- github check <owner> <repo>       # open issues/PRs as JSON
@@ -667,9 +672,10 @@ Two traps:
    `WorkflowStageName` unions and workflow-engine stage order derive from it). Then update
    `core/workflow-engine.ts`: `buildPromptForStage`, `applyGithubAction`
    (+ `runPrWithCodeEdits`-style special-casing if needed).
-2. Update `STAGE_LABELS` in `src/components/KanbanBoard.tsx` and
-   `src/components/WorkflowQueue.tsx`, plus `ALL_STAGES` and `STAGE_LABELS` in
-   `src/components/GlobalSettings.tsx` (duplicated by convention).
+2. Name the stage in `stages` in `src/i18n/messages/common.ts`, in every language — `npm run lint`
+   fails until you do (`satisfies Record<AgentStage, string>`). The board, the queue and Global
+   settings all read that one record. Then add it to `ALL_STAGES` in
+   `src/components/GlobalSettings.tsx`.
 3. Extend `core/workflow-engine.test.ts` — stage progression, maker-checker
    alternation, and error/retry behavior against the existing fakes.
 
@@ -689,7 +695,11 @@ Two traps:
    `toHaveBeenCalledTimes`.
 4. Query the way an operator sees it (`getByRole('heading', …)`,
    `getByRole('button', { name: 'Confirm remove' })`); there are no test ids in the
-   markup and none are needed.
+   markup and none are needed. Tests render English: the stub answers `ui.getLanguage` with
+   `'system'` and jsdom reports `navigator.languages` as `en-US`. For another language,
+   `stub.getLanguage.mockResolvedValue('ko')` before mounting (or pass `messages={MESSAGES.ko}` to a
+   component rendered on its own), and query through `MESSAGES.ko.<namespace>.<key>` rather than a
+   Korean literal, so a wording fix does not break the test.
 5. Staging a slow IPC round trip — the shape most renderer races take — is
    `stub.setRepos.mockImplementationOnce(async (next) => { await deferred; stub.applyRepos(next); return [] })`,
    then asserting on the UI *after* a signal that the continuation has actually run (the
@@ -705,6 +715,42 @@ Two traps:
 8. Prove the test is load-bearing: revert the behaviour it describes and watch it fail. A
    renderer test that passes both ways is the problem issue #58 described. Say in the PR
    which mutation you ran — and say so too when a test turns out *not* to discriminate.
+
+### Add user-visible renderer text
+
+1. Add a key to the component's catalog in `src/i18n/messages/<component>.ts` — in `en` **and** every
+   other language (`const ko: typeof en`, so `npm run lint` lists what is missing). Interpolation is a
+   function (`saveFailed: (reason: string) => …`), so each language can order the words itself.
+2. Read it through the component's `messages` prop (`messages.<namespace>.<key>`); pass `messages` on to
+   any child or helper that needs it. Dates use `toLocaleString(messages.dateLocales)`, which keeps the
+   OS's regional format for the language on screen (`en-GB` stays day-first).
+   Text you keep in state — an error, a status — is a `Wording`: `setError({ word: (m) => m.<ns>.<key> })`
+   (an object, because React calls a bare function handed to a setter), rendered with
+   `wordIn(error, messages)`; across a throw, `new WordedError((m) => …, messages)`, which the catching
+   component keeps as `err instanceof WordedError ? err.wording : <raw text>` (see `queueFailure()` in
+   `src/components/Sidebar.tsx`). A finished string stays in the old language when the operator
+   switches while it is on screen.
+3. Never translate text core or GitHub produced (`err.message`, `task.error`, `problem.message`,
+   `queueRecovery.reason`, titles, bodies) — render it as received.
+4. `npx vitest run --project renderer src/i18n` must pass: `no-hardcoded-text.test.ts` reports
+   `file:line` for literal text in TSX, `catalog.test.ts` names any Korean value that still holds
+   English, and `korean-sweep.test.tsx` names stray English on the rendered Korean screens. A Latin word
+   a Korean value keeps on purpose (a product name, an identifier the operator types) goes into
+   `src/test/korean-latin.ts` with a reason — the list fails if it carries an entry nothing uses.
+   If your text only appears in a state the sweep never renders, add that state to the sweep.
+
+### Add a UI language
+
+1. Add its code to `UI_LANGUAGES` in `core/ui-language.ts`.
+2. `npm run lint`, then add the translation to every catalog it names under `src/i18n/messages/`, plus
+   `MESSAGES` and `LANGUAGE_NAMES` (the language's own name for itself) in `src/i18n/index.ts`.
+3. Extend `core/ui-language.test.ts` (`LANGUAGE_PREFERENCES` order, OS-tag resolution) and run
+   `npx vitest run --project core core/ui-language.test.ts`.
+4. Give the new catalog the same "nothing left in English" checks Korean has: `src/i18n/catalog.test.ts`
+   and `src/i18n/korean-sweep.test.tsx` work by script, so for a non-Latin-script language copy them
+   with that language's list of deliberate Latin; for a Latin-script language, compare each value
+   against `en` instead.
+5. `mao config set-language <code>` and the GUI pickers pick the new code up with no further change.
 
 ### Add an AI provider integration
 
@@ -842,7 +888,11 @@ Two traps:
 Per AGENTS.md, the reviewer should be a different agent than the implementer.
 Check, in order: architecture rules (core Electron-free? logic in shells? does the
 `core` vitest project still run with no plugins and no DOM?),
-lockstep files all updated (IPC 3-file chain, store pair, stage labels/options in all three UI copies),
+lockstep files all updated (IPC 3-file chain, store pair, a stage's name in `stages` in
+`src/i18n/messages/common.ts` for every language plus `ALL_STAGES` in `GlobalSettings.tsx`, new UI
+text in every language's catalog — and for a new language, every catalog plus `MESSAGES`/`LANGUAGE_NAMES`),
+renderer text that bypasses the guard (a literal passed through a setter or helper, a date not formatted
+with `messages.dateLocales`, a worded message kept in state as a finished string instead of a `Wording`),
 a new store-shape rule — does the field latch, do whole-file observations upgrade it to restart-only,
 and are fresh observations limited to recovery, auto-trigger and imminent public-write boundaries?,
 domain invariants (maker-checker, CI gate, timeouts, error-not-crash), secrets

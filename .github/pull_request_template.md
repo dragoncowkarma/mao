@@ -40,7 +40,8 @@
 
 - [ ] **New IPC channel** → updated all 3: `electron/ipc.ts`, `electron/preload.ts`, `src/electron.d.ts`
 - [ ] **New store field** → updated both `MaoStoreSchema` and `MAO_STORE_DEFAULTS` in `core/store.ts`
-- [ ] **New pipeline stage** → updated `STAGE_ORDER`, `buildPromptForStage`, `applyGithubAction` in `core/workflow-engine.ts` + `STAGE_LABELS` in `KanbanBoard.tsx` and `WorkflowQueue.tsx` + tests
+- [ ] **New pipeline stage** → updated `AGENT_STAGES` in `core/ai/types.ts`, `buildPromptForStage`, `applyGithubAction` in `core/workflow-engine.ts` + the stage name in `stages` in `src/i18n/messages/common.ts` (every language) + `ALL_STAGES` in `GlobalSettings.tsx` + tests
+- [ ] **New UI language** → added to `UI_LANGUAGES` in `core/ui-language.ts` + every catalog in `src/i18n/messages/` + `MESSAGES`/`LANGUAGE_NAMES` in `src/i18n/index.ts`
 - [ ] **Build output rename** → audited `electron/main.ts`, `vite.config.ts`, `package.json`
 
 ### UI changes (if applicable)
@@ -48,6 +49,7 @@
 - [ ] Design tokens use CSS variables from `src/index.css`, no hardcoded hex
 - [ ] Semantic classes (`.btn`, `.card`, `.tag`) used where appropriate
 - [ ] No `rounded-*` (project uses `--radius-md: 0px`)
+- [ ] New user-visible text added to the component's catalog in `src/i18n/messages/` for every language (no literal text in TSX — `src/i18n/no-hardcoded-text.test.ts`)
 - [ ] Renderer **behaviour** change → covered by a test under `src/**/*.test.tsx`, mounted against `createElectronApiStub()` (`tsc --noEmit` and a green `vite build` prove nothing about what the UI does)
 
 ## Screenshots / recordings

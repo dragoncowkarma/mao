@@ -18,6 +18,7 @@ import {
   type RunOverride,
 } from '../core/workflow-engine.ts'
 import type { ThemePreference } from '../core/store.ts'
+import { LANGUAGE_PREFERENCES, isLanguagePreference } from '../core/ui-language.ts'
 
 function log(...args: unknown[]) {
   console.log('[mao]', ...args)
@@ -103,6 +104,21 @@ config
   })
 
 config
+  .command('set-language <language>')
+  .description(
+    `Set the UI language preference (${LANGUAGE_PREFERENCES.join(', ')}) — read by the Electron GUI. ` +
+      "'system' follows the OS's preferred languages; CLI output itself stays in English",
+  )
+  .action((language: string) => {
+    if (!isLanguagePreference(language)) {
+      throw new Error(`Invalid language "${language}" — expected one of: ${LANGUAGE_PREFERENCES.join(', ')}`)
+    }
+    const { store } = loadApp()
+    store.set('language', language)
+    log(`Language preference set to ${language}`)
+  })
+
+config
   .command('show')
   .description('Print the current stored config (secrets redacted)')
   .action(() => {
@@ -112,6 +128,7 @@ config
       githubRepos: store.get('githubRepos'),
       aiProviders: store.get('aiProviders').map((p) => ({ ...p, apiKey: p.apiKey ? '[set]' : undefined })),
       theme: store.get('theme'),
+      language: store.get('language'),
       workflowPersistenceBroken: hasPersistenceBrokenMarker(resolveDataDir()),
       // A separate fact from the line above, never folded into it: that one means a prior process could
       // no longer *write* the queue, this one that this process cannot *read* it. Reporting a read-shape

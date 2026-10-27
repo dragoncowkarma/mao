@@ -9,6 +9,7 @@ import {
   type AiProviderConfig,
 } from './ai/types.ts'
 import { isRepoRef } from './repo-registry.ts'
+import type { LanguagePreference } from './ui-language.ts'
 import { WORKFLOW_ACTIVE_LABEL, WORKFLOW_TASK_STATUSES } from './workflow-engine.ts'
 import type { QueuedTask, RepoRef } from './workflow-engine.ts'
 
@@ -30,6 +31,17 @@ export interface MaoStoreSchema {
    */
   buildSha: string
   theme: ThemePreference
+  /**
+   * The GUI's display language — see `core/ui-language.ts`, which owns the list of languages and how
+   * `'system'` resolves against the OS. Read by the Electron GUI; `mao config set-language` writes it.
+   *
+   * Deliberately not in `STORED_SHAPE_RULES`, like `theme`, and the three questions that table asks
+   * answer themselves. The fallback costs nothing: the renderer resolves a value it cannot use exactly
+   * like `'system'`. The next language write heals it — either GUI picker or `mao config
+   * set-language`, neither preflighted and neither touching GitHub. And no unattended work can start
+   * or stop because of it.
+   */
+  language: LanguagePreference
 }
 
 export const MAO_STORE_DEFAULTS: MaoStoreSchema = {
@@ -39,6 +51,7 @@ export const MAO_STORE_DEFAULTS: MaoStoreSchema = {
   workflowTasks: [],
   buildSha: '',
   theme: 'system',
+  language: 'system',
 }
 
 type UnknownRecord = Record<string, unknown>

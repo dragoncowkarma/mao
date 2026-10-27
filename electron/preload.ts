@@ -11,6 +11,7 @@ import type {
 } from '../core/workflow-engine.ts'
 import type { AutoTriggerStatus } from '../core/auto-trigger.ts'
 import type { StoredValueProblem, ThemePreference } from '../core/store.ts'
+import type { LanguagePreference } from '../core/ui-language.ts'
 import type { SelfUpdateCheck } from '../core/self-update.ts'
 
 export interface AppUpdateCheck extends SelfUpdateCheck {
@@ -102,5 +103,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   ui: {
     getTheme: (): Promise<ThemePreference> => ipcRenderer.invoke('ui:getTheme'),
     setTheme: (theme: ThemePreference): Promise<void> => ipcRenderer.invoke('ui:setTheme', theme),
+    getLanguage: (): Promise<LanguagePreference> => ipcRenderer.invoke('ui:getLanguage'),
+    setLanguage: (language: LanguagePreference): Promise<void> => ipcRenderer.invoke('ui:setLanguage', language),
   },
 } satisfies Window['electronAPI'])

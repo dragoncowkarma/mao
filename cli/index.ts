@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import path from 'node:path'
-import { Command } from 'commander'
+import { Command, InvalidArgumentError } from 'commander'
 import { createMaoApp, type MaoApp } from '../core/app.ts'
 import { startAutoTrigger } from '../core/auto-trigger.ts'
 import { FileStore } from '../core/store.ts'
@@ -168,7 +168,17 @@ repos
       'issue/PR write access; re-adding an already-tracked repo to change its settings is not.',
   )
   .option('--no-auto-trigger', 'do not auto-poll this repo for new issues')
-  .option('--poll-interval-ms <ms>', 'override the default poll interval', (v) => parseInt(v, 10))
+  // Rejected at the boundary rather than normalized behind the operator's back. `parseInt` answered
+  // `NaN` for `abc` and `0` for `0`, and both were persisted: core now drops either when it reads the
+  // row, so neither is dangerous any more, but silently substituting the 30s default for a number
+  // someone deliberately typed is its own surprise. Say no instead.
+  .option('--poll-interval-ms <ms>', 'override the default poll interval', (value) => {
+    const ms = Number(value)
+    if (!Number.isFinite(ms) || !Number.isInteger(ms) || ms <= 0) {
+      throw new InvalidArgumentError('must be a positive whole number of milliseconds')
+    }
+    return ms
+  })
   .action(async (owner: string, repo: string, opts: { autoTrigger: boolean; pollIntervalMs?: number }) => {
     const { store, updateRepos } = loadApp()
     const ref: RepoRef = { owner, repo, autoTrigger: opts.autoTrigger, pollIntervalMs: opts.pollIntervalMs }

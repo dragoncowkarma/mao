@@ -705,7 +705,16 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   type-checked in the directions their failures point: `autoTrigger` present but not exactly `true`
   becomes `false` (the same asymmetry `mergeOccurrences` applies — a stored `"false"` must not read as
   "poll"), and a `pollIntervalMs` that is not a finite positive number is dropped so the global default
-  applies. Filtering never hides the fault, only the values; the report still carries the count. The other guarded fields need no such rule
+  applies. Filtering never hides the fault, only the values; the report still carries the count.
+  **`core/auto-trigger.ts` normalizes through the same helper before canonicalising, and that is not
+  optional.** A normalization that reaches only the display is worse than none, because it makes the
+  display lie: the scheduler read the stored rows directly, so a `"false"` stayed truthy and polled
+  while the sidebar showed *off*, and a `pollIntervalMs: 0` polled on every tick (the destructuring
+  default only fills in `undefined`) — a matching open issue could enter the unattended auto-advancing
+  pipeline under a UI claiming auto-trigger was disabled. `mao repos add --poll-interval-ms` rejects a
+  non-positive or non-integer value at the boundary for the same reason: core makes such a row harmless
+  on read, but substituting the default for a number the operator deliberately typed is its own
+  surprise. Any new consumer of `githubRepos` goes through `usableRepoList()` too. The other guarded fields need no such rule
   because `usableStoredValue()` filters *them*, so their readers never see a junk entry at all. Reporting it is the other half: the drop used to be
   silent, which is the same dead end for an operator as the unguarded crash was — a `config.json`
   holding `[null]`, a half-written `[{"owner":"acme"}]` or a bare `["acme/widgets"]` left the sidebar

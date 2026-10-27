@@ -1,5 +1,5 @@
 import { parseProviderOverride } from './assignment.ts'
-import { canonicalRepoList, sameRepoRef } from './repo-registry.ts'
+import { canonicalRepoList, sameRepoRef, usableRepoList } from './repo-registry.ts'
 import type { GithubService, GithubTask } from './github-service.ts'
 import { STORE_RESTART_REQUIRED, type StoredObservation } from './store.ts'
 import {
@@ -199,7 +199,14 @@ export function startAutoTrigger(
       if (latchUnreadableStore()) console.error(`[auto-trigger] ${STORE_RESTART_REQUIRED}`)
       return
     }
-    for (const repoRef of canonicalRepoList(repos, repos)) {
+    // Normalized before canonicalisation, not after, so `mergeOccurrences`' fail-closed
+    // `autoTrigger === false` tie-break compares real booleans — a stored `"false"` is truthy and would
+    // otherwise slip past it. `usableRepoList` is the single definition of what a stored row means
+    // (core/repo-registry.ts); before this path used it, the sidebar could show a repository as *off*
+    // while this loop polled it, and a `pollIntervalMs: 0` polled on every tick because the
+    // destructuring default below only fills in `undefined`.
+    const tracked = usableRepoList(repos)
+    for (const repoRef of canonicalRepoList(tracked, tracked)) {
       // A preceding repository in this same tick can discover either block. Stop immediately rather
       // than spending reads on later repositories and relying on their eventual enqueue to refuse.
       if (workflowEngine.isPersistenceBroken() || workflowEngine.getQueueRecoveryReason() !== undefined) {
@@ -257,7 +264,11 @@ export function startAutoTrigger(
       latchUnreadableStore()
       throw error
     }
-    const current = canonicalRepoList(repos, repos).find((candidate) => sameRepoRef(candidate, repoRef))
+    // Normalized through the same definition the scheduler uses, so one stored row cannot mean two
+    // different things depending on which path reached it. `pollRepo` reads only identity from the
+    // entry, so nothing here depends on it — the uniformity is the point.
+    const tracked = usableRepoList(repos)
+    const current = canonicalRepoList(tracked, tracked).find((candidate) => sameRepoRef(candidate, repoRef))
     if (current === undefined) {
       throw new Error(`Repository ${repoRef.owner}/${repoRef.repo} is no longer tracked; nothing was polled.`)
     }

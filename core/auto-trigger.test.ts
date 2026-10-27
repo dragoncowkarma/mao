@@ -666,3 +666,66 @@ describe('startAutoTrigger when the stored repository list cannot be read', () =
     expect(repaired.workflowTasks).toHaveLength(1)
   })
 })
+
+/**
+ * The scheduler's reading of a stored row has to match the one the operator is shown.
+ *
+ * This is not a hand-edit-only concern: `mao repos add --poll-interval-ms 0` persisted a zero, and
+ * nothing rejected a non-boolean `autoTrigger`. Before `usableRepoList` reached this path, the sidebar
+ * rendered such a repository as *off* — because the presentation projection normalized it — while this
+ * loop polled it on every tick, so a matching open issue entered the unattended auto-advancing pipeline
+ * under a UI that said auto-trigger was disabled. A normalization that reaches only the display is worse
+ * than none.
+ */
+describe('auto-trigger normalizes stored settings the way the UI does', () => {
+  it('does not poll a repository whose stored autoTrigger is a truthy non-boolean', async () => {
+    // `"false"` is the shape that bites: truthy, so `!autoTrigger` was false and the repo polled, while
+    // `usableRepoList` showed it as off. A 1ms tick makes a polling implementation obvious.
+    const github = makeGithub()
+    const engine = makeEngine()
+
+    const trigger = startAutoTrigger(
+      github,
+      engine,
+      inspectRepos([{ ...repo, autoTrigger: 'false' } as unknown as RepoRef]),
+      1,
+    )
+    handles.push(trigger.handle)
+    await new Promise((resolve) => setTimeout(resolve, 30))
+
+    expect(github.fetchTasks).not.toHaveBeenCalled()
+    expect(engine.enqueueFromIssue).not.toHaveBeenCalled()
+  })
+
+  it('throttles a repository whose stored pollIntervalMs is zero', async () => {
+    // Zero is not filled in by the destructuring default — that only covers `undefined` — so
+    // `now - last < 0` was never true and every tick polled. Dropping it restores the 30s default, which
+    // over this window means exactly one poll rather than a burst.
+    const github = makeGithub()
+    const engine = makeEngine()
+
+    const trigger = startAutoTrigger(
+      github,
+      engine,
+      inspectRepos([{ ...repo, pollIntervalMs: 0 }]),
+      1,
+    )
+    handles.push(trigger.handle)
+    await new Promise((resolve) => setTimeout(resolve, 30))
+
+    expect(github.fetchTasks).toHaveBeenCalledTimes(1)
+  })
+
+  it('still honours a real interval and a real autoTrigger', async () => {
+    // The control: normalizing must not silence a repository that was configured to poll, or the two
+    // assertions above would pass for a scheduler that had simply stopped working.
+    const github = makeGithub()
+    const engine = makeEngine()
+
+    const trigger = startAutoTrigger(github, engine, inspectRepos([{ ...repo, autoTrigger: true, pollIntervalMs: 1 }]), 1)
+    handles.push(trigger.handle)
+    await new Promise((resolve) => setTimeout(resolve, 30))
+
+    expect(vi.mocked(github.fetchTasks).mock.calls.length).toBeGreaterThan(1)
+  })
+})

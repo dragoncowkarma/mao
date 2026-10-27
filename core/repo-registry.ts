@@ -38,8 +38,8 @@ export function isRepoRef(ref: unknown): ref is RepoRef {
 }
 
 /**
- * The rows of a stored repository list that are safe to show an operator — the one definition of that,
- * shared by every surface that prints or renders the list.
+ * The rows of a stored repository list that are safe to *use* — the one definition of that, shared by
+ * every surface that prints or renders the list and by the auto-trigger scheduler that acts on it.
  *
  * `MaoStore.get('githubRepos')` deliberately hands back a mixed array unchanged: `isRepoRef` /
  * `canonicalRepoList` own entry validity and need to see the junk in order to drop it, and replacing
@@ -74,11 +74,18 @@ export function isRepoRef(ref: unknown): ref is RepoRef {
  * - `pollIntervalMs` is kept only when it is a finite positive number, and otherwise dropped so the
  *   global default applies — a `0` or a `NaN` shown as a repository's interval is worse than none.
  *
- * Note this projection governs what is *shown* and what the GUI sends back on a write, not what
- * auto-trigger polls: `startAutoTrigger` reads the stored list directly. Dropping an undeclared property
- * on a GUI round trip is deliberate — nothing validates it, so nothing should persist it — and identity
- * is untouched, so `reposNeedingCapabilityCheck` still sees a tracked repository as tracked rather than
- * as a new registration needing a preflight.
+ * **Every consumer of the stored list goes through this, the scheduler included.** An earlier version of
+ * this comment said the projection governed only what was *shown*, and that divergence was itself the
+ * bug: `startAutoTrigger` read the stored rows directly, so a `"false"` stayed truthy and polled while
+ * the sidebar displayed *off*, and a `pollIntervalMs: 0` never throttled — a matching open issue could
+ * enter the unattended auto-advancing pipeline under a UI that said auto-trigger was disabled. A
+ * normalization that only reaches the display is worse than none, because it makes the display lie. So
+ * `core/auto-trigger.ts` normalizes through here before canonicalising, and this is the single
+ * definition of what a stored row *means*.
+ *
+ * Dropping an undeclared property on a GUI round trip is deliberate — nothing validates it, so nothing
+ * should persist it — and identity is untouched, so `reposNeedingCapabilityCheck` still sees a tracked
+ * repository as tracked rather than as a new registration needing a preflight.
  *
  * Total rather than trusting, for `repoRefKey`'s reason: the guard substitutes `[]` for a wrong
  * container today, but a caller handing this something else must get an empty list rather than a throw.

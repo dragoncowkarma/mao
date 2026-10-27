@@ -6,18 +6,14 @@ import { previewStageAgent } from '../../core/agent-selection'
 import { sameRepoRef } from '../../core/repo-registry'
 import type { RunOverride } from '../../core/agent-selection'
 import type { QueuedTask, RepoRef } from '../../core/workflow-engine'
+import type { Messages } from '../i18n'
 import AgentRunControls from './AgentRunControls'
 import TaskDetailModal from './TaskDetailModal'
 
 interface WorkflowQueueProps {
+  /** Every string the queue shows, in the language the operator picked. */
+  messages: Messages
   repo: RepoRef
-}
-
-const STAGE_LABELS: Record<QueuedTask['stage'], string> = {
-  issue: 'Issue',
-  pr: 'PR',
-  review: 'Review',
-  merge: 'Merge',
 }
 
 function statusTagClass(task: QueuedTask): string {
@@ -27,10 +23,13 @@ function statusTagClass(task: QueuedTask): string {
   return 'tag-outline'
 }
 
-function statusLabel(task: QueuedTask): string {
-  if (task.status === 'done') return 'Done'
-  if (task.status === 'paused') return `${STAGE_LABELS[task.stage]} · paused`
-  return `${STAGE_LABELS[task.stage]} · ${task.status}`
+function statusLabel(task: QueuedTask, messages: Messages): string {
+  const tag = messages.workflowQueue.statusTag
+  const statuses = messages.workflowQueue.statuses
+  if (task.status === 'done') return tag.done
+  const stage = messages.common.stages[task.stage]
+  if (task.status === 'paused') return tag.inStage(stage, statuses.paused)
+  return tag.inStage(stage, statuses[task.status])
 }
 
 /** A task is "active" (in-flight right now) when it's actually running, or sitting in review — the
@@ -40,11 +39,13 @@ function isActiveTask(task: QueuedTask): boolean {
 }
 
 function AgentBadge({
+  messages,
   name,
   kind,
   model,
   effort,
 }: {
+  messages: Messages
   name: string
   /** The AI tool behind the provider — a provider's name needn't say which CLI it drives. */
   kind?: string
@@ -56,12 +57,13 @@ function AgentBadge({
       {name}
       {kind && <span className="opacity-60">· {kind}</span>}
       {model && <span className="opacity-60">· {model}</span>}
-      {effort && <span className="opacity-60">· {effort} effort</span>}
+      {effort && <span className="opacity-60">· {messages.common.effortLevel(effort)}</span>}
     </span>
   )
 }
 
 function TaskCard({
+  messages,
   task,
   providers,
   busy,
@@ -70,6 +72,7 @@ function TaskCard({
   onToggleAutoAdvance,
   onOpenTask,
 }: {
+  messages: Messages
   task: QueuedTask
   /** Registered AI providers, for naming the assigned agent and populating the run dropdowns. */
   providers: AiProviderConfig[]
@@ -100,8 +103,10 @@ function TaskCard({
       <div className="flex items-center justify-between gap-2">
         <span className="card-title text-[15px]">{task.title}</span>
         <div className="flex items-center gap-2">
-          {task.status === 'running' && <span className="live-dot" title="Currently working" />}
-          <span className={`tag ${statusTagClass(task)}`}>{statusLabel(task)}</span>
+          {task.status === 'running' && (
+            <span className="live-dot" title={messages.workflowQueue.currentlyWorking} />
+          )}
+          <span className={`tag ${statusTagClass(task)}`}>{statusLabel(task, messages)}</span>
         </div>
       </div>
 
@@ -113,7 +118,7 @@ function TaskCard({
               className="link-button"
               onClick={() => onOpenTask(task.github.issueNumber!, 'issue')}
             >
-              Issue #{task.github.issueNumber}
+              {messages.common.issueRef(task.github.issueNumber)}
             </button>
           )}
           {task.github.prNumber !== undefined && (
@@ -122,7 +127,7 @@ function TaskCard({
               className="link-button"
               onClick={() => onOpenTask(task.github.prNumber!, 'pull_request')}
             >
-              PR #{task.github.prNumber}
+              {messages.common.prRef(task.github.prNumber)}
             </button>
           )}
         </div>
@@ -130,14 +135,15 @@ function TaskCard({
 
       {upcoming && (
         <div className="flex items-center gap-2">
-          <span className="tag tag-stage">{STAGE_LABELS[task.stage]}</span>
+          <span className="tag tag-stage">{messages.common.stages[task.stage]}</span>
           <AgentBadge
+            messages={messages}
             name={upcoming.name}
             kind={providerToolKind(upcoming)}
             model={upcoming.model}
             effort={upcoming.effort}
           />
-          <span className="text-muted text-xs">up next</span>
+          <span className="text-muted text-xs">{messages.workflowQueue.upNext}</span>
         </div>
       )}
 
@@ -146,15 +152,16 @@ function TaskCard({
           <div className="flex items-center gap-2">
             <span className="live-dot" />
             <AgentBadge
+              messages={messages}
               name={task.active.agentName}
               kind={providerToolKind(task.active)}
               model={task.active.model}
               effort={task.active.effort}
             />
-            <span className="text-muted text-xs">running now</span>
+            <span className="text-muted text-xs">{messages.workflowQueue.runningNow}</span>
           </div>
           <details>
-            <summary className="cursor-pointer text-xs text-muted">Prompt</summary>
+            <summary className="cursor-pointer text-xs text-muted">{messages.common.prompt}</summary>
             <pre className="mt-1 max-h-64 overflow-y-auto whitespace-pre-wrap text-xs">{task.active.prompt}</pre>
           </details>
         </div>
@@ -165,8 +172,9 @@ function TaskCard({
           {task.history.map((step, i) => (
             <div key={i} className="flex flex-col gap-1">
               <div className="flex flex-wrap items-center gap-1.5">
-                <span className="tag tag-stage">{STAGE_LABELS[step.stage]}</span>
+                <span className="tag tag-stage">{messages.common.stages[step.stage]}</span>
                 <AgentBadge
+                  messages={messages}
                   name={step.agentName}
                   kind={providerToolKind(step)}
                   model={step.model}
@@ -176,17 +184,21 @@ function TaskCard({
                   onClick={() => setExpanded(expanded === i ? null : i)}
                   className="btn btn-ghost px-1 text-xs"
                 >
-                  {expanded === i ? 'Hide details' : 'Show prompt/output'}
+                  {expanded === i
+                    ? messages.workflowQueue.hideDetails
+                    : messages.workflowQueue.showPromptOutput}
                 </button>
               </div>
               {expanded === i && (
                 <div className="flex flex-col gap-2 pl-1">
                   <div>
-                    <p className="text-muted text-[10px] uppercase tracking-wide">Prompt</p>
+                    <p className="text-muted text-[10px] uppercase tracking-wide">{messages.common.prompt}</p>
                     <pre className="max-h-64 overflow-y-auto whitespace-pre-wrap text-xs">{step.prompt}</pre>
                   </div>
                   <div>
-                    <p className="text-muted text-[10px] uppercase tracking-wide">Output</p>
+                    <p className="text-muted text-[10px] uppercase tracking-wide">
+                      {messages.workflowQueue.output}
+                    </p>
                     <pre className="max-h-64 overflow-y-auto whitespace-pre-wrap text-xs">{step.output}</pre>
                   </div>
                 </div>
@@ -199,15 +211,16 @@ function TaskCard({
       {task.status === 'paused' && (
         <div className="flex flex-col gap-1.5">
           <p className="text-muted text-xs">
-            Waiting for manual advance before starting the {STAGE_LABELS[task.stage]} stage.
+            {messages.workflowQueue.waitingForAdvance(messages.common.stages[task.stage])}
           </p>
           <AgentRunControls
             // Remount per task *and* stage so a choice made for one stage never carries into the
             // next — the same one-run-only rule the engine enforces.
             key={`${task.id}:${task.stage}:advance`}
+            messages={messages}
             task={task}
             providers={providers}
-            actionLabel="Run next stage"
+            actionLabel={messages.workflowQueue.runNextStage}
             busy={busy}
             onRun={(runOverride) => onAdvance(task.id, runOverride)}
           />
@@ -221,7 +234,7 @@ function TaskCard({
             checked={task.autoAdvance}
             onChange={(e) => onToggleAutoAdvance(task.id, e.target.checked)}
           />
-          Auto-advance through stages
+          {messages.workflowQueue.autoAdvanceThroughStages}
         </label>
       )}
 
@@ -232,9 +245,10 @@ function TaskCard({
           </p>
           <AgentRunControls
             key={`${task.id}:${task.stage}:retry`}
+            messages={messages}
             task={task}
             providers={providers}
-            actionLabel="Retry"
+            actionLabel={messages.common.retry}
             busy={busy}
             onRun={(runOverride) => onRetry(task.id, runOverride)}
           />
@@ -244,7 +258,7 @@ function TaskCard({
   )
 }
 
-export default function WorkflowQueue({ repo }: WorkflowQueueProps) {
+export default function WorkflowQueue({ messages, repo }: WorkflowQueueProps) {
   const [tasks, setTasks] = useState<QueuedTask[]>([])
   const [providers, setProviders] = useState<AiProviderConfig[]>([])
   const [title, setTitle] = useState('')
@@ -341,17 +355,17 @@ export default function WorkflowQueue({ repo }: WorkflowQueueProps) {
     <div>
       <div className="flex items-center justify-between gap-2">
         <div className="flex items-center gap-2">
-          <h2>Workflow Queue</h2>
+          <h2>{messages.workflowQueue.heading}</h2>
           {activeCount > 0 && (
             <span className="summary-indicator">
               <span className="live-dot" />
-              {activeCount} active
+              {messages.common.activeCount(activeCount)}
             </span>
           )}
         </div>
         {finishedCount > 0 && (
           <button onClick={clearCompleted} className="btn btn-secondary">
-            Clear completed ({finishedCount})
+            {messages.workflowQueue.clearCompleted(finishedCount)}
           </button>
         )}
       </div>
@@ -359,7 +373,7 @@ export default function WorkflowQueue({ repo }: WorkflowQueueProps) {
       <div className="my-3 flex flex-wrap items-center gap-2">
         <input
           className="input min-w-[220px] flex-1"
-          placeholder="New task title"
+          placeholder={messages.workflowQueue.newTaskTitle}
           value={title}
           onChange={(e) => setTitle(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && startWorkflow()}
@@ -370,10 +384,10 @@ export default function WorkflowQueue({ repo }: WorkflowQueueProps) {
             checked={autoAdvanceNewTask}
             onChange={(e) => setAutoAdvanceNewTask(e.target.checked)}
           />
-          Auto-advance
+          {messages.workflowQueue.autoAdvance}
         </label>
         <button onClick={startWorkflow} className="btn btn-primary shrink-0">
-          Start
+          {messages.workflowQueue.start}
         </button>
       </div>
 
@@ -381,6 +395,7 @@ export default function WorkflowQueue({ repo }: WorkflowQueueProps) {
         {repoTasks.map((task) => (
           <TaskCard
             key={task.id}
+            messages={messages}
             task={task}
             providers={providers}
             busy={runningTaskId === task.id}
@@ -390,7 +405,7 @@ export default function WorkflowQueue({ repo }: WorkflowQueueProps) {
             onOpenTask={(number, type) => setOpenTask({ number, type })}
           />
         ))}
-        {repoTasks.length === 0 && <p className="text-muted text-sm">No workflow tasks yet.</p>}
+        {repoTasks.length === 0 && <p className="text-muted text-sm">{messages.workflowQueue.noTasks}</p>}
       </div>
 
       {error && (
@@ -401,6 +416,7 @@ export default function WorkflowQueue({ repo }: WorkflowQueueProps) {
 
       {openTask && (
         <TaskDetailModal
+          messages={messages}
           repo={repo}
           number={openTask.number}
           type={openTask.type}

@@ -2,6 +2,8 @@ import { useState } from 'react'
 import type { QueueRecoveryState, RepoRef } from '../../core/workflow-engine'
 import type { RepoWorkflowCapability } from '../../core/repo-capabilities'
 import type { StoredValueProblem } from '../../core/store'
+import { LANGUAGE_PREFERENCES, type LanguagePreference } from '../../core/ui-language'
+import { LANGUAGE_NAMES, WordedError, uiLanguageFor, wordIn, type Messages, type Wording } from '../i18n'
 
 /**
  * Electron re-wraps anything thrown inside `ipcMain.handle` as
@@ -15,18 +17,19 @@ function readableIpcError(err: unknown): string {
   return match ? match[1] : raw
 }
 
+/** A queue action's failure as the card keeps it: App's own outcomes stay re-wordable. */
+function queueFailure(err: unknown): Wording {
+  return err instanceof WordedError ? err.wording : readableIpcError(err)
+}
+
 /**
  * The three pipeline grants GitHub cannot confirm without a write. Shown after a successful add so the
  * GUI says exactly what `mao repos add` says — a passing preflight is not proof of write access.
  */
-function unverifiedNotice(checked: RepoWorkflowCapability[]): string {
+function unverifiedNotice(checked: RepoWorkflowCapability[], messages: Messages): string {
   const pending = checked.filter((capability) => capability.unverified.length > 0)
   if (pending.length === 0) return ''
-  return (
-    `Added, but write access is unverified for ${pending.map((c) => `${c.owner}/${c.repo}`).join(', ')}: ` +
-    'GitHub cannot confirm this credential\'s Issues, Contents and Pull requests grants without a ' +
-    'write, so a workflow stage can still fail with a permission error.'
-  )
+  return messages.sidebar.addRepo.addedUnverified(pending.map((c) => `${c.owner}/${c.repo}`).join(', '))
 }
 
 interface SidebarProps {
@@ -79,6 +82,13 @@ interface SidebarProps {
   onClearPersistenceBroken: () => Promise<void>
   view: 'project' | 'global-settings'
   onViewChange: (view: 'project' | 'global-settings') => void
+  /** Every string this sidebar shows, in the language the operator picked. */
+  messages: Messages
+  /** The stored language preference, for the menu's picker. */
+  language: LanguagePreference
+  onLanguageChange: (language: LanguagePreference) => void
+  /** Why the newest language change could not be saved, as the IPC rejection worded it; '' otherwise. */
+  languageError: string
 }
 
 export default function Sidebar({
@@ -95,13 +105,21 @@ export default function Sidebar({
   onClearPersistenceBroken,
   view,
   onViewChange,
+  messages,
+  language,
+  onLanguageChange,
+  languageError,
 }: SidebarProps) {
   const [adding, setAdding] = useState(false)
   const [owner, setOwner] = useState('')
   const [repo, setRepo] = useState('')
   const [checking, setChecking] = useState(false)
   const [addError, setAddError] = useState('')
-  const [addNotice, setAddNotice] = useState('')
+  /**
+   * The last add's verdicts, not its notice: the caveat is worded at render, so switching the language
+   * while it is on screen re-words it rather than leaving it in the language of the click.
+   */
+  const [addVerdicts, setAddVerdicts] = useState<RepoWorkflowCapability[]>([])
   const [confirmingReset, setConfirmingReset] = useState(false)
   const [resetting, setResetting] = useState(false)
   const [resetError, setResetError] = useState('')
@@ -111,7 +129,12 @@ export default function Sidebar({
   const [confirmingPersistenceClear, setConfirmingPersistenceClear] = useState(false)
   const [clearingPersistence, setClearingPersistence] = useState(false)
   const [persistenceMarkerCleared, setPersistenceMarkerCleared] = useState(false)
-  const [queueError, setQueueError] = useState('')
+  /**
+   * The finished queue action's result. A `Wording`, because App words its own outcomes from the catalog
+   * (as `WordedError`s) and the card has to follow a language change; IPC and core text stays a string.
+   */
+  const [queueError, setQueueError] = useState<Wording>('')
+  const addNotice = unverifiedNotice(addVerdicts, messages)
 
   /**
    * Whether it is the *repository list* that is unusable, not merely something in the same file.
@@ -150,7 +173,7 @@ export default function Sidebar({
     try {
       await onResaveQueue()
     } catch (err) {
-      setQueueError(readableIpcError(err))
+      setQueueError(queueFailure(err))
     } finally {
       setResaving(false)
     }
@@ -164,7 +187,7 @@ export default function Sidebar({
       await onRecoverQueue()
       setConfirmingRecovery(false)
     } catch (err) {
-      setQueueError(readableIpcError(err))
+      setQueueError(queueFailure(err))
     } finally {
       setRecovering(false)
     }
@@ -179,7 +202,7 @@ export default function Sidebar({
       setPersistenceMarkerCleared(true)
       setConfirmingPersistenceClear(false)
     } catch (err) {
-      setQueueError(readableIpcError(err))
+      setQueueError(queueFailure(err))
     } finally {
       setClearingPersistence(false)
     }
@@ -196,13 +219,13 @@ export default function Sidebar({
     if (!trimmedOwner || !trimmedRepo || checking) return
     setChecking(true)
     setAddError('')
-    setAddNotice('')
+    setAddVerdicts([])
     try {
       const checked = await onAddRepo({ owner: trimmedOwner, repo: trimmedRepo })
       setOwner('')
       setRepo('')
       setAdding(false)
-      setAddNotice(unverifiedNotice(checked))
+      setAddVerdicts(checked)
     } catch (err) {
       setAddError(readableIpcError(err))
     } finally {
@@ -236,21 +259,21 @@ export default function Sidebar({
   return (
     <aside className="sidebar">
       <div className="sidebar-section">
-        <span className="nav-brand">MAO</span>
+        <span className="nav-brand">{messages.sidebar.brand}</span>
       </div>
 
       <div className="sidebar-section flex-1">
         <div className="flex items-center justify-between mb-1">
-          <span className="sidebar-heading">Projects</span>
+          <span className="sidebar-heading">{messages.sidebar.projects}</span>
           <button
             onClick={() => {
               setAdding((v) => !v)
               setAddError('')
-              setAddNotice('')
+              setAddVerdicts([])
             }}
             className="btn btn-ghost px-1 text-xs"
           >
-            + Add
+            {messages.sidebar.addRepo.toggle}
           </button>
         </div>
 
@@ -258,8 +281,8 @@ export default function Sidebar({
           <div className="card mb-2 gap-1.5 p-2">
             <p className="card-title text-[13px]">
               {queueRecovery.required || persistenceBroken
-                ? 'Workflow automation is halted'
-                : 'The stored workflow queue is unreadable'}
+                ? messages.sidebar.queue.haltedTitle
+                : messages.sidebar.queue.unreadableTitle}
             </p>
             {/* A field-only boot problem uses the latched reason verbatim. A whole-file problem found
                 while already latched must use the CURRENT report instead: recovery cannot verify a write
@@ -272,11 +295,9 @@ export default function Sidebar({
                 {queueStoredProblem ? (
                   <p className="text-muted text-[11px] leading-snug">
                     {queueStoredProblem.wholeFile
-                      ? `MAO also cannot read ${queueStoredProblem.source} at all, so every stored setting is affected. `
-                      : `MAO also cannot use the stored workflow queue in ${queueStoredProblem.source}. `}
-                    This is independent of the persistence marker. Repair and inspect the stored data as
-                    part of reconciliation before clearing the marker; queue recovery writes remain
-                    unavailable while the durable result is uncertain.
+                      ? messages.sidebar.marker.alsoUnreadableFile(queueStoredProblem.source)
+                      : messages.sidebar.marker.alsoUnusableQueue(queueStoredProblem.source)}{' '}
+                    {messages.sidebar.marker.storedDataIndependent}
                   </p>
                 ) : null}
               </>
@@ -284,9 +305,7 @@ export default function Sidebar({
               restartOnlyQueueRecovery ? (
                 <p className="text-muted text-[11px] leading-snug">
                   {wholeFileQueueProblem ? `${queueStoredProblem.message} ` : ''}
-                  This process observed a whole-file read failure, so workflow automation remains halted
-                  even if the file is readable now. Its startup snapshot cannot safely write over a
-                  repair. Repair the file if needed, then restart MAO to load the complete stored state.
+                  {messages.sidebar.queue.restartOnly}
                 </p>
               ) : (
                 <p className="text-muted text-[11px] leading-snug">{queueRecovery.reason}</p>
@@ -303,18 +322,12 @@ export default function Sidebar({
                  unreadable observation. The flag comes from core; no UI parses the report text. */
               queueStoredProblem?.wholeFile ? (
                 <p className="text-muted text-[11px] leading-snug">
-                  MAO could not read {queueStoredProblem.source} at all, so it established neither the
-                  stored workflow queue nor any other setting. Repository polling and new queue mutations
-                  are paused, every write is refused, and any running workflow will stop when it next tries
-                  to persist. The file still holds everything it held. Repair the file, then restart MAO.
+                  {messages.sidebar.queue.lateWholeFile(queueStoredProblem.source)}
                 </p>
               ) : (
                 <>
                   <p className="text-muted text-[11px] leading-snug">
-                    MAO cannot read the stored workflow queue in {queueStoredProblem?.source}. This session
-                    is not halted — it is still holding the queue it loaded at startup, and its next queue
-                    write will rewrite the file from that. Restarting before that happens will refuse to
-                    start unattended work until the value is replaced.
+                    {messages.sidebar.queue.lateFieldOnly(queueStoredProblem?.source ?? '')}
                   </p>
                   {/* Deliberately NOT `mao workflow confirm-queue-recovery` here. That command discards
                       anything its separate process cannot validate and writes ITS startup snapshot over
@@ -325,7 +338,7 @@ export default function Sidebar({
                     className="btn btn-secondary self-start text-xs"
                     disabled={resaving}
                   >
-                    {resaving ? 'Saving…' : 'Save this session’s queue now'}
+                    {resaving ? messages.sidebar.queue.saving : messages.sidebar.queue.saveSessionQueue}
                   </button>
                 </>
               )
@@ -333,21 +346,16 @@ export default function Sidebar({
             {persistenceBroken ? (
               <>
                 <p className="text-muted text-[11px] leading-snug">
-                  Queue recovery and live-session Save are unavailable while the durable result is
-                  uncertain. Check the stored queue and target repositories before clearing the marker.
+                  {messages.sidebar.marker.unavailable}
                 </p>
                 {persistenceMarkerCleared ? (
                   <p className="text-[11px] leading-snug" style={{ color: 'var(--color-accent-700)' }}>
-                    The marker is cleared. This process remains halted; restart MAO to load the verified
-                    queue.
+                    {messages.sidebar.marker.cleared}
                   </p>
                 ) : confirmingPersistenceClear ? (
                   <div className="flex flex-col gap-2">
                     <p className="text-muted text-[11px] leading-snug">
-                      Confirm only after comparing the stored queue with the target repositories and
-                      resolving any half-finished issue, branch or pull request. Wait for any active stage
-                      in this process to stop. Clearing the marker does not change this running process;
-                      restart is required before automation can resume.
+                      {messages.sidebar.marker.clearConfirmation}
                     </p>
                     <div className="flex gap-2">
                       <button
@@ -355,7 +363,9 @@ export default function Sidebar({
                         className="btn btn-primary text-xs"
                         disabled={clearingPersistence}
                       >
-                        {clearingPersistence ? 'Clearing…' : 'Confirm marker clear'}
+                        {clearingPersistence
+                          ? messages.sidebar.marker.clearing
+                          : messages.sidebar.marker.confirmClear}
                       </button>
                       <button
                         onClick={() => {
@@ -365,7 +375,7 @@ export default function Sidebar({
                         className="btn btn-secondary text-xs"
                         disabled={clearingPersistence}
                       >
-                        Cancel
+                        {messages.common.cancel}
                       </button>
                     </div>
                   </div>
@@ -374,15 +384,13 @@ export default function Sidebar({
                     onClick={() => setConfirmingPersistenceClear(true)}
                     className="btn btn-secondary self-start text-xs"
                   >
-                    Clear marker after verification
+                    {messages.sidebar.marker.clearAfterVerification}
                   </button>
                 )}
               </>
             ) : restartOnlyQueueRecovery ? (
               <p className="text-muted text-[11px] leading-snug">
-                If a workflow was already running, verify its queue and GitHub state after restart. If
-                MAO reports an unresolved persistence outcome, use the marker recovery shown here only
-                after that check.
+                {messages.sidebar.queue.restartFollowUp}
               </p>
             ) : null}
             {queueRecovery.required &&
@@ -392,18 +400,16 @@ export default function Sidebar({
               confirmingRecovery ? (
                 <div className="flex flex-col gap-2">
                   <p className="text-muted text-[11px] leading-snug">
-                    Recovery permanently deletes invalid queue entries and retains every readable task.
-                    Tasks stored as running are restored as pending. After automation is released, later
-                    queue activity — including an auto-trigger poll that enqueues work — may execute those
-                    retained tasks.
+                    {messages.sidebar.queue.recoveryConsequences}
                   </p>
                   <p className="text-muted text-[11px] leading-snug">
-                    Before continuing, check the target repositories for workflow-active issues and
-                    half-finished branches or pull requests so recovery does not repeat GitHub work.
+                    {messages.sidebar.queue.recoveryCheckFirst}
                   </p>
                   <div className="flex gap-2">
                     <button onClick={submitRecovery} className="btn btn-primary text-xs" disabled={recovering}>
-                      {recovering ? 'Recovering…' : 'Confirm recovery'}
+                      {recovering
+                        ? messages.sidebar.queue.recovering
+                        : messages.sidebar.queue.confirmRecovery}
                     </button>
                     {/* Disabled mid-write rather than hidden, like the repo-list reset: the write is
                         already queued and a Cancel that appeared to work would say otherwise. */}
@@ -415,7 +421,7 @@ export default function Sidebar({
                       className="btn btn-secondary text-xs"
                       disabled={recovering}
                     >
-                      Cancel
+                      {messages.common.cancel}
                     </button>
                   </div>
                 </div>
@@ -424,7 +430,7 @@ export default function Sidebar({
                   onClick={() => setConfirmingRecovery(true)}
                   className="btn btn-secondary self-start text-xs"
                 >
-                  Recover readable tasks
+                  {messages.sidebar.queue.recoverReadableTasks}
                 </button>
               )
             ) : queueRecovery.required && !restartOnlyQueueRecovery && !persistenceBroken ? (
@@ -432,8 +438,7 @@ export default function Sidebar({
                  would overwrite that repair with this process's filtered, restart-normalized subset,
                  so the way out is a restart — only a fresh boot can load the complete repaired queue. */
               <p className="text-muted text-[11px] leading-snug">
-                The stored queue reads normally again. Restart MAO to load it — this session is still
-                halted because its in-memory queue may be incomplete.
+                {messages.sidebar.queue.repairedElsewhere}
               </p>
             ) : null}
           </div>
@@ -448,19 +453,19 @@ export default function Sidebar({
             did nothing. Dismissed explicitly so it cannot be missed either. */}
         {queueError && (
           <div className="card mb-2 gap-1.5 p-2">
-            <p className="card-title text-[13px]">Workflow queue</p>
+            <p className="card-title text-[13px]">{messages.sidebar.queueResult.title}</p>
             <p className="text-xs" style={{ color: 'var(--color-accent-700)' }}>
-              {queueError}
+              {wordIn(queueError, messages)}
             </p>
             <button onClick={() => setQueueError('')} className="btn btn-secondary self-start text-xs">
-              Dismiss
+              {messages.sidebar.queueResult.dismiss}
             </button>
           </div>
         )}
 
         {otherProblems.length > 0 && (
           <div className="card mb-2 gap-1.5 p-2">
-            <p className="card-title text-[13px]">Stored settings could not be read</p>
+            <p className="card-title text-[13px]">{messages.sidebar.storedProblems.title}</p>
             {otherProblems.map((problem) => (
               <p key={problem.field} className="text-muted text-[11px] leading-snug">
                 {problem.message}
@@ -470,7 +475,9 @@ export default function Sidebar({
               (confirmingReset ? (
                 <div className="flex gap-2">
                   <button onClick={submitReset} className="btn btn-primary text-xs" disabled={resetting}>
-                    {resetting ? 'Resetting…' : 'Confirm reset'}
+                    {resetting
+                      ? messages.sidebar.storedProblems.resetting
+                      : messages.sidebar.storedProblems.confirmReset}
                   </button>
                   {/* Disabled mid-write rather than hidden: the write is already queued and cannot be
                       called back, and a Cancel that appears to work would say otherwise. */}
@@ -482,12 +489,12 @@ export default function Sidebar({
                     className="btn btn-secondary text-xs"
                     disabled={resetting}
                   >
-                    Cancel
+                    {messages.common.cancel}
                   </button>
                 </div>
               ) : (
                 <button onClick={() => setConfirmingReset(true)} className="btn btn-secondary self-start text-xs">
-                  Reset stored list
+                  {messages.sidebar.storedProblems.resetList}
                 </button>
               ))}
             {resetError && (
@@ -502,7 +509,7 @@ export default function Sidebar({
           <div className="card mb-2 gap-1.5 p-2">
             <input
               className="input"
-              placeholder="owner"
+              placeholder={messages.sidebar.addRepo.ownerPlaceholder}
               value={owner}
               onChange={(e) => setOwner(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && submitAdd()}
@@ -510,13 +517,13 @@ export default function Sidebar({
             />
             <input
               className="input"
-              placeholder="repo"
+              placeholder={messages.sidebar.addRepo.repoPlaceholder}
               value={repo}
               onChange={(e) => setRepo(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && submitAdd()}
             />
             <button onClick={submitAdd} className="btn btn-primary text-xs" disabled={checking}>
-              {checking ? 'Checking access…' : 'Add'}
+              {checking ? messages.sidebar.addRepo.checking : messages.sidebar.addRepo.submit}
             </button>
             {addError && (
               <p className="text-xs" style={{ color: 'var(--color-accent-700)' }}>
@@ -536,11 +543,13 @@ export default function Sidebar({
               <span className="truncate">
                 {r.owner}/{r.repo}
               </span>
-              {r.autoTrigger === false && <span className="text-[10px] opacity-70">off</span>}
+              {r.autoTrigger === false && (
+                <span className="text-[10px] opacity-70">{messages.sidebar.autoTriggerOff}</span>
+              )}
             </button>
           ))}
           {repos.length === 0 && !adding && !repoListUnusable && (
-            <p className="text-muted text-xs px-2">No projects yet — add a repository to get started.</p>
+            <p className="text-muted text-xs px-2">{messages.sidebar.noProjects}</p>
           )}
         </nav>
 
@@ -554,8 +563,34 @@ export default function Sidebar({
           onClick={() => onViewChange('global-settings')}
           className={`sidebar-item ${view === 'global-settings' ? 'active' : ''}`}
         >
-          <span>Global settings</span>
+          <span>{messages.sidebar.globalSettings}</span>
         </button>
+        {/* The language menu sits beside Global settings because it has to be reachable from every view
+            — including by an operator who just picked a language they cannot read. Each option names
+            its language in that language, so the way back never depends on the current one. */}
+        <div className="flex items-center justify-between gap-2 p-2 text-sm">
+          <label htmlFor="sidebar-language">{messages.language.label}</label>
+          <select
+            id="sidebar-language"
+            className="input input-sm w-auto"
+            value={language}
+            onChange={(e) => onLanguageChange(e.target.value as LanguagePreference)}
+          >
+            {LANGUAGE_PREFERENCES.map((preference) => (
+              // Each name is in its own language, and says so, so a screen reader voices it correctly.
+              <option key={preference} value={preference} lang={preference === 'system' ? undefined : preference}>
+                {preference === 'system'
+                  ? messages.language.systemResolved(LANGUAGE_NAMES[uiLanguageFor('system')])
+                  : LANGUAGE_NAMES[preference]}
+              </option>
+            ))}
+          </select>
+        </div>
+        {languageError && (
+          <p className="px-2 text-[11px] leading-snug" style={{ color: 'var(--color-accent-700)' }}>
+            {messages.language.saveFailed(readableIpcError(languageError))}
+          </p>
+        )}
       </div>
     </aside>
   )

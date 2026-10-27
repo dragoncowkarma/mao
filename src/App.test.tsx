@@ -1,9 +1,11 @@
 import { StrictMode } from 'react'
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 import App from './App'
 import { createElectronApiStub } from './test/electron-api-stub'
+import { LANGUAGE_NAMES, MESSAGES, type Messages } from './i18n'
+import type { GithubTask } from '../core/github-service'
 import type { RepoRef } from '../core/workflow-engine'
 import type { StoredValueProblem } from '../core/store'
 import type { QueueRecoveryOutcome } from '../core/workflow-engine'
@@ -1200,5 +1202,292 @@ describe('App halted workflow queue', () => {
 
     expect(screen.queryByText('Workflow automation is halted')).toBeNull()
     expect(screen.queryByRole('button', { name: 'Recover readable tasks' })).toBeNull()
+  })
+})
+
+describe('App UI language', () => {
+  /** jsdom reports en-US. A test about the OS's own languages replaces the getter for its duration. */
+  function preferOsLanguages(languages: string[]) {
+    return vi.spyOn(window.navigator, 'languages', 'get').mockReturnValue(languages)
+  }
+
+  function mountApp() {
+    render(
+      <StrictMode>
+        <App />
+      </StrictMode>,
+    )
+  }
+
+  const menu = (language: 'en' | 'ko') => screen.getByRole('combobox', { name: MESSAGES[language].language.label })
+
+  const updatedAt = '2026-03-04T05:06:07Z'
+  /** A board card with a date on it — the 4th of March, which month-first and day-first orders tell apart. */
+  const datedTask: GithubTask = {
+    id: 1,
+    number: 7,
+    title: 'Translate the board',
+    type: 'issue',
+    state: 'open',
+    url: 'https://github.com/acme/one/issues/7',
+    updatedAt,
+    urgent: false,
+    labels: [],
+    body: '',
+  }
+
+  it('renders in the stored language once it arrives, and labels the document with it', async () => {
+    const stub = createElectronApiStub([ONE])
+    stub.getLanguage.mockResolvedValue('ko')
+    mountApp()
+
+    // The first paint follows the OS (English under jsdom); the stored choice replaces it.
+    expect(await screen.findByRole('button', { name: MESSAGES.ko.app.tabs.board })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: MESSAGES.en.app.tabs.board })).toBeNull()
+    expect(menu('ko')).toHaveValue('ko')
+    expect(document.documentElement.lang).toBe('ko')
+  })
+
+  it('switches every component from the sidebar menu at once, without a restart, and saves the choice', async () => {
+    const stub = createElectronApiStub([ONE])
+    const user = userEvent.setup()
+    mountApp()
+    await screen.findByRole('button', { name: MESSAGES.en.app.tabs.board })
+    expect(document.documentElement.lang).toBe('en')
+
+    await user.selectOptions(menu('en'), LANGUAGE_NAMES.ko)
+
+    // App's own tabs, the sidebar around them and the board below them: three components, one prop.
+    expect(await screen.findByRole('button', { name: MESSAGES.ko.app.tabs.board })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: MESSAGES.ko.sidebar.globalSettings })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: MESSAGES.ko.kanbanBoard.heading })).toBeInTheDocument()
+    expect(document.documentElement.lang).toBe('ko')
+    expect(stub.setLanguage).toHaveBeenLastCalledWith('ko')
+
+    // And back from a menu now labelled in Korean: its options still name each language in itself.
+    await user.selectOptions(menu('ko'), LANGUAGE_NAMES.en)
+
+    expect(await screen.findByRole('button', { name: MESSAGES.en.app.tabs.board })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: MESSAGES.en.kanbanBoard.heading })).toBeInTheDocument()
+    expect(document.documentElement.lang).toBe('en')
+    expect(stub.setLanguage).toHaveBeenLastCalledWith('en')
+  })
+
+  it('switches from Global settings too, sharing one choice with the sidebar menu', async () => {
+    const stub = createElectronApiStub([ONE])
+    const user = userEvent.setup()
+    mountApp()
+
+    await user.click(await screen.findByRole('button', { name: MESSAGES.en.sidebar.globalSettings }))
+    const group = screen.getByRole('group', { name: MESSAGES.en.language.label })
+    await user.click(within(group).getByRole('button', { name: LANGUAGE_NAMES.ko }))
+
+    expect(await screen.findByRole('heading', { name: MESSAGES.ko.globalSettings.heading })).toBeInTheDocument()
+    expect(menu('ko')).toHaveValue('ko')
+    expect(stub.setLanguage).toHaveBeenLastCalledWith('ko')
+  })
+
+  it('follows the OS for system, and the menu says which language that is', async () => {
+    const spy = preferOsLanguages(['ko-KR', 'en-US'])
+    try {
+      createElectronApiStub([ONE])
+      mountApp()
+
+      expect(await screen.findByRole('button', { name: MESSAGES.ko.app.tabs.board })).toBeInTheDocument()
+      expect(menu('ko')).toHaveValue('system')
+      expect(within(menu('ko')).getByRole('option', { selected: true })).toHaveTextContent(
+        MESSAGES.ko.language.systemResolved(LANGUAGE_NAMES.ko),
+      )
+      expect(document.documentElement.lang).toBe('ko')
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it('reads a stored value no picker can show as system rather than trusting it', async () => {
+    const stub = createElectronApiStub([ONE])
+    // Deferred, so the assertions run after the answer has been applied. The rendered language looks the
+    // same either way, and so does the sidebar menu — React selects a `<select>`'s first option, which is
+    // 'system', when no option matches — so the witness is Global settings' toggles: an untrusted "fr"
+    // leaves "System" pressed, a trusted one leaves nothing pressed.
+    let answer!: (value: unknown) => void
+    stub.getLanguage.mockImplementation(() => new Promise((resolve) => (answer = resolve)) as never)
+    const user = userEvent.setup()
+    mountApp()
+    await user.click(await screen.findByRole('button', { name: MESSAGES.en.sidebar.globalSettings }))
+
+    await act(async () => answer('fr'))
+
+    const group = screen.getByRole('group', { name: MESSAGES.en.language.label })
+    expect(within(group).getByRole('button', { name: MESSAGES.en.language.system })).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    )
+    expect(document.documentElement.lang).toBe('en')
+  })
+
+  it('formats dates in the chosen language', async () => {
+    // Both directions, because the process's own default locale decides what an argument-less
+    // `toLocaleString()` prints: on a Korean machine only the English render can tell them apart, on
+    // an English one only the Korean render can.
+    for (const [language, other] of [
+      ['en', 'ko'],
+      ['ko', 'en'],
+    ] as const) {
+      cleanup()
+      const stub = createElectronApiStub([ONE])
+      stub.fetchTasks.mockResolvedValue([datedTask])
+      stub.getLanguage.mockResolvedValue(language)
+      mountApp()
+
+      expect(await screen.findByText(new Date(updatedAt).toLocaleString(language)), language).toBeInTheDocument()
+      expect(screen.queryByText(new Date(updatedAt).toLocaleString(other)), language).toBeNull()
+    }
+  })
+
+  it('keeps the OS’s own regional date format for the language on screen', async () => {
+    // A bare 'en' formats month-first, the US way, where the argument-less `toLocaleString()` this replaced
+    // followed the OS. A UK operator would read 4 March as 3 April. Korean has no regional tag in this OS
+    // list, so it still formats the plain Korean way.
+    const spy = preferOsLanguages(['en-GB', 'ja-JP'])
+    try {
+      for (const [language, locales] of [
+        ['en', ['en-GB']],
+        ['ko', ['ko']],
+      ] as const) {
+        cleanup()
+        const stub = createElectronApiStub([ONE])
+        stub.fetchTasks.mockResolvedValue([datedTask])
+        stub.getLanguage.mockResolvedValue(language)
+        mountApp()
+
+        expect(await screen.findByText(new Date(updatedAt).toLocaleString([...locales])), language).toBeInTheDocument()
+      }
+      expect(new Date(updatedAt).toLocaleString('en-GB')).not.toBe(new Date(updatedAt).toLocaleString('en'))
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it('keeps a pick made while the stored language was still loading', async () => {
+    // Main answers IPC in order, so a read sent at mount carries the value from before a pick made while
+    // it was in flight. Applying it would snap the window back while the store holds the new choice.
+    const stub = createElectronApiStub([ONE])
+    let answer!: (value: unknown) => void
+    stub.getLanguage.mockImplementation(() => new Promise((resolve) => (answer = resolve)) as never)
+    const user = userEvent.setup()
+    mountApp()
+    await screen.findByRole('button', { name: MESSAGES.en.app.tabs.board })
+
+    await user.selectOptions(menu('en'), LANGUAGE_NAMES.ko)
+    await screen.findByRole('button', { name: MESSAGES.ko.app.tabs.board })
+    await act(async () => answer('en'))
+
+    expect(screen.getByRole('button', { name: MESSAGES.ko.app.tabs.board })).toBeInTheDocument()
+    expect(menu('ko')).toHaveValue('ko')
+  })
+
+  // Every outcome App words itself, from both actions — one re-worded kind would leave the other nine free
+  // to regress to a plain Error, which freezes the card in the language of the click.
+  it.each([
+    ['recover', 'restart-required', (m: Messages) => m.app.queueOutcome.restartRequired],
+    ['recover', 'superseded', (m: Messages) => m.app.queueOutcome.recover.superseded],
+    ['recover', 'write-failed', (m: Messages) => m.app.queueOutcome.recover.writeFailed],
+    ['recover', 'invalid-replacement', (m: Messages) => m.app.queueOutcome.recover.invalidReplacement],
+    ['recover', 'already-readable', (m: Messages) => m.app.queueOutcome.recover.alreadyReadable],
+    ['resave', 'already-readable', (m: Messages) => m.app.queueOutcome.resave.alreadyReadable],
+    ['resave', 'superseded', (m: Messages) => m.app.queueOutcome.resave.superseded],
+    ['resave', 'restart-required', (m: Messages) => m.app.queueOutcome.restartRequired],
+    ['resave', 'write-failed', (m: Messages) => m.app.queueOutcome.resave.writeFailed],
+    ['resave', 'invalid-replacement', (m: Messages) => m.app.queueOutcome.resave.invalidReplacement],
+  ] as const)('re-words the %s “%s” result already on screen when the language changes', async (action, kind, word) => {
+    const user = userEvent.setup()
+    const outcome = { kind } as QueueRecoveryOutcome
+    if (action === 'recover') {
+      // Halted at boot: the stub latches on a seeded `workflowTasks` problem.
+      const stub = createElectronApiStub([], [UNUSABLE_QUEUE])
+      stub.confirmQueueRecovery.mockResolvedValue(outcome)
+      mountApp()
+      await user.click(await screen.findByRole('button', { name: MESSAGES.en.sidebar.queue.recoverReadableTasks }))
+      await user.click(screen.getByRole('button', { name: MESSAGES.en.sidebar.queue.confirmRecovery }))
+    } else {
+      // Broken after a clean start: not latched, so the card offers the live-session save.
+      const stub = createElectronApiStub([], [UNUSABLE_QUEUE_LATE])
+      stub.recoveryRequired.mockResolvedValue({
+        required: false,
+        reason: undefined,
+        restartRequired: false,
+        persistenceBroken: false,
+      })
+      stub.resaveQueue.mockResolvedValue(outcome)
+      mountApp()
+      await user.click(await screen.findByRole('button', { name: MESSAGES.en.sidebar.queue.saveSessionQueue }))
+    }
+    expect(await screen.findByText(word(MESSAGES.en))).toBeInTheDocument()
+
+    await user.selectOptions(menu('en'), LANGUAGE_NAMES.ko)
+
+    expect(await screen.findByText(word(MESSAGES.ko))).toBeInTheDocument()
+    expect(screen.queryByText(word(MESSAGES.en))).toBeNull()
+  })
+
+  it('shows core’s own reason for a queue result as it came, in either language', async () => {
+    const reason = 'could not read the config file'
+    const user = userEvent.setup()
+    const stub = createElectronApiStub([], [UNUSABLE_QUEUE_LATE])
+    stub.recoveryRequired.mockResolvedValue({
+      required: false,
+      reason: undefined,
+      restartRequired: false,
+      persistenceBroken: false,
+    })
+    stub.resaveQueue.mockResolvedValue({ kind: 'unverified', reason })
+    mountApp()
+    await user.click(await screen.findByRole('button', { name: MESSAGES.en.sidebar.queue.saveSessionQueue }))
+    expect(await screen.findByText(reason)).toBeInTheDocument()
+
+    await user.selectOptions(menu('en'), LANGUAGE_NAMES.ko)
+
+    // The card around it switched; the reason did not, because it is not MAO's to translate.
+    expect(await screen.findByRole('button', { name: MESSAGES.ko.sidebar.queueResult.dismiss })).toBeInTheDocument()
+    expect(screen.getByText(reason)).toBeInTheDocument()
+  })
+
+  it('keeps a refused choice for this session and says the preference was not saved', async () => {
+    const stub = createElectronApiStub([ONE])
+    const reason = '[store] Refusing to write "language" to /data/config.json, because the file could not be read.'
+    stub.setLanguage.mockRejectedValueOnce(
+      new Error(`Error invoking remote method 'ui:setLanguage': Error: ${reason}`),
+    )
+    const user = userEvent.setup()
+    mountApp()
+    await screen.findByRole('button', { name: MESSAGES.en.app.tabs.board })
+
+    await user.selectOptions(menu('en'), LANGUAGE_NAMES.ko)
+
+    expect(await screen.findByText(MESSAGES.ko.language.saveFailed(reason))).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: MESSAGES.ko.app.tabs.board })).toBeInTheDocument()
+
+    // The next change that does save takes the warning down; it would otherwise linger in English.
+    await user.selectOptions(menu('ko'), LANGUAGE_NAMES.en)
+    await waitFor(() => expect(screen.queryByText(MESSAGES.en.language.saveFailed(reason))).toBeNull())
+    expect(screen.getByRole('button', { name: MESSAGES.en.app.tabs.board })).toBeInTheDocument()
+  })
+
+  it('does not report an older refusal once a newer choice has been saved', async () => {
+    const stub = createElectronApiStub([ONE])
+    let refuseFirst!: (err: Error) => void
+    stub.setLanguage.mockImplementationOnce(() => new Promise<void>((_resolve, reject) => (refuseFirst = reject)))
+    const user = userEvent.setup()
+    mountApp()
+    await screen.findByRole('button', { name: MESSAGES.en.app.tabs.board })
+
+    await user.selectOptions(menu('en'), LANGUAGE_NAMES.ko) // still in flight
+    await user.selectOptions(menu('ko'), LANGUAGE_NAMES.en) // saved
+    await waitFor(() => expect(stub.setLanguage).toHaveBeenLastCalledWith('en'))
+    await act(async () => refuseFirst(new Error('[store] Refusing to write "language"')))
+
+    expect(screen.queryByText(/could not be saved/)).toBeNull()
+    expect(screen.getByRole('button', { name: MESSAGES.en.app.tabs.board })).toBeInTheDocument()
   })
 })

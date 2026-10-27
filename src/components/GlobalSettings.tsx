@@ -3,20 +3,22 @@ import { electronApi } from '../electron-api'
 import type { AgentStage, AiProviderConfig, ModelEffortPreset, ProviderKindId } from '../../core/ai/types'
 import { PROVIDER_OPTIONS } from '../../core/ai/provider-options'
 import type { ThemePreference } from '../../core/store'
+import { LANGUAGE_PREFERENCES, type LanguagePreference } from '../../core/ui-language'
+import { LANGUAGE_NAMES, uiLanguageFor, wordIn, type Messages, type Wording } from '../i18n'
 
 const ALL_STAGES: AgentStage[] = ['issue', 'pr', 'review', 'merge']
-const STAGE_LABELS: Record<AgentStage, string> = { issue: 'Issue', pr: 'PR', review: 'Review', merge: 'Merge' }
 
 interface GlobalSettingsProps {
+  /** Every string this pane shows, in the language the operator picked. */
+  messages: Messages
   theme: ThemePreference
   onThemeChange: (theme: ThemePreference) => void
+  /** The stored language preference — the same state the sidebar's language menu edits. */
+  language: LanguagePreference
+  onLanguageChange: (language: LanguagePreference) => void
 }
 
-const THEME_OPTIONS: { value: ThemePreference; label: string }[] = [
-  { value: 'light', label: 'Light' },
-  { value: 'dark', label: 'Dark' },
-  { value: 'system', label: 'System' },
-]
+const THEME_OPTIONS: ThemePreference[] = ['light', 'dark', 'system']
 
 function emptyProvider(): AiProviderConfig {
   return { id: crypto.randomUUID(), name: '', kind: 'api', apiFormat: 'anthropic' }
@@ -26,39 +28,34 @@ function emptyPreset(): ModelEffortPreset {
   return { id: crypto.randomUUID(), model: '' }
 }
 
-function validateProviders(providers: AiProviderConfig[]): string[] {
+function validateProviders(providers: AiProviderConfig[], messages: Messages): string[] {
+  const text = messages.globalSettings.validation
   const errors: string[] = []
   const seenNames = new Set<string>()
 
   for (const p of providers) {
     const name = p.name.trim()
-    const label = name || 'Unnamed provider'
+    const label = name || text.unnamedProvider
 
     if (!name) {
-      errors.push('Every AI provider needs a name.')
+      errors.push(text.nameRequired)
     } else {
       const key = name.toLowerCase()
-      if (seenNames.has(key)) errors.push(`Duplicate provider name: "${name}".`)
+      if (seenNames.has(key)) errors.push(text.duplicateName(name))
       seenNames.add(key)
     }
 
-    if (p.kind === 'api' && !p.apiKey?.trim()) errors.push(`"${label}" is an API provider but has no API key.`)
-    if (p.kind === 'cli' && !p.command?.trim()) errors.push(`"${label}" is a CLI provider but has no command.`)
+    if (p.kind === 'api' && !p.apiKey?.trim()) errors.push(text.apiKeyMissing(label))
+    if (p.kind === 'cli' && !p.command?.trim()) errors.push(text.commandMissing(label))
   }
 
   return errors
 }
 
-const PROVIDER_KIND_LABELS: Record<ProviderKindId, string> = {
-  antigravity: 'Antigravity (agy)',
-  claude: 'Claude',
-  codex: 'Codex',
-  custom: 'Custom',
-}
-
 // ─── Preset row ────────────────────────────────────────────────────────────────
 
 interface PresetRowProps {
+  messages: Messages
   preset: ModelEffortPreset
   kindId?: ProviderKindId
   isSelected: boolean
@@ -67,7 +64,7 @@ interface PresetRowProps {
   onRemove: () => void
 }
 
-function PresetRow({ preset, kindId, isSelected, onSelect, onChange, onRemove }: PresetRowProps) {
+function PresetRow({ messages, preset, kindId, isSelected, onSelect, onChange, onRemove }: PresetRowProps) {
   const opts = kindId ? PROVIDER_OPTIONS[kindId] : null
   const modelOpts = opts?.models ?? []
   const effortOpts = opts?.efforts ?? []
@@ -82,7 +79,7 @@ function PresetRow({ preset, kindId, isSelected, onSelect, onChange, onRemove }:
         type="radio"
         checked={isSelected}
         onChange={onSelect}
-        title="Set as active preset"
+        title={messages.globalSettings.setActivePreset}
         className="cursor-pointer"
       />
 
@@ -93,7 +90,7 @@ function PresetRow({ preset, kindId, isSelected, onSelect, onChange, onRemove }:
           value={preset.model}
           onChange={(e) => onChange({ model: e.target.value, effort: undefined })}
         >
-          <option value="">— select model —</option>
+          <option value="">{messages.globalSettings.selectModel}</option>
           {modelOpts.map((m) => (
             <option key={m.value} value={m.value}>
               {m.label}
@@ -103,7 +100,7 @@ function PresetRow({ preset, kindId, isSelected, onSelect, onChange, onRemove }:
       ) : (
         <input
           className="input flex-1 min-w-[180px]"
-          placeholder="Model ID (e.g. gpt-4o)"
+          placeholder={messages.globalSettings.modelIdPlaceholder}
           value={preset.model}
           onChange={(e) => onChange({ model: e.target.value })}
         />
@@ -118,7 +115,7 @@ function PresetRow({ preset, kindId, isSelected, onSelect, onChange, onRemove }:
             onChange({ effort: (e.target.value || undefined) as ModelEffortPreset['effort'] })
           }
         >
-          <option value="">Effort: —</option>
+          <option value="">{messages.globalSettings.effortUnset}</option>
           {effortOpts.map((ef) => (
             <option key={ef.value} value={ef.value}>
               {ef.label}
@@ -127,11 +124,13 @@ function PresetRow({ preset, kindId, isSelected, onSelect, onChange, onRemove }:
         </select>
       )}
       {noEffort && (
-        <span className="text-muted text-xs w-[140px] flex-none pl-1">No effort</span>
+        <span className="text-muted text-xs w-[140px] flex-none pl-1">
+          {messages.globalSettings.noEffort}
+        </span>
       )}
 
       <button onClick={onRemove} className="btn btn-ghost shrink-0 text-xs">
-        Remove
+        {messages.globalSettings.remove}
       </button>
     </div>
   )
@@ -140,12 +139,13 @@ function PresetRow({ preset, kindId, isSelected, onSelect, onChange, onRemove }:
 // ─── Provider card ─────────────────────────────────────────────────────────────
 
 interface ProviderCardProps {
+  messages: Messages
   provider: AiProviderConfig
   onUpdate: (patch: Partial<AiProviderConfig>) => void
   onRemove: () => void
 }
 
-function ProviderCard({ provider: p, onUpdate, onRemove }: ProviderCardProps) {
+function ProviderCard({ messages, provider: p, onUpdate, onRemove }: ProviderCardProps) {
   const [presetsExpanded, setPresetsExpanded] = useState(false)
 
   function updatePreset(presetId: string, patch: Partial<ModelEffortPreset>) {
@@ -204,7 +204,7 @@ function ProviderCard({ provider: p, onUpdate, onRemove }: ProviderCardProps) {
       <div className="flex flex-wrap items-center gap-2">
         <input
           className="input min-w-[140px] flex-1"
-          placeholder="Name"
+          placeholder={messages.globalSettings.providerNamePlaceholder}
           value={p.name}
           onChange={(e) => onUpdate({ name: e.target.value })}
         />
@@ -213,8 +213,8 @@ function ProviderCard({ provider: p, onUpdate, onRemove }: ProviderCardProps) {
           value={p.kind}
           onChange={(e) => onUpdate({ kind: e.target.value as 'api' | 'cli' })}
         >
-          <option value="api">API (BYOK)</option>
-          <option value="cli">CLI</option>
+          <option value="api">{messages.globalSettings.kindOptions.api}</option>
+          <option value="cli">{messages.globalSettings.kindOptions.cli}</option>
         </select>
 
         {p.kind === 'api' ? (
@@ -226,12 +226,12 @@ function ProviderCard({ provider: p, onUpdate, onRemove }: ProviderCardProps) {
                 onUpdate({ apiFormat: e.target.value as 'anthropic' | 'openai' })
               }
             >
-              <option value="anthropic">Anthropic</option>
-              <option value="openai">OpenAI-compatible</option>
+              <option value="anthropic">{messages.globalSettings.apiFormatOptions.anthropic}</option>
+              <option value="openai">{messages.globalSettings.apiFormatOptions.openai}</option>
             </select>
             <input
               className="input min-w-[140px] flex-1"
-              placeholder="API key"
+              placeholder={messages.globalSettings.apiKeyPlaceholder}
               type="password"
               value={p.apiKey ?? ''}
               onChange={(e) => onUpdate({ apiKey: e.target.value })}
@@ -241,7 +241,7 @@ function ProviderCard({ provider: p, onUpdate, onRemove }: ProviderCardProps) {
           <>
             <input
               className="input min-w-[180px] flex-1"
-              placeholder="Command (e.g. claude)"
+              placeholder={messages.globalSettings.commandPlaceholder}
               value={p.command ?? ''}
               onChange={(e) => onUpdate({ command: e.target.value })}
             />
@@ -252,9 +252,9 @@ function ProviderCard({ provider: p, onUpdate, onRemove }: ProviderCardProps) {
                 onUpdate({ providerKindId: e.target.value as ProviderKindId, presets: [], selectedPresetId: undefined })
               }
             >
-              {(Object.keys(PROVIDER_KIND_LABELS) as ProviderKindId[]).map((k) => (
+              {(Object.keys(messages.globalSettings.toolOptions) as ProviderKindId[]).map((k) => (
                 <option key={k} value={k}>
-                  {PROVIDER_KIND_LABELS[k]}
+                  {messages.globalSettings.toolOptions[k]}
                 </option>
               ))}
             </select>
@@ -268,7 +268,7 @@ function ProviderCard({ provider: p, onUpdate, onRemove }: ProviderCardProps) {
             value={p.model ?? ''}
             onChange={(e) => onUpdate({ model: e.target.value })}
           >
-            <option value="">Model: default</option>
+            <option value="">{messages.globalSettings.modelDefault}</option>
             {kindOpts.models.map((m) => (
               <option key={m.value} value={m.value}>
                 {m.label}
@@ -278,7 +278,7 @@ function ProviderCard({ provider: p, onUpdate, onRemove }: ProviderCardProps) {
         ) : (
           <input
             className="input w-[140px] flex-none"
-            placeholder="Model (optional)"
+            placeholder={messages.globalSettings.modelPlaceholder}
             value={p.model ?? ''}
             onChange={(e) => onUpdate({ model: e.target.value })}
           />
@@ -291,22 +291,22 @@ function ProviderCard({ provider: p, onUpdate, onRemove }: ProviderCardProps) {
             onUpdate({ effort: (e.target.value || undefined) as AiProviderConfig['effort'] })
           }
         >
-          <option value="">Effort: —</option>
-          <option value="low">Low</option>
-          <option value="medium">Medium</option>
-          <option value="high">High</option>
-          <option value="xhigh">X-High</option>
-          <option value="max">Max</option>
+          <option value="">{messages.globalSettings.effortUnset}</option>
+          <option value="low">{messages.globalSettings.effortOptions.low}</option>
+          <option value="medium">{messages.globalSettings.effortOptions.medium}</option>
+          <option value="high">{messages.globalSettings.effortOptions.high}</option>
+          <option value="xhigh">{messages.globalSettings.effortOptions.xhigh}</option>
+          <option value="max">{messages.globalSettings.effortOptions.max}</option>
         </select>
 
         <button onClick={onRemove} className="btn btn-ghost shrink-0">
-          Remove
+          {messages.globalSettings.remove}
         </button>
       </div>
 
       {/* Stage restrictions — leave all unchecked to allow any stage (unrestricted). */}
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
-        <span className="text-muted">Allowed stages:</span>
+        <span className="text-muted">{messages.globalSettings.allowedStages}</span>
         {ALL_STAGES.map((stage) => {
           const isRestricted = !!(p.allowedStages && p.allowedStages.length > 0)
           return (
@@ -323,14 +323,14 @@ function ProviderCard({ provider: p, onUpdate, onRemove }: ProviderCardProps) {
                   onUpdate({ allowedStages: next.length > 0 ? next : undefined })
                 }}
               />
-              {STAGE_LABELS[stage]}
+              {messages.common.stages[stage]}
             </label>
           )
         })}
         <span className="text-muted italic">
           {!p.allowedStages || p.allowedStages.length === 0
-            ? '(all stages — unrestricted)'
-            : `restricted to: ${p.allowedStages.map((s) => STAGE_LABELS[s]).join(', ')}`}
+            ? messages.globalSettings.allStagesUnrestricted
+            : messages.globalSettings.restrictedTo(p.allowedStages.map((s) => messages.common.stages[s]))}
         </span>
       </div>
 
@@ -342,7 +342,7 @@ function ProviderCard({ provider: p, onUpdate, onRemove }: ProviderCardProps) {
             onClick={() => setPresetsExpanded((v) => !v)}
           >
             <span style={{ display: 'inline-block', transform: presetsExpanded ? 'rotate(90deg)' : 'none', transition: 'transform 0.15s' }}>▶</span>
-            Model / Effort presets
+            {messages.globalSettings.presets}
             {presetCount > 0 && (
               <span className="ml-1 rounded-full bg-[var(--color-accent)] px-1.5 py-0.5 text-[10px] text-white">
                 {presetCount}
@@ -350,18 +350,19 @@ function ProviderCard({ provider: p, onUpdate, onRemove }: ProviderCardProps) {
             )}
           </button>
           <button onClick={addPreset} className="btn btn-secondary text-xs">
-            + Add preset
+            {messages.globalSettings.addPreset}
           </button>
         </div>
 
         {presetsExpanded && (
           <div className="flex flex-col gap-2 pl-2">
             {(p.presets ?? []).length === 0 ? (
-              <p className="text-muted text-xs">No presets yet. Click "+ Add preset" to add one.</p>
+              <p className="text-muted text-xs">{messages.globalSettings.noPresets}</p>
             ) : (
               (p.presets ?? []).map((pr) => (
                 <PresetRow
                   key={pr.id}
+                  messages={messages}
                   preset={pr}
                   kindId={p.providerKindId}
                   isSelected={p.selectedPresetId === pr.id}
@@ -380,11 +381,21 @@ function ProviderCard({ provider: p, onUpdate, onRemove }: ProviderCardProps) {
 
 // ─── GlobalSettings ────────────────────────────────────────────────────────────
 
-export default function GlobalSettings({ theme, onThemeChange }: GlobalSettingsProps) {
+export default function GlobalSettings({
+  messages,
+  theme,
+  onThemeChange,
+  language,
+  onLanguageChange,
+}: GlobalSettingsProps) {
   const [githubToken, setGithubToken] = useState('')
   const [providers, setProviders] = useState<AiProviderConfig[]>([])
-  const [savedMessage, setSavedMessage] = useState('')
-  const [saveError, setSaveError] = useState('')
+  const [saved, setSaved] = useState(false)
+  /**
+   * Why Save did not go through. Validation is worded at render — from the providers as they were when
+   * Save was clicked — so a language switch re-words it; a refusal from main is its own text.
+   */
+  const [saveError, setSaveError] = useState<Wording>('')
 
   useEffect(() => {
     electronApi().ai.list().then(setProviders)
@@ -405,17 +416,17 @@ export default function GlobalSettings({ theme, onThemeChange }: GlobalSettingsP
   async function saveAll() {
     setSaveError('')
 
-    const errors = validateProviders(providers)
-    if (errors.length > 0) {
-      setSaveError(errors.join(' '))
+    if (validateProviders(providers, messages).length > 0) {
+      const attempted = providers
+      setSaveError({ word: (m) => validateProviders(attempted, m).join(' ') })
       return
     }
 
     try {
       await electronApi().ai.save(providers)
       if (githubToken) await electronApi().github.setToken(githubToken)
-      setSavedMessage('Saved')
-      setTimeout(() => setSavedMessage(''), 1500)
+      setSaved(true)
+      setTimeout(() => setSaved(false), 1500)
     } catch (err) {
       setSaveError(err instanceof Error ? err.message : String(err))
     }
@@ -423,32 +434,50 @@ export default function GlobalSettings({ theme, onThemeChange }: GlobalSettingsP
 
   return (
     <div>
-      <h2>Global settings</h2>
-      <p className="text-muted mb-4 text-sm">Applies across every registered project.</p>
+      <h2>{messages.globalSettings.heading}</h2>
+      <p className="text-muted mb-4 text-sm">{messages.globalSettings.description}</p>
 
       <div className="mb-4">
-        <h3 className="!mb-2">Appearance</h3>
+        <h3 className="!mb-2">{messages.globalSettings.appearance}</h3>
         <div className="tabs">
-          {THEME_OPTIONS.map((opt) => (
+          {THEME_OPTIONS.map((option) => (
             <button
-              key={opt.value}
-              className={`tab ${theme === opt.value ? 'active' : ''}`}
-              onClick={() => onThemeChange(opt.value)}
+              key={option}
+              className={`tab ${theme === option ? 'active' : ''}`}
+              onClick={() => onThemeChange(option)}
             >
-              {opt.label}
+              {messages.globalSettings.themeOptions[option]}
             </button>
           ))}
         </div>
-        <p className="text-muted -mt-2 text-xs">
-          "System" follows your OS light/dark setting and updates automatically if it changes.
-        </p>
+        <p className="text-muted -mt-2 text-xs">{messages.globalSettings.themeSystemHint}</p>
+      </div>
+
+      <div className="mb-4">
+        <h3 className="!mb-2">{messages.language.label}</h3>
+        {/* A labelled group, because Appearance above has a "System" button too. */}
+        <div className="tabs" role="group" aria-label={messages.language.label}>
+          {LANGUAGE_PREFERENCES.map((preference) => (
+            <button
+              key={preference}
+              className={`tab ${language === preference ? 'active' : ''}`}
+              aria-pressed={language === preference}
+              // The name is in its own language, and says so, so a screen reader voices it correctly.
+              lang={preference === 'system' ? undefined : preference}
+              onClick={() => onLanguageChange(preference)}
+            >
+              {preference === 'system' ? messages.language.system : LANGUAGE_NAMES[preference]}
+            </button>
+          ))}
+        </div>
+        <p className="text-muted -mt-2 text-xs">{messages.language.hint(LANGUAGE_NAMES[uiLanguageFor('system')])}</p>
       </div>
 
       <div className="field mb-4 max-w-[420px]">
-        <label>GitHub token</label>
+        <label>{messages.globalSettings.githubToken}</label>
         <input
           className="input"
-          placeholder="ghp_..."
+          placeholder={messages.globalSettings.githubTokenPlaceholder}
           type="password"
           value={githubToken}
           onChange={(e) => setGithubToken(e.target.value)}
@@ -456,9 +485,9 @@ export default function GlobalSettings({ theme, onThemeChange }: GlobalSettingsP
       </div>
 
       <div className="mb-2 flex items-center justify-between">
-        <h3 className="!m-0">AI Providers</h3>
+        <h3 className="!m-0">{messages.globalSettings.aiProviders}</h3>
         <button onClick={addProvider} className="btn btn-secondary">
-          + Add provider
+          {messages.globalSettings.addProvider}
         </button>
       </div>
 
@@ -466,27 +495,28 @@ export default function GlobalSettings({ theme, onThemeChange }: GlobalSettingsP
         {providers.map((p) => (
           <ProviderCard
             key={p.id}
+            messages={messages}
             provider={p}
             onUpdate={(patch) => updateProvider(p.id, patch)}
             onRemove={() => removeProvider(p.id)}
           />
         ))}
-        {providers.length === 0 && <p className="text-muted">No AI providers registered yet.</p>}
+        {providers.length === 0 && <p className="text-muted">{messages.globalSettings.noProviders}</p>}
       </div>
 
       <div className="flex items-center gap-3">
         <button onClick={saveAll} className="btn btn-primary">
-          Save changes
+          {messages.globalSettings.saveChanges}
         </button>
-        {savedMessage && (
+        {saved && (
           <span className="text-xs" style={{ color: 'var(--color-accent)' }}>
-            {savedMessage}
+            {messages.globalSettings.saved}
           </span>
         )}
       </div>
       {saveError && (
         <p className="mt-2 text-xs" style={{ color: 'var(--color-accent-700)' }}>
-          {saveError}
+          {wordIn(saveError, messages)}
         </p>
       )}
     </div>

@@ -7,18 +7,14 @@ import { sameRepoRef } from '../../core/repo-registry'
 import type { RunOverride } from '../../core/agent-selection'
 import type { GithubTask } from '../../core/github-service'
 import type { QueuedTask, RepoRef } from '../../core/workflow-engine'
+import type { Messages } from '../i18n'
 import AgentRunControls from './AgentRunControls'
 import TaskDetailModal from './TaskDetailModal'
 
 interface KanbanBoardProps {
+  /** Every string the board shows, in the language the operator picked. */
+  messages: Messages
   repo: RepoRef
-}
-
-const STAGE_LABELS: Record<QueuedTask['stage'], string> = {
-  issue: 'Issue',
-  pr: 'PR',
-  review: 'Review',
-  merge: 'Merge',
 }
 
 /** Finds the workflow task (if any) driving this GitHub issue/PR, so the card can show live pipeline state. */
@@ -41,12 +37,14 @@ function isActiveTask(task: QueuedTask): boolean {
   return task.status === 'running' || task.stage === 'review'
 }
 
-function workflowBadgeLabel(task: QueuedTask): string {
-  if (task.status === 'error') return `${STAGE_LABELS[task.stage]} failed`
-  if (task.status === 'running') return `${STAGE_LABELS[task.stage]} running`
-  if (task.status === 'paused') return `${STAGE_LABELS[task.stage]} paused`
-  if (task.status === 'done') return 'workflow done'
-  return `${STAGE_LABELS[task.stage]} queued`
+function workflowBadgeLabel(task: QueuedTask, messages: Messages): string {
+  const badge = messages.kanbanBoard.workflowBadge
+  const stage = messages.common.stages[task.stage]
+  if (task.status === 'error') return badge.failed(stage)
+  if (task.status === 'running') return badge.running(stage)
+  if (task.status === 'paused') return badge.paused(stage)
+  if (task.status === 'done') return badge.done
+  return badge.queued(stage)
 }
 
 /** The agent running right now, or the most recent one that touched the task — the entry that
@@ -61,7 +59,11 @@ function lastStep(task: QueuedTask) {
  * for it. That last case is why `providers` is needed: a freshly queued card has neither `active` nor
  * `history`, and before issue #42 named no AI at all until its stage was already underway.
  */
-function currentAgentLabel(task: QueuedTask, providers: AiProviderConfig[]): string | undefined {
+function currentAgentLabel(
+  task: QueuedTask,
+  providers: AiProviderConfig[],
+  messages: Messages,
+): string | undefined {
   // Running now, or finished the whole pipeline — either way the card names a real, past-tense agent.
   const settled = task.active ?? (task.status === 'done' ? task.history[task.history.length - 1] : undefined)
   const upcoming = settled
@@ -84,13 +86,13 @@ function currentAgentLabel(task: QueuedTask, providers: AiProviderConfig[]): str
   if (!name) return undefined
   const model = upcoming?.model ?? step?.model
   const effort = upcoming?.effort ?? step?.effort
-  return [name, model, effort ? `${effort} effort` : undefined].filter(Boolean).join(' · ')
+  return [name, model, effort ? messages.common.effortLevel(effort) : undefined].filter(Boolean).join(' · ')
 }
 
 /** Label for the run button when this task's stage can be (re)started right now, else undefined. */
-function runActionLabel(task: QueuedTask): string | undefined {
-  if (task.status === 'error') return 'Retry'
-  if (task.status === 'paused') return 'Run'
+function runActionLabel(task: QueuedTask, messages: Messages): string | undefined {
+  if (task.status === 'error') return messages.common.retry
+  if (task.status === 'paused') return messages.kanbanBoard.run
   return undefined
 }
 
@@ -101,17 +103,19 @@ function sortTasks(tasks: GithubTask[]): GithubTask[] {
   })
 }
 
-function timeAgo(ms: number): string {
+function timeAgo(ms: number, messages: Messages): string {
+  const ago = messages.kanbanBoard.timeAgo
   const seconds = Math.max(0, Math.round((Date.now() - ms) / 1000))
-  if (seconds < 5) return 'just now'
-  if (seconds < 60) return `${seconds}s ago`
+  if (seconds < 5) return ago.justNow
+  if (seconds < 60) return ago.seconds(seconds)
   const minutes = Math.round(seconds / 60)
-  if (minutes < 60) return `${minutes}m ago`
+  if (minutes < 60) return ago.minutes(minutes)
   const hours = Math.round(minutes / 60)
-  return `${hours}h ago`
+  return ago.hours(hours)
 }
 
 function Column({
+  messages,
   title,
   tasks,
   allTasks,
@@ -121,6 +125,7 @@ function Column({
   onRunTask,
   runningTaskId,
 }: {
+  messages: Messages
   title: string
   tasks: GithubTask[]
   /** Full board task list — used to resolve linked issue/PR numbers into their states and titles. */
@@ -144,7 +149,7 @@ function Column({
         {activeCount > 0 && (
           <span className="summary-indicator">
             <span className="live-dot" />
-            {activeCount} active
+            {messages.common.activeCount(activeCount)}
           </span>
         )}
       </h4>
@@ -161,12 +166,12 @@ function Column({
             task.type === 'pull_request'
               ? (task.linkedIssueNumbers ?? []).map((n) => ({
                   number: n,
-                  label: `Issue #${n}`,
+                  label: messages.common.issueRef(n),
                   task: allTasks.find((t) => t.number === n),
                 }))
               : allTasks
                   .filter((t) => t.type === 'pull_request' && t.linkedIssueNumbers?.includes(task.number))
-                  .map((t) => ({ number: t.number, label: `PR #${t.number}`, task: t }))
+                  .map((t) => ({ number: t.number, label: messages.common.prRef(t.number), task: t }))
 
           return (
             <div
@@ -188,22 +193,22 @@ function Column({
                   {workflowTask && (
                     <span className={`tag ${workflowBadgeClass(workflowTask)}`}>
                       {workflowTask.status === 'running' && <span className="live-dot mr-1" />}
-                      {workflowBadgeLabel(workflowTask)}
+                      {workflowBadgeLabel(workflowTask, messages)}
                     </span>
                   )}
-                  {task.urgent && <span className="tag tag-accent">urgent</span>}
+                  {task.urgent && <span className="tag tag-accent">{messages.common.urgent}</span>}
                 </div>
               </div>
               <p className="card-title text-[15px]">{task.title}</p>
-              <p className="card-meta">{new Date(task.updatedAt).toLocaleString()}</p>
+              <p className="card-meta">{new Date(task.updatedAt).toLocaleString(messages.dateLocales)}</p>
               {workflowTask &&
                 (() => {
                   // Don't gate the Run/Retry button on agent metadata: a task that fails during its
                   // very first stage has `active` cleared by runStage() and no history entry yet, so
                   // there is nothing to show here except the button itself — it must still render.
                   const step = lastStep(workflowTask)
-                  const agentLabel = currentAgentLabel(workflowTask, providers)
-                  const label = runActionLabel(workflowTask)
+                  const agentLabel = currentAgentLabel(workflowTask, providers, messages)
+                  const label = runActionLabel(workflowTask, messages)
                   if (!agentLabel && !label && !step?.prompt) return null
                   return (
                     <div
@@ -216,7 +221,9 @@ function Column({
                         {agentLabel && !label && <p className="card-meta">{agentLabel}</p>}
                         {step?.prompt && (
                           <details>
-                            <summary className="cursor-pointer text-xs text-muted">Prompt</summary>
+                            <summary className="cursor-pointer text-xs text-muted">
+                              {messages.common.prompt}
+                            </summary>
                             <pre className="mt-1 max-h-40 overflow-y-auto whitespace-pre-wrap text-xs">
                               {step.prompt}
                             </pre>
@@ -228,6 +235,7 @@ function Column({
                           // Remount per task *and* stage so a choice made for one stage never carries
                           // into the next — the same one-run-only rule the engine enforces.
                           key={`${workflowTask.id}:${workflowTask.stage}`}
+                          messages={messages}
                           task={workflowTask}
                           providers={providers}
                           actionLabel={label}
@@ -252,11 +260,15 @@ function Column({
                           onSelectTask(linked)
                         }}
                       >
-                        {label} · {linked.state}
+                        {label} · {messages.common.githubState(linked.state)}
                       </button>
                     ) : (
-                      <span key={number} className="tag tag-neutral" title="No longer in open items">
-                        {label} · closed
+                      <span
+                        key={number}
+                        className="tag tag-neutral"
+                        title={messages.kanbanBoard.noLongerOpen}
+                      >
+                        {label} · {messages.common.githubState('closed')}
                       </span>
                     ),
                   )}
@@ -265,13 +277,13 @@ function Column({
             </div>
           )
         })}
-        {tasks.length === 0 && <p className="text-muted text-sm">No items</p>}
+        {tasks.length === 0 && <p className="text-muted text-sm">{messages.kanbanBoard.noItems}</p>}
       </div>
     </div>
   )
 }
 
-export default function KanbanBoard({ repo }: KanbanBoardProps) {
+export default function KanbanBoard({ messages, repo }: KanbanBoardProps) {
   const [tasks, setTasks] = useState<GithubTask[]>([])
   const [workflowTasks, setWorkflowTasks] = useState<QueuedTask[]>([])
   const [providers, setProviders] = useState<AiProviderConfig[]>([])
@@ -375,15 +387,15 @@ export default function KanbanBoard({ repo }: KanbanBoardProps) {
   return (
     <div>
       <div className="flex flex-wrap items-baseline justify-between gap-4">
-        <h2>Board</h2>
+        <h2>{messages.kanbanBoard.heading}</h2>
         <div className="flex items-center gap-3">
           {lastSyncedAt && (
             <span className="text-muted flex items-center gap-1.5 text-xs">
-              <span className="live-dot" /> synced {timeAgo(lastSyncedAt)}
+              <span className="live-dot" /> {messages.kanbanBoard.synced(timeAgo(lastSyncedAt, messages))}
             </span>
           )}
           <button onClick={refreshNow} disabled={refreshing} className="btn btn-secondary">
-            {refreshing ? 'Refreshing…' : 'Refresh'}
+            {refreshing ? messages.kanbanBoard.refreshing : messages.kanbanBoard.refresh}
           </button>
         </div>
       </div>
@@ -391,7 +403,8 @@ export default function KanbanBoard({ repo }: KanbanBoardProps) {
       {error && <p className="mt-2 text-xs" style={{ color: 'var(--color-accent-700)' }}>{error}</p>}
       <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2">
         <Column
-          title="Issues"
+          messages={messages}
+          title={messages.kanbanBoard.columns.issues}
           tasks={issues}
           allTasks={sorted}
           workflowTasks={workflowTasks}
@@ -401,7 +414,8 @@ export default function KanbanBoard({ repo }: KanbanBoardProps) {
           runningTaskId={runningTaskId}
         />
         <Column
-          title="Pull Requests"
+          messages={messages}
+          title={messages.kanbanBoard.columns.pullRequests}
           tasks={pullRequests}
           allTasks={sorted}
           workflowTasks={workflowTasks}
@@ -414,6 +428,7 @@ export default function KanbanBoard({ repo }: KanbanBoardProps) {
 
       {selectedTask && (
         <TaskDetailModal
+          messages={messages}
           repo={repo}
           number={selectedTask.number}
           type={selectedTask.type}

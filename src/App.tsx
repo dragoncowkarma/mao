@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import Sidebar from './components/Sidebar'
 import KanbanBoard from './components/KanbanBoard'
 import WorkflowQueue from './components/WorkflowQueue'
@@ -10,7 +10,9 @@ import type { QueueRecoveryState, RepoRef } from '../core/workflow-engine'
 import type { RepoWorkflowCapability } from '../core/repo-capabilities'
 import { sameRepoRef } from '../core/repo-registry'
 import type { StoredValueProblem, ThemePreference } from '../core/store'
+import { isLanguagePreference, type LanguagePreference } from '../core/ui-language'
 import type { AppUpdateCheck } from './electron'
+import { WordedError, messagesFor, uiLanguageFor } from './i18n'
 
 /** Matches the board's own listing poll: this is a background diagnostic, not something to spin on. */
 const STORE_PROBLEM_POLL_MS = 30_000
@@ -33,6 +35,20 @@ export default function App() {
   const [view, setView] = useState<View>('project')
   const [projectTab, setProjectTab] = useState<ProjectTab>('board')
   const [theme, setThemeState] = useState<ThemePreference>('system')
+  /**
+   * The stored language preference, normalised: a value the store holds but no picker can show reads as
+   * 'system', which is also how `resolveUiLanguage()` renders it. 'system' until the stored one arrives,
+   * so the first paint follows the OS rather than waiting on IPC.
+   */
+  const [language, setLanguageState] = useState<LanguagePreference>('system')
+  /** Why the newest language change could not be persisted; '' once one has been. */
+  const [languageError, setLanguageError] = useState('')
+  /**
+   * Counts language writes, so only the newest one decides `languageError`. Two quick picks are two IPC
+   * round trips that can settle in either order, and a refusal of the older one must not report a
+   * failure for a choice that was saved after it.
+   */
+  const languageWrite = useRef(0)
   const [update, setUpdate] = useState<AppUpdateCheck | null>(null)
   const [dismissedUpdateSha, setDismissedUpdateSha] = useState<string | null>(null)
   /** Surfaces a failed settings edit or removal, which are otherwise silent (no preflight, no form). */
@@ -119,6 +135,10 @@ export default function App() {
     navigationGeneration.current += 1
     setProjectTab(next)
   }
+
+  /** The language every component renders in, and the catalog for it — handed down as a prop. */
+  const uiLanguage = uiLanguageFor(language)
+  const messages = useMemo(() => messagesFor(uiLanguage), [uiLanguage])
 
   const matchingSelectedIndex = selectedRepo === null ? null : selectedRepoIndex(repos, selectedRepo)
   const selectedIndex = matchingSelectedIndex === -1 ? null : matchingSelectedIndex
@@ -275,6 +295,44 @@ export default function App() {
     await electronApi().ui.setTheme(next)
   }
 
+  // A read that fails leaves the OS's language showing: the preference is cosmetic, and the store's
+  // own report (polled above) is what tells the operator their config file could not be read.
+  //
+  // Applied only while nothing has been picked. Main answers IPC in order, so a read sent at mount
+  // carries the value from before any pick made while it was in flight — applying it would snap the
+  // window back to a language the operator just left, while the store already holds their new choice.
+  useEffect(() => {
+    electronApi()
+      .ui.getLanguage()
+      .then((stored) => {
+        if (languageWrite.current === 0) setLanguageState(isLanguagePreference(stored) ? stored : 'system')
+      })
+      .catch(() => {})
+  }, [])
+
+  // `<html lang>` drives screen-reader pronunciation and the browser's CJK font fallback, so it has to
+  // follow the rendered language rather than index.html's static `en`.
+  useEffect(() => {
+    document.documentElement.lang = uiLanguage
+  }, [uiLanguage])
+
+  /**
+   * Switches at once and persists in the background, like `setTheme`. A refused write — the store
+   * refuses every write while config.json cannot be read — keeps the choice for this session and says
+   * so beside the picker, instead of an unhandled rejection the operator never sees: they watched the
+   * language change and would otherwise assume it was saved.
+   */
+  async function setLanguage(next: LanguagePreference) {
+    const write = (languageWrite.current += 1)
+    setLanguageState(next)
+    try {
+      await electronApi().ui.setLanguage(next)
+      if (languageWrite.current === write) setLanguageError('')
+    } catch (err) {
+      if (languageWrite.current === write) setLanguageError(err instanceof Error ? err.message : String(err))
+    }
+  }
+
   useEffect(() => {
     let cancelled = false
 
@@ -304,13 +362,13 @@ export default function App() {
     if (!update) return
     const force =
       update.runningTaskCount === 0 ||
-      window.confirm(`${update.runningTaskCount} workflow task(s) are still running. Restart anyway?`)
+      window.confirm(messages.app.confirmRestartWithRunningTasks(update.runningTaskCount))
     if (!force) return
     try {
       await electronApi().app.relaunch(update.runningTaskCount > 0)
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
-      if (window.confirm(`${message}. Restart anyway?`)) {
+      if (window.confirm(messages.app.confirmRestartAfterError(message))) {
         await electronApi().app.relaunch(true)
       }
     }
@@ -490,34 +548,23 @@ export default function App() {
       const outcome = await electronApi().workflow.confirmQueueRecovery()
       // Every non-success outcome is surfaced by throwing, because Sidebar's own catch is what puts a
       // message on screen. None of them carries the backend's error text — see QueueRecoveryOutcome.
+      // The ones MAO words itself are WordedErrors, so the card re-words them if the language changes
+      // while it is up; `outcome.reason` is core's text and stays a plain Error.
       if (outcome.kind === 'unverified') throw new Error(outcome.reason)
       if (outcome.kind === 'restart-required') {
-        throw new Error(
-          'This MAO process observed a whole-file read failure, so it cannot safely write the repaired ' +
-            'settings. Nothing was written; repair the file if needed, then restart MAO.',
-        )
+        throw new WordedError((m) => m.app.queueOutcome.restartRequired, messages)
       }
       if (outcome.kind === 'superseded') {
-        throw new Error(
-          'The stored queue changed while confirming, so nothing was written. Something else is writing ' +
-            'the config file — re-check it and try again.',
-        )
+        throw new WordedError((m) => m.app.queueOutcome.recover.superseded, messages)
       }
       if (outcome.kind === 'write-failed') {
-        throw new Error(
-          'The replacement write failed, so what reached the config file is unknown and automation stays ' +
-            'halted. MAO recorded a persistence marker; reconcile the stored queue with GitHub, clear ' +
-            'that marker through the recovery card, then restart MAO.',
-        )
+        throw new WordedError((m) => m.app.queueOutcome.recover.writeFailed, messages)
       }
       if (outcome.kind === 'invalid-replacement') {
-        throw new Error(
-          'MAO rejected the replacement queue before writing because it contains an invalid task. Nothing ' +
-            'was written and automation stays halted. Inspect the retained tasks, then try again.',
-        )
+        throw new WordedError((m) => m.app.queueOutcome.recover.invalidReplacement, messages)
       }
       if (outcome.kind === 'already-readable') {
-        throw new Error('The stored queue reads normally again — nothing was written. Restart MAO to load it.')
+        throw new WordedError((m) => m.app.queueOutcome.recover.alreadyReadable, messages)
       }
     } finally {
       await refreshQueueRecovery()
@@ -539,33 +586,20 @@ export default function App() {
     try {
       const outcome = await electronApi().workflow.resaveQueue()
       if (outcome.kind === 'already-readable') {
-        throw new Error('The stored queue reads normally again — nothing was written.')
+        throw new WordedError((m) => m.app.queueOutcome.resave.alreadyReadable, messages)
       }
       if (outcome.kind === 'superseded') {
-        throw new Error(
-          'The stored queue changed while saving, so nothing was written. Something else is writing the ' +
-            'config file — re-check it and try again.',
-        )
+        throw new WordedError((m) => m.app.queueOutcome.resave.superseded, messages)
       }
       if (outcome.kind === 'unverified') throw new Error(outcome.reason)
       if (outcome.kind === 'restart-required') {
-        throw new Error(
-          'This MAO process observed a whole-file read failure, so it cannot safely write the repaired ' +
-            'settings. Nothing was written; repair the file if needed, then restart MAO.',
-        )
+        throw new WordedError((m) => m.app.queueOutcome.restartRequired, messages)
       }
       if (outcome.kind === 'write-failed') {
-        throw new Error(
-          'The save failed, so what reached the config file is unknown. MAO recorded a persistence ' +
-            'marker; reconcile the stored queue with GitHub, clear that marker through the recovery ' +
-            'card, then restart MAO.',
-        )
+        throw new WordedError((m) => m.app.queueOutcome.resave.writeFailed, messages)
       }
       if (outcome.kind === 'invalid-replacement') {
-        throw new Error(
-          'MAO rejected this session\'s queue before writing because it contains an invalid task. Nothing ' +
-            'was written. Inspect the in-memory queue, then try again.',
-        )
+        throw new WordedError((m) => m.app.queueOutcome.resave.invalidReplacement, messages)
       }
     } finally {
       await refreshStoreProblems()
@@ -673,11 +707,16 @@ export default function App() {
         onClearPersistenceBroken={clearWorkflowPersistenceBroken}
         view={view}
         onViewChange={selectView}
+        messages={messages}
+        language={language}
+        onLanguageChange={setLanguage}
+        languageError={languageError}
       />
 
       <main className="flex-1 mx-auto w-full max-w-[1120px] px-6 py-8">
         {update && (
           <UpdateBanner
+            messages={messages}
             update={update}
             onRestart={restartForUpdate}
             onDismiss={() => {
@@ -688,13 +727,17 @@ export default function App() {
         )}
 
         {view === 'global-settings' ? (
-          <GlobalSettings theme={theme} onThemeChange={setTheme} />
+          <GlobalSettings
+            messages={messages}
+            theme={theme}
+            onThemeChange={setTheme}
+            language={language}
+            onLanguageChange={setLanguage}
+          />
         ) : !selected ? (
           <div>
-            <h2>Welcome to MAO</h2>
-            <p className="text-muted mt-2 text-sm">
-              Add a repository from the sidebar to see its issues and pull requests here.
-            </p>
+            <h2>{messages.app.welcomeTitle}</h2>
+            <p className="text-muted mt-2 text-sm">{messages.app.welcomeHint}</p>
           </div>
         ) : (
           <div>
@@ -715,26 +758,31 @@ export default function App() {
                 className={`tab ${projectTab === 'board' ? 'active' : ''}`}
                 onClick={() => selectProjectTab('board')}
               >
-                Board
+                {messages.app.tabs.board}
               </button>
               <button
                 className={`tab ${projectTab === 'queue' ? 'active' : ''}`}
                 onClick={() => selectProjectTab('queue')}
               >
-                Queue
+                {messages.app.tabs.queue}
               </button>
               <button
                 className={`tab ${projectTab === 'settings' ? 'active' : ''}`}
                 onClick={() => selectProjectTab('settings')}
               >
-                Settings
+                {messages.app.tabs.settings}
               </button>
             </div>
 
-            {projectTab === 'board' && <KanbanBoard repo={selected} />}
-            {projectTab === 'queue' && <WorkflowQueue repo={selected} />}
+            {projectTab === 'board' && <KanbanBoard messages={messages} repo={selected} />}
+            {projectTab === 'queue' && <WorkflowQueue messages={messages} repo={selected} />}
             {projectTab === 'settings' && (
-              <ProjectSettings repo={selected} onChange={updateSelectedRepo} onRemove={removeSelectedRepo} />
+              <ProjectSettings
+                messages={messages}
+                repo={selected}
+                onChange={updateSelectedRepo}
+                onRemove={removeSelectedRepo}
+              />
             )}
           </div>
         )}

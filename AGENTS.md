@@ -32,6 +32,7 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
 | `core/github-service.ts` | Octokit REST wrapper (issues, PRs, labels, reviews, merge, CI status) — plus the read-only `checkRepoWorkflowCapability()` / `assertRepoWorkflowWritable()` preflight |
 | `core/repo-capabilities.ts` | Pure verdict logic for "can this credential run the pipeline in this repo?" — `evaluateRepoCapability()`, `describeRepoCapability()`, `describeUnverifiedGrants()`, `RepoCapabilityError` |
 | `core/repo-registry.ts` | Pure, renderer-importable repository identity plus the single definition of "this repo entry is newly registered" — `repoRefKey()`/`sameRepoRef()` (case-insensitive, as GitHub resolves owner/repo), `canonicalRepoList()`, `reposNeedingCapabilityCheck()` / `assertReposRegistrable()`, and the serialized `createRepoRegistrar()` both `github:setRepos` and `mao repos add`/`remove` write through |
+| `core/ui-language.ts` | Pure, renderer-importable GUI language rules — `UI_LANGUAGES` (the single list every other language reference derives from), `LanguagePreference` (`'system'` or a shipped language), `isLanguagePreference()` (what `mao config set-language` accepts) and `resolveUiLanguage()` (an explicit choice wins; `'system'` or an unusable stored value takes the OS's first supported language, else English) |
 | `core/provider-import.ts` | CLI-only provider-file import for `mao config import-providers` (no IPC channel): reads and parses input, validates through the store write guard, persists, then logs imported IDs; rejection messages omit parser/backend errors and provider values |
 | `core/git-workspace.ts` | Local git clone/branch/commit/push via `execFile` (no shell) |
 | `core/swarm-runner.ts` | Shell-free launcher and repository/asset validation for the autonomous Swarm Orchestrator |
@@ -47,6 +48,7 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
 | `electron/store.ts` | One call: `openGuardedStoreFile(configPath, () => new Store(…))`. The file is judged before conf is constructed, because conf writes merged defaults from its own constructor; the instance is never bound to a name, exported, or read anywhere else |
 | `src/` | React 18 renderer (Vite + Tailwind); `App.tsx` owns all cross-view state |
 | `src/electron-api.ts` | The renderer's only door to the preload bridge: `setElectronApi()` binds it (production from `src/main.tsx`, tests from a stub), `electronApi()` reads it |
+| `src/i18n/` | Renderer message catalogs: one module per component under `messages/`, each with `en` and a `ko` typed against it (`const ko: typeof en`), composed by `index.ts` into `Messages`/`MESSAGES`; App resolves the stored `language` and hands `messagesFor()`'s catalog down as the `messages` prop — its `dateLocales` put the OS's own regional tags for that language first, so an `en-GB` machine keeps day-first dates. `Wording`/`WordedError` keep text MAO words itself re-wordable while it sits in state. `LANGUAGE_NAMES` are endonyms, never translated. `no-hardcoded-text.test.ts` fails on literal user-visible text in TSX, `catalog.test.ts` on English left in the Korean catalog (beyond the reasoned list in `src/test/korean-latin.ts`), and `korean-sweep.test.tsx` on stray English anywhere it renders the Korean UI |
 | `src/test/` | Renderer test harness — `setup.ts` (jsdom polyfills, unmount + unbind between tests) and `electron-api-stub.ts` (a typed fake bridge, `satisfies ElectronApi`) |
 | `cli/index.ts` | Commander CLI: `config` / `repos` / `github` / `workflow` / `run` / `swarm` |
 | `.agents/workflows/swarm_orchestrator.py` | Autonomous Worker/Reviewer/Maintainer lifecycle, credential-aligned write preflight, origin fetch/push identity binding, isolated worktrees, process registry, retry/cooldown, and safe merged-task cleanup; copied beside the CLI bundle by `scripts/build-cli.mjs` |
@@ -97,8 +99,8 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
    component wired to the global is a component no renderer test can hand a fake. From
    `core/` it imports
    types, plus values from the modules marked *renderer-importable* in the
-   architecture map above — `core/agent-selection.ts`, `core/ai/provider-options.ts`
-   and `core/repo-registry.ts`, which are pure and whose own `core/` imports are all
+   architecture map above — `core/agent-selection.ts`, `core/ai/provider-options.ts`,
+   `core/repo-registry.ts` and `core/ui-language.ts`, which are pure and whose own `core/` imports are all
    `import type`, so nothing Node-side is pulled into the bundle. Importing a value
    from any other `core/` module is not allowed; re-implementing one of these rules
    in `src/` instead is worse, and is what let the board and the registry disagree
@@ -239,10 +241,23 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   classification deliberately differ because Swarm checks the active `gh` credential.
 - **New pipeline stage** → the ordered `AGENT_STAGES` (both the `AgentStage` union and workflow-engine
   stage order derive from it) in `core/ai/types.ts`, then `buildPromptForStage` + `applyGithubAction` in
-  `core/workflow-engine.ts`, **plus** the `STAGE_LABELS` record in
-  `src/components/KanbanBoard.tsx` and `src/components/WorkflowQueue.tsx`, and both
-  `ALL_STAGES` + `STAGE_LABELS` in `src/components/GlobalSettings.tsx`, plus
-  `core/workflow-engine.test.ts`.
+  `core/workflow-engine.ts`, **plus** the stage's display name in `stages` in
+  `src/i18n/messages/common.ts` for every language — the one copy the board, the queue and Global
+  settings read; `npm run lint` fails until it exists, because the English record is
+  `satisfies Record<AgentStage, string>` and every other language is typed against it — and
+  `ALL_STAGES` in `src/components/GlobalSettings.tsx`, plus `core/workflow-engine.test.ts`.
+- **New UI language** → add it to `UI_LANGUAGES` in `core/ui-language.ts`; `npm run lint` then names
+  every catalog in `src/i18n/messages/` that lacks it (each exports `Record<UiLanguage, …>`), plus
+  `MESSAGES` and `LANGUAGE_NAMES` in `src/i18n/index.ts`. `isLanguagePreference()`, the store type and
+  `mao config set-language` follow automatically.
+- **New user-visible renderer text** → a key in the component's catalog under `src/i18n/messages/`, in
+  every language, read through the `messages` prop. `npx vitest run --project renderer
+  src/i18n/no-hardcoded-text.test.ts` fails on letter-bearing JSX text, display attributes
+  (`placeholder`, `title`, `aria-label`, …), literals rendered through `{…}`, option `label`s and
+  `new Error`/`confirm` text written as literals in a `.tsx` file. A Korean value that keeps a Latin
+  word on purpose (a product name, an identifier) adds it to `src/test/korean-latin.ts` with its reason,
+  or `src/i18n/catalog.test.ts` and `src/i18n/korean-sweep.test.tsx` fail; a new screen or state worth
+  sweeping goes into the sweep.
 - **Build outputs** → `electron/main.ts` resolves `preload.js` and
   `../dist/index.html` relative to its own compiled location; the `dist-electron`
   directory name itself lives in `vite.config.ts` (`outDir`) and `package.json`
@@ -944,7 +959,9 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   Preserve and extend these doc comments when editing.
 - **Errors**: guard clauses that throw early with contextual messages
   (`'GitHub token is not set'`); providers prefix `[${this.name}]`; renderer
-  normalizes via `err instanceof Error ? err.message : String(err)`.
+  normalizes via `err instanceof Error ? err.message : String(err)` — except a `WordedError` (text the
+  renderer worded from its catalog), which is kept as its `wording` so it re-words after a language
+  switch (`queueFailure()` in `src/components/Sidebar.tsx`).
 - **Async**: async/await; deliberate fire-and-forget marked with `void`; raw
   `Promise` constructor only for event-based child processes, with a `settled`
   guard and cleared timeouts.
@@ -959,6 +976,19 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   needs a test under `src/**/*.test.tsx` — mount the real component against
   `createElectronApiStub()` and assert what the operator sees. `tsc --noEmit` and a
   green `vite build` prove nothing about what the UI does.
+- **Renderer text**: every user-visible string comes from the component's catalog in
+  `src/i18n/messages/` through the `messages` prop (props-down — no context), with `en` matching what
+  the operator saw before and each other language typed against it; a date is
+  `toLocaleString(messages.dateLocales)`, never the bare language. Text MAO words itself and keeps in
+  state — an error, a status line — is a `Wording` (`{ word: (m) => … }`, or a thrown `WordedError`),
+  worded at render: a finished string stays in the old language after a switch. Text *core* writes — store reports, preflight refusals,
+  queue-recovery reasons, task errors, anything from GitHub — is shown as received and never
+  translated: it is shared with the CLI and bound by core's value-free reporting rules. Catalog
+  completeness is enforced by `npm run lint`; literal text in the shapes `src/i18n/no-hardcoded-text.test.ts`
+  reads (JSX text, display attributes, `{…}` literals, option `label`s, `new Error`/`confirm` text) by
+  that test; English left in a Korean value by `src/i18n/catalog.test.ts`; and English a helper or
+  setter puts on a screen the Korean sweep (`src/i18n/korean-sweep.test.tsx`) renders, by the sweep. A
+  screen the sweep does not reach, a date's locale and state-held wording are review items.
 
 ## Git conventions
 

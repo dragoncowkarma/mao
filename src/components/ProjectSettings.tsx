@@ -1,27 +1,32 @@
 import { useState } from 'react'
 import type { RepoRef } from '../../core/workflow-engine'
+import type { Messages } from '../i18n'
 
 interface ProjectSettingsProps {
+  /** Every string this pane shows, in the language the operator picked. */
+  messages: Messages
   repo: RepoRef
   onChange: (patch: Partial<RepoRef>) => void
   onRemove: () => void
 }
 
-export default function ProjectSettings({ repo, onChange, onRemove }: ProjectSettingsProps) {
+export default function ProjectSettings({ messages, repo, onChange, onRemove }: ProjectSettingsProps) {
   const [confirmingRemove, setConfirmingRemove] = useState(false)
 
   const pollSeconds = Math.round((repo.pollIntervalMs ?? 30_000) / 1000)
 
   return (
     <div className="max-w-[420px]">
-      <h3>Project settings</h3>
+      <h3>{messages.projectSettings.heading}</h3>
       <p className="text-muted mb-4 text-sm">
-        Settings scoped to <strong>{repo.owner}/{repo.repo}</strong> only.
+        {messages.projectSettings.scopedTo.before}
+        <strong>{repo.owner}/{repo.repo}</strong>
+        {messages.projectSettings.scopedTo.after}
       </p>
 
       <div className="card mb-4 gap-3">
         <label className="flex items-center justify-between gap-2">
-          <span>Auto-trigger new issues</span>
+          <span>{messages.projectSettings.autoTrigger}</span>
           <input
             type="checkbox"
             checked={repo.autoTrigger !== false}
@@ -29,11 +34,11 @@ export default function ProjectSettings({ repo, onChange, onRemove }: ProjectSet
           />
         </label>
         <p className="text-muted text-xs">
-          When enabled, newly opened issues on this repo are automatically enqueued into the workflow.
+          {messages.projectSettings.autoTriggerHint}
         </p>
 
         <div className="field">
-          <label>Poll interval (seconds)</label>
+          <label>{messages.projectSettings.pollInterval}</label>
           <input
             className="input"
             type="number"
@@ -48,22 +53,22 @@ export default function ProjectSettings({ repo, onChange, onRemove }: ProjectSet
       </div>
 
       <div className="card gap-2">
-        <p className="card-title text-[15px]">Remove project</p>
+        <p className="card-title text-[15px]">{messages.projectSettings.removeTitle}</p>
         <p className="text-muted text-xs">
-          Stops polling and unregisters this repo. Existing GitHub issues/PRs are unaffected.
+          {messages.projectSettings.removeHint}
         </p>
         {confirmingRemove ? (
           <div className="flex gap-2">
             <button onClick={onRemove} className="btn btn-primary">
-              Confirm remove
+              {messages.projectSettings.confirmRemove}
             </button>
             <button onClick={() => setConfirmingRemove(false)} className="btn btn-secondary">
-              Cancel
+              {messages.common.cancel}
             </button>
           </div>
         ) : (
           <button onClick={() => setConfirmingRemove(true)} className="btn btn-secondary self-start">
-            Remove {repo.owner}/{repo.repo}
+            {messages.projectSettings.removeRepo(repo.owner, repo.repo)}
           </button>
         )}
       </div>

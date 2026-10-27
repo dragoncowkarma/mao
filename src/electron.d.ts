@@ -4,6 +4,7 @@ import type { RepoWorkflowCapability } from '../core/repo-capabilities'
 import type { QueueRecoveryOutcome, QueueRecoveryState, QueuedTask, RepoRef, RunOverride } from '../core/workflow-engine'
 import type { AutoTriggerStatus } from '../core/auto-trigger'
 import type { StoredValueProblem, ThemePreference } from '../core/store'
+import type { LanguagePreference } from '../core/ui-language'
 import type { SelfUpdateCheck } from '../core/self-update'
 
 export interface AppUpdateCheck extends SelfUpdateCheck {
@@ -64,6 +65,12 @@ declare global {
       ui: {
         getTheme: () => Promise<ThemePreference>
         setTheme: (theme: ThemePreference) => Promise<void>
+        /**
+         * The stored preference as written. Typed as the schema declares it, but it is unvalidated JSON:
+         * resolve it with `resolveUiLanguage()` rather than trusting it to be one of the listed values.
+         */
+        getLanguage: () => Promise<LanguagePreference>
+        setLanguage: (language: LanguagePreference) => Promise<void>
       }
     }
   }

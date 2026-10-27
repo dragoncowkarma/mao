@@ -5,8 +5,11 @@ import { getProviderOptions, providerToolLabel } from '../../core/ai/provider-op
 import { eligibleAgentsForRun, previewStageAgent } from '../../core/agent-selection'
 import type { RunOverride } from '../../core/agent-selection'
 import type { QueuedTask } from '../../core/workflow-engine'
+import type { Messages } from '../i18n'
 
 interface AgentRunControlsProps {
+  /** Every string the controls show, in the language the operator picked. */
+  messages: Messages
   task: QueuedTask
   /** Every registered provider, as returned by `electronApi().ai.list()`. */
   providers: AiProviderConfig[]
@@ -82,7 +85,14 @@ function takesNoEffort(provider: AiProviderConfig | undefined, model: string | u
  * maker-checker forbids is never offered in the first place — and if a stale render slips one
  * through, the engine rejects the call with a clear message rather than silently running someone else.
  */
-export default function AgentRunControls({ task, providers, actionLabel, busy, onRun }: AgentRunControlsProps) {
+export default function AgentRunControls({
+  messages,
+  task,
+  providers,
+  actionLabel,
+  busy,
+  onRun,
+}: AgentRunControlsProps) {
   const [pick, setPick] = useState<RunOverride>({})
 
   const previous = task.history[task.history.length - 1]
@@ -105,7 +115,7 @@ export default function AgentRunControls({ task, providers, actionLabel, busy, o
       disabled={busy}
       className="btn btn-primary ml-auto shrink-0 px-2.5 py-1 text-xs"
     >
-      {busy ? 'Running…' : actionLabel}
+      {busy ? messages.agentRunControls.running : actionLabel}
     </button>
   )
 
@@ -117,7 +127,7 @@ export default function AgentRunControls({ task, providers, actionLabel, busy, o
     <div className="flex flex-wrap items-center gap-1.5">
       <select
         className="input input-sm w-auto flex-none"
-        title="AI tool for this run"
+        title={messages.agentRunControls.toolForRun}
         value={preview?.id ?? ''}
         // A different tool has its own models and efforts, so any pick made for the old one is stale.
         onChange={(e) => setPick({ providerId: e.target.value || undefined })}
@@ -131,7 +141,7 @@ export default function AgentRunControls({ task, providers, actionLabel, busy, o
 
       <select
         className="input input-sm w-auto flex-none"
-        title="Model for this run"
+        title={messages.agentRunControls.modelForRun}
         value={preview?.model ?? ''}
         onChange={(e) => {
           const model = e.target.value || undefined
@@ -140,7 +150,7 @@ export default function AgentRunControls({ task, providers, actionLabel, busy, o
           setPick((prev) => ({ ...prev, model, effort: takesNoEffort(provider, model) ? undefined : prev.effort }))
         }}
       >
-        <option value="">— model —</option>
+        <option value="">{messages.agentRunControls.modelPlaceholder}</option>
         {modelOptions.map((m) => (
           <option key={m.value} value={m.value}>
             {m.label}
@@ -151,11 +161,11 @@ export default function AgentRunControls({ task, providers, actionLabel, busy, o
       {effortOptions.length > 0 && (
         <select
           className="input input-sm w-auto flex-none"
-          title="Reasoning effort for this run"
+          title={messages.agentRunControls.effortForRun}
           value={preview?.effort ?? ''}
           onChange={(e) => setPick((prev) => ({ ...prev, effort: (e.target.value || undefined) as RunOverride['effort'] }))}
         >
-          <option value="">— effort —</option>
+          <option value="">{messages.agentRunControls.effortPlaceholder}</option>
           {effortOptions.map((ef) => (
             <option key={ef.value} value={ef.value}>
               {ef.label}

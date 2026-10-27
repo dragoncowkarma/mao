@@ -5,6 +5,7 @@ import type { AiProviderConfig } from '../../core/ai/types'
 import type { GithubTask } from '../../core/github-service'
 import type { RepoWorkflowCapability } from '../../core/repo-capabilities'
 import type { StoredValueProblem, ThemePreference } from '../../core/store'
+import type { LanguagePreference } from '../../core/ui-language'
 import type {
   QueuedTask,
   QueueRecoveryOutcome,
@@ -54,6 +55,10 @@ export function createElectronApiStub(initialRepos: RepoRef[] = [], initialProbl
   const storeProblems = vi.fn(async (): Promise<StoredValueProblem[]> => problems.map((p) => ({ ...p })))
   const getTheme = vi.fn(async (): Promise<ThemePreference> => 'system')
   const setTheme = vi.fn(async (): Promise<void> => {})
+  // 'system', like a fresh install. jsdom reports `navigator.languages` as en-US, so every existing test
+  // keeps rendering English; a test about another language re-programs this before mounting.
+  const getLanguage = vi.fn(async (): Promise<LanguagePreference> => 'system')
+  const setLanguage = vi.fn(async (_language: LanguagePreference): Promise<void> => {})
   const checkUpdate = vi.fn(
     async (): Promise<AppUpdateCheck> => ({
       currentSha: 'test-sha',
@@ -136,6 +141,8 @@ export function createElectronApiStub(initialRepos: RepoRef[] = [], initialProbl
     ui: {
       getTheme,
       setTheme,
+      getLanguage,
+      setLanguage,
     },
   } satisfies ElectronApi
 
@@ -160,5 +167,7 @@ export function createElectronApiStub(initialRepos: RepoRef[] = [], initialProbl
     confirmQueueRecovery,
     resaveQueue,
     clearPersistenceBroken,
+    getLanguage,
+    setLanguage,
   }
 }

@@ -3,6 +3,7 @@ import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 import WorkflowQueue from './WorkflowQueue'
 import { createElectronApiStub } from '../test/electron-api-stub'
+import { MESSAGES } from '../i18n'
 import type { QueuedTask, RepoRef } from '../../core/workflow-engine'
 
 const repo: RepoRef = { owner: 'acme', repo: 'widgets' }
@@ -33,7 +34,7 @@ function renderQueue(tasks: QueuedTask[] = []) {
   const stub = createElectronApiStub()
   stub.listWorkflowTasks.mockResolvedValue(tasks)
   const user = userEvent.setup()
-  render(<WorkflowQueue repo={repo} />)
+  render(<WorkflowQueue messages={MESSAGES.en} repo={repo} />)
   return { stub, user }
 }
 

@@ -2,8 +2,11 @@ import { useEffect, useRef, useState } from 'react'
 import { electronApi } from '../electron-api'
 import type { GithubTask, GithubTaskDetail } from '../../core/github-service'
 import type { RepoRef } from '../../core/workflow-engine'
+import { wordIn, type Messages, type Wording } from '../i18n'
 
 interface TaskDetailModalProps {
+  /** Every string the modal shows, in the language the operator picked. */
+  messages: Messages
   repo: RepoRef
   /** Identifies the card that was clicked; full title/body/labels/comments are fetched on open. */
   number: number
@@ -28,6 +31,7 @@ interface TaskDetailModalProps {
  * resolves. A "View on GitHub" link stays available for the cases the in-app view doesn't cover.
  */
 export default function TaskDetailModal({
+  messages,
   repo,
   number,
   type,
@@ -42,7 +46,8 @@ export default function TaskDetailModal({
   const [loading, setLoading] = useState(true)
   const [autoAdvance, setAutoAdvance] = useState(true)
   const [enqueueing, setEnqueueing] = useState(false)
-  const [enqueueError, setEnqueueError] = useState('')
+  /** The engine's own error as it came, or MAO's fallback worded at render so it follows a language change. */
+  const [enqueueError, setEnqueueError] = useState<Wording>('')
 
   /**
    * Guards the enqueue flow's async tail (the poll in waitForImmediateFailure, and its onEnqueued()
@@ -96,13 +101,13 @@ export default function TaskDetailModal({
    * created task is enough to catch them and show them inline instead of silently closing the
    * modal and leaving the user to notice the failed card later in the queue.
    */
-  async function waitForImmediateFailure(taskId: string): Promise<string | null> {
+  async function waitForImmediateFailure(taskId: string): Promise<Wording | null> {
     for (let i = 0; i < 10; i++) {
       if (!mountedRef.current) return null
       const tasks = await electronApi().workflow.list()
       if (!mountedRef.current) return null
       const task = tasks.find((t) => t.id === taskId)
-      if (task?.status === 'error') return task.error ?? 'Task failed to start'
+      if (task?.status === 'error') return task.error ?? { word: (m) => m.taskDetailModal.failedToStart }
       if (task && task.status !== 'pending') return null
       await new Promise((r) => setTimeout(r, 150))
     }
@@ -128,7 +133,10 @@ export default function TaskDetailModal({
     }
   }
 
-  const kicker = type === 'pull_request' ? 'Pull Request' : 'Issue'
+  const kicker =
+    type === 'pull_request'
+      ? messages.taskDetailModal.kicker.pullRequest
+      : messages.taskDetailModal.kicker.issue
   const fallbackUrl = `https://github.com/${repo.owner}/${repo.repo}/${type === 'pull_request' ? 'pull' : 'issues'}/${number}`
 
   // For PRs: resolve linked issue numbers from the fetched detail body.
@@ -139,12 +147,12 @@ export default function TaskDetailModal({
     type === 'pull_request'
       ? (detail?.linkedIssueNumbers ?? []).map((n) => ({
           number: n,
-          label: `Closes Issue #${n}`,
+          label: messages.taskDetailModal.linked.closesIssue(n),
           task: allTasks.find((t) => t.number === n),
         }))
       : allTasks
           .filter((t) => t.type === 'pull_request' && t.linkedIssueNumbers?.includes(number))
-          .map((t) => ({ number: t.number, label: `PR #${t.number}`, task: t }))
+          .map((t) => ({ number: t.number, label: messages.common.prRef(t.number), task: t }))
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
@@ -156,15 +164,22 @@ export default function TaskDetailModal({
             </span>
             <h3 className="mt-1">{detail?.title ?? '…'}</h3>
           </div>
-          <button type="button" onClick={onClose} className="btn btn-ghost shrink-0" aria-label="Close">
-            Close
+          <button
+            type="button"
+            onClick={onClose}
+            className="btn btn-ghost shrink-0"
+            aria-label={messages.taskDetailModal.close}
+          >
+            {messages.taskDetailModal.close}
           </button>
         </div>
 
         {detail && (
           <div className="flex flex-wrap items-center gap-1.5">
-            <span className={`tag ${detail.state === 'open' ? 'tag-outline' : 'tag-neutral'}`}>{detail.state}</span>
-            {detail.urgent && <span className="tag tag-accent">urgent</span>}
+            <span className={`tag ${detail.state === 'open' ? 'tag-outline' : 'tag-neutral'}`}>
+              {messages.common.githubState(detail.state)}
+            </span>
+            {detail.urgent && <span className="tag tag-accent">{messages.common.urgent}</span>}
             {detail.labels.map((label) => (
               <span key={label} className="tag tag-neutral">
                 {label}
@@ -175,7 +190,11 @@ export default function TaskDetailModal({
 
         {linkedItems.length > 0 && (
           <div className="flex flex-wrap items-center gap-1.5">
-            <span className="card-meta shrink-0">{type === 'pull_request' ? 'Closes:' : 'Linked PRs:'}</span>
+            <span className="card-meta shrink-0">
+              {type === 'pull_request'
+                ? messages.taskDetailModal.linked.closesHeading
+                : messages.taskDetailModal.linked.prsHeading}
+            </span>
             {linkedItems.map(({ number: n, label, task }) =>
               task ? (
                 <button
@@ -185,7 +204,7 @@ export default function TaskDetailModal({
                   className="tag tag-neutral cursor-pointer"
                   title={task.title}
                 >
-                  {label} · {task.state}
+                  {label} · {messages.common.githubState(task.state)}
                 </button>
               ) : (
                 <a
@@ -194,16 +213,16 @@ export default function TaskDetailModal({
                   target="_blank"
                   rel="noreferrer"
                   className="tag tag-neutral"
-                  title="No longer in open items — view on GitHub"
+                  title={messages.taskDetailModal.linked.noLongerOpen}
                 >
-                  {label} · closed ↗
+                  {label} · {messages.common.githubState('closed')} ↗
                 </a>
               ),
             )}
           </div>
         )}
 
-        {loading && <p className="text-muted text-sm">Loading…</p>}
+        {loading && <p className="text-muted text-sm">{messages.taskDetailModal.loading}</p>}
         {error && (
           <p className="text-sm" style={{ color: 'var(--color-accent-700)' }}>
             {error}
@@ -214,20 +233,25 @@ export default function TaskDetailModal({
           <div className="flex flex-col gap-3">
             <div>
               <p className="card-meta">
-                Opened by {detail.author} · {new Date(detail.updatedAt).toLocaleString()}
+                {messages.taskDetailModal.openedBy(
+                  detail.author,
+                  new Date(detail.updatedAt).toLocaleString(messages.dateLocales),
+                )}
               </p>
-              <p className="mt-2 whitespace-pre-wrap text-sm">{detail.body || 'No description provided.'}</p>
+              <p className="mt-2 whitespace-pre-wrap text-sm">
+                {detail.body || messages.taskDetailModal.noDescription}
+              </p>
             </div>
 
             {detail.comments.length > 0 && (
               <div className="flex flex-col gap-2">
                 <p className="text-muted text-[10px] uppercase tracking-wide">
-                  {detail.comments.length} comment{detail.comments.length === 1 ? '' : 's'}
+                  {messages.taskDetailModal.commentCount(detail.comments.length)}
                 </p>
                 {detail.comments.map((comment) => (
                   <div key={comment.id} className="card gap-1 p-2">
                     <p className="card-meta">
-                      {comment.author} · {new Date(comment.createdAt).toLocaleString()}
+                      {comment.author} · {new Date(comment.createdAt).toLocaleString(messages.dateLocales)}
                     </p>
                     <p className="whitespace-pre-wrap text-sm">{comment.body}</p>
                   </div>
@@ -246,14 +270,14 @@ export default function TaskDetailModal({
                 onChange={(e) => setAutoAdvance(e.target.checked)}
                 disabled={enqueueing}
               />
-              Auto-advance through pr → review → merge unattended
+              {messages.taskDetailModal.autoAdvance}
             </label>
             <button type="button" onClick={enqueue} disabled={enqueueing} className="btn btn-primary self-start">
-              {enqueueing ? 'Adding…' : 'Add to workflow'}
+              {enqueueing ? messages.taskDetailModal.adding : messages.taskDetailModal.addToWorkflow}
             </button>
             {enqueueError && (
               <p className="text-sm" style={{ color: 'var(--color-accent-700)' }}>
-                {enqueueError}
+                {wordIn(enqueueError, messages)}
               </p>
             )}
           </div>
@@ -261,7 +285,7 @@ export default function TaskDetailModal({
 
         <div>
           <a href={detail?.url ?? fallbackUrl} target="_blank" rel="noreferrer" className="text-xs">
-            View on GitHub ↗
+            {messages.taskDetailModal.viewOnGithub} ↗
           </a>
         </div>
       </div>

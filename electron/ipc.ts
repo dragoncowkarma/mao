@@ -8,6 +8,7 @@ import { assertCanRelaunchForUpdate, checkForUpdates, countRunningWorkflowTasks 
 import { createAiProvider, type AiProviderConfig } from '../core/ai/index.ts'
 import { QUEUE_PERSISTENCE_BROKEN, type RepoRef, type RunOverride } from '../core/workflow-engine.ts'
 import type { ThemePreference } from '../core/store.ts'
+import type { LanguagePreference } from '../core/ui-language.ts'
 import {
   assertCanClearPersistenceBroken,
   clearPersistenceBrokenMarker,
@@ -181,5 +182,14 @@ export function registerIpcHandlers() {
 
   ipcMain.handle('ui:setTheme', (_event, theme: ThemePreference) => {
     store.set('theme', theme)
+  })
+
+  // The raw stored value, as `ui:getTheme` answers. The renderer resolves it through
+  // `resolveUiLanguage()`, which treats anything it cannot use as 'system', so a hand-edited value
+  // needs no repair here before it can be shown.
+  ipcMain.handle('ui:getLanguage', () => store.get('language'))
+
+  ipcMain.handle('ui:setLanguage', (_event, language: LanguagePreference) => {
+    store.set('language', language)
   })
 }

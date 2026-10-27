@@ -1,9 +1,11 @@
-import { render, screen } from '@testing-library/react'
+import { render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 import Sidebar from './Sidebar'
 import { describeUnloadableStore, describeUnusableTaskQueue, type StoredValueProblem } from '../../core/store'
 import type { QueueRecoveryState } from '../../core/workflow-engine'
+import type { RepoWorkflowCapability } from '../../core/repo-capabilities'
+import { LANGUAGE_NAMES, MESSAGES } from '../i18n'
 
 /**
  * Sidebar on its own, driven by props.
@@ -68,6 +70,10 @@ function renderSidebar(overrides: Partial<Parameters<typeof Sidebar>[0]> = {}) {
     onClearPersistenceBroken,
     view: 'project' as const,
     onViewChange: vi.fn(),
+    messages: MESSAGES.en,
+    language: 'system' as const,
+    onLanguageChange: vi.fn(),
+    languageError: '',
     ...overrides,
   }
   render(<Sidebar {...props} />)
@@ -371,5 +377,107 @@ describe('Sidebar queue recovery', () => {
 
     expect(screen.queryByText('Workflow automation is halted')).toBeNull()
     expect(screen.queryByRole('button', { name: 'Recover readable tasks' })).toBeNull()
+  })
+})
+
+describe('Sidebar language menu', () => {
+  it('names every language in that language, whatever the sidebar is showing', () => {
+    // An operator who picked a language they cannot read has to be able to find the way back, so the
+    // options are the one thing in the menu that does not follow the current language.
+    renderSidebar({ messages: MESSAGES.ko, language: 'ko' })
+
+    const menu = screen.getByRole('combobox', { name: MESSAGES.ko.language.label })
+    expect(menu).toHaveValue('ko')
+    expect(within(menu).getAllByRole('option').map((option) => option.textContent)).toEqual([
+      // jsdom reports en-US, so 'system' resolves to English here — and says so.
+      MESSAGES.ko.language.systemResolved(LANGUAGE_NAMES.en),
+      'English',
+      '한국어',
+    ])
+    // And each name says which language it is in, so assistive tech voices it as that language rather
+    // than as the page's. 'System' is worded in the page's language and takes the page's.
+    expect(within(menu).getAllByRole('option').map((option) => option.getAttribute('lang'))).toEqual([
+      null,
+      'en',
+      'ko',
+    ])
+  })
+
+  it('hands the chosen preference up', async () => {
+    const onLanguageChange = vi.fn()
+    const { user } = renderSidebar({ onLanguageChange })
+    const menu = screen.getByRole('combobox', { name: 'Language' })
+
+    await user.selectOptions(menu, '한국어')
+    expect(onLanguageChange).toHaveBeenLastCalledWith('ko')
+    await user.selectOptions(menu, 'English')
+    expect(onLanguageChange).toHaveBeenLastCalledWith('en')
+  })
+
+  it('says a change was not saved, without the IPC plumbing around the reason', () => {
+    renderSidebar({
+      languageError:
+        "Error invoking remote method 'ui:setLanguage': Error: [store] Refusing to write \"language\" to " +
+        '/data/config.json, because the file could not be read.',
+    })
+
+    expect(
+      screen.getByText(
+        MESSAGES.en.language.saveFailed(
+          '[store] Refusing to write "language" to /data/config.json, because the file could not be read.',
+        ),
+      ),
+    ).toBeInTheDocument()
+  })
+
+  it('says nothing about saving when the last change was saved', () => {
+    renderSidebar()
+
+    expect(screen.queryByText(/could not be saved/)).toBeNull()
+  })
+
+  it('re-words the unverified-access caveat when the language changes while it is showing', async () => {
+    // The caveat is the GUI's only statement that a passing preflight is not proof of write access, so
+    // it must not stay behind in the language of the click once the operator switches.
+    const unverified: RepoWorkflowCapability = {
+      owner: 'acme',
+      repo: 'one',
+      ok: true,
+      gaps: [],
+      unverified: ['issues-write', 'contents-write', 'pull-requests-write'],
+      observed: { archived: false, disabled: false, hasIssues: true, push: true, private: false, credential: 'unknown' },
+    }
+    const props = {
+      repos: [],
+      selectedIndex: null,
+      onSelect: vi.fn(),
+      onAddRepo: vi.fn(async () => [unverified]),
+      storeProblems: [] as StoredValueProblem[],
+      onResetRepoList: vi.fn(async () => {}),
+      queueRecovery: { required: false, reason: undefined, restartRequired: false, persistenceBroken: false },
+      queueStoredStillUnreadable: false,
+      onRecoverQueue: vi.fn(async () => {}),
+      onResaveQueue: vi.fn(async () => {}),
+      onClearPersistenceBroken: vi.fn(async () => {}),
+      view: 'project' as const,
+      onViewChange: vi.fn(),
+      language: 'en' as const,
+      onLanguageChange: vi.fn(),
+      languageError: '',
+    }
+    const user = userEvent.setup()
+    const { rerender } = render(<Sidebar {...props} messages={MESSAGES.en} />)
+
+    await user.click(screen.getByRole('button', { name: MESSAGES.en.sidebar.addRepo.toggle }))
+    await user.type(screen.getByPlaceholderText(MESSAGES.en.sidebar.addRepo.ownerPlaceholder), 'acme')
+    await user.type(screen.getByPlaceholderText(MESSAGES.en.sidebar.addRepo.repoPlaceholder), 'one')
+    await user.click(screen.getByRole('button', { name: MESSAGES.en.sidebar.addRepo.submit }))
+
+    expect(await screen.findByText(MESSAGES.en.sidebar.addRepo.addedUnverified('acme/one'))).toBeInTheDocument()
+
+    rerender(<Sidebar {...props} language="ko" messages={MESSAGES.ko} />)
+
+    expect(screen.getByText(MESSAGES.ko.sidebar.addRepo.addedUnverified('acme/one'))).toBeInTheDocument()
+    expect(screen.queryByText(MESSAGES.en.sidebar.addRepo.addedUnverified('acme/one'))).toBeNull()
   })
 })

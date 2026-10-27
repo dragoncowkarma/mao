@@ -9,6 +9,7 @@ Electron dev-toolkit that lets AI agents drive a GitHub workflow — **issue →
 - **BYOK / CLI adapter** — plug in an API key (Anthropic or OpenAI-compatible) or a locally installed CLI (`claude`, `codex`, etc.) as an AI provider, via a common `AiProvider` interface. Each provider can optionally carry a `model` and an informational `effort` (low/medium/high) shown next to its work throughout the UI.
 - **Maker-checker cross-verification** — the AI that handled a task's previous pipeline stage is automatically excluded from the next one, so no agent reviews or merges its own work.
 - **Project sidebar** — every registered `owner/repo` is a project in the left sidebar; selecting one opens straight into its Board (issues/PRs), with Queue and per-project Settings as tabs alongside it. Global settings (GitHub token, AI providers) live in their own section, separate from per-project config (auto-trigger on/off, poll interval).
+- **UI language** — English or 한국어, switchable from the language menu at the bottom of the sidebar or from Global settings, with no restart. "System" (the default) follows the OS's preferred languages and falls back to English; `mao config set-language <system|en|ko>` sets the same preference from the CLI. Messages that come from core or GitHub (store reports, permission errors, task errors, issue text) are shown as written.
 - **Kanban board** — GitHub Issues/PRs synced live (manual "Refresh" button plus a "synced Xs ago" indicator), sorted urgent-first then latest-updated. Cards driven by an active workflow task show their live pipeline stage/status (queued, running, paused, failed, done) at a glance.
 - **Automated pipeline** — `issue → pr → review → merge`, driven by registered AI agents:
   - **issue**: an agent drafts the issue body and files it on GitHub.
@@ -80,6 +81,7 @@ core/
   swarm-runner.ts   Shell-free launcher for the autonomous Swarm CLI asset
   auto-trigger.ts   Per-repo polling scheduler
   store.ts          Shared persistence schema and FileStore
+  ui-language.ts    GUI language list and how 'system' resolves against the OS
 electron/
   ipc.ts            Thin IPC delegations to core services
   main.ts / preload.ts  Electron entry points
@@ -88,14 +90,15 @@ cli/
 .agents/workflows/
   swarm_orchestrator.py  Autonomous role lifecycle, worktrees, process tracking, retry/cooldown
 src/
-  App.tsx           Sidebar + project tabs (Board / Queue / Settings) shell
+  App.tsx           Sidebar + project tabs (Board / Queue / Settings) shell; owns the UI language
+  i18n/             Message catalogs: one module per component, en + ko
   components/
-    Sidebar.tsx        Project list, add-repo, link to Global settings
+    Sidebar.tsx        Project list, add-repo, link to Global settings, language menu
     KanbanBoard.tsx    Issues/PRs for the selected project, with live workflow status badges
     WorkflowQueue.tsx  Task list for the selected project: agent/model/effort, prompts,
                        manual advance/pause controls
     ProjectSettings.tsx  Per-repo auto-trigger toggle, poll interval, remove
-    GlobalSettings.tsx   GitHub token, AI providers (model/effort)
+    GlobalSettings.tsx   Theme, language, GitHub token, AI providers (model/effort)
 scripts/
   test-workflow.ts  Standalone harness — runs WorkflowEngine + GithubService outside Electron
 ```

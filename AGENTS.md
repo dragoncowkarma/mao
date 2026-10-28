@@ -117,8 +117,13 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
    `verbatimModuleSyntax` (without it esbuild elides `import { type X } from './y'`, the exact form that
    defeated the regex) and `platform: 'neutral'` (under `'node'` a reach for `node:fs` is merely
    *external*, so it never appears among the metafile inputs and a planted `import 'node:fs'` left the
-   suite green). Graph paths are normalised to `/`, since `path.relative()` yields backslashes on
-   Windows and `package.json` declares a Windows ZIP target that CI does not cover.
+   suite green). Because esbuild also omits computed runtime edges from that graph, an AST pass rejects
+   non-literal `import()`/`require()` specifiers and every runtime `require` reference except a direct,
+   non-optional call with a literal specifier; aliases, parentheses and property access fail closed
+   instead of leaving an unrecorded loader in the renderer bundle. Erased type references, ambient or
+   declaration names and non-shorthand object/type property names are not runtime references. Graph
+   paths are normalised to `/`, since `path.relative()` yields backslashes on Windows and `package.json`
+   declares a Windows ZIP target that CI does not cover.
    There are no IPC push events — the
    UI polls and re-fetches after each mutation; keep that pull model.
 7. **Electron security posture.** `webPreferences` set only `preload` so Electron 33

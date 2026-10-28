@@ -63,10 +63,12 @@ import { describe, expect, it } from 'vitest'
  * and a substituting template literal behave the same way. Those are real runtime edges in the shipped
  * renderer bundle, which is exactly what rule 6 forbids.
  *
- * So each subject is also parsed and rejected for any `import()` or `require()` whose specifier is not a
- * plain string literal. **Any** non-literal, not just ones that look like Node built-ins: a specifier the
- * check cannot read is a specifier it cannot vouch for, and failing closed is the whole point of the
- * file. The AST pass covers the entry it is given rather than the transitive graph — which is sufficient
+ * So each subject is also parsed and rejected for any `import()` or direct `require()` whose specifier
+ * is not a plain string literal. **Any** non-literal, not just ones that look like Node built-ins: a
+ * specifier the check cannot read is a specifier it cannot vouch for, and failing closed is the whole
+ * point of the file. A `require` reference hidden behind parentheses, an alias, optional chaining or a
+ * property access is rejected too — esbuild can leave those calls in the output without recording an
+ * edge. The AST pass covers the entry it is given rather than the transitive graph — which is sufficient
  * here only because every allowlisted module is itself a subject of the same assertion.
  *
  * The whole measured pass costs about 30ms, and it needs no DOM and no vite plugin, so it sits in the
@@ -144,23 +146,148 @@ async function violationsOf(options: Record<string, unknown>, alsoAllowed: strin
 }
 
 /**
- * Any `import()` or `require()` in `source` whose specifier is not a plain string literal.
+ * Any `import()` or direct `require()` in `source` whose specifier is not a plain string literal, plus
+ * every `require` reference that is not itself the direct callee of a call.
  *
- * A bundler records nothing for these, so the graph check cannot see them — see the file comment. A
- * no-substitution template literal counts as plain; one with a `${…}` in it does not.
+ * A bundler records nothing for these, so the graph check cannot see them — see the file comment. Only
+ * `require('<plain specifier>')` is delegated to the graph check; aliases, parentheses, optional calls
+ * and property access cannot be proven to create a graph edge and therefore fail closed. Erased type
+ * references, ambient/declaration names and non-shorthand object/type property names are not runtime
+ * value references and are ignored. A no-substitution template literal counts as plain; one with a
+ * `${…}` in it does not.
  */
 function computedImportViolations(source: string, label: string): string[] {
   const parsed = ts.createSourceFile(label, source, ts.ScriptTarget.ESNext, true, ts.ScriptKind.TS)
   const found: string[] = []
   const isPlainSpecifier = (node: ts.Node | undefined): boolean =>
     node !== undefined && (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node))
+  const isRequirePropertyName = (node: ts.Node | undefined): boolean => {
+    let name = node && ts.isComputedPropertyName(node) ? node.expression : node
+    while (
+      name &&
+      (ts.isParenthesizedExpression(name) ||
+        ts.isAsExpression(name) ||
+        ts.isTypeAssertionExpression(name) ||
+        ts.isNonNullExpression(name) ||
+        ts.isSatisfiesExpression(name))
+    ) {
+      name = name.expression
+    }
+    return (
+      name !== undefined &&
+      (ts.isIdentifier(name) || ts.isStringLiteral(name) || ts.isNoSubstitutionTemplateLiteral(name)) &&
+      name.text === 'require'
+    )
+  }
+  const isInsideTypeNode = (node: ts.Node): boolean => {
+    for (let parent = node.parent; parent; parent = parent.parent) {
+      if (ts.isTypeNode(parent)) return true
+    }
+    return false
+  }
+  const isInsideTypeOnlyImportOrExport = (node: ts.Node): boolean => {
+    for (let parent = node.parent; parent; parent = parent.parent) {
+      if (
+        (ts.isImportClause(parent) ||
+          ts.isImportSpecifier(parent) ||
+          ts.isImportEqualsDeclaration(parent) ||
+          ts.isExportDeclaration(parent) ||
+          ts.isExportSpecifier(parent)) &&
+        parent.isTypeOnly
+      ) {
+        return true
+      }
+      if (ts.isImportDeclaration(parent) || ts.isExportDeclaration(parent)) return false
+    }
+    return false
+  }
+  const isInsideAmbientDeclaration = (node: ts.Node): boolean => {
+    if (parsed.isDeclarationFile) return true
+    for (let parent = node.parent; parent; parent = parent.parent) {
+      const modifiers = (parent as ts.Node & { readonly modifiers?: readonly ts.Node[] }).modifiers
+      if (modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.DeclareKeyword)) return true
+    }
+    return false
+  }
+  const isNonReferenceName = (node: ts.Identifier): boolean => {
+    const parent = node.parent
+    // These both carry a `name`, but the identifier is read at runtime rather than declared there.
+    if (ts.isPropertyAccessExpression(parent) || ts.isShorthandPropertyAssignment(parent)) return false
+    // Imported/exported member names are accounted for by the graph edge, not a CommonJS loader read.
+    if (ts.isImportSpecifier(parent) || ts.isExportSpecifier(parent)) return true
+    const labelledParent = parent as ts.Node & { readonly label?: ts.Identifier }
+    if (labelledParent.label === node) return true
+    const namedParent = parent as ts.Node & { readonly name?: ts.Node }
+    return namedParent.name === node
+  }
+  const isDirectRequireCallee = (node: ts.Node): boolean =>
+    ts.isIdentifier(node) &&
+    node.text === 'require' &&
+    ts.isCallExpression(node.parent) &&
+    node.parent.expression === node &&
+    node.parent.questionDotToken === undefined
+  const isRequireElementAccess = (node: ts.Node): boolean =>
+    ts.isElementAccessExpression(node) &&
+    isRequirePropertyName(node.argumentExpression) &&
+    !isInsideTypeNode(node)
+  const isRequireBinding = (node: ts.Node): boolean =>
+    ts.isBindingElement(node) &&
+    ts.isObjectBindingPattern(node.parent) &&
+    isRequirePropertyName(node.propertyName ?? node.name) &&
+    !isInsideTypeNode(node) &&
+    !isInsideAmbientDeclaration(node)
+  const isWithinAssignmentTarget = (node: ts.Node): boolean => {
+    let current = node
+    while (current.parent) {
+      const parent = current.parent
+      if (ts.isBinaryExpression(parent)) {
+        return parent.operatorToken.kind === ts.SyntaxKind.EqualsToken && parent.left === current
+      }
+      if (
+        ts.isObjectLiteralExpression(parent) ||
+        ts.isArrayLiteralExpression(parent) ||
+        ts.isPropertyAssignment(parent) ||
+        ts.isShorthandPropertyAssignment(parent) ||
+        ts.isSpreadAssignment(parent) ||
+        ts.isParenthesizedExpression(parent)
+      ) {
+        current = parent
+        continue
+      }
+      return false
+    }
+    return false
+  }
+  const isRequireDestructuringAssignment = (node: ts.Node): boolean =>
+    ts.isPropertyAssignment(node) && isRequirePropertyName(node.name) && isWithinAssignmentTarget(node)
   const visit = (node: ts.Node): void => {
     if (ts.isCallExpression(node)) {
       const dynamicImport = node.expression.kind === ts.SyntaxKind.ImportKeyword
-      const requireCall = ts.isIdentifier(node.expression) && node.expression.text === 'require'
+      const requireCall = isDirectRequireCallee(node.expression)
       if ((dynamicImport || requireCall) && !isPlainSpecifier(node.arguments[0])) {
         found.push(`${label}: ${dynamicImport ? 'import' : 'require'}() with a non-literal specifier`)
       }
+    }
+    if (isRequireBinding(node)) {
+      found.push(`${label}: require extracted through object destructuring`)
+    }
+    if (isRequireDestructuringAssignment(node)) {
+      found.push(`${label}: require extracted through a destructuring assignment`)
+    }
+    if (
+      ts.isIdentifier(node) &&
+      node.text === 'require' &&
+      !isInsideTypeNode(node) &&
+      !isInsideTypeOnlyImportOrExport(node) &&
+      !(ts.isBindingElement(node.parent) && isRequireBinding(node.parent)) &&
+      !(ts.isPropertyAssignment(node.parent) && isRequireDestructuringAssignment(node.parent)) &&
+      !isNonReferenceName(node) &&
+      !isDirectRequireCallee(node)
+    ) {
+      found.push(`${label}: require referenced outside a direct call`)
+    }
+    if (isRequireElementAccess(node)) {
+      found.push(`${label}: require accessed through a computed property`)
     }
     ts.forEachChild(node, visit)
   }
@@ -223,6 +350,26 @@ describe('the core modules src/ may value-import', () => {
     const computed: Record<string, string> = {
       'computed dynamic import': "const specifier = 'node:fs'\nexport const load = () => import(specifier)",
       'computed require': "const specifier = 'node:fs'\nexport const load = () => require(specifier)",
+      'parenthesized require': "const specifier = 'node:fs'\nexport const load = () => (require)(specifier)",
+      'aliased require':
+        "const specifier = 'node:fs'\nconst runtimeRequire = require\nexport const load = () => runtimeRequire(specifier)",
+      'require.call': "const specifier = 'node:fs'\nexport const load = () => require.call(null, specifier)",
+      'optional require': "export const load = () => require?.('node:fs')",
+      'global require element access':
+        "const specifier = 'node:fs'\nexport const load = () => globalThis['require'](specifier)",
+      'module require element access':
+        "const specifier = 'node:fs'\nexport const load = () => module['require'](specifier)",
+      'parenthesized require element access':
+        "const specifier = 'node:fs'\nexport const load = () => globalThis[('require')](specifier)",
+      'asserted require element access':
+        "const specifier = 'node:fs'\nexport const load = () => globalThis['require' as const](specifier)",
+      'destructured require':
+        "const { require } = module\nexport const load = () => require('node:fs')",
+      'computed destructured require':
+        "const { ['require']: runtimeRequire } = module\nexport const load = () => runtimeRequire('node:fs')",
+      'require shorthand property': "export const loaders = { require }",
+      'require destructuring assignment':
+        "let runtimeRequire\n({ require: runtimeRequire } = module)\nexport const load = () => runtimeRequire('node:fs')",
       'substituting template': "const name = 'fs'\nexport const load = () => import(`node:${name}`)",
       'specifier from a parameter': 'export const load = (specifier: string) => import(specifier)',
     }
@@ -269,6 +416,22 @@ describe('the core modules src/ may value-import', () => {
     // be satisfied by rejecting every `import()`, which would make the fixtures above meaningless.
     expect(
       await violationsForSource("export const load = () => import('./core/ai/provider-options.ts')"),
+    ).toEqual([])
+    // The CommonJS spelling is fine too when its specifier is plain and the graph can prove the edge.
+    expect(
+      await violationsForSource("export const load = () => require('./core/ai/provider-options.ts')"),
+    ).toEqual([])
+    // Names alone are not runtime edges. Rejecting these would turn the fail-closed loader rule into a
+    // lexical ban on an otherwise ordinary property or local identifier.
+    expect(
+      await violationsForSource(
+        'export type Metadata = { require: boolean }\nexport type Loader = typeof require\nexport type Handler = ({ require }: Metadata) => void\ndeclare function inspect({ require }: Metadata): void\nexport const metadata = { require: true }\nconst require = true',
+      ),
+    ).toEqual([])
+    expect(
+      await violationsForSource(
+        "import type { require as Loader } from './core/ai/provider-options.ts'\nvoid 0 as unknown as Loader",
+      ),
     ).toEqual([])
   })
 })

@@ -63,10 +63,11 @@ export default function App() {
    * read to decide what to do with the value being stored, and a render is not what has to happen in
    * between.
    *
-   * - `lastUnusable` — whether the previous report said the stored list held *nothing* usable, so a
-   *   change in that answer can be recognised. Not "was there a report": see `applyStoreProblems()`.
-   * - `rereadOwed` — the stored list has changed between holding nothing usable and holding something,
-   *   and the renderer has not taken the new one yet. Survives a failed read so the next poll retries.
+   * - `lastReport` — the previous report's text, or `undefined` for none, so any change in what the
+   *   store says about the list can be recognised. Not `nothingUsable`, and not "was there a report":
+   *   see `applyStoreProblems()`.
+   * - `rereadOwed` — the store's answer about the list has changed and the renderer has not taken the
+   *   new list yet. Survives a failed read so the next poll retries.
    * - `generation` — bumped whenever something invalidates a list read already in flight: the observed
    *   state changing, or this window starting a write. Repairs are observed on a 30s poll
    *   but adopted through a read that takes its own time, so the two interleave; without this, a read
@@ -79,7 +80,7 @@ export default function App() {
    *   of order, and only the newest may apply, or a late older answer rolls the sidebar back.
    */
   const repoListWatch = useRef({
-    lastUnusable: false,
+    lastReport: undefined as string | undefined,
     rereadOwed: false,
     generation: 0,
     writesInFlight: 0,
@@ -142,12 +143,22 @@ export default function App() {
    * them. Re-reading on *every* poll instead would reintroduce the hazard `persistRepos`' success path
    * avoids: a round trip landing mid-typing stomps newer keystrokes in the settings pane.
    *
-   * The watched fact is `nothingUsable`, not whether a report exists at all, and the difference is a
-   * state issue #72 made reachable: an array with some usable entries is reported too, while
-   * `github:getRepos` still answers its survivors — so the rows are real and nothing has to be re-read
-   * for the report alone. Watching the report's mere presence would instead miss the transition that
-   * matters most, an all-invalid list hand-repaired into a partly usable one, where rows appear for the
-   * first time while a report is still, correctly, up.
+   * The watched fact is the **report itself**, not whether one exists and not `nothingUsable`. Those
+   * two coarser keys each miss a transition, and issue #72 made both reachable by adding a reported
+   * state (`'some-entries'`) in which the renderer holds real rows:
+   *
+   * - "does a report exist" misses an all-invalid list hand-repaired into a partly usable one — still
+   *   reported either side, while rows appear for the first time.
+   * - `nothingUsable` misses the reverse, `'some-entries'` repaired to healthy — `false` either side,
+   *   so the warning vanishes and the rescued repository never arrives. **That one is not cosmetic.**
+   *   `persistRepos` sends the renderer's whole list, so the next settings toggle on a surviving row
+   *   writes a list that omits the repaired entry and deletes it again — and the report this PR added
+   *   is precisely what sent the operator to `config.json` to make that repair.
+   *
+   * Any change in the report is a change in what the store holds for this field (the text carries the
+   * counts), so it is the key that catches every one of those. Whether a whole-list *reset* may be
+   * offered stays a separate question, answered by `nothingUsable` in the sidebar — conflating the two
+   * is what produced the bug above.
    *
    * Deliberately does **not** clear the flag when it answers `true`: the transition is observable once,
    * and clearing it here would spend it on a read that has not happened yet. `adoptStoredRepoList()`
@@ -156,9 +167,9 @@ export default function App() {
    */
   function applyStoreProblems(next: StoredValueProblem[]): boolean {
     const watch = repoListWatch.current
-    const unusable = next.some((problem) => problem.field === 'githubRepos' && problem.nothingUsable)
-    if (unusable !== watch.lastUnusable) {
-      watch.lastUnusable = unusable
+    const report = next.find((problem) => problem.field === 'githubRepos')?.message
+    if (report !== watch.lastReport) {
+      watch.lastReport = report
       watch.generation += 1
       watch.rereadOwed = true
     }

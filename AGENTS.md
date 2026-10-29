@@ -498,11 +498,18 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   that destroys the value, so reading it only afterwards cannot warn anyone in time. It narrows that
   to one poll interval rather than eliminating it: an Add is not gated on a fresh read, deliberately,
   because gating it would make the GUI refuse a recovery `mao repos add` still performs. The poll
-  also re-reads the *list* on the one transition that matters — a report that said the list was
-  unusable followed by one that does not. A repair from outside this window heals the store without
-  the renderer writing anything, so nothing else would re-read it, and taking only the diagnostic
-  down leaves the card gone and the sidebar still insisting there are no projects. Only on that
-  transition: re-reading every poll would reintroduce the round-trip-lands-mid-typing hazard
+  also re-reads the *list* whenever the report **changes at all** — appearing, disappearing, or saying
+  something different. A repair from outside this window heals the store without the renderer writing
+  anything, so nothing else would re-read it, and taking only the diagnostic down leaves the card gone
+  and the sidebar still insisting there are no projects. The key is the report text, not a coarser
+  summary of it, and both coarser keys were tried and were wrong once `'some-entries'` existed: "does a
+  report exist" misses an all-invalid list hand-repaired into a partly usable one, and `nothingUsable`
+  misses `'some-entries'` repaired to healthy — `false` on both sides, so the warning vanished and the
+  rescued repository never arrived. That second one destroys data rather than merely hiding it, because
+  `persistRepos` sends the renderer's whole list: the next settings toggle on a surviving row writes a
+  list that omits the repaired entry. **Whether a whole-list reset may be offered is a separate
+  question** (`nothingUsable`, in the sidebar); conflating the two is what produced that bug. Not every
+  poll, though: re-reading unconditionally would reintroduce the round-trip-lands-mid-typing hazard
   `persistRepos`' success path exists to avoid. The transition is observable **once**, so it is not
   consumed until the list is actually in hand — a read that fails leaves the repair pending and the
   renderer's current list untouched, and the next poll tries again. Clearing it first, or adopting

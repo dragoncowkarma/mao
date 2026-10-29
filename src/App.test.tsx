@@ -295,6 +295,73 @@ describe('App unusable stored settings', () => {
     }
   })
 
+  it('takes the repaired list when a partly usable one reads normally again', async () => {
+    // Review finding on this PR. `some-entries` and healthy are both `nothingUsable: false`, so a watch
+    // keyed on that flag saw no transition: the warning vanished and the rescued repository never
+    // arrived. The report is what sent the operator to `config.json` in the first place, so the repair
+    // it asks for has to be the one case that cannot be missed.
+    vi.useFakeTimers()
+    try {
+      const stub = createElectronApiStub([ONE], [PARTLY_USABLE_REPO_LIST])
+      render(
+        <StrictMode>
+          <App />
+        </StrictMode>,
+      )
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(screen.getByText(/1 entry of 2 does not name a repository/)).toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'acme/two' })).toBeNull()
+
+      stub.applyRepos([ONE, TWO])
+      stub.storeProblems.mockResolvedValue([])
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+
+      expect(screen.getByRole('button', { name: 'acme/two' })).toBeInTheDocument()
+      expect(screen.queryByText(/does not name a repository/)).toBeNull()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not delete a repaired repository with the next settings save', async () => {
+    // The half of that finding which is not cosmetic. `persistRepos` sends the renderer's whole list,
+    // so a stale mirror is not merely out of date — the first settings toggle on a surviving row writes
+    // a list that omits the repaired entry, and `updateRepos` persists exactly that.
+    vi.useFakeTimers()
+    try {
+      const stub = createElectronApiStub([ONE], [PARTLY_USABLE_REPO_LIST])
+      render(
+        <StrictMode>
+          <App />
+        </StrictMode>,
+      )
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+
+      stub.applyRepos([ONE, TWO])
+      stub.storeProblems.mockResolvedValue([])
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+      })
+      await act(async () => {
+        fireEvent.click(screen.getByRole('checkbox'))
+      })
+
+      expect(stub.setRepos).toHaveBeenCalledWith([{ ...ONE, autoTrigger: false }, TWO])
+      expect(stub.storedRepos()).toEqual([{ ...ONE, autoTrigger: false }, TWO])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('shows the repositories a partial hand-repair rescued, without waiting for a write', async () => {
     // The transition `nothingUsable` exists to catch, and the one a report-presence watch misses: an
     // all-invalid list hand-edited into a partly usable one still reports, so nothing else would re-read

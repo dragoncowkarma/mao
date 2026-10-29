@@ -3,6 +3,7 @@ import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 import Sidebar, { type RepoListResetOutcome } from './Sidebar'
 import {
+  describeUnloadableStore,
   describeUnusableRepoList,
   describeUnusableTaskQueue,
   type StoredValueProblem,
@@ -55,11 +56,27 @@ const PARTLY_USABLE_REPO_LIST = storedValueProblem(
   describeUnusableRepoList([WIDGETS, null], '/data/config.json')!,
 )
 
-const HALTED: QueueRecoveryState = { required: true, reason: UNUSABLE_QUEUE.message }
+const HALTED: QueueRecoveryState = {
+  required: true,
+  reason: UNUSABLE_QUEUE.message,
+  restartRequired: false,
+  persistenceBroken: false,
+}
+
+const PERSISTENCE_BROKEN: QueueRecoveryState = {
+  required: true,
+  reason:
+    'Workflow queue persistence has an unresolved write outcome. No further queue mutation or ' +
+    'repository polling is allowed. Verify the stored queue and GitHub state, clear the ' +
+    'persistence-broken marker only after that check, then restart MAO.',
+  restartRequired: false,
+  persistenceBroken: true,
+}
 
 function renderSidebar(overrides: Partial<Parameters<typeof Sidebar>[0]> = {}) {
   const onRecoverQueue = vi.fn(async () => {})
   const onResaveQueue = vi.fn(async () => {})
+  const onClearPersistenceBroken = vi.fn(async () => {})
   const props = {
     repos: [],
     selectedIndex: 0,
@@ -67,10 +84,16 @@ function renderSidebar(overrides: Partial<Parameters<typeof Sidebar>[0]> = {}) {
     onAddRepo: vi.fn(async () => []),
     storeProblems: [] as StoredValueProblem[],
     onResetRepoList: vi.fn(async (): Promise<RepoListResetOutcome> => 'replaced'),
-    queueRecovery: { required: false, reason: undefined } as QueueRecoveryState,
+    queueRecovery: {
+      required: false,
+      reason: undefined,
+      restartRequired: false,
+      persistenceBroken: false,
+    } as QueueRecoveryState,
     queueStoredStillUnreadable: false,
     onRecoverQueue,
     onResaveQueue,
+    onClearPersistenceBroken,
     view: 'project' as const,
     onViewChange: vi.fn(),
     ...overrides,
@@ -79,6 +102,7 @@ function renderSidebar(overrides: Partial<Parameters<typeof Sidebar>[0]> = {}) {
   return {
     onRecoverQueue,
     onResaveQueue,
+    onClearPersistenceBroken,
     onResetRepoList: props.onResetRepoList,
     user: userEvent.setup(),
     rerender: (next: Partial<Parameters<typeof Sidebar>[0]> = {}) => rerender(<Sidebar {...props} {...next} />),
@@ -246,7 +270,7 @@ describe('Sidebar queue recovery', () => {
     // only for a boot-time latch — so in exactly this state NEITHER appeared and the operator saw
     // nothing at all.
     renderSidebar({
-      queueRecovery: { required: false, reason: undefined },
+      queueRecovery: { required: false, reason: undefined, restartRequired: false, persistenceBroken: false },
       queueStoredStillUnreadable: true,
       storeProblems: [UNUSABLE_QUEUE],
     })
@@ -269,7 +293,7 @@ describe('Sidebar queue recovery', () => {
     // session's real queue is lost the moment it restarts without having written. The safe action is for
     // THIS session to save the queue it is holding.
     const { user, onResaveQueue, onRecoverQueue } = renderSidebar({
-      queueRecovery: { required: false, reason: undefined },
+      queueRecovery: { required: false, reason: undefined, restartRequired: false, persistenceBroken: false },
       queueStoredStillUnreadable: true,
       storeProblems: [UNUSABLE_QUEUE],
     })
@@ -287,7 +311,7 @@ describe('Sidebar queue recovery', () => {
 
   it('shows why a late save failed instead of failing silently', async () => {
     const { user, onResaveQueue } = renderSidebar({
-      queueRecovery: { required: false, reason: undefined },
+      queueRecovery: { required: false, reason: undefined, restartRequired: false, persistenceBroken: false },
       queueStoredStillUnreadable: true,
       storeProblems: [UNUSABLE_QUEUE],
     })
@@ -300,13 +324,165 @@ describe('Sidebar queue recovery', () => {
 
   it('prints the late-case explanation once, and the halted report not at all', () => {
     renderSidebar({
-      queueRecovery: { required: false, reason: undefined },
+      queueRecovery: { required: false, reason: undefined, restartRequired: false, persistenceBroken: false },
       queueStoredStillUnreadable: true,
       storeProblems: [UNUSABLE_QUEUE],
     })
 
     expect(screen.getAllByText(/This session is not halted/)).toHaveLength(1)
     expect(screen.queryByText(UNUSABLE_QUEUE.message)).toBeNull()
+  })
+
+  /**
+   * A file that did not load at all is a different late state from a wrong-shaped field in a file that did.
+   *
+   * Issue #67 made every write refuse while the file is unloadable, which turned the late card's own
+   * promise — "its next queue write will rewrite the file from that" — into a falsehood, and left a Save
+   * button that `resaveStoredQueue` can only answer `'restart-required'` for. Core marks the whole-file case
+   * so the UI can tell them apart without parsing the report.
+   *
+   * It names no `defect`, because no value was observed to have one — and `nothingUsable: false`, which
+   * is what core answers for a state that established nothing: the sidebar must not offer to replace a
+   * whole value it cannot read.
+   */
+  const UNLOADABLE_FILE: StoredValueProblem = {
+    field: 'workflowTasks',
+    source: '/data/config.json',
+    message: describeUnloadableStore('/data/config.json', 'unparseable'),
+    wholeFile: true,
+    nothingUsable: false,
+  }
+
+  it('does not promise a rewrite the write gate refuses', () => {
+    renderSidebar({
+      queueRecovery: { required: false, reason: undefined, restartRequired: false, persistenceBroken: false },
+      queueStoredStillUnreadable: true,
+      storeProblems: [UNLOADABLE_FILE],
+    })
+
+    expect(screen.queryByText(/next queue write will rewrite the file/)).toBeNull()
+    expect(screen.getByText(/every write is refused/)).toBeInTheDocument()
+    expect(screen.getByText(/still holds everything it held/)).toBeInTheDocument()
+    expect(screen.queryByText(/This session is not halted/)).toBeNull()
+    expect(screen.getByText(/Repository polling and new queue mutations are paused/)).toBeInTheDocument()
+  })
+
+  it('offers no save button for a file it could not read, because that save cannot succeed', async () => {
+    const { onResaveQueue } = renderSidebar({
+      queueRecovery: { required: false, reason: undefined, restartRequired: false, persistenceBroken: false },
+      queueStoredStillUnreadable: true,
+      storeProblems: [UNLOADABLE_FILE],
+    })
+
+    expect(screen.queryByRole('button', { name: /Save this session/ })).toBeNull()
+    expect(onResaveQueue).not.toHaveBeenCalled()
+    // Still not the destructive CLI command, and still not the halted wording.
+    expect(screen.queryByText(/confirm-queue-recovery/)).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Recover readable tasks' })).toBeNull()
+  })
+
+  it('still offers the save for a wrong-shaped field in a file that did load', async () => {
+    // The flag must discriminate, not suppress: this is the state the save was built for.
+    const { user, onResaveQueue } = renderSidebar({
+      queueRecovery: { required: false, reason: undefined, restartRequired: false, persistenceBroken: false },
+      queueStoredStillUnreadable: true,
+      storeProblems: [UNUSABLE_QUEUE],
+    })
+
+    await user.click(screen.getByRole('button', { name: /Save this session/ }))
+
+    expect(onResaveQueue).toHaveBeenCalledTimes(1)
+  })
+
+  it('offers no recovery action when a halted session can no longer read the whole file', () => {
+    renderSidebar({
+      queueRecovery: HALTED,
+      queueStoredStillUnreadable: true,
+      storeProblems: [UNLOADABLE_FILE],
+    })
+
+    expect(screen.getByText('Workflow automation is halted')).toBeInTheDocument()
+    expect(screen.getByText(/startup snapshot cannot safely write over a repair/)).toBeInTheDocument()
+    expect(screen.getByText(/restart MAO to load the complete stored state/)).toBeInTheDocument()
+    expect(screen.getByText(/unresolved persistence outcome/)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Recover readable tasks' })).toBeNull()
+    expect(screen.queryByRole('button', { name: /Save this session/ })).toBeNull()
+  })
+
+  it('keeps whole-file-origin recovery restart-only after the file becomes field-readable', () => {
+    // The current problem shape is no longer enough to decide safety. A FileStore that previously lost
+    // the whole file still holds every other setting from startup, so recovering this now-field-only
+    // queue would serialize that stale snapshot over the repair.
+    renderSidebar({
+      queueRecovery: { ...HALTED, restartRequired: true },
+      queueStoredStillUnreadable: true,
+      storeProblems: [UNUSABLE_QUEUE],
+    })
+
+    expect(screen.getByText(/observed a whole-file read failure/)).toBeInTheDocument()
+    expect(screen.getByText(/even if the file is readable now/)).toBeInTheDocument()
+    expect(screen.getByText(/unresolved persistence outcome/)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Recover readable tasks' })).toBeNull()
+    expect(screen.queryByRole('button', { name: /Save this session/ })).toBeNull()
+  })
+
+  it('surfaces a marker-only persistence halt and clears it only after confirmation', async () => {
+    const { onClearPersistenceBroken, user } = renderSidebar({ queueRecovery: PERSISTENCE_BROKEN })
+
+    expect(screen.getByText('Workflow automation is halted')).toBeInTheDocument()
+    expect(screen.getByText(/unresolved write outcome/)).toBeInTheDocument()
+    expect(screen.getByText(/Verify the stored queue and GitHub state/)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Recover readable tasks' })).toBeNull()
+    expect(screen.queryByRole('button', { name: /Save this session/ })).toBeNull()
+
+    await user.click(screen.getByRole('button', { name: 'Clear marker after verification' }))
+    expect(onClearPersistenceBroken).not.toHaveBeenCalled()
+    expect(screen.getByText(/comparing the stored queue with the target repositories/)).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Confirm marker clear' }))
+
+    expect(onClearPersistenceBroken).toHaveBeenCalledTimes(1)
+    expect(screen.getByText(/marker is cleared/)).toBeInTheDocument()
+    expect(screen.getByText(/process remains halted/)).toBeInTheDocument()
+    expect(screen.queryByText(/mao config clear-persistence-broken/)).toBeNull()
+  })
+
+  it('keeps the confirmation open and surfaces a marker-clear failure', async () => {
+    const onClearPersistenceBroken = vi.fn(async () => {
+      throw new Error('marker is still present')
+    })
+    const { user } = renderSidebar({ queueRecovery: PERSISTENCE_BROKEN, onClearPersistenceBroken })
+
+    await user.click(screen.getByRole('button', { name: 'Clear marker after verification' }))
+    await user.click(screen.getByRole('button', { name: 'Confirm marker clear' }))
+
+    expect(await screen.findByText('marker is still present')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Confirm marker clear' })).toBeInTheDocument()
+    expect(screen.queryByText(/marker is cleared/)).toBeNull()
+  })
+
+  it('shows stored queue corruption alongside an independent persistence marker', () => {
+    renderSidebar({
+      queueRecovery: { ...PERSISTENCE_BROKEN, restartRequired: true },
+      queueStoredStillUnreadable: true,
+      storeProblems: [UNLOADABLE_FILE],
+    })
+
+    expect(screen.getByText(/unresolved write outcome/)).toBeInTheDocument()
+    expect(screen.getByText(/also cannot read \/data\/config.json at all/)).toBeInTheDocument()
+    expect(screen.getByText(/every stored setting is affected/)).toBeInTheDocument()
+    expect(screen.getByText(/independent of the persistence marker/)).toBeInTheDocument()
+    expect(screen.getByText(/Repair and inspect the stored data/)).toBeInTheDocument()
+  })
+
+  it('also keeps a field-level queue problem visible beside the persistence marker', () => {
+    renderSidebar({
+      queueRecovery: PERSISTENCE_BROKEN,
+      queueStoredStillUnreadable: true,
+      storeProblems: [UNUSABLE_QUEUE],
+    })
+
+    expect(screen.getByText(/also cannot use the stored workflow queue in \/data\/config.json/)).toBeInTheDocument()
+    expect(screen.getByText(/independent of the persistence marker/)).toBeInTheDocument()
   })
 
   it('says nothing about the queue when nothing is halted', () => {

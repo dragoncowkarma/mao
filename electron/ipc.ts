@@ -3,11 +3,15 @@ import path from 'node:path'
 import { store } from './store.ts'
 import { createMaoApp } from '../core/app.ts'
 import { startAutoTrigger } from '../core/auto-trigger.ts'
-import { isRepoRef, sameRepoRef } from '../core/repo-registry.ts'
+import { isRepoRef } from '../core/repo-registry.ts'
 import { assertCanRelaunchForUpdate, checkForUpdates, countRunningWorkflowTasks } from '../core/self-update.ts'
 import { createAiProvider, type AiProviderConfig } from '../core/ai/index.ts'
-import type { RepoRef, RunOverride } from '../core/workflow-engine.ts'
+import { QUEUE_PERSISTENCE_BROKEN, type RepoRef, type RunOverride } from '../core/workflow-engine.ts'
 import type { ThemePreference } from '../core/store.ts'
+import {
+  assertCanClearPersistenceBroken,
+  clearPersistenceBrokenMarker,
+} from '../core/persistence-guard.ts'
 
 export function registerIpcHandlers() {
   const buildSha = process.env.MAO_BUILD_SHA ?? ''
@@ -26,7 +30,7 @@ export function registerIpcHandlers() {
     dataDir: app.getPath('userData'),
     resume: true,
   })
-  const autoTrigger = startAutoTrigger(githubService, workflowEngine, () => store.get('githubRepos'))
+  const autoTrigger = startAutoTrigger(githubService, workflowEngine, () => store.inspect('githubRepos'))
 
   ipcMain.handle('app:checkUpdate', async () => {
     const update = await checkForUpdates(githubService, store.get('buildSha'))
@@ -94,18 +98,13 @@ export function registerIpcHandlers() {
     autoTrigger.getStatus(owner, repo),
   )
 
-  // Refresh drives a real poll, so its verdict has to reach the operator. pollNow() swallows every
-  // failure into auto-trigger's lastError map, which nothing in the renderer reads — so without this
-  // the GUI would report a clean sync for a repository MAO cannot write to, and on revoked access
-  // would show fetchTasks' opaque 404 instead of the message the preflight just produced. Rejecting
-  // here surfaces it in the board's existing error slot; the board's own 30s fetchTasks poll keeps
-  // the card list populated meanwhile.
+  // Refresh drives a real poll, so its verdict has to reach the operator. pollNow() owns the fresh
+  // tracked-list read, whole-file latch and permission preflight in that order, and propagates its
+  // manual-poll error. Reading the store or preflighting here first would bypass that ordering: a late
+  // whole-file failure could reject before restartRequired was remembered, and a removed repository
+  // would spend a GitHub call before membership rejected it.
   ipcMain.handle('github:refreshRepo', async (_event, owner: string, repo: string) => {
-    const repos = store.get('githubRepos')
-    const repoRef = repos.find((r) => sameRepoRef(r, { owner, repo })) ?? { owner, repo }
-    await githubService.assertRepoWorkflowWritable(owner, repo)
-    await autoTrigger.pollNow(repoRef)
-    return githubService.fetchTasks(owner, repo)
+    return autoTrigger.pollNow({ owner, repo })
   })
 
   ipcMain.handle('workflow:enqueue', (_event, title: string, repo: RepoRef, autoAdvance?: boolean) =>
@@ -140,21 +139,43 @@ export function registerIpcHandlers() {
   // `app:storeProblems` (AGENTS.md rule 6) and driven by the ENGINE rather than by `storeProblems`,
   // because the latch is monotone: after an out-of-band repair the store reads clean while this process
   // stays halted, and the card has to stay up and keep working in exactly that window.
-  ipcMain.handle('workflow:recoveryRequired', () => ({
-    required: workflowEngine.isQueueRecoveryLatched(),
-    reason: workflowEngine.getQueueRecoveryReason(),
-  }))
+  ipcMain.handle('workflow:recoveryRequired', () => {
+    const persistenceBroken = workflowEngine.isPersistenceBroken()
+    return {
+      // A prior marker is as much a workflow halt as an unreadable queue. Keep the stricter persistence
+      // reason when both exist: recovery/resave cannot resolve an unknown durable write outcome.
+      required: persistenceBroken || workflowEngine.isQueueRecoveryLatched(),
+      reason: persistenceBroken ? QUEUE_PERSISTENCE_BROKEN : workflowEngine.getQueueRecoveryReason(),
+      restartRequired: workflowEngine.isQueueRecoveryRestartRequired(),
+      persistenceBroken,
+    }
+  })
 
   // Returns core's typed outcome rather than a boolean, so the renderer and `mao workflow
   // confirm-queue-recovery` cannot disagree about whether confirmation succeeded.
   ipcMain.handle('workflow:confirmQueueRecovery', () => confirmQueueRecovery())
 
-  // For a value that went unusable after a clean start: this process still holds the real queue, so this
-  // rewrites the file from it. Offered instead of the discard there, because a discard run in another
-  // process would replace the file with ITS corrected startup subset and lose this one. Delegated to
-  // core, which observes the store fresh and writes conditionally — the renderer's card is up to 30s
-  // stale, so an unconditional write from here would overwrite a repair that landed in between.
+  // For a field-only value that went unusable after a clean start: this process still holds the real
+  // queue, so this rewrites the field from it. A whole-file failure instead returns restart-required.
+  // Offered instead of the discard in the field-only case, because a discard run in another process
+  // would replace the file with ITS corrected startup subset and lose this one. Delegated to core, which
+  // observes the store fresh and writes conditionally — the renderer's card is up to 30s stale, so an
+  // unconditional write from here would overwrite a repair that landed in between.
   ipcMain.handle('workflow:resaveQueue', () => resaveStoredQueue())
+
+  // The packaged Electron app does not ship the headless CLI, and its userData directory is not the
+  // CLI's default data directory. Give the GUI a recovery route that clears the exact marker this
+  // process loaded. The engine remains blocked in memory; only a fresh process may resume after the
+  // renderer's explicit verification/confirmation step.
+  ipcMain.handle('workflow:clearPersistenceBroken', () => {
+    assertCanClearPersistenceBroken(workflowEngine.getTasks())
+    if (!clearPersistenceBrokenMarker(app.getPath('userData'))) {
+      throw new Error(
+        'Failed to clear the workflow persistence marker. Queue mutation, polling and resume remain ' +
+          'blocked. Check the MAO data directory permissions and try again.',
+      )
+    }
+  })
 
   ipcMain.handle('ui:getTheme', () => store.get('theme'))
 

@@ -13,6 +13,7 @@ import { checkoutBranch, commitAndPush, ensureClone, hasChanges } from './git-wo
 
 const EXPECTED_TIMEOUT_MS = 15 * 60 * 1000
 const tmpDirs: string[] = []
+const allowPush = () => {}
 
 type ExecFileCallback = (error: Error | null, stdout: string, stderr: string) => void
 
@@ -61,7 +62,7 @@ describe('git workspace command timeout', () => {
     await ensureClone(root, 'acme', 'widgets', 'secret-token')
     await checkoutBranch(dir, 'main', 'workflow/test')
     await hasChanges(dir)
-    await commitAndPush(dir, 'workflow/test', 'Test commit')
+    await commitAndPush(dir, 'workflow/test', 'Test commit', allowPush)
 
     expect(execFileMock).toHaveBeenCalledTimes(10)
     for (const [, , options] of execFileMock.mock.calls) {
@@ -71,6 +72,28 @@ describe('git workspace command timeout', () => {
         killSignal: 'SIGKILL',
       })
     }
+  })
+
+  it('rechecks readiness after commit and does not spawn push once blocked', async () => {
+    let blocked = false
+    execFileMock.mockImplementation((...args: unknown[]) => {
+      const commandArgs = args[1] as string[]
+      queueMicrotask(() => {
+        if (commandArgs[0] === 'commit') blocked = true
+        callbackFrom(args)(null, '', '')
+      })
+      return { kill: vi.fn() }
+    })
+    const beforePush = vi.fn(() => {
+      if (blocked) throw new Error('queue persistence became unsafe')
+    })
+
+    await expect(
+      commitAndPush('/test/repo', 'workflow/test', 'Test commit', beforePush),
+    ).rejects.toThrow('queue persistence became unsafe')
+
+    expect(beforePush).toHaveBeenCalledTimes(1)
+    expect(execFileMock.mock.calls.map((call) => (call[1] as string[])[0])).toEqual(['add', 'commit'])
   })
 
   it('rejects independently and sends SIGKILL when execFile never calls back', async () => {

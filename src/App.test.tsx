@@ -1117,6 +1117,37 @@ describe('App repository add and unsaved global settings', () => {
  * exactly where the repo-list reset does.
  */
 describe('App halted workflow queue', () => {
+  it('shows and clears a prior-process persistence marker through the Electron bridge', async () => {
+    const stub = createElectronApiStub()
+    stub.recoveryRequired.mockResolvedValue({
+      required: true,
+      reason:
+        'Workflow queue persistence has an unresolved write outcome. No further queue mutation or ' +
+        'repository polling is allowed. Verify the stored queue and GitHub state, clear the ' +
+        'persistence-broken marker only after that check, then restart MAO.',
+      restartRequired: false,
+      persistenceBroken: true,
+    })
+    const user = userEvent.setup()
+    render(
+      <StrictMode>
+        <App />
+      </StrictMode>,
+    )
+
+    expect(await screen.findByText('Workflow automation is halted')).toBeInTheDocument()
+    expect(screen.getByText(/unresolved write outcome/)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Recover readable tasks' })).toBeNull()
+    expect(screen.queryByRole('button', { name: /Save this session/ })).toBeNull()
+
+    await user.click(screen.getByRole('button', { name: 'Clear marker after verification' }))
+    expect(stub.clearPersistenceBroken).not.toHaveBeenCalled()
+    await user.click(screen.getByRole('button', { name: 'Confirm marker clear' }))
+
+    await waitFor(() => expect(stub.clearPersistenceBroken).toHaveBeenCalledTimes(1))
+    expect(screen.getByText(/marker is cleared/)).toBeInTheDocument()
+  })
+
   it('shows the store report and offers a two-step recovery', async () => {
     const { user, stub } = await renderApp([], [UNUSABLE_QUEUE])
 
@@ -1211,7 +1242,12 @@ describe('App halted workflow queue', () => {
   async function renderLateCorruption(outcome: QueueRecoveryOutcome, { healsAfter = false } = {}) {
     const user = userEvent.setup()
     const stub = createElectronApiStub([], [UNUSABLE_QUEUE_LATE])
-    stub.recoveryRequired.mockResolvedValue({ required: false, reason: undefined })
+    stub.recoveryRequired.mockResolvedValue({
+      required: false,
+      reason: undefined,
+      restartRequired: false,
+      persistenceBroken: false,
+    })
     stub.resaveQueue.mockResolvedValue(outcome)
     render(
       <StrictMode>
@@ -1247,6 +1283,7 @@ describe('App halted workflow queue', () => {
     const cases: Array<[QueueRecoveryOutcome, RegExp]> = [
       [{ kind: 'superseded' }, /changed while saving/],
       [{ kind: 'unverified', reason: 'could not read the config file' }, /could not read the config file/],
+      [{ kind: 'restart-required' }, /observed a whole-file read failure.*Nothing was written/s],
       [{ kind: 'write-failed' }, /what reached the config file is unknown/],
       [{ kind: 'invalid-replacement' }, /rejected this session's queue before writing.*Nothing was written/s],
     ]

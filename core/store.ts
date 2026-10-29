@@ -643,6 +643,48 @@ function usableStoredValue<K extends keyof MaoStoreSchema>(key: K, raw: MaoStore
 }
 
 /**
+ * A store diagnostic whose operator-facing text was built entirely from structured, value-free inputs.
+ *
+ * The class stays private so another module cannot bless an arbitrary backend error as safe. The
+ * original message is kept in a private slot too: `Error.message` is mutable, so checking the nominal
+ * type and then returning that public property would let a caller replace a safe report with a token
+ * after construction.
+ */
+class OperatorSafeStoreError extends Error {
+  readonly #safeMessage: string
+
+  protected constructor(message: string) {
+    super(message)
+    this.#safeMessage = message
+  }
+
+  static messageOf(error: unknown): string | undefined {
+    return error instanceof OperatorSafeStoreError ? error.#safeMessage : undefined
+  }
+}
+
+/** Returns only diagnostics this module constructed without stored values or backend error text. */
+export function operatorSafeStoreMessage(error: unknown): string | undefined {
+  return OperatorSafeStoreError.messageOf(error)
+}
+
+/** Internal wrapper for the value-free reports produced by the write guards below. */
+class StoredWriteGuardError extends OperatorSafeStoreError {
+  readonly restartRequired: boolean
+
+  constructor(message: string, { restartRequired = false }: { restartRequired?: boolean } = {}) {
+    super(message)
+    this.name = 'StoredWriteGuardError'
+    this.restartRequired = restartRequired
+  }
+}
+
+/** True only for this module's value-free refusal caused by a whole-file read failure. */
+export function storeWriteRequiresRestart(error: unknown): boolean {
+  return error instanceof StoredWriteGuardError && error.restartRequired
+}
+
+/**
  * A value a caller tried to persist but which would violate the schema after a JSON round trip.
  *
  * Read recovery filters because the bad bytes already exist and callers need a way back. Writes have
@@ -679,7 +721,7 @@ function assertStoredWrite<K extends keyof MaoStoreSchema>(
   source: string,
 ): void {
   const problem = describeInvalidStoredWrite(key, value, source)
-  if (problem !== null) throw new Error(problem)
+  if (problem !== null) throw new StoredWriteGuardError(problem)
 }
 
 /** A stored value the schema cannot use, in the form a shell can show an operator. */
@@ -694,22 +736,41 @@ export interface StoredValueProblem {
    * Which part of the stored value the schema cannot use (see `StoredValueDefect`). Decides what the
    * guard substituted, and therefore what a healing write actually did — see
    * `describeHealedStoredValue()`.
-   */
-  defect: StoredValueDefect
-  /**
-   * Whether nothing in the stored value survived, so replacing the whole value loses nothing a caller
-   * could have used.
    *
-   * Flattened out of `defect` here rather than derived by the consumer, because the consumer is a
-   * *destructive* control — the sidebar's "Reset stored list", which writes an empty list — and the
-   * direction a stale derivation fails in is *offering* it. A renderer could legally write
-   * `defect !== 'some-entries'`: it is a comparison against a literal, no value import, so nothing in
-   * `src/` or in the renderer-isolation test would stop it (and AGENTS.md rule 6 only stops it importing
-   * the *function* that decides). That is exactly why the answer is computed here. Add a fourth defect
-   * kind and a renderer that has never heard of it still withholds the reset, instead of offering a
-   * one-click deletion of every repository the operator can see working.
+   * **Absent for a `wholeFile` problem**, where no value was ever observed: the file did not load, so
+   * every raw value is a schema default and no shape was established. Naming one anyway would claim
+   * something this did not see — and if it claimed `'value'` for `githubRepos`, it would arm a
+   * destructive control over a file nothing can currently read.
+   */
+  defect?: StoredValueDefect
+  /**
+   * Whether replacing the whole stored value would lose nothing a caller could have used.
+   *
+   * Required, unlike `defect`, because it is a *permission* rather than an observation and every state
+   * can answer it — a file that did not load answers `false`, since nothing established that its
+   * contents are expendable. That is also the fail-closed direction, which is the whole point of
+   * computing it here: it gates a destructive control (the sidebar's "Reset stored list", which writes
+   * an empty list), and the direction a stale derivation fails in is *offering* it.
+   *
+   * A renderer could legally write `defect !== 'some-entries'`: it is a comparison against a literal,
+   * no value import, so nothing in `src/` or in the renderer-isolation test would stop it (and
+   * AGENTS.md rule 6 only stops it importing the *function* that decides). That is exactly why the
+   * answer is computed here. Add a state and a renderer that has never heard of it still withholds the
+   * reset, instead of offering a one-click deletion of every repository the operator can see working.
    */
   nothingUsable: boolean
+  /**
+   * True when the whole file could not be loaded, so `field` names the carrier rather than the fault.
+   *
+   * The two states need different operator text and different affordances, and nothing else distinguishes
+   * them: a wrong-shaped *field* in a file that loaded leaves every other value readable and is healed by
+   * the next write of that field, while a file that did not load establishes nothing and **refuses** every
+   * write. `src/components/Sidebar.tsx` branches on this — it used to promise that "its next queue write
+   * will rewrite the file from that" and offer a Save button, which for an unloadable file is a sentence
+   * that is false and a button that can only answer `'restart-required'`. Keyed on a flag rather than on the
+   * message text, which no UI should parse.
+   */
+  wholeFile?: true
 }
 
 /**
@@ -743,13 +804,16 @@ function storedValueProblem<K extends keyof MaoStoreSchema>(
  * repositories were gone. The count belongs to the report that preceded this, not here.
  */
 export function describeHealedStoredValue(problem: StoredValueProblem): string {
-  if (problem.defect === 'value') {
-    return `Replaced the unusable "${problem.field}" value in ${problem.source}.`
+  if (problem.defect === 'some-entries') {
+    return `Dropped the unusable "${problem.field}" entries from ${problem.source}, keeping the readable ones.`
   }
   if (problem.defect === 'every-entry') {
     return `Dropped the unusable "${problem.field}" entries from ${problem.source}.`
   }
-  return `Dropped the unusable "${problem.field}" entries from ${problem.source}, keeping the readable ones.`
+  // `'value'`, or a `wholeFile` problem that named no shape at all. Both report a replacement of the
+  // whole value rather than guess: there were no entries to keep either way, and the one caller is
+  // scoped to `githubRepos` while a `wholeFile` problem is carried on the queue field.
+  return `Replaced the unusable "${problem.field}" value in ${problem.source}.`
 }
 
 /**
@@ -787,9 +851,310 @@ export function describeStoredProblems(
  */
 export const QUEUE_GATING_FIELD = 'workflowTasks' as const
 
+/** Fixed, value-free guidance after this process observes a whole-file read failure. */
+export const STORE_RESTART_REQUIRED =
+  '[store] The stored settings file could not be read. This process cannot safely write its startup ' +
+  'snapshot over a repair. Repair the file if needed, then restart MAO; no stored value is shown.'
+
 /** The unusable-queue problem among a backend's problems, or `undefined` when the queue reads normally. */
 export function findStoredQueueProblem(problems: StoredValueProblem[]): StoredValueProblem | undefined {
   return problems.find((problem) => problem.field === QUEUE_GATING_FIELD)
+}
+
+/**
+ * Why a `config.json` that is *present* could not be turned into stored values at all.
+ *
+ * A **missing** file is deliberately not one of these: that is a fresh install, the one case where
+ * answering schema defaults is exactly right, and the one case a write may safely proceed from.
+ *
+ * This is a whole-file fact, one layer below `STORED_SHAPE_RULES`. Those rules describe a field that is
+ * present but the wrong shape inside a file that loaded; these describe a file from which no field —
+ * `githubToken` included — was ever established.
+ */
+export type StoreReadFailure = 'unreadable' | 'unparseable' | 'not-an-object'
+
+/** The clause naming what is actually wrong with the file, for the reports below. */
+function storeReadCause(failure: StoreReadFailure | undefined): string {
+  if (failure === 'unparseable') return 'It is not valid JSON.'
+  if (failure === 'not-an-object') return 'It is valid JSON, but not a JSON object.'
+  if (failure === 'unreadable') return 'The filesystem refused to open it.'
+  return ''
+}
+
+/**
+ * What to actually do about it, which differs by kind — and that is the point of carrying the kind at
+ * all. "Check the file and the permissions on it" is useless advice for a trailing comma, and it was the
+ * only advice this module gave before the kind was threaded through.
+ *
+ * Falls back to the original wording when the kind is unknown, so a caller that has no error to classify
+ * (see `core/app.ts`'s `observeStoredQueue`) still reports something true.
+ */
+function storeReadRemedy(failure: StoreReadFailure | undefined): string {
+  if (failure === 'unparseable' || failure === 'not-an-object') {
+    return 'Repair the JSON by hand, or move the file aside to start from an empty config, then retry.'
+  }
+  if (failure === 'unreadable') return 'Check the permissions and owner on the file, then retry.'
+  return 'Check the file and the permissions on it, then retry.'
+}
+
+/**
+ * A load that failed, sorted into `StoreReadFailure` — or `null` for the fresh-install case, which is
+ * not a failure.
+ *
+ * `ENOENT` is the only errno treated as "nothing is wrong". Everything else the filesystem can raise —
+ * `EACCES` after a mode or ownership change, `EISDIR`, `EIO` on a failing disk — describes a file that
+ * exists and cannot be read, which is the opposite of a fresh install and must never be answered with
+ * defaults a write could then persist over it.
+ */
+export function classifyStoreReadFailure(error: unknown): StoreReadFailure | null {
+  if ((error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') return null
+  return error instanceof SyntaxError ? 'unparseable' : 'unreadable'
+}
+
+/**
+ * A `config.json` that exists and could not be loaded, as an error the guard can classify later.
+ *
+ * Deliberately does **not** set `cause`, and that is a secrets rule rather than a style choice. V8 puts a
+ * prefix of the offending input into `SyntaxError.message` — `JSON.parse('ghp_…')` reports ``Unexpected
+ * token 'g', "ghp_…" is not valid JSON`` — and a `config.json` clobbered down to a bare token is exactly
+ * the hand-edit that produces it. Node prints the `[cause]` chain for an uncaught throw and any handler
+ * may log it, so attaching the original error would publish the token. The classification is everything a
+ * caller can act on; the text that would leak is nothing a caller needs.
+ */
+export class UnreadableStoreError extends Error {
+  readonly source: string
+  readonly failure: StoreReadFailure
+
+  constructor(source: string, failure: StoreReadFailure) {
+    super(`[store] ${source} could not be read. ${storeReadCause(failure)}`)
+    this.name = 'UnreadableStoreError'
+    this.source = source
+    this.failure = failure
+  }
+}
+
+/**
+ * Any read failure as this module's own value-free error.
+ *
+ * The single place a foreign error is converted, so no caller has to remember that a backend's own error
+ * may quote the file. conf rethrows V8's parse error, which carries the input's first ten characters —
+ * `Unexpected token 'g', "ghp_SENTIN"... is not valid JSON` — so for a `config.json` clobbered down to a
+ * bare token, letting it reach a log or an IPC reply publishes the credential.
+ */
+function asUnreadableStoreError(error: unknown, source: string): UnreadableStoreError {
+  if (error instanceof UnreadableStoreError) return error
+  return new UnreadableStoreError(source, classifyStoreReadFailure(error) ?? 'unreadable')
+}
+
+/**
+ * A failure raised while *writing*, with anything that could quote the file replaced.
+ *
+ * Narrower than `asUnreadableStoreError` on purpose. A backend's `set` re-reads before it writes — conf
+ * does — so a replacement landing at that moment surfaces as a parse error carrying the file's first ten
+ * characters. Only that class is rewrapped: an errno failure names the path, which is not secret, and
+ * converting it would report a failed write as a failed read.
+ */
+function withoutStoredBytes(error: unknown, source: string): unknown {
+  if (error instanceof UnreadableStoreError) return error
+  return error instanceof SyntaxError ? new UnreadableStoreError(source, 'unparseable') : error
+}
+
+/**
+ * The failure kind behind a caught read error.
+ *
+ * Classifies a raw error too, rather than only reading `UnreadableStoreError.failure`: the Electron
+ * backend's read is conf's own, which rethrows a bare `SyntaxError` for an unparseable file and never
+ * produces this module's class, so without the fallback the GUI's report would name no cause at all.
+ */
+function storeReadFailureOf(error: unknown): StoreReadFailure | undefined {
+  if (error instanceof UnreadableStoreError) return error.failure
+  return classifyStoreReadFailure(error) ?? undefined
+}
+
+/** The cause-and-remedy tail, skipping the cause when the kind is unknown so no double space appears. */
+function storeReadTail(failure: StoreReadFailure | undefined): string {
+  return [storeReadCause(failure), storeReadRemedy(failure)].filter((part) => part !== '').join(' ')
+}
+
+/**
+ * The report for refusing a write because the file it would rewrite could not be read — issue #67.
+ *
+ * Both shipped backends persist the whole schema as one JSON blob on every `set()`, so a write performed
+ * while the load failed does not change one field: it replaces the file with the schema defaults the
+ * failed load left in memory. `githubToken` is stored there in plain text and exists nowhere else, so
+ * that is credential loss, and it was reachable from any ordinary command — `mao config set-theme dark`,
+ * or a `mao repos remove` that matched nothing and said so while destroying the file.
+ *
+ * Refusing the *write* rather than the *boot* is what keeps the diagnosis possible. Reads still answer,
+ * so `mao config show`, `mao repos list` and the Sidebar can report the problem (see
+ * `createGuardedStore`'s `problems()`), which a throwing constructor would have taken down with the
+ * destructive write. It is also the rule this module already stated for `StoredObservation.readable` and
+ * which `core/app.ts`'s `saveProviders` already applied to one field; this generalises it to every key
+ * from the one place both backends compose through.
+ *
+ * Nothing is renamed or copied aside. Not writing preserves the file more completely than moving it
+ * would, and `config.json` is secret-bearing — an automatic rename would plant the token at a second path
+ * the operator never chose, and a copy would leave two files holding one credential.
+ */
+export function describeRefusedStoredWrite(
+  field: keyof MaoStoreSchema,
+  source: string,
+  failure: StoreReadFailure | undefined,
+): string {
+  return (
+    `[store] Refusing to write "${field}" to ${source}, because the file could not be read. A write ` +
+    'replaces the whole file, so it would overwrite the stored GitHub token, AI providers, tracked ' +
+    'repositories and workflow queue with schema defaults. Nothing has been written — the file is exactly ' +
+    `as it was. ${storeReadTail(failure)} Its contents are not shown here, because the GitHub token is ` +
+    'stored in it in plain text.'
+  )
+}
+
+/**
+ * The `problems()` entry for a file that could not be loaded at all, as opposed to one field in it.
+ *
+ * Without this the gate above is a wall with no sign on it: for an unparseable file every per-field rule
+ * reads the already-defaulted snapshot and answers "nothing wrong", so `mao config show` printed
+ * `storeProblems: []` next to `githubToken: '[unset]'` for a file that still held the token — which
+ * points the operator at `mao config set-token`, the most destructive command available to them.
+ */
+export function describeUnloadableStore(source: string, failure: StoreReadFailure | undefined): string {
+  return (
+    `[store] ${source} could not be read at all, so no stored value was established and MAO is running ` +
+    'on schema defaults — every setting in the file is affected, not one of them. Writes are refused ' +
+    `while this stands, so the file still holds everything it held. ${storeReadTail(failure)} Its ` +
+    'contents are not shown here, because the GitHub token is stored in it in plain text.'
+  )
+}
+
+/**
+ * Reads and parses a config file, refusing anything that is not a usable settings object.
+ *
+ * The one strict loader, shared by both backends rather than reimplemented beside each: `FileStore`'s
+ * `getFresh` reads through it, and `electron/store.ts` runs it *before* electron-store exists (see
+ * `openGuardedStoreFile`). `{}` for a missing file — the normal first run — and `UnreadableStoreError`
+ * for everything else.
+ *
+ * A top-level `null`, array, string or number is refused rather than returned. Each parses cleanly and
+ * then spreads to nothing — or, for a string, to numeric index keys — so it used to arrive as a complete
+ * defaults object with `readable: true` and nothing anywhere to report it: the one shape with no signal.
+ */
+export function loadStoredFileStrict(filePath: string): Partial<MaoStoreSchema> {
+  let text: string
+  try {
+    text = fs.readFileSync(filePath, 'utf-8')
+  } catch (error) {
+    const failure = classifyStoreReadFailure(error)
+    if (failure === null) return {}
+    throw new UnreadableStoreError(filePath, failure)
+  }
+  return parseStoredSettings(text, filePath)
+}
+
+/**
+ * The root-shape rule on its own, over text rather than a path.
+ *
+ * Split out so the *same* rule can be handed to a backend that does its own reading — see
+ * `createStoredFileParser`. `JSON.parse` can only fail with a `SyntaxError`, so the kind is fixed here
+ * rather than classified.
+ */
+export function parseStoredSettings(text: string, source: string): Partial<MaoStoreSchema> {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    throw new UnreadableStoreError(source, 'unparseable')
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new UnreadableStoreError(source, 'not-an-object')
+  }
+  return parsed as Partial<MaoStoreSchema>
+}
+
+/**
+ * The root-shape rule as a backend's own deserializer — for electron-store's `deserialize` option.
+ *
+ * This is what closes the interval `openGuardedStoreFile`'s pre-check cannot: the check reads the file,
+ * then conf reads it *again* inside its constructor, and a replacement landing in between was coerced and
+ * written back before anything could refuse it. Judging conf's **own** bytes removes the interval rather
+ * than narrowing it — there is no longer a read that escapes the rule. It also makes every later conf
+ * read strict, including the one its `set()` performs internally, so a parse failure there surfaces as
+ * this module's value-free error instead of V8's, which quotes the file.
+ *
+ * Typed as returning the full schema because that is the option's signature. The value really is partial
+ * and that is correct: conf merges its `defaults` over whatever this returns, and the read guard handles
+ * a key that is missing or the wrong shape regardless.
+ */
+export function createStoredFileParser(source: string): (text: string) => MaoStoreSchema {
+  return (text) => parseStoredSettings(text, source) as MaoStoreSchema
+}
+
+/**
+ * Composes a backend whose *construction* already reads — and may already write — the config file.
+ *
+ * This exists for electron-store, and the ordering is the whole point. conf builds its store inside its
+ * own constructor: for a file that is valid JSON but not an object its getter succeeds
+ * (`Object.assign({}, [1,2,3])`), its `assert.deepEqual` against the merged defaults then fails, and it
+ * writes those defaults straight back — destroying the file *before any `set()` exists to refuse it*.
+ * Verified against conf 14.0.0 for `null`, `[]`, a bare string and a number. No write gate can reach
+ * that, so the file has to be judged before the backend is built, which is what `loadStoredFileStrict`
+ * does here.
+ *
+ * The `try` around `construct()` is the second half, and not redundant with the check above. conf
+ * rethrows V8's own parse error for an unparseable file, and V8 puts the input's first ten characters
+ * into that message (`Unexpected token 'g', "ghp_SENTIN"... is not valid JSON`) — so for a `config.json`
+ * clobbered down to a bare token, letting conf's error escape publishes the credential into the main
+ * process's logs. Rewrapping closes that, and also covers the narrow window where the file changes
+ * between the check and the construction.
+ *
+ * It rewraps through `withoutStoredBytes`, not `asUnreadableStoreError`, and the difference is the whole
+ * reason that narrower helper exists. conf's constructor is a *writer* — merging its defaults back is the
+ * behaviour this function is built around — so a construction failure is as likely to be a failed write
+ * (a read-only `userData`, ENOSPC) as a failed read. Converting those would tell an operator the file
+ * "could not be read" and send them to check its permissions while the file reads perfectly, and the CLI
+ * reading the very same file would report it healthy. Only a parse failure, which can quote the bytes, is
+ * rewritten.
+ *
+ * `filePath` is the caller's own resolved path rather than one read back off the constructed backend,
+ * because there is no backend yet when it is needed. Callers must therefore pin whatever options
+ * determine that path instead of relying on the backend's defaults.
+ */
+export function openGuardedStoreFile(
+  filePath: string,
+  construct: () => StoredValueBackend,
+  warn?: (message: string) => void,
+): MaoStore {
+  loadStoredFileStrict(filePath)
+  let backing: StoredValueBackend
+  try {
+    backing = construct()
+  } catch (error) {
+    throw withoutStoredBytes(error, filePath)
+  }
+  // The strict fresh read is supplied here rather than left to the backend, and it is not a convenience.
+  // conf does not fail for a root it can still coerce: its getter is `Object.assign({}, parsed)`, so a
+  // `config.json` replaced with `[1,2,3]`, `null`, a bare string or a number after a clean boot comes back
+  // as a property bag — every schema key simply absent — and `readRawFresh`'s fallback to `get` saw a
+  // healthy store. `assertStoredFileLoadable` then passed and the next `set()` rewrote the file from
+  // defaults, which is issue #67 again on the far side of boot. Judging the file at construction cannot
+  // cover that; only a fresh read that applies the same root-shape rule can, and this is the one place
+  // that knows both the path and that the backend was opened from it.
+  const strict: StoredValueBackend = {
+    get: <K extends keyof MaoStoreSchema>(key: K) => backing.get(key),
+    set: <K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]) => {
+      // The write gate ran before this, but a backend that re-reads to merge can still meet a file
+      // replaced in between — and conf's error for that quotes the bytes. Covers `setIfUnchanged`'s
+      // final write too, which reaches the backend through this same wrapper.
+      try {
+        backing.set(key, value)
+      } catch (error) {
+        throw withoutStoredBytes(error, filePath)
+      }
+    },
+    getFresh: <K extends keyof MaoStoreSchema>(key: K) =>
+      loadStoredFileStrict(filePath)[key] as MaoStoreSchema[K] | undefined,
+  }
+  return createGuardedStore(strict, filePath, warn)
 }
 
 /**
@@ -800,10 +1165,14 @@ export function findStoredQueueProblem(problems: StoredValueProblem[]): StoredVa
  * only the field and the file. It is phrased as a halt because that is what it causes: a state MAO
  * cannot establish is treated as unusable, never as healthy.
  */
-export function describeUninspectableStore(field: keyof MaoStoreSchema, source: string): string {
+export function describeUninspectableStore(
+  field: keyof MaoStoreSchema,
+  source: string,
+  failure?: StoreReadFailure,
+): string {
   return (
     `[store] MAO could not read "${field}" from ${source} at all, so it cannot establish whether the ` +
-    'value is usable — treating it as unusable. Check the file and the permissions on it, then retry.'
+    `value is usable — treating it as unusable. ${storeReadTail(failure)}`
   )
 }
 
@@ -1065,6 +1434,30 @@ export function createGuardedStore(
     return value === undefined ? structuredClone(MAO_STORE_DEFAULTS[key]) : value
   }
 
+  /**
+   * Refuses a write when the file it is about to rewrite could not be read — issue #67. See
+   * `describeRefusedStoredWrite` for why this is a write refusal and not a boot refusal.
+   *
+   * Lives here rather than in either backend because both compose through this function, so one rule
+   * covers `FileStore` and electron-store at once — including a file corrupted *after* a clean boot,
+   * which no constructor-time check could see. It is the action `StoredObservation.readable` has always
+   * documented ("callers that are about to write must treat this as unknown and refuse") and which
+   * `core/app.ts`'s `saveProviders` already took for one field; this generalises it to every key.
+   *
+   * `setIfUnchanged` deliberately does not route through here: it already refuses on a throwing fresh
+   * read by returning `'unverifiable'`, which is a stronger guard than this one and reports a result
+   * rather than throwing.
+   */
+  function assertStoredFileLoadable<K extends keyof MaoStoreSchema>(key: K): void {
+    try {
+      readRawFresh(key)
+    } catch (error) {
+      throw new StoredWriteGuardError(describeRefusedStoredWrite(key, source, storeReadFailureOf(error)), {
+        restartRequired: true,
+      })
+    }
+  }
+
   function readRaw<K extends keyof MaoStoreSchema>(key: K): MaoStoreSchema[K] {
     const value = backend.get(key)
     // Cloned, never the shared `MAO_STORE_DEFAULTS` instance — one caller pushing into what it read
@@ -1074,17 +1467,57 @@ export function createGuardedStore(
 
   return {
     get<K extends keyof MaoStoreSchema>(key: K): MaoStoreSchema[K] {
-      return guardRead(key, readRaw(key))
+      // conf re-reads and re-parses the file on every `get`, so this read can fail — and its error is
+      // V8's, which quotes the file. Converted rather than swallowed: answering schema defaults for a
+      // file MAO could not read is exactly the silence issue #67 was about, and the write gate already
+      // stops anything from persisting over it. `FileStore` answers from its constructor snapshot and
+      // cannot reach this path at all, so this is the Electron host's path only.
+      //
+      // It does NOT follow that throwing is free for every caller. `core/auto-trigger.ts`'s `tick()`
+      // reads the repository list through this, and it is invoked bare and from `setInterval` — a throw
+      // escaping there is an unhandled rejection nothing can catch, measured as one per tick before that
+      // caller was guarded. A new consumer of `get()` on a long-lived host has to handle this the same
+      // way; reverting to a coerced default here instead would restore the silence.
+      let raw: MaoStoreSchema[K]
+      try {
+        raw = readRaw(key)
+      } catch (error) {
+        throw asUnreadableStoreError(error, source)
+      }
+      return guardRead(key, raw)
     },
     validateWrite<K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]): string | undefined {
       return describeInvalidStoredWrite(key, value, source) ?? undefined
     },
     set<K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]): void {
+      // The caller's own mistake first, then the file's state: a bad value is the more specific fault and
+      // is worth reporting even when the file is also unreadable.
       assertStoredWrite(key, value, source)
+      assertStoredFileLoadable(key)
       backend.set(key, value)
     },
     problems(): StoredValueProblem[] {
-      return describeStoredProblems(readRaw, source)
+      // Probed before the per-field rules, because when the load failed they cannot see anything: every
+      // raw value `readRaw` hands them is a schema default, which is valid, so the honest answer "the
+      // whole file is unreadable" came back as `[]`. One entry, not one per field — the file is the
+      // problem, and three copies of the same sentence would read as three faults.
+      //
+      // Carried on `QUEUE_GATING_FIELD` so `findStoredQueueProblem()` and the Sidebar's queue card still
+      // find it (an unreadable file *is* an unreadable queue). It deliberately does not claim to be a
+      // `githubRepos` problem, which would put the Sidebar's destructive "Reset stored list" button under
+      // a message that is not about repositories — and that write is refused now anyway.
+      //
+      // The probe and the per-field rules sit inside ONE boundary, not two. `describeStoredProblems` reads
+      // every guarded field, and for conf each of those is a fresh parse of the file — so a file that
+      // turned unparseable after the probe succeeded used to let V8's error, and the bytes it quotes,
+      // escape from the middle of a diagnostic whose whole job is to report safely.
+      try {
+        readRawFresh(QUEUE_GATING_FIELD)
+        return describeStoredProblems(readRaw, source)
+      } catch (error) {
+        const message = describeUnloadableStore(source, storeReadFailureOf(error))
+        return [{ field: QUEUE_GATING_FIELD, source, message, wholeFile: true, nothingUsable: false }]
+      }
     },
     inspect<K extends keyof MaoStoreSchema>(key: K): StoredObservation<K> {
       let raw: MaoStoreSchema[K]
@@ -1092,20 +1525,21 @@ export function createGuardedStore(
         // The FRESH read deliberately, not `get`'s: an observation exists to be acted on, and on
         // `FileStore` a snapshot read would compare a recovery against a value taken at construction.
         raw = readRawFresh(key)
-      } catch {
+      } catch (error) {
         // Fail closed, and say nothing about the value: a read that threw established nothing, so a
         // caller about to write must refuse rather than assume the stored value is the corrupt one it
-        // last saw. `readable: false` is what carries that distinction.
+        // last saw. `readable: false` is what carries that distinction. The error is classified for the
+        // report's sake only — never interpolated, because a parse error may quote the file's own bytes.
         return {
           value: structuredClone(MAO_STORE_DEFAULTS[key]),
-          problem: describeUninspectableStore(key, source),
+          problem: describeUninspectableStore(key, source, storeReadFailureOf(error)),
           readable: false,
           witness: undefined,
         }
       }
       // Guarded through the same `guardRead` as `get()`, deliberately — including its once-per-field
       // warning — so an observation and a plain read cannot disagree about the value or about whether
-      // the operator was told. `unusableStoredValue` is read from the SAME `raw`, not from a second read.
+      // the operator was told. The problem is derived from the SAME `raw`, not from a second read.
       return {
         value: guardRead(key, raw),
         problem: storedValueProblem(key, raw, source)?.message,
@@ -1189,21 +1623,22 @@ export class FileStore implements MaoStore {
   }
 
   /**
-   * `load()`, but a file that exists and cannot be read **throws** instead of reading as `{}`.
+   * `load()`, but a file that exists and cannot be loaded **throws** instead of reading as `{}`.
    *
-   * Only for `getFresh`. The constructor keeps the swallowing `load()` on purpose: answering schema
-   * defaults for an unparseable file is the pre-existing behaviour (and the known blind spot tracked as
-   * issue #67), and changing it here would quietly change what every boot does. What a *conditional
-   * write* needs is the opposite — an unreadable file must become "unknown", never "unchanged".
+   * The constructor keeps the swallowing `load()`, and that is still deliberate: boot coerces so every
+   * read-only command keeps working and can report the problem. What a *conditional write* — and now the
+   * write gate in `createGuardedStore` — needs is the opposite: a file MAO could not load must become
+   * "unknown", never "unchanged". Issue #67 is answered on the write side, not by aborting the boot.
+   *
+   * Three things it refuses where the raw loader did not. A top-level `null`, array, string or number
+   * parses cleanly and then spreads to nothing — or, for a string, to numeric index keys — so it reached
+   * `set()` as a full defaults object and destroyed the file exactly as an unparseable one did, while
+   * `inspect()` answered `readable: true` and the queue latch never fired: the one shape with no signal
+   * anywhere. `ENOENT` stays the single benign errno. And the error is this module's own, so no caller
+   * can print V8's parse message, which embeds a prefix of the file — see `UnreadableStoreError`.
    */
   private loadStrict(): Partial<MaoStoreSchema> {
-    try {
-      return JSON.parse(fs.readFileSync(this.filePath, 'utf-8'))
-    } catch (err) {
-      // A missing file is the normal first run, and reads as "nothing stored" rather than a failure.
-      if ((err as { code?: string }).code === 'ENOENT') return {}
-      throw err
-    }
+    return loadStoredFileStrict(this.filePath)
   }
 
   private persist() {

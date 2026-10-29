@@ -76,11 +76,41 @@ Additionally, because CI does **not** cover them:
   `scripts/build-cli.mjs`, `npm run build:cli` is the required execution check.
 - Touched `.agents/workflows/swarm_orchestrator.py`? → `npm run test` must run its
   Python worktree-safety matrix; also smoke-test the bundled `mao swarm --status`.
-- Touched the IPC surface? → **nothing automated** checks that
-  `electron/preload.ts` and `src/electron.d.ts` stay consistent (`contextBridge`
-  takes an untyped object, so tsc checks each file only against core types, not
-  against each other). Diff the two by eye and smoke-test with `npm run dev` —
-  channel-string typos and preload/d.ts drift both fail only at runtime.
+- Touched the IPC surface? → focused run:
+  `npx vitest run --project renderer src/electron-ipc-surface.test.ts`, and read what it
+  does **not** cover before trusting a green run.
+  `electron/preload.ts` ↔ `src/electron.d.ts` consistency is now a **lint** error, not an
+  eyeball exercise: the bridge carries `satisfies Window['electronAPI']`, so a method
+  missing from either file, an extra one, or a disagreeing signature fails `npm run lint`.
+  (`contextBridge.exposeInMainWorld` takes `any` — before that annotation tsc checked the
+  bridge against nothing at all.) The channel **strings** stay untypeable, and
+  `src/electron-ipc-surface.test.ts` covers them: same set in `ipc.ts` and `preload.ts`,
+  each registered and exposed once, each named `<namespace>:<method>`, plus the global the
+  bridge is installed under — `exposeInMainWorld`'s first argument must equal both the
+  `Window` member in `src/electron.d.ts` and the property `src/main.tsx` reads, with exactly
+  one install. It parses the TypeScript AST and **fails closed** on both the channel and the
+  call form: a channel that is not a plain string literal (a template, a shared constant, a
+  variable), an `invoke` outside every namespace, or any use of `ipcMain`/`ipcRenderer`/
+  `contextBridge` that is not a recognised direct call (`ipcMain['handle'](…)`, a destructured
+  method, an aliased local, a namespace import, `ipcMain.on`) fails by file and line rather
+  than being skipped. An `import { ipcMain as main }` alias is read, not refused — recognition
+  resolves the import; a **default** or namespace `electron` import is refused instead, since
+  `electron.ipcMain.handle(…)` is a shape it does not read. Quote style, a quoted namespace
+  key, an ES method shorthand, a multi-line call and a unicode escape are all just syntax to
+  it. The surface comes from the runtime import graph rooted at `electron/main.ts` and
+  `electron/preload.ts`, so an unimported file does not count as registered and an imported
+  nested module does. `verbatimModuleSyntax: true` is pinned so every ordinary static import
+  stays a runtime edge even when its binding is used only as a type; only whole-clause
+  `import type` / `export type` edges disappear (`import { type Marker }` still emits a
+  side-effect edge). Dynamic `import()` is refused because neither execution nor registration
+  ordering can be proven, unresolved relative imports are refused, and TypeScript resolution
+  preserves valid substitutions such as `./x.js` → `./x.ts`. Runtime `electron` re-exports,
+  import-equals and `require('electron')` are refused rather than allowed to hide a binding.
+  Paths are POSIX-normalised so the suite also runs on Windows.
+  Still not covered, so still worth `npm run dev`: whether the handler actually *does* the
+  right thing, and anything the renderer swallows. A renderer that catches a rejected
+  `invoke` — several do, deliberately — turns a broken channel into a feature that silently
+  never appears, which no amount of static checking will show you.
 
 ## Headless CLI usage
 
@@ -278,6 +308,19 @@ show` reports `workflowQueueRecoveryRequired: true` — a **separate** field fro
 `workflowPersistenceBroken`, which still means only "a prior process could not *write*". Do not run
 `mao config clear-persistence-broken` for this; it cannot describe or fix it.
 
+When `workflowPersistenceBroken` itself is true, treat the durable queue as potentially older than work
+already performed on GitHub. MAO blocks queue mutations, automatic/manual repository polling and stage
+processing in both the process that observed the failure and later starts that see the marker. This is
+stronger than `resume: false`: an auto-trigger enqueue or operator click would otherwise wake every
+restored pending task. Inspect `mao workflow list` and the actual issues, branches and pull requests;
+only then run `mao config clear-persistence-broken` and start a fresh MAO process. In the GUI, use its
+two-step **Clear marker after verification** action instead: it targets Electron's actual `userData`,
+whereas the CLI's default data directory can differ and a packaged GUI may not include the CLI at all.
+The GUI refuses to clear while any stage is still active in that process. Neither route releases the
+current process; restart is required. Do not use queue recovery or **Save this session's queue** to write
+around the marker. If a queue-shape or whole-file problem is shown at the same time, repair and inspect
+that stored data too — it is independent of the marker and must not be hidden by it.
+
 To recover (this is the **halted** case — see the late-corruption note below if the session is still
 running its real queue):
 
@@ -297,10 +340,10 @@ the file immediately before it writes, and reports only what that established:
 | --- | --- |
 | recovered the stored workflow queue | the value was still unusable right before the write; its fresh readable subset was retained, invalid entries were deleted, and the write did not throw. Durable readable entries are preserved as observed; in memory, a retained `running` task is restored as `pending` with `active` cleared. Confirmation itself does not resume tasks. The one-shot CLI exits, so use `mao run`; in an already-running host, later queue activity or an auto-trigger enqueue may process retained tasks after the latch is released |
 | reads normally — nothing written | something else repaired the file first (a hand-edit, or the same command in another terminal). **Nothing is written**, because this process still holds only its filtered startup subset and writing it would destroy that repair. Restart to load the real one |
-| nothing was written (could not read) | the config file could not be read at all, so whether the unusable value is still there is unknown. Refusing beats writing on a guess — fix the file or its permissions and retry |
+| restart required — nothing written | this process observed a whole-file read failure. Even if the file is readable now, its startup snapshot cannot safely write one field without overwriting the repaired token, providers, repositories or queue. Repair the file if needed, then restart MAO |
 | the stored queue changed while confirming | the value moved between the check and the write, so the write refused and **nothing was written**. Something else is writing the file — re-check it and retry |
 | the replacement was invalid | prospective validation rejected the replacement before the comparison or backend write, so **nothing was written** and the halt remains |
-| the replacement write failed | the attempt threw, so what reached the file is unknown. Inspect it before salvaging, then retry |
+| the replacement write failed | the attempt threw, so what reached the file is unknown. MAO records the persistence-broken marker and blocks all queue work. Reconcile the stored queue with GitHub, clear the marker through the matching CLI/GUI recovery path, then restart |
 
 None of those messages quotes the underlying error, because an I/O or parse failure can echo the file's
 own bytes and that file holds your GitHub token in plaintext.
@@ -312,11 +355,11 @@ timing, and the command will say `discarded` either way. That is the ordinary mu
 every field in this single-blob config shares (issue #73). So: do not run two recoveries at once, and do
 not hand-edit the file while a recovery is running, and expect a clean winner.
 
-**A problem found after a clean start does not halt that session — and `confirm-queue-recovery` is the
-wrong tool for it.** The latch is decided at boot, so if the file is corrupted while MAO is already
-running, the engine is still holding the queue it loaded and its next queue write rewrites the file from
-it. The sidebar says exactly that, in its own words rather than repeating the store's "automation is
-halted" report, which would be false there.
+**A wrong-shaped `workflowTasks` field found after a clean start does not halt that session — and
+`confirm-queue-recovery` is the wrong tool for it.** The latch is decided at boot, so if that one field
+is changed to an unusable shape in a file MAO can still load, the engine is still holding the queue it
+loaded and its next queue write can rewrite the field from it. The sidebar says exactly that, in its own
+words rather than repeating the store's boot-time "automation is halted" report.
 
 Do **not** reach for `mao workflow confirm-queue-recovery` in that state. It discards invalid entries,
 and run in a separate process it writes **that** process's corrected startup subset over the file — often
@@ -328,8 +371,36 @@ fresh, write only if the value has not moved, report what was established — an
 session is halted, because a halted session's queue is only a filtered startup subset and saving it would
 make this a silent discard. So it can also answer "nothing was written": if something repaired the file first,
 you are told rather than left assuming the click saved anything.
-With no GUI open, the safe equivalent is to let the running `mao run` reach its next queue write, or to
-stop it and then recover — not to discard from a second terminal while it is live.
+With no GUI open, the safe equivalent for this **field-only** state is to let the running `mao run` reach
+its next queue write, or to stop it and then recover — not to discard from a second terminal while it is
+live.
+
+**A whole-file read failure discovered after startup is different.** If the JSON becomes unparseable or
+non-object, or the filesystem stops allowing reads, no setting was established by that fresh read and
+every store write is refused. Both long-lived hosts give auto-trigger a fresh `inspect('githubRepos')`
+rather than `FileStore.get()`'s boot snapshot, so repository polling latches the process before any
+GitHub call. Every public queue mutation performs the same fresh readiness check before changing memory;
+an in-flight workflow stops when it next tries to persist. Once observed, this halt is monotone even if
+the file becomes readable again: a live `FileStore` still holds its complete boot snapshot and must not
+overwrite the repair. The engine remembers that whole-file origin separately from the current problem
+shape, so repairing into a file whose `workflowTasks` alone is still malformed does not make the recovery
+button safe again. There is no usable **Save this session's queue** or
+`confirm-queue-recovery` action in that process. Stop the headless process if one is running, repair the
+JSON or permissions, and restart MAO so every setting and the complete queue are loaded together. Do not
+wait for a queue write: the write gate is specifically preventing one.
+
+The stage also passes that readiness check into composite write helpers. Branch creation and note-file
+commit recheck after their awaited GitHub reads and immediately before `createRef` / file update;
+real-checkout publication rechecks after the local commit and immediately before `git push`. Keep those
+callbacks at the helper's last synchronous pre-write boundary — checking only after a composite helper
+returns cannot stop the write it already performed.
+
+If a workflow was already in flight when that halt was discovered, its last durable state can still
+precede GitHub work that finished before the next readiness check. After restart, inspect both the queue
+and the target repository before resuming. When `mao config show` reports
+`workflowPersistenceBroken: true`, clear it with `mao config clear-persistence-broken` only after that
+inspection; in Electron use the GUI's marker-clear confirmation so the action targets Electron's own
+`userData`. The marker exists specifically to prevent automatic replay from the older durable state.
 
 Restarting before any of that *will* refuse to start unattended work until the value is replaced.
 
@@ -337,11 +408,65 @@ What the halt does **not** cover, so do not read it as more: a `config.json` tha
 all **does** now latch the queue, because the boot observation goes through `inspect()` → `getFresh()` →
 `loadStrict()`, which throws on a file that exists and cannot be parsed — so it arrives as unreadable and
 halts. Every *other* field still reads as its schema default, because the constructor keeps the
-swallowing `load()`, so issue #67 is narrower than it was rather than closed. Element-level validation
+swallowing `load()` — but that is no longer a route to data loss, because the destroying write is refused
+(see below). Element-level validation
 covers complete declared provider/task shapes but deliberately leaves semantic requirements (for example,
 non-empty credentials or a stage-specific PR number) to their owning settings and workflow paths. `mao
 swarm` reads none of this, so "the queue is latched" never means "this host performs no
 unattended GitHub writes".
+
+**A `config.json` MAO cannot read at all.** The guards above are about one *field* of the wrong shape in a
+file that loaded. A file that will not parse — a truncated write, a stray trailing comma — one that is
+valid JSON but not an object (`null`, `[]`, a bare string), or one the process is not allowed to open is a
+different failure: MAO keeps **reading** so you can diagnose it, and **refuses every write** so the file
+survives (issue #67).
+
+Reads still answer, and `config show` now tells you why instead of printing `storeProblems: []`:
+
+```
+$ mao config show
+{ "githubToken": "[unset]", ..., "workflowQueueRecoveryRequired": true,
+  "storeProblems": [ { "field": "workflowTasks", "source": "/path/to/config.json",
+    "message": "[store] /path/to/config.json could not be read at all, so no stored value was
+     established ... It is not valid JSON. Repair the JSON by hand, or move the file aside ..." } ] }
+```
+
+Any write exits 1 and changes nothing:
+
+```
+$ mao config set-theme dark
+[mao] [store] Refusing to write "theme" to /path/to/config.json, because the file could not be read.
+A write replaces the whole file, so it would overwrite the stored GitHub token, AI providers, tracked
+repositories and workflow queue with schema defaults. Nothing has been written ...
+```
+
+Before this, that same command exited **0**, printed `Theme preference set to dark`, and replaced the file
+with defaults — destroying the token, providers, tracked repositories and the queue. `mao repos remove` was
+worse: it printed `No tracked repo matches …` and destroyed the file in the same breath. The remedy is
+named per cause — repair the JSON, or fix the file's permissions and owner — never "check the permissions"
+for a trailing comma. Nothing is renamed, copied or backed up: the file is left exactly as it was, which is
+why the report tells you to copy anything you need out of it before repairing it by hand. Its contents are
+never printed, because the token is in it in plain text.
+
+A **missing** `config.json` is not this case: that is a fresh install, it stays silent, writes work, and the
+file is created on the first save. `mao config clear-persistence-broken` does not load the store, so it
+works regardless.
+
+The **GUI** is covered too, and needed more than the write gate. conf writes merged defaults from its own
+*constructor*, so a valid-JSON-but-not-an-object `config.json` was destroyed just by opening the app — and
+conf does not fail for a root it can coerce, so the same file arriving *after* a clean boot read as a
+healthy store and the next write destroyed it anyway. All of it is closed, and not by narrowing windows: the
+file is judged before conf is built, the fresh read every gate consults is strict for both backends, and
+conf is handed core's own deserializer so the same rule applies to the bytes **conf** parses — in its
+constructor, on every later read, and on the merge inside a write. A replacement landing between the check
+and the construction, or at the setter's re-read, is therefore refused rather than coerced. conf's parse
+error — which quotes the first ten characters of the file — is rewrapped everywhere it can surface, so
+neither a failed `get()`, a mid-diagnostic failure, nor a failed write can put a clobbered token into a
+log or an IPC reply. A genuine write failure keeps its own error, since its message names only the path.
+
+What remains is **issue #91**: the GUI still exits at startup, with no dialog, for a file it cannot use.
+The bytes survive. Do not assume `mao config show` reads the same file — a GUI-only install ships no CLI,
+and Electron's `userData` uses `productName` while the CLI resolves `defaultDataDir('mao')`.
 
 The GUI shows the same unverified-grants caveat the CLI prints (`github:setRepos` returns the
 verdicts), and the board's **Refresh** surfaces a failed preflight instead of reporting a clean sync —
@@ -534,19 +659,33 @@ Two traps:
 
 1. Implement the logic in `core/` (engine/service method), not in the shell.
 2. `electron/ipc.ts` — `ipcMain.handle('<domain>:<camelCaseAction>', …)` as a
-   one-line delegation (domains: `ai`, `github`, `workflow`).
-3. `electron/preload.ts` — same channel string, same namespace, positional args.
-4. `src/electron.d.ts` — mirror the method signature.
+   one-line delegation (domains: `app`, `ai`, `github`, `workflow`, `ui`).
+3. `electron/preload.ts` — same channel string, same namespace, positional args. The
+   channel must be exactly `<namespace>:<method>` for the method you add it to;
+   `src/electron-ipc-surface.test.ts` asserts that, and it is what makes a typo report the
+   method rather than a diff of two sorted lists.
+4. `src/electron.d.ts` — mirror the method signature. `npm run lint` fails until it
+   matches: the bridge is pinned with `satisfies Window['electronAPI']`.
 5. `src/test/electron-api-stub.ts` — add the channel to the fake bridge. It is written
    with `satisfies ElectronApi`, so `npm run lint` fails until you do; stub it as
    `notStubbed('<domain>.<action>')` unless a test actually needs it to answer.
 6. If the CLI should have parity, add the matching subcommand in `cli/index.ts`.
-7. `npm run lint`, then smoke-test in `npm run dev` (typos fail only at runtime).
+7. Write the channel as a plain single-quoted literal on both sides. The surface test
+   parses the AST and fails closed, so a template literal or a channel hoisted into a shared
+   constant is rejected by name and line — it would take the comparison's protection away
+   rather than extend it.
+8. `npm run lint` and `npm run test` now catch a missing file or a mistyped channel. Still
+   smoke-test in `npm run dev`: neither proves the handler does the right thing, and a
+   renderer that swallows a rejected `invoke` shows a broken channel as a feature that
+   simply never appears.
 
 ### Add a store field
 
 1. Add to **both** `MaoStoreSchema` and `MAO_STORE_DEFAULTS` in `core/store.ts`.
-2. Backends (`electron/store.ts`, `FileStore`) pick up get/set automatically — but not shape
+2. Nothing is needed for the whole-file tier: a `config.json` that could not be loaded refuses **every**
+   write in `createGuardedStore.set()` and is reported by `problems()`, so a new field inherits that
+   protection by existing. The per-field tier is the part that needs you — backends
+   (`electron/store.ts`, `FileStore`) pick up get/set automatically, but not shape
    validation. Neither backend validates the JSON it reads, so a field whose declared type a
    hand-edited `config.json` can violate (an array, an object) belongs in `STORED_SHAPE_RULES` in the
    same file. Read `createStoredReadGuard`'s doc comment first, and answer three questions in the rule's
@@ -753,10 +892,11 @@ Per AGENTS.md, the reviewer should be a different agent than the implementer.
 Check, in order: architecture rules (core Electron-free? logic in shells? does the
 `core` vitest project still run with no plugins and no DOM?),
 lockstep files all updated (IPC 3-file chain, store pair, stage labels/options in all three UI copies),
-a new store-shape rule — does the field latch; is `confirmQueueRecovery()` still the only reader
-that observes the store (every gate reads the field); does the report's scope match the correction's
-(reported more than corrected is allowed, the reverse is not); and does every destructive control the
-report offers gate on `nothingUsable` rather than on the problem merely existing?,
+a new store-shape rule — does the field latch, do whole-file observations upgrade it to restart-only,
+are fresh observations limited to recovery, auto-trigger and imminent public-write boundaries, does the
+report's scope match the correction's (reported more than corrected is allowed, the reverse is not), and
+does every destructive control the report offers gate on `nothingUsable` rather than on the problem
+merely existing?,
 domain invariants (maker-checker, CI gate, timeouts, error-not-crash), secrets
 hygiene, then style (match surrounding code — there is no autoformatter).
 

@@ -44,7 +44,12 @@ export default function App() {
    * discarded — and the guard's own report goes to a console a packaged-app operator never sees.
    */
   const [storeProblems, setStoreProblems] = useState<StoredValueProblem[]>([])
-  const [queueRecovery, setQueueRecovery] = useState<QueueRecoveryState>({ required: false, reason: undefined })
+  const [queueRecovery, setQueueRecovery] = useState<QueueRecoveryState>({
+    required: false,
+    reason: undefined,
+    restartRequired: false,
+    persistenceBroken: false,
+  })
   /**
    * Whether `app:storeProblems` has ever answered. Until it has, the renderer does not know whether the
    * config file still holds the unreadable queue — and the two unknowns are not symmetric: telling a
@@ -482,8 +487,9 @@ export default function App() {
    * The outcome is decided in `core/` (see `QueueRecoveryOutcome`) rather than inferred here, so this
    * button and `mao workflow confirm-queue-recovery` cannot disagree about whether it worked. Both
    * non-success outcomes are surfaced by throwing, because Sidebar's own catch is what puts a message on
-   * screen: `'unverified'` means the store could not be read so nothing was written, `'write-failed'`
-   * means the attempt threw and what reached the file is unknown, and
+   * screen: `'unverified'` means this action could not establish a safe replacement,
+   * `'restart-required'` means the process observed a whole-file outage, `'write-failed'` means the
+   * attempt threw and what reached the file is unknown, and
    * `'already-readable'` means something else repaired the file first and writing would have destroyed
    * that repair. Both reads are refreshed afterwards either way.
    */
@@ -493,6 +499,12 @@ export default function App() {
       // Every non-success outcome is surfaced by throwing, because Sidebar's own catch is what puts a
       // message on screen. None of them carries the backend's error text — see QueueRecoveryOutcome.
       if (outcome.kind === 'unverified') throw new Error(outcome.reason)
+      if (outcome.kind === 'restart-required') {
+        throw new Error(
+          'This MAO process observed a whole-file read failure, so it cannot safely write the repaired ' +
+            'settings. Nothing was written; repair the file if needed, then restart MAO.',
+        )
+      }
       if (outcome.kind === 'superseded') {
         throw new Error(
           'The stored queue changed while confirming, so nothing was written. Something else is writing ' +
@@ -502,7 +514,8 @@ export default function App() {
       if (outcome.kind === 'write-failed') {
         throw new Error(
           'The replacement write failed, so what reached the config file is unknown and automation stays ' +
-            'halted. Inspect the file before salvaging anything from it, then try again.',
+            'halted. MAO recorded a persistence marker; reconcile the stored queue with GitHub, clear ' +
+            'that marker through the recovery card, then restart MAO.',
         )
       }
       if (outcome.kind === 'invalid-replacement') {
@@ -543,9 +556,17 @@ export default function App() {
         )
       }
       if (outcome.kind === 'unverified') throw new Error(outcome.reason)
+      if (outcome.kind === 'restart-required') {
+        throw new Error(
+          'This MAO process observed a whole-file read failure, so it cannot safely write the repaired ' +
+            'settings. Nothing was written; repair the file if needed, then restart MAO.',
+        )
+      }
       if (outcome.kind === 'write-failed') {
         throw new Error(
-          'The save failed, so what reached the config file is unknown. Inspect it, then try again.',
+          'The save failed, so what reached the config file is unknown. MAO recorded a persistence ' +
+            'marker; reconcile the stored queue with GitHub, clear that marker through the recovery ' +
+            'card, then restart MAO.',
         )
       }
       if (outcome.kind === 'invalid-replacement') {
@@ -558,6 +579,17 @@ export default function App() {
       await refreshStoreProblems()
       await refreshQueueRecovery()
     }
+  }
+
+  /**
+   * Clears the marker in Electron's actual userData directory after Sidebar's explicit reconciliation
+   * confirmation. The current engine intentionally stays blocked; only restart may reload the verified
+   * durable queue and resume work.
+   */
+  async function clearWorkflowPersistenceBroken() {
+    await electronApi().workflow.clearPersistenceBroken()
+    // Do not refresh the engine state into "cleared": it is deliberately monotone for this process and
+    // stays blocked until restart. Sidebar keeps the successful marker-removal acknowledgement locally.
   }
 
   /**
@@ -657,6 +689,7 @@ export default function App() {
         queueStoredStillUnreadable={!storeProblemsRead || storeProblems.some((problem) => problem.field === 'workflowTasks')}
         onRecoverQueue={recoverUnreadableQueue}
         onResaveQueue={resaveStoredQueue}
+        onClearPersistenceBroken={clearWorkflowPersistenceBroken}
         view={view}
         onViewChange={selectView}
       />

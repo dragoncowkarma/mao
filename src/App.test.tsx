@@ -54,6 +54,20 @@ const PARTLY_USABLE_REPO_LIST = storedValueProblem(
 )
 
 /**
+ * The same defect at a different count — two unusable entries of three rather than one of two.
+ *
+ * A *partial* hand-repair lands here: `some-entries` on both sides, so nothing coarser than the report
+ * text distinguishes them. Core puts the counts in the message for the operator's sake, and that is
+ * what makes the transition observable at all; this pair is the fixture that holds the renderer to it.
+ */
+const MOSTLY_UNUSABLE_REPO_LIST = storedValueProblem(
+  'githubRepos',
+  'some-entries',
+  '[store] "githubRepos" in /data/config.json is a JSON array in which 2 entries of 3 do not name ' +
+    'a repository ({ owner, repo }, both non-empty): null.',
+)
+
+/**
  * A report about a field this sidebar's reset does not touch. The reset deletes `githubRepos` and
  * nothing else, and `describeStoredProblems` is written to grow to the other array-typed fields
  * (issue #68) — so the card has to tell the difference before it offers a destructive button.
@@ -322,6 +336,50 @@ describe('App unusable stored settings', () => {
 
       expect(screen.getByRole('button', { name: 'acme/two' })).toBeInTheDocument()
       expect(screen.queryByText(/does not name a repository/)).toBeNull()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('takes a partial repair that leaves the list still unusable', async () => {
+    // Raised by the follow-up review, which verified this by hand: repairing *one* of two unusable
+    // entries leaves the defect at `'some-entries'`, so a watch keyed on the defect kind — the coarser
+    // key this fix was first sketched with — sees no transition and never re-reads. The report's counts
+    // are what change, which is why the key is the report text; and the consequence of missing it is
+    // the same one that made the original finding more than cosmetic, so the settings save is asserted
+    // here too.
+    vi.useFakeTimers()
+    try {
+      const stub = createElectronApiStub([ONE], [MOSTLY_UNUSABLE_REPO_LIST])
+      render(
+        <StrictMode>
+          <App />
+        </StrictMode>,
+      )
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(screen.queryByRole('button', { name: 'acme/two' })).toBeNull()
+
+      stub.applyRepos([ONE, TWO])
+      stub.storeProblems.mockResolvedValue([PARTLY_USABLE_REPO_LIST])
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+
+      expect(screen.getByRole('button', { name: 'acme/two' })).toBeInTheDocument()
+      // Still reported, and the whole-list reset still withheld: one entry is still unusable.
+      expect(screen.getByText(/1 entry of 2 does not name a repository/)).toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'Reset stored list' })).toBeNull()
+
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+      })
+      await act(async () => {
+        fireEvent.click(screen.getByRole('checkbox'))
+      })
+
+      expect(stub.setRepos).toHaveBeenCalledWith([{ ...ONE, autoTrigger: false }, TWO])
     } finally {
       vi.useRealTimers()
     }

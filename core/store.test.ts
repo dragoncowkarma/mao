@@ -11,6 +11,7 @@ import {
   describeUnusableProviderList,
   describeUnusableTaskQueue,
   describeUninspectableStore,
+  describeHealedStoredValue,
   findStoredQueueProblem,
   createGuardedStore,
   classifyStoreReadFailure,
@@ -225,14 +226,103 @@ describe('FileStore githubRepos read guard', () => {
     expect(MAO_STORE_DEFAULTS.githubRepos).toEqual([])
   })
 
-  it('leaves element-level validity to repo-registry', () => {
-    // The boundary PR #57 drew: `isRepoRef`/`canonicalRepoList` own which *entries* are usable, and they
-    // need to see the junk to drop it. This guard owns the *container* only — the gap issue #60 found.
-    captureWarnings()
+  it('hands a mixed list through untouched, and reports what the next write will drop', () => {
+    // The boundary PR #57 drew, with the half issue #72 moved. `isRepoRef`/`canonicalRepoList` still own
+    // which *entries* are usable and still need to see the junk to drop it — so the read corrects
+    // nothing here. What changed is that it is no longer silent: the drop was safe and invisible, and an
+    // operator learned about it only by noticing a repository had vanished.
+    const warn = captureWarnings()
     const { store } = storeHolding({ githubRepos: [null, widgets] })
 
     expect(store.get('githubRepos')).toEqual([null, widgets])
     expect(canonicalRepoList(store.get('githubRepos'), store.get('githubRepos'))).toEqual([widgets])
+    expect(store.problems().map((problem) => problem.field)).toEqual(['githubRepos'])
+    expect(warn).toHaveBeenCalledTimes(1)
+  })
+
+  it('reports an array in which no entry can name a repository', () => {
+    // The state that read as a plain "No projects yet": every entry dropped, nothing to show, nothing
+    // said. Both halves of the count are asserted because only the total tells the operator whether one
+    // entry or twelve are about to be overwritten.
+    const warn = captureWarnings()
+    const { store, filePath } = storeHolding({ githubRepos: [null, 'acme/widgets'] })
+
+    expect(store.get('githubRepos')).toEqual([null, 'acme/widgets'])
+    expect(warn).toHaveBeenCalledTimes(1)
+    const message = warn.mock.calls[0]![0] as string
+    expect(message).toContain('"githubRepos"')
+    expect(message).toContain('2 entries of 2 do not name a repository')
+    expect(message).toContain('null, a string')
+    expect(message).toContain(filePath)
+    // Nothing is usable, so the whole-list recovery loses nothing and is named.
+    expect(message).toContain('Reset stored list')
+    expect(store.problems()).toHaveLength(1)
+    expect(store.problems()[0]!.defect).toBe('every-entry')
+    expect(store.problems()[0]!.nothingUsable).toBe(true)
+  })
+
+  it('reports a mixed list by count and type, and does not offer to replace it', () => {
+    // The opposite recovery, for the same field, decided by whether anything survived: with rows on
+    // screen a whole-list write deletes repositories the operator can see working, so neither the
+    // message nor (see Sidebar.test.tsx) the button offers one.
+    const warn = captureWarnings()
+    const { store, filePath } = storeHolding({ githubRepos: [widgets, null, { owner: 'acme' }] })
+
+    expect(store.get('githubRepos')).toEqual([widgets, null, { owner: 'acme' }])
+    const message = warn.mock.calls[0]![0] as string
+    expect(message).toContain('2 entries of 3 do not name a repository')
+    // Deduplicated: two unusable entries, two distinct types.
+    expect(message).toContain('null, an object')
+    expect(message).toContain('tracking the 1 readable repository normally')
+    expect(message).toContain(filePath)
+    expect(message).not.toContain('Reset stored list')
+    expect(store.problems()[0]!.defect).toBe('some-entries')
+    expect(store.problems()[0]!.nothingUsable).toBe(false)
+  })
+
+  it('counts a half-written entry by what it cannot do, not by its type', () => {
+    // `{ owner: '', repo: 'widgets' }` is an object with both declared keys, so a `typeof`-level check
+    // would call it usable — and `startAutoTrigger` cannot poll it, `repos remove` cannot name it, and
+    // `canonicalRepoList` drops it. The report has to agree with the predicate that actually drops.
+    const warn = captureWarnings()
+    const { store } = storeHolding({ githubRepos: [{ owner: '', repo: 'widgets' }] })
+
+    store.get('githubRepos')
+    const message = warn.mock.calls[0]![0] as string
+    expect(message).toContain('1 entry of 1 does not name a repository')
+    expect(message).toContain('an object')
+    expect(message).not.toContain('widgets')
+    expect(store.problems()[0]!.defect).toBe('every-entry')
+  })
+
+  it('counts a sparse hole as an entry that cannot name a repository', () => {
+    // A hole cannot reach the guard from the *file* — JSON has no hole, so a parsed list carries a real
+    // `null` — but it can reach a report before the file is read back. `store.set` takes a `githubRepos`
+    // list verbatim (that write is deliberately unvalidated; see below) and `problems()` answers from the
+    // same snapshot, while `persist()` turns the hole into `null` on the way to disk. So a counter with
+    // hole-skipping `filter`/`every` semantics would report a healthy list and then hand the next reader
+    // a `null` it never mentioned.
+    captureWarnings()
+    const { store } = storeHolding({ githubRepos: [widgets] })
+
+    store.set('githubRepos', [widgets, , gadgets] as unknown as RepoRef[])
+
+    const problems = store.problems()
+    expect(problems).toHaveLength(1)
+    expect(problems[0]!.message).toContain('1 entry of 3 does not name a repository')
+    expect(problems[0]!.defect).toBe('some-entries')
+  })
+
+  it('accepts an invalid entry on write, unlike the two fields that reject one', () => {
+    // Deliberate asymmetry, and the reason `describeInvalidStoredWrite` is keyed on its own two fields
+    // rather than on the read table's predicates. `createRepoRegistrar` is the only writer and it writes
+    // `canonicalRepoList`'s output, so rejecting entries here would buy nothing — while making a store
+    // an older build wrote unrecoverable through the one API that can replace it.
+    captureWarnings()
+    const { store } = storeHolding({ githubRepos: [widgets] })
+
+    expect(() => store.set('githubRepos', [null] as unknown as RepoRef[])).not.toThrow()
+    expect(store.validateWrite('githubRepos', [null] as unknown as RepoRef[])).toBeUndefined()
   })
 
   it('returns a value the expression auto-trigger runs per tick can consume', () => {
@@ -546,6 +636,22 @@ describe('FileStore workflowTasks read guard', () => {
       expect(message).not.toContain('ghp_liveSecretValue')
       expect(message).not.toContain('ghp_anotherSecret')
     }
+
+    // And inside an array, which is where the temptation is: naming the half-written entry would
+    // genuinely help, and is exactly what must not be printed. `githubRepos` is the only field whose
+    // entry report is reachable this way — the other two already had theirs pinned above.
+    for (const value of [[{ owner: 'ghp_liveSecretValue', repo: '' }], [{ token: 'ghp_anotherSecret' }, null]]) {
+      const message = describeUnusableRepoList(value, '/tmp/config.json')!
+      expect(message).toContain('an object')
+      expect(message).not.toContain('ghp_liveSecretValue')
+      expect(message).not.toContain('ghp_anotherSecret')
+    }
+
+    // A legitimate value is no less private than a secret-shaped one: this text reaches piped output,
+    // agent logs, an IPC payload and a screen-shared window.
+    const named = describeUnusableRepoList([widgets, null], '/tmp/config.json')!
+    expect(named).not.toContain('acme')
+    expect(named).not.toContain('widgets')
   })
 
   it('survives a write to an unrelated field, which is what lets the next boot latch again', () => {
@@ -702,6 +808,119 @@ describe('describeStoredProblems', () => {
     expect(problems.map((problem) => problem.field)).toEqual(['githubRepos'])
     expect(problems[0]!.source).toBe('/tmp/config.json')
     expect(describeStoredProblems((key) => structuredClone(MAO_STORE_DEFAULTS)[key], '/tmp/c.json')).toEqual([])
+  })
+})
+
+/**
+ * Every guarded field, with one usable and one unusable entry each, so the classification table below
+ * can be driven over all three rather than over the one this change was about.
+ */
+const GUARDED_ENTRY_FIXTURES: Array<{
+  field: 'githubRepos' | 'aiProviders' | 'workflowTasks'
+  describe_: (value: unknown, source: string) => string | null
+  valid: unknown
+  invalid: unknown
+}> = [
+  { field: 'githubRepos', describe_: describeUnusableRepoList, valid: widgets, invalid: null },
+  { field: 'aiProviders', describe_: describeUnusableProviderList, valid: claude, invalid: { id: 'x' } },
+  { field: 'workflowTasks', describe_: describeUnusableTaskQueue, valid: pendingTask, invalid: { id: 'task-2' } },
+]
+
+describe('stored shape classification', () => {
+  /** The raw reader `describeStoredProblems` takes, with one field overridden and the rest healthy. */
+  function problemsFor(field: keyof MaoStoreSchema, raw: unknown, source = '/tmp/config.json') {
+    const values = { ...structuredClone(MAO_STORE_DEFAULTS), [field]: raw } as unknown as MaoStoreSchema
+    return describeStoredProblems((key) => values[key], source)
+  }
+
+  it('reports exactly when it classifies a defect, for every field and every shape', () => {
+    // The invariant the flattened `nothingUsable` rests on, and the one thing nothing in the compiler
+    // can check. `storedValueProblem()` derives the defect and the message from the same raw value by
+    // the same predicate and treats a disagreement as "nothing to report" rather than throwing — so a
+    // describer whose non-null range drifted from the classifier would go silent on both surfaces at
+    // once, which is precisely the silence issue #72 is about. The mixed row is what makes this
+    // non-vacuous: with only wrong containers and clean arrays it passes against a describer that
+    // ignores entries entirely.
+    for (const { field, describe_, valid, invalid } of GUARDED_ENTRY_FIXTURES) {
+      const shapes: Array<[unknown, string | null]> = [
+        [[], null],
+        [[valid], null],
+        [[invalid], 'every-entry'],
+        [[valid, invalid], 'some-entries'],
+        ...DISCARDED_SHAPES.map(([shape]) => [shape, 'value'] as [unknown, string | null]),
+      ]
+
+      for (const [raw, expectedDefect] of shapes) {
+        const problems = problemsFor(field, raw)
+        const message = describe_(raw, '/tmp/config.json')
+
+        expect([field, raw, problems.length === 1]).toEqual([field, raw, message !== null])
+        expect([field, raw, problems[0]?.defect ?? null]).toEqual([field, raw, expectedDefect])
+      }
+    }
+  })
+
+  it('answers nothingUsable false only for a list some of whose entries survive', () => {
+    // What gates the sidebar's whole-list reset. True for a wrong container and for an array with
+    // nothing usable in it — both leave no row, so replacing the value loses nothing a caller could have
+    // used — and false the moment one entry names something, because a reset would then delete it.
+    for (const { field, valid, invalid } of GUARDED_ENTRY_FIXTURES) {
+      expect(problemsFor(field, { keyed: valid })[0]!.nothingUsable).toBe(true)
+      expect(problemsFor(field, [invalid])[0]!.nothingUsable).toBe(true)
+      expect(problemsFor(field, [valid, invalid])[0]!.nothingUsable).toBe(false)
+      expect(problemsFor(field, [valid])).toEqual([])
+    }
+  })
+})
+
+describe('an unloadable file answers the permission question too', () => {
+  it('names no defect and refuses a whole-value replacement', () => {
+    // Issue #67's whole-file problem observed no value, so it has no shape to name — but it still has to
+    // answer whether replacing a whole value is lossless, and the only safe answer for a state that
+    // established nothing is "no". `StoredValueProblem.nothingUsable` is required for exactly that
+    // reason; `defect` is not.
+    captureWarnings()
+    const { store, filePath } = storeHolding({ githubRepos: [widgets] })
+    fs.writeFileSync(filePath, '{ not json')
+
+    const problems = store.problems()
+
+    expect(problems).toHaveLength(1)
+    expect(problems[0]!.wholeFile).toBe(true)
+    expect(problems[0]!.defect).toBeUndefined()
+    expect(problems[0]!.nothingUsable).toBe(false)
+  })
+})
+
+describe('describeHealedStoredValue', () => {
+  it('says which kind of write happened, because the two are not the same event', () => {
+    // `mao repos remove` prints this after a write that made a reported problem go away. Calling a
+    // dropped-entries write a replacement tells an operator whose readable repositories were *kept*
+    // that their stored value is gone.
+    const problem = { field: 'githubRepos' as const, source: '/tmp/config.json', message: 'ignored' }
+
+    expect(describeHealedStoredValue({ ...problem, defect: 'value', nothingUsable: true })).toBe(
+      'Replaced the unusable "githubRepos" value in /tmp/config.json.',
+    )
+    expect(describeHealedStoredValue({ ...problem, defect: 'every-entry', nothingUsable: true })).toBe(
+      'Dropped the unusable "githubRepos" entries from /tmp/config.json.',
+    )
+    expect(describeHealedStoredValue({ ...problem, defect: 'some-entries', nothingUsable: false })).toBe(
+      'Dropped the unusable "githubRepos" entries from /tmp/config.json, keeping the readable ones.',
+    )
+  })
+
+  it('names the field and the file and nothing else', () => {
+    const healed = describeHealedStoredValue({
+      field: 'githubRepos',
+      source: '/tmp/config.json',
+      message: describeUnusableRepoList([widgets, null], '/tmp/config.json')!,
+      defect: 'some-entries',
+      nothingUsable: false,
+    })
+
+    expect(healed).not.toContain('acme')
+    expect(healed).not.toContain('widgets')
   })
 })
 

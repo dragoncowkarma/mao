@@ -3,7 +3,7 @@ import path from 'node:path'
 import { Command } from 'commander'
 import { createMaoApp, type MaoApp } from '../core/app.ts'
 import { startAutoTrigger } from '../core/auto-trigger.ts'
-import { FileStore } from '../core/store.ts'
+import { describeHealedStoredValue, FileStore, type StoredValueProblem } from '../core/store.ts'
 import { defaultDataDir } from '../core/paths.ts'
 import { clearPersistenceBrokenMarker, hasPersistenceBrokenMarker } from '../core/persistence-guard.ts'
 import { runSwarm, SwarmRepositoryPathError } from '../core/swarm-runner.ts'
@@ -153,6 +153,33 @@ config
     log('Cleared workflowPersistenceBroken. Restart MAO to reload and resume the verified queue.')
   })
 
+/**
+ * Says what a repository-list write healed, for the two commands that perform one.
+ *
+ * `mao repos remove` against an unusable stored value matches nothing, so `No tracked repo matches …`
+ * was all it said — while the write it had just performed was the recovery the store's own report told
+ * the operator to run. Left there, the one command that always heals reads like a no-op.
+ *
+ * What it healed comes from core (`describeHealedStoredValue`) rather than being spelled here, because
+ * the kinds are not the same event: a wrong container was *replaced*, while an array's unusable entries
+ * were *dropped* and its readable repositories kept. Calling the second a replacement describes a
+ * destructive write that did not happen, to an operator who has no other way to find out.
+ *
+ * Scoped to the one field these commands write. Walking every prior problem credited this command with
+ * an `aiProviders` or `workflowTasks` value that another process repaired during its `await`.
+ *
+ * It reports only a wrong-shaped *field* in a file that LOADED. When the file itself could not be read,
+ * the write is refused before it happens (issue #67), the command exits non-zero with that report, and
+ * nothing here runs — which is the point, because the write would have destroyed the token along with
+ * the list. Such a problem is also carried on the queue field, so the scoping above skips it anyway.
+ */
+function reportHealedFields(store: MaoApp['store'], before: StoredValueProblem[]): void {
+  const remaining = store.problems()
+  for (const problem of before.filter((candidate) => candidate.field === 'githubRepos')) {
+    if (!remaining.some((still) => still.field === problem.field)) log(describeHealedStoredValue(problem))
+  }
+}
+
 // --- repos ------------------------------------------------------------------
 
 const repos = program.command('repos').description('Manage GitHub repositories tracked by auto-trigger')
@@ -168,6 +195,10 @@ repos
   .action(async (owner: string, repo: string, opts: { autoTrigger: boolean; pollIntervalMs?: number }) => {
     const { store, updateRepos } = loadApp()
     const ref: RepoRef = { owner, repo, autoTrigger: opts.autoTrigger, pollIntervalMs: opts.pollIntervalMs }
+    // Read before the write, like `repos remove` below and for the same reason: this is a repository-list
+    // write, so it drops whatever the stored list held that cannot name a repository. An add that healed
+    // the file while saying only `Tracking …` leaves the operator to notice the loss on their own.
+    const problemsBefore = store.problems()
     // Same serialized core path the GUI's github:setRepos uses, so the two shells agree on what counts
     // as a new registration and on read/preflight/write being one unit. `repos add` doubles as this
     // CLI's only settings editor, so re-adding an already-tracked repo to flip --no-auto-trigger stays
@@ -187,6 +218,7 @@ repos
       const caveat = describeUnverifiedGrants(capability)
       if (caveat) log(caveat)
     }
+    reportHealedFields(store, problemsBefore)
   })
 
 repos
@@ -206,18 +238,7 @@ repos
     await updateRepos((previous) => previous.filter((r) => !sameRepoRef(r, target)))
     if (tracked.length === 0) log(`No tracked repo matches ${owner}/${repo}`)
     else for (const r of tracked) log(`Stopped tracking ${r.owner}/${r.repo}`)
-    // A removal against an unusable stored value matches nothing, so `No tracked repo matches …` was all
-    // it said — while the write it had just performed was the recovery the store's own report told the
-    // operator to run. Left there, the command that heals a wrong-shaped *field* reads like a no-op.
-    // It heals only a file that LOADED: when the file itself could not be read, the write is refused
-    // before it happens (issue #67), this command exits non-zero with that report, and nothing below
-    // runs — which is the point, because the write would have destroyed the token along with the list.
-    const remaining = store.problems()
-    for (const before of problemsBefore) {
-      if (!remaining.some((problem) => problem.field === before.field)) {
-        log(`Replaced the unusable "${before.field}" value in ${before.source}.`)
-      }
-    }
+    reportHealedFields(store, problemsBefore)
   })
 
 repos

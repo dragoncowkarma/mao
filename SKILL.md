@@ -180,13 +180,20 @@ polling. Where two entries for one repository disagree about `autoTrigger`, the 
 **Recovering a `config.json` with an unusable stored list or list entry.**
 `config.json` is unvalidated JSON, so a hand-edit (or a file an older build wrote) can leave any of the
 schema's three array fields as an object, a string, `null` — anything but the array it declares. Every
-read of all three goes through a guard in `core/store.ts`: a wrong container becomes the empty schema
-default, while a mixed `aiProviders` or `workflowTasks` array keeps its structurally valid entries in
-order and ignores only the invalid ones. The guard reports once **per field** per command on **stderr**,
-naming the field and file plus the actual container type or invalid-entry count. It never prints an
-entry, prompt, token or API key: the same file holds `githubToken` in plaintext, and a malformed field is
-exactly the hand-edit that can leave a fragment of a neighbouring key inside it. `githubRepos` entry
-semantics remain `isRepoRef`/`canonicalRepoList`'s responsibility.
+read of all three goes through a guard in `core/store.ts`, which classifies the stored value as a wrong
+container, an array with nothing usable in it, or a mixed array — and reports all three. What it
+*corrects* is narrower than what it reports, deliberately. A wrong container becomes a cloned empty
+schema default for every field. A mixed `aiProviders` or `workflowTasks` array keeps its structurally
+valid entries in order and ignores only the invalid ones. A `githubRepos` array is handed through as
+stored at any level of damage: `isRepoRef`/`canonicalRepoList` still own dropping an entry that cannot
+name a repository, `mao repos list` is where you copy one out before the next write destroys it, and
+`github:getRepos` filters for the renderer on its own behalf. So for repositories the guard reports and
+nothing else — reporting is the whole of issue #72, because the drop was already safe and completely
+silent. The guard reports once **per field** per command on **stderr**, naming the field and file plus
+the actual container type, or the invalid-entry count out of the total and (for `githubRepos`) the
+deduplicated types of the rejected entries. It never prints an entry, owner, repo, prompt, token or API
+key: the same file holds `githubToken` in plaintext, and a malformed field is exactly the hand-edit that
+can leave a fragment of a neighbouring key inside it.
 
 Reads never repair the file. On the write side, the shared guard rejects an `aiProviders` or
 `workflowTasks` list with any invalid entry before either backend mutates memory or disk. This includes
@@ -211,37 +218,72 @@ sidebar's Reset stored list, always works — neither registers anything, so nei
 write access. …
 ```
 
-So `mao repos list` prints `[]` (and `mao config show`'s JSON stays parseable on stdout), and `mao run`'s
-scheduler keeps ticking instead of dying on its first poll. Nothing is repaired on read — the unusable
-value stays in the file, so copy any repositories you still need out of it first; the next list write
-(`mao repos remove <owner> <repo>`, `mao repos add <owner> <repo>`, or the GUI's Reset/Add) overwrites it
-with a real list. A **removal registers nothing, so it is never preflighted and always works**; an `add`
-is preflighted, and because the unusable value names no tracked repository every entry counts as a first
+An array is reported in one of two other voices, depending on whether anything in it survived:
+
+```
+[store] "githubRepos" in /path/to/config.json is a JSON array in which 2 entries of 3 do not name a
+repository ({ owner, repo }, both non-empty): null, an object. No stored value is shown in this
+report. Ignoring them and tracking the 1 readable repository normally. Those entries are still in
+/path/to/config.json, and the next repository-list write — adding or removing a repository, or
+editing one's settings — drops them for good, so copy out anything you need first. Replacing the
+whole list is deliberately not offered here: it would delete the repositories that still work.
+```
+
+A wrong container reads as the empty default, so `mao repos list` prints `[]` and `mao run`'s scheduler
+keeps ticking instead of dying on its first poll. An **array** does not: `mao repos list` prints it
+exactly as stored, junk entries included, because that listing is where you copy them out before a write
+destroys them — the sidebar and `github:getRepos` show only the survivors, so nothing else can still
+name what is about to go. `mao config show`'s JSON stays parseable on stdout in every case.
+
+Nothing is repaired on read. Which write heals it, and what that costs, depends on what is wrong. With
+**nothing usable** — a wrong container, or an array in which no entry names a repository — the next list
+write replaces or drops the lot: `mao repos remove <owner> <repo>`, `mao repos add <owner> <repo>`, or
+the GUI's Reset/Add. A **removal registers nothing, so it is never preflighted and always works**; an
+`add` is preflighted, and because such a value names no tracked repository every entry counts as a first
 registration — so `repos add` needs a working GitHub token, and fails leaving the bad value in place
-without one.
+without one. With **some entries usable** there is no whole-list recovery and none is offered: the
+readable repositories are tracked normally, and the invalid entries sit in the file until the next
+repository-list write — adding or removing a repository, or editing one's settings — drops them for
+good. Copy them out before you touch the list.
 
 Because stderr is easy to miss (`2>/dev/null` discards it), the same thing is queryable. `mao config
 show` reports it as `storeProblems` — one entry per field, each with the field name, the config file and
 the message — so a diagnostic command never reports a value that is not in the file. The GUI polls the
 same list over `app:storeProblems` and the sidebar shows it in place of "No projects yet", with a
-**Reset stored list** button (two-step) that discards the unusable value by writing an empty list. That
-is the GUI's only always-available recovery: with no usable list there is no project row, so no Settings
-tab and no Remove button, and Add can be refused by the preflight. The button re-checks before it
-writes — heal the store from a terminal while the window is open and confirming the reset picks up the
-repaired list instead of wiping it — and it appears only when `githubRepos` itself is the unusable
-value. A hand-edit made while the window is open is picked up by the sidebar's 30s poll, so the notice
+**Reset stored list** button (two-step) that discards the unusable value by writing an empty list —
+offered only when **nothing** in the stored list is usable, which core answers as
+`StoredValueProblem.nothingUsable` rather than leaving the renderer to derive it from the defect kind.
+That is the GUI's only always-available recovery for that state: with no usable list there is no project
+row, so no Settings tab and no Remove button, and Add can be refused by the preflight. With some entries
+usable the button is withheld, because the premise inverts — the readable repositories have rows, Remove
+is reachable, and an empty-list write would delete them; the card still shows the report, which says
+what will drop and when. The button re-checks before it writes — heal the store from a terminal while
+the window is open, or rescue just some of its entries, and confirming the reset picks that up instead
+of wiping it — and it appears only when `githubRepos` itself is the unusable value. A reset that
+decided not to write says so, in a message outside the card (the card itself disappears when the file
+turns out to be fully repaired), and names which of the two it was: the list reads normally again, or
+some of its entries turned out to name repositories after all. A hand-edit made while the window is open is picked up by the sidebar's 30s poll, so the notice
 does not wait for the next write to appear — and when that poll finds the list repaired (by `mao repos
 add` in a terminal, say), the GUI re-reads the list too, so the projects appear instead of the sidebar
-going quiet but staying empty. If that re-read fails, the repair stays pending and the next poll
+going quiet but staying empty. That holds for a *partial* repair as well — rescuing some entries of a
+mixed list still changes the report, and the re-read is keyed on the report changing rather than on the
+warning disappearing. It has to be: the renderer's list is what the next settings save sends back, so a
+stale mirror would delete the entry you just rescued. If that re-read fails, the repair stays pending and the next poll
 retries rather than leaving the window stuck until it is restarted, and a read overtaken by a newer
 observation or by a write from the window itself is discarded rather than applied — so a settings edit
-saved while a repair is being picked up is not quietly rolled back to the pre-edit value. `mao repos remove` also says which unusable value it
-replaced — without that line the command that always heals prints only `No tracked repo matches …`
-and reads like a no-op.
+saved while a repair is being picked up is not quietly rolled back to the pre-edit value. The same poll
+also drops rows the store no longer holds, so a list that went bad while the window was open does not
+leave live-looking projects under a card saying nothing is tracked. `mao repos add` and `mao repos
+remove` both say what their write healed, in core's words rather than each shell's — a wrong container
+was *replaced*, while an array's unusable entries were *dropped* and its readable repositories kept.
+Without that line the removal that always heals prints only `No tracked repo matches …` and reads like a
+no-op, and calling the second case a replacement would describe a destructive write that did not happen.
 
 **Recovering an unreadable `workflowTasks` — the one field that halts automation.** The other two are
-reported and safely corrected for readers and nothing else: `mao repos list` prints `[]`, `mao config
-show` stays parseable, and an unusable `aiProviders` keeps any valid entries (or leaves none, so every
+reported and start nothing: a `githubRepos` array is reported and handed through unchanged, so `mao
+repos list` still shows the entries you may need to salvage and only a list write drops them; a wrong
+container for either reads as the empty default, so `mao repos list` prints `[]`; `mao config show`
+stays parseable; and an unusable `aiProviders` keeps any valid entries (or leaves none, so every
 stage fails with the existing retryable "No AI providers registered"). A queue with a wrong container
 or even one invalid entry is different, and deliberately fails closed:
 
@@ -654,10 +696,20 @@ Two traps:
    one, that no preflight can block and that performs no GitHub write of its own — and **does losing it
    let unattended work start against state MAO can no longer account for?** If it does, the field needs a
    latch like `workflowTasks`', not just a report; if it does not, say so in the rule's comment, as
-   `aiProviders` does. For structured arrays, validate both the container and every declared nested
-   shape: filter invalid existing entries on read, preserve valid entries in order, reject the entire
-   invalid list on `set`/`setIfUnchanged`, and count sparse holes as invalid before JSON turns them into
-   `null`. A per-shape table test in `core/store.test.ts` goes with every new rule.
+   `aiProviders` does. A rule is three members — `usableEntry`, `report`, `readEntries` — so the
+   classification, the message and the in-memory correction all come from one `storedValueDefect()` call;
+   `report` takes the defect rather than deciding one, and `readEntries` applies whether or not the value
+   has a defect, because `workflowTasks` normalizes as well as filters and keying it on a defect would
+   quietly stop normalizing exactly the healthy queues. For structured arrays, validate both the
+   container and every declared nested shape, reject the entire invalid list on `set`/`setIfUnchanged`,
+   and count sparse holes as invalid before JSON turns them into `null`. Then answer a fourth question:
+   **does something downstream already drop invalid entries?** If it does — as
+   `isRepoRef`/`canonicalRepoList` do for `githubRepos` — filtering again in the guard removes no crash
+   site and takes away the only listing an operator can still salvage from, so the rule reports and hands
+   the array through. Reporting scope may exceed correcting scope; it must never be the reverse. And if
+   the report gates a destructive control in a shell, flatten that decision into `StoredValueProblem` in
+   core (as `nothingUsable` does) rather than letting the shell compare defect kinds, so a new kind fails
+   closed. A per-shape table test in `core/store.test.ts` goes with every new rule.
 3. Renderer needs it? Add get/set IPC channels (recipe above). CLI needs it?
    Extend `cli/index.ts` (keep `config show` redaction for anything secret).
 
@@ -844,7 +896,10 @@ Check, in order: architecture rules (core Electron-free? logic in shells? does t
 `core` vitest project still run with no plugins and no DOM?),
 lockstep files all updated (IPC 3-file chain, store pair, stage labels/options in all three UI copies),
 a new store-shape rule — does the field latch, do whole-file observations upgrade it to restart-only,
-and are fresh observations limited to recovery, auto-trigger and imminent public-write boundaries?,
+are fresh observations limited to recovery, auto-trigger and imminent public-write boundaries, does the
+report's scope match the correction's (reported more than corrected is allowed, the reverse is not), and
+does every destructive control the report offers gate on `nothingUsable` rather than on the problem
+merely existing?,
 domain invariants (maker-checker, CI gate, timeouts, error-not-crash), secrets
 hygiene, then style (match surrounding code — there is no autoformatter).
 

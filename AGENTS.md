@@ -37,7 +37,7 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
 | `core/swarm-runner.ts` | Shell-free launcher and repository/asset validation for the autonomous Swarm Orchestrator |
 | `core/auto-trigger.ts` | Per-repo polling scheduler; auto-enqueues new open issues |
 | `core/assignment.ts` | Issue/PR body directive parser — `parseAssignmentTags()` for swarm_orchestrator-style `[Worker: id]`/`[Reviewer: id]`/`[Maintainer: id]` role tags, and `parseProviderOverride()` which folds those plus task-level `[Model: id]`/`[Effort: level]` tags into a `ProviderOverride` |
-| `core/store.ts` | `MaoStoreSchema`, `MAO_STORE_DEFAULTS`, the `MaoStore` interface, `FileStore` (JSON impl for the CLI), `createStoredReadGuard()` — the read-path guard every backend applies so a field's declared type survives contact with unvalidated JSON — `describeStoredProblems()` behind `MaoStore.problems()`, which answers *which* values it had to replace, and the whole-file tier below those — `classifyStoreReadFailure()`/`UnreadableStoreError` plus the write refusal in `createGuardedStore.set()` that closes issue #67 |
+| `core/store.ts` | `MaoStoreSchema`, `MAO_STORE_DEFAULTS`, the `MaoStore` interface, `FileStore` (JSON impl for the CLI), `createStoredReadGuard()` — the read-path guard every backend applies so a field's declared type survives contact with unvalidated JSON — `describeStoredProblems()` behind `MaoStore.problems()`, which answers which stored values the schema cannot fully use, reported whether the guard replaced them, filtered them, or (for `githubRepos`) handed them through; `StoredValueDefect` / `StoredValueProblem.nothingUsable`, the single core-side answer to whether replacing a whole value loses anything, and `describeHealedStoredValue()`, so every operator-facing store string lives here rather than in a shell; and the whole-file tier below all of those — `classifyStoreReadFailure()`/`UnreadableStoreError` plus the write refusal in `createGuardedStore.set()` that closes issue #67 |
 | `core/app.ts` | `createMaoApp()` — the **single composition root** both frontends call |
 | `core/paths.ts` | Platform-appropriate data dir for the CLI (mirrors Electron's `userData`) |
 | `core/ai/` | `AiProvider` interface + adapters: `api-provider.ts` (Anthropic / OpenAI-compatible HTTP) and `cli-provider.ts` (spawns `claude`, `codex`, …) |
@@ -222,7 +222,17 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   the check established.
 - **New store field** → both `MaoStoreSchema` and `MAO_STORE_DEFAULTS` in
   `core/store.ts` (tsc enforces the pair). Both backends pick
-  the field up automatically.
+  the field up automatically. A field whose declared shape a hand-edited `config.json` can violate also
+  needs a three-member rule (`usableEntry`, `report`, `readEntries`) in `STORED_SHAPE_RULES` plus a
+  per-shape table test in `core/store.test.ts`; nothing in the compiler asks for either. Widening
+  `StoredValueProblem` is a lockstep change of its own — `src/` type-imports it, so every
+  `StoredValueProblem` fixture in `src/App.test.tsx` and `src/components/Sidebar.test.tsx` fails
+  `npm run lint` until it carries each **required** member, and they are built through
+  `src/test/store-problem.ts` so a fixture cannot state a `defect`/`nothingUsable` pair core would never
+  produce. That is the one part of this coupling you find at lint time rather than at runtime — and it is
+  why `nothingUsable` is required while `defect` is not: a whole-file problem observed no value and so
+  has no shape to name, but it can still answer whether a whole-value replacement may be offered (it
+  answers `false`, because nothing established that the file's contents are expendable).
 - **New `MaoStore` backend** → write the raw key/value surface (`StoredValueBackend`) and hand it to
   `createGuardedStore(backend, source)` (`core/store.ts`). Do not re-implement the composition: both
   shipped backends *are* that function, which is what makes "the two shells cannot answer differently
@@ -409,16 +419,39 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   non-iterable `previous` for `mao repos add` and for auto-trigger's per-tick canonicalisation, and `mao
   repos list` printed the malformed value as if it were the list — and because nothing could write the
   list either, the only way out was hand-editing JSON. `createStoredReadGuard()` (`core/store.ts`)
-  answers `[]` for a wrong container and filters invalid `aiProviders` / `workflowTasks` entries from a
-  mixed array, reporting once per process through `console.warn` with the field, config file path and
-  invalid count — never an entry, prompt, token or API key. Coercing rather than throwing is what makes
+  answers a *cloned* schema default for a wrong container and filters invalid `aiProviders` /
+  `workflowTasks` entries from a mixed array, reporting once per field per process through
+  `console.warn` with the field, the config file path, the invalid count out of the total and — for
+  `githubRepos` — the deduplicated *types* of the rejected entries (`null, an object`), never an entry,
+  owner, repo, prompt, token or API key. Coercing rather than throwing is what makes
   recovery possible —
   `updateRepos` reads before it writes, so a throwing read takes `repos add`/`repos remove` down with it.
   The read is deliberately **not** a repair: nothing in the guard writes, so a read-only command leaves
-  the file as it found it and the operator can still salvage what the unusable value named. Entry policy
-  is field-specific: `githubRepos` still belongs to `isRepoRef`/`canonicalRepoList` (#72), while the
-  guard validates the complete declared shapes of `aiProviders` and `workflowTasks` (#75), preserving
-  valid entries in order. Do not make the guard silent, and do not add a field to
+  the file as it found it and the operator can still salvage what the unusable value named.
+  **Reporting and correcting are separate scopes, and `githubRepos` is why that is written down: a field
+  may be reported more than it is corrected, never the reverse.** `STORED_SHAPE_RULES` carries one
+  three-member rule per field — `usableEntry`, `report`, `readEntries` — so the classification, the
+  message and the in-memory correction all derive from a single `storedValueDefect()` call, which reads
+  every raw value as `'value'` (not the declared array), `'every-entry'` (an array, nothing usable) or
+  `'some-entries'` (mixed); an empty array is not a defect, it is what the default *is*. `report` takes
+  that defect instead of deciding one, so a report and a correction cannot disagree — an earlier
+  revision had the describer classify independently, and the only available reconciliation was to read a
+  disagreement as silence, which for `workflowTasks` would have **lowered** the queue-recovery latch
+  (`MaoStore.inspect()` feeds it). `aiProviders` and `workflowTasks` validate their complete declared
+  entry shapes and filter on read (#75), preserving valid entries in order. `githubRepos` is reported at
+  the entry level too (#72) and corrected nowhere: an array is handed through as stored (copied, not
+  aliased), because `isRepoRef`/`canonicalRepoList` own the drop and `mao repos list` is the only
+  listing that still shows what the next write will remove — the sidebar and `github:getRepos` show the
+  survivors alone. Filtering there would be *safe* and would simply not help, at the cost of the one
+  copy the report tells the operator to go and read; substituting the default would hide the
+  repositories that still work. What #72 fixed is the silence, not the drop: PR #57 made those entries
+  safe and completely invisible, so `[null]`, `[{"owner":"acme"}]` or `["acme/widgets"]` reached the
+  sidebar as the character-for-character "No projects yet" of a genuinely empty list, a mixed list
+  showed its survivors and said nothing about the rest, and the next list write erased them for good.
+  `isRepoRef` is identity-only by design — the same predicate the drop uses, since a report for
+  something no write clears would never go away — so a junk `autoTrigger`/`pollIntervalMs` on an
+  otherwise valid entry is counted among the readable repositories and is `core/auto-trigger.ts`'
+  unvalidated read to answer for, not this guard's. Do not make the guard silent, and do not add a field to
   `STORED_SHAPE_RULES` without answering the question that field raises: what does the fallback cost,
   which write heals it, and **does losing it let unattended work start against state MAO can no longer
   account for?** All three array-typed fields are guarded now. `aiProviders` is reported and filtered but
@@ -431,31 +464,52 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   with `mao config import-providers`. Any unusable `workflowTasks` entry halts everything; see the next
   bullet.
   The recovery is not silent in either shell, and that is a contract, not a log line: `get()` returns only
-  the corrected value (a default or a filtered subset), so the fact cannot ride on the value. `MaoStore`
+  the corrected value (a cloned default, a filtered subset, or — for `githubRepos` — a copy of the stored
+  array itself), so the fact cannot ride on the value. For repositories that is the strongest form of the
+  problem: a mixed list is indistinguishable from a healthy one by value alone, and `github:getRepos`
+  filters downstream, so nothing in the value or in the rows tells three tracked repositories apart from
+  three tracked repositories plus two entries one write away from deletion. `MaoStore`
   therefore carries `problems()` — evaluated on demand against what the backend holds *now*, never
   accumulated as reads happen, because the renderer polls it over a channel of its own and the order of
   two IPC calls must not decide whether the operator is told. `mao config show` prints it; the GUI polls
   `app:storeProblems` and the sidebar shows the report with a **Reset stored list** action, because the
   guard's `console.warn` reaches a main-process console a packaged-app operator never sees and an
-  unusable list leaves no row to select, hence no Settings tab and no Remove button. That reset writes an
+  a list with nothing usable in it leaves no row to select, hence no Settings tab and no Remove button. That reset writes an
   *empty* list on purpose: an unusable value names no tracked repository, so every row would count as a
   new registration and be preflighted — a missing or revoked token would block the one recovery left.
   Two properties of that button are load-bearing and tested: it re-reads `problems()` and **aborts** if
   that read shows something already healed the store (a separate IPC round trip, so it narrows the
   cross-process race rather than closing it — `github:setRepos` writes unconditionally) (the report sends the operator to `config.json`, and a `mao repos
   add` in a terminal heals it — writing `[]` blind would then delete the healthy list they just built),
-  and it is offered only for a `githubRepos` problem, never for another field's report, because the
-  write it performs deletes `githubRepos` and nothing else. The renderer **polls** it rather than only
+  and it is offered only for a `githubRepos` problem whose `nothingUsable` is true — never for another
+  field's report, because the write deletes `githubRepos` and nothing else, and never for a mixed list,
+  because there the justification inverts: the reset is safe precisely *because* an unusable value names
+  no tracked repository, so the moment some entries do name one it would delete repositories the operator
+  can see working and can already remove one at a time. The renderer gates on
+  `StoredValueProblem.nothingUsable` rather than comparing `defect` against a literal, and core decides
+  it (`defect !== 'some-entries'` for a shape problem, `false` for a whole-file one), so a new state
+  fails closed in core instead of failing open in a GUI that has never heard of it. The pre-write re-read requires `nothingUsable` too, and the reset
+  answers a typed `RepoListResetOutcome` (`'replaced' | 'already-readable' | 'partly-usable'`) for the
+  same reason `confirmQueueRecovery()` answers a typed outcome: it can legitimately write nothing, and a
+  resolved `Promise<void>` cannot say so. The sidebar renders both no-write cases *outside* the problem
+  card, because `already-readable` unmounts that card. The renderer **polls** it rather than only
   reading it at mount: the report sends the operator to `config.json`, and an edit made there while
   the window is open would otherwise stay invisible until the next list write — which is the thing
   that destroys the value, so reading it only afterwards cannot warn anyone in time. It narrows that
   to one poll interval rather than eliminating it: an Add is not gated on a fresh read, deliberately,
   because gating it would make the GUI refuse a recovery `mao repos add` still performs. The poll
-  also re-reads the *list* on the one transition that matters — a report that said the list was
-  unusable followed by one that does not. A repair from outside this window heals the store without
-  the renderer writing anything, so nothing else would re-read it, and taking only the diagnostic
-  down leaves the card gone and the sidebar still insisting there are no projects. Only on that
-  transition: re-reading every poll would reintroduce the round-trip-lands-mid-typing hazard
+  also re-reads the *list* whenever the report **changes at all** — appearing, disappearing, or saying
+  something different. A repair from outside this window heals the store without the renderer writing
+  anything, so nothing else would re-read it, and taking only the diagnostic down leaves the card gone
+  and the sidebar still insisting there are no projects. The key is the report text, not a coarser
+  summary of it, and both coarser keys were tried and were wrong once `'some-entries'` existed: "does a
+  report exist" misses an all-invalid list hand-repaired into a partly usable one, and `nothingUsable`
+  misses `'some-entries'` repaired to healthy — `false` on both sides, so the warning vanished and the
+  rescued repository never arrived. That second one destroys data rather than merely hiding it, because
+  `persistRepos` sends the renderer's whole list: the next settings toggle on a surviving row writes a
+  list that omits the repaired entry. **Whether a whole-list reset may be offered is a separate
+  question** (`nothingUsable`, in the sidebar); conflating the two is what produced that bug. Not every
+  poll, though: re-reading unconditionally would reintroduce the round-trip-lands-mid-typing hazard
   `persistRepos`' success path exists to avoid. The transition is observable **once**, so it is not
   consumed until the list is actually in hand — a read that fails leaves the repair pending and the
   renderer's current list untouched, and the next poll tries again. Clearing it first, or adopting

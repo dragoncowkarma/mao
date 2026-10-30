@@ -1,13 +1,25 @@
+import { app } from 'electron'
+import path from 'node:path'
 import Store from 'electron-store'
 import {
-  createGuardedStore,
+  createStoredFileParser,
+  openGuardedStoreFile,
   MAO_STORE_DEFAULTS,
-  withFileWriteLock,
   type MaoStore,
   type MaoStoreSchema,
 } from '../core/store.ts'
 
-const backing = new Store<MaoStoreSchema>({ defaults: MAO_STORE_DEFAULTS })
+/**
+ * Where electron-store would put the file anyway, resolved here instead of read back off the instance.
+ *
+ * `cwd` and `name` are pinned rather than left to electron-store's defaults, and that is load-bearing: the
+ * file has to be judged *before* the instance exists (see `openGuardedStoreFile`), so there is no
+ * `backing.path` to ask yet. Pinning both makes this path the same one conf will resolve, by construction
+ * rather than by matching its defaults from memory. The values are exactly those defaults —
+ * `app.getPath('userData')` and `config` — so an existing installation keeps reading the file it already
+ * has.
+ */
+const configPath = path.join(app.getPath('userData'), 'config.json')
 
 /**
  * electron-store, composed into a `MaoStore` by the same core function `FileStore` is.
@@ -21,15 +33,38 @@ const backing = new Store<MaoStoreSchema>({ defaults: MAO_STORE_DEFAULTS })
  * `FileStore`: it merges `defaults` only when it first writes the file, so a key an operator deletes by
  * hand comes back `undefined`.
  *
+ * `openGuardedStoreFile` is what makes conf safe to construct at all. conf builds its store inside its own
+ * constructor, so for a `config.json` that is valid JSON but not an object it merges the defaults and
+ * writes them straight back — destroying the file before any write gate exists to refuse it. Judging the
+ * file first means `new Store(...)` is never reached for such a file, and rewrapping a construction failure
+ * keeps conf's own parse error — which quotes the first ten characters of the file, and so the token in a
+ * clobbered one — out of the main process's logs. Both halves are core's, not this shell's.
+ *
+ * `clearInvalidConfig` is deliberately not passed, so conf's `false` default stands: enabling it would make
+ * conf answer `{}` for an unparseable file and then write the defaults over it, which is the same
+ * destruction the gate above exists to prevent, moved inside the library where nothing can intercept it.
+ *
+ * This still throws at module load for a file it cannot use, and `electron/main.ts` imports this module
+ * through `electron/ipc.ts`, so the app exits before a window exists and the operator sees no dialog. The
+ * bytes survive, which is the point, and `mao config show` reports the cause against the same file — the
+ * CLI's data directory is this one. Showing it in the GUI needs the construction moved off module scope
+ * and is left to its own change.
+ *
  * Typed as `MaoStore` rather than as the electron-store instance, and the instance is deliberately not
  * exported: the only thing the main process may do with persistence is the core contract, and a handler
- * that reached past it would read unvalidated values with nothing to flag it. `backing.path` is
- * electron-store's resolved config file, so the report names the file the operator has to edit.
+ * that reached past it would read unvalidated values with nothing to flag it.
  *
- * `withFileWriteLock` gives it the same cross-process write lock `FileStore` takes for that path (issue
- * #73), so the desktop app and a `mao` CLI pointed at one `config.json` serialize their writes against
- * each other. conf already re-reads the file before every `set` and replaces it atomically, so it needs
- * no change of its own to stop a write reverting another process's keys — the lock is what stops a
- * conditional write's compare being overtaken by a CLI write before its rename.
+ * `openGuardedStoreFile` also gives it the cross-process write lock `FileStore` takes for the same path
+ * (issue #73), so the desktop app and a `mao` CLI pointed at one `config.json` serialize their writes.
  */
-export const store: MaoStore = createGuardedStore(withFileWriteLock(backing, backing.path), backing.path)
+export const store: MaoStore = openGuardedStoreFile(configPath, () =>
+  new Store<MaoStoreSchema>({
+    defaults: MAO_STORE_DEFAULTS,
+    cwd: path.dirname(configPath),
+    name: 'config',
+    // conf's own reader, so the root-shape rule applies to the bytes conf actually parses — inside its
+    // constructor, and on every later read and merge-before-write. Without it the pre-check above only
+    // narrows the window instead of closing it.
+    deserialize: createStoredFileParser(configPath),
+  }),
+)

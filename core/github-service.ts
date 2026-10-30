@@ -361,11 +361,15 @@ export class GithubService {
    * message says the ref already exists is treated as success (the branch is reused) rather than
    * rethrown. Any other failure (including a genuine 422 for an unrelated reason) still throws.
    */
-  async createBranch(owner: string, repo: string, branchName: string) {
+  async createBranch(owner: string, repo: string, branchName: string, beforeWrite: () => void) {
     if (!this.octokit) throw new Error('GitHub token is not set')
     const { data: repoData } = await this.octokit.rest.repos.get({ owner, repo })
     const base = repoData.default_branch
     const { data: ref } = await this.octokit.rest.git.getRef({ owner, repo, ref: `heads/${base}` })
+    // The reads above are individually time-bounded but can still outlive a newly latched queue/store
+    // failure. Re-check at the last synchronous boundary before the GitHub write; a caller-side check
+    // after this composite helper returns is too late to stop createRef.
+    beforeWrite()
     try {
       await this.octokit.rest.git.createRef({
         owner,
@@ -389,7 +393,15 @@ export class GithubService {
    * as issue #37's `createBranch` case. Look up any existing sha on `branch` first and pass it through
    * when present; a missing file (404) means this is the first write, so no sha is needed.
    */
-  async commitFile(owner: string, repo: string, branch: string, path: string, content: string, message: string) {
+  async commitFile(
+    owner: string,
+    repo: string,
+    branch: string,
+    path: string,
+    content: string,
+    message: string,
+    beforeWrite: () => void,
+  ) {
     if (!this.octokit) throw new Error('GitHub token is not set')
     let sha: string | undefined
     try {
@@ -399,6 +411,9 @@ export class GithubService {
       const status = (err as { status?: number } | null)?.status
       if (status !== 404) throw err
     }
+    // `getContent` is an awaited read. A persistence/recovery block can appear while it is in flight,
+    // so the engine's outer post-call check cannot protect the write below.
+    beforeWrite()
     await this.octokit.rest.repos.createOrUpdateFileContents({
       owner,
       repo,

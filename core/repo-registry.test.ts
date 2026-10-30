@@ -615,6 +615,7 @@ describe('createRepoRegistrar', () => {
     // clearing everything worked, but a write that kept the good repos still threw inside
     // reposNeedingCapabilityCheck, so the operator could not get rid of the bad entry without losing
     // the rest.
+    const warn = silenceStoreWarnings()
     const store = makeRealStore()
     store.set('githubRepos', [null, widgets, gadgets] as unknown as RepoRef[])
     const github = passingGithub()
@@ -624,6 +625,11 @@ describe('createRepoRegistrar', () => {
     await expect(updateRepos(drop)).resolves.toEqual([])
 
     expect(store.get('githubRepos')).toEqual([widgets])
+    // Announced before it happened, which is issue #72's half of this: the write that rescues the good
+    // repos is also the one that destroys the malformed entry, so the operator has to have been told
+    // while it was still on disk.
+    expect(warn).toHaveBeenCalled()
+    expect(warn.mock.calls[0]![0] as string).toContain('1 entry of 3 does not name a repository')
     // Dropping the malformed entry is not a registration, so nothing is preflighted for it.
     expect(github.assertRepoWorkflowWritable).not.toHaveBeenCalled()
   })
@@ -632,6 +638,7 @@ describe('createRepoRegistrar', () => {
     // The bypass this is guarding: with {owner:'acme', repo:123} on disk, registering the real
     // acme/123 looked already-tracked, so it was persisted having never been checked for write access
     // — the single guarantee the module exists for, defeated by a type the store never validates.
+    silenceStoreWarnings()
     const store = makeRealStore()
     store.set('githubRepos', [{ owner: 'acme', repo: 123 }] as unknown as RepoRef[])
     const github = passingGithub()

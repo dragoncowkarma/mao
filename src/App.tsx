@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import Sidebar from './components/Sidebar'
+import Sidebar, { type RepoListResetOutcome } from './components/Sidebar'
 import KanbanBoard from './components/KanbanBoard'
 import WorkflowQueue from './components/WorkflowQueue'
 import ProjectSettings from './components/ProjectSettings'
@@ -44,7 +44,12 @@ export default function App() {
    * discarded — and the guard's own report goes to a console a packaged-app operator never sees.
    */
   const [storeProblems, setStoreProblems] = useState<StoredValueProblem[]>([])
-  const [queueRecovery, setQueueRecovery] = useState<QueueRecoveryState>({ required: false, reason: undefined })
+  const [queueRecovery, setQueueRecovery] = useState<QueueRecoveryState>({
+    required: false,
+    reason: undefined,
+    restartRequired: false,
+    persistenceBroken: false,
+  })
   /**
    * Whether `app:storeProblems` has ever answered. Until it has, the renderer does not know whether the
    * config file still holds the unreadable queue — and the two unknowns are not symmetric: telling a
@@ -58,15 +63,16 @@ export default function App() {
    * read to decide what to do with the value being stored, and a render is not what has to happen in
    * between.
    *
-   * - `lastUnusable` — what the previous report said, so the next one can be recognised as a repair
-   *   rather than merely a quiet answer.
-   * - `repairOwed` — a repair has been seen but its list has not been adopted yet. Survives a failed
-   *   read so the next poll tries again.
+   * - `lastReport` — the previous report's text, or `undefined` for none, so any change in what the
+   *   store says about the list can be recognised. Not `nothingUsable`, and not "was there a report":
+   *   see `applyStoreProblems()`.
+   * - `rereadOwed` — the store's answer about the list has changed and the renderer has not taken the
+   *   new list yet. Survives a failed read so the next poll retries.
    * - `generation` — bumped whenever something invalidates a list read already in flight: the observed
    *   state changing, or this window starting a write. Repairs are observed on a 30s poll
    *   but adopted through a read that takes its own time, so the two interleave; without this, a read
    *   started for one repair could land after the store had broken and been repaired again, show the
-   *   list from before that second repair, and spend `repairOwed` so nothing ever read the current one.
+   *   list from before that second repair, and spend `rereadOwed` so nothing ever read the current one.
    * - `writesInFlight` — writes from this window that have not settled. A read taken across one answers
    *   with a list the write is about to replace, and a generation captured *after* the write began looks
    *   current, so the read is not started at all; the write's own completion re-enters and retries.
@@ -74,8 +80,8 @@ export default function App() {
    *   of order, and only the newest may apply, or a late older answer rolls the sidebar back.
    */
   const repoListWatch = useRef({
-    lastUnusable: false,
-    repairOwed: false,
+    lastReport: undefined as string | undefined,
+    rereadOwed: false,
     generation: 0,
     writesInFlight: 0,
     adoption: 0,
@@ -126,43 +132,61 @@ export default function App() {
    * place, which is precisely when the notice has to stay up.
    */
   /**
-   * Stores a report and answers whether the repository list still has to be re-read because it was
-   * repaired since the last one.
+   * Stores a report and answers whether the repository list still has to be re-read because what the
+   * store holds has changed shape since the last one.
    *
-   * That transition is the only thing worth acting on. While the list is unusable the renderer holds
-   * `[]` — the guard's answer, not a list — so it is not stale, it is correct; and once a repair has
-   * been adopted there is nothing further to take. Re-reading on *every* poll instead would reintroduce
-   * the hazard `persistRepos`' success path avoids: a round trip landing mid-typing stomps newer
-   * keystrokes in the settings pane.
+   * That transition is the only thing worth acting on, and it is watched in **both** directions. While
+   * the stored list holds nothing usable the renderer holds `[]` — the guard's answer, not a list — and
+   * the moment that answer changes either way the rows on screen are describing a store that no longer
+   * exists: a repair puts repositories there that nothing else would read, and a corruption leaves live
+   * rows sitting under a card saying nothing is tracked, with `github:refreshRepo` still able to poll
+   * them. Re-reading on *every* poll instead would reintroduce the hazard `persistRepos`' success path
+   * avoids: a round trip landing mid-typing stomps newer keystrokes in the settings pane.
+   *
+   * The watched fact is the **report itself**, not whether one exists and not `nothingUsable`. Those
+   * two coarser keys each miss a transition, and issue #72 made both reachable by adding a reported
+   * state (`'some-entries'`) in which the renderer holds real rows:
+   *
+   * - "does a report exist" misses an all-invalid list hand-repaired into a partly usable one — still
+   *   reported either side, while rows appear for the first time.
+   * - `nothingUsable` misses the reverse, `'some-entries'` repaired to healthy — `false` either side,
+   *   so the warning vanishes and the rescued repository never arrives. **That one is not cosmetic.**
+   *   `persistRepos` sends the renderer's whole list, so the next settings toggle on a surviving row
+   *   writes a list that omits the repaired entry and deletes it again — and the report this PR added
+   *   is precisely what sent the operator to `config.json` to make that repair.
+   *
+   * Any change in the report is a change in what the store holds for this field (the text carries the
+   * counts), so it is the key that catches every one of those. Whether a whole-list *reset* may be
+   * offered stays a separate question, answered by `nothingUsable` in the sidebar — conflating the two
+   * is what produced the bug above.
    *
    * Deliberately does **not** clear the flag when it answers `true`: the transition is observable once,
-   * and clearing it here would spend it on a read that has not happened yet. `adoptRepairedRepoList()`
-   * clears it, and only once the list is in hand — so a transient failure leaves the repair pending and
-   * the next poll tries again, instead of stranding the sidebar on "No projects yet" until a restart.
+   * and clearing it here would spend it on a read that has not happened yet. `adoptStoredRepoList()`
+   * clears it, and only once the list is in hand — so a transient failure leaves it pending and the next
+   * poll tries again, instead of stranding the sidebar on "No projects yet" until a restart.
    */
   function applyStoreProblems(next: StoredValueProblem[]): boolean {
     const watch = repoListWatch.current
-    const unusable = next.some((problem) => problem.field === 'githubRepos')
-    if (unusable !== watch.lastUnusable) {
-      watch.lastUnusable = unusable
+    const report = next.find((problem) => problem.field === 'githubRepos')?.message
+    if (report !== watch.lastReport) {
+      watch.lastReport = report
       watch.generation += 1
+      watch.rereadOwed = true
     }
-    const healed = watch.repairOwed && !unusable
-    if (!healed) watch.repairOwed = unusable
     setStoreProblems(next)
     setStoreProblemsRead(true)
-    return healed
+    return watch.rereadOwed
   }
 
   /**
-   * Takes the repaired list, and only then treats the repair as done.
+   * Takes the list the store holds now, and only then treats the change as handled.
    *
    * Throws if the read fails, which every caller swallows — on purpose. The renderer's current list is
    * left exactly as it was rather than replaced with an empty one, and because the flag is still set the
    * next poll re-enters here. Adopting `[]` on failure would look identical to "there really are no
    * projects", which is the one thing this whole path exists to stop the operator being told.
    */
-  async function adoptRepairedRepoList(): Promise<void> {
+  async function adoptStoredRepoList(): Promise<void> {
     const watch = repoListWatch.current
     // Not while this window is writing: the store is about to hold whatever the write is sending, so a
     // read now can only produce a list to be discarded — and its generation, captured after the write
@@ -170,13 +194,13 @@ export default function App() {
     if (watch.writesInFlight > 0) return
     const startedAt = watch.generation
     const request = (watch.adoption += 1)
-    const repaired = await electronApi().github.getRepos()
+    const stored = await electronApi().github.getRepos()
     // Superseded while this read was in flight — by a newer report, by a write from this window, or by a
     // later adoption that has already answered. The list is dropped rather than applied, and
-    // `repairOwed` is left standing so the next report reads whatever exists then.
+    // `rereadOwed` is left standing so the next report reads whatever exists then.
     if (watch.generation !== startedAt || watch.adoption !== request) return
-    watch.repairOwed = false
-    setRepos(repaired)
+    watch.rereadOwed = false
+    setRepos(stored)
   }
 
   function refreshStoreProblems(): Promise<void> {
@@ -192,7 +216,7 @@ export default function App() {
         // ever re-read the list. Taking only the diagnostic down would leave the card gone and the
         // sidebar still insisting there are no projects, which is worse than either alone. Selection
         // reconciles itself: the identity effect above adopts the first entry once one exists.
-        if (applyStoreProblems(next)) await adoptRepairedRepoList()
+        if (applyStoreProblems(next)) await adoptStoredRepoList()
       })
       .catch(() => {})
   }
@@ -481,8 +505,9 @@ export default function App() {
    * The outcome is decided in `core/` (see `QueueRecoveryOutcome`) rather than inferred here, so this
    * button and `mao workflow confirm-queue-recovery` cannot disagree about whether it worked. Both
    * non-success outcomes are surfaced by throwing, because Sidebar's own catch is what puts a message on
-   * screen: `'unverified'` means the store could not be read so nothing was written, `'write-failed'`
-   * means the attempt threw and what reached the file is unknown, and
+   * screen: `'unverified'` means this action could not establish a safe replacement,
+   * `'restart-required'` means the process observed a whole-file outage, `'write-failed'` means the
+   * attempt threw and what reached the file is unknown, and
    * `'already-readable'` means something else repaired the file first and writing would have destroyed
    * that repair. Both reads are refreshed afterwards either way.
    */
@@ -492,6 +517,12 @@ export default function App() {
       // Every non-success outcome is surfaced by throwing, because Sidebar's own catch is what puts a
       // message on screen. None of them carries the backend's error text — see QueueRecoveryOutcome.
       if (outcome.kind === 'unverified') throw new Error(outcome.reason)
+      if (outcome.kind === 'restart-required') {
+        throw new Error(
+          'This MAO process observed a whole-file read failure, so it cannot safely write the repaired ' +
+            'settings. Nothing was written; repair the file if needed, then restart MAO.',
+        )
+      }
       if (outcome.kind === 'superseded') {
         throw new Error(
           'The stored queue changed while confirming, so nothing was written. Something else is writing ' +
@@ -501,7 +532,8 @@ export default function App() {
       if (outcome.kind === 'write-failed') {
         throw new Error(
           'The replacement write failed, so what reached the config file is unknown and automation stays ' +
-            'halted. Inspect the file before salvaging anything from it, then try again.',
+            'halted. MAO recorded a persistence marker; reconcile the stored queue with GitHub, clear ' +
+            'that marker through the recovery card, then restart MAO.',
         )
       }
       if (outcome.kind === 'invalid-replacement') {
@@ -542,9 +574,17 @@ export default function App() {
         )
       }
       if (outcome.kind === 'unverified') throw new Error(outcome.reason)
+      if (outcome.kind === 'restart-required') {
+        throw new Error(
+          'This MAO process observed a whole-file read failure, so it cannot safely write the repaired ' +
+            'settings. Nothing was written; repair the file if needed, then restart MAO.',
+        )
+      }
       if (outcome.kind === 'write-failed') {
         throw new Error(
-          'The save failed, so what reached the config file is unknown. Inspect it, then try again.',
+          'The save failed, so what reached the config file is unknown. MAO recorded a persistence ' +
+            'marker; reconcile the stored queue with GitHub, clear that marker through the recovery ' +
+            'card, then restart MAO.',
         )
       }
       if (outcome.kind === 'invalid-replacement') {
@@ -560,6 +600,17 @@ export default function App() {
   }
 
   /**
+   * Clears the marker in Electron's actual userData directory after Sidebar's explicit reconciliation
+   * confirmation. The current engine intentionally stays blocked; only restart may reload the verified
+   * durable queue and resume work.
+   */
+  async function clearWorkflowPersistenceBroken() {
+    await electronApi().workflow.clearPersistenceBroken()
+    // Do not refresh the engine state into "cleared": it is deliberately monotone for this process and
+    // stays blocked until restart. Sidebar keeps the successful marker-removal acknowledgement locally.
+  }
+
+  /**
    * The in-app way out of a stored repository list the schema cannot use.
    *
    * Reachable when nothing else is: with no usable list there is no sidebar row, so no project is
@@ -568,7 +619,7 @@ export default function App() {
    * write-permission preflight, which is what an operator with a missing or revoked token is left
    * with. Sidebar confirms first, and shows the report naming the file to salvage from.
    */
-  async function resetRepoList() {
+  async function resetRepoList(): Promise<RepoListResetOutcome> {
     setRepoError('')
     // Re-read before destroying anything. This store is not this window's alone: the report itself tells
     // the operator to go to `config.json`, and `mao repos add` in a terminal heals it — while this card,
@@ -576,9 +627,19 @@ export default function App() {
     // deletes the healthy list they just built. Fail closed: a read that throws aborts the reset.
     const current = await electronApi().app.storeProblems()
     applyStoreProblems(current)
-    if (!current.some((problem) => problem.field === 'githubRepos')) {
-      await adoptRepairedRepoList().catch(() => {})
-      return
+    // Not "is it still unusable?" but "is any of it still usable?" — the two answers diverged once an
+    // array with some usable entries became a reported state of its own (issue #72). A hand-edit, or a
+    // `mao repos add` in a terminal, can rescue entries after this card rendered, and writing an empty
+    // list then deletes exactly what was rescued. Both ways out lead here: adopt whatever the store
+    // holds now and write nothing. The operator is not left guessing — the rows appear, the button goes
+    // (the report's own `nothingUsable` is what renders it), and the message changes under them.
+    const problem = current.find((candidate) => candidate.field === 'githubRepos')
+    if (problem === undefined || !problem.nothingUsable) {
+      await adoptStoredRepoList().catch(() => {})
+      // Which of the two no-write cases it was, because they call for different things from the
+      // operator: a list that reads normally again needs nothing, while a partly usable one still holds
+      // entries the next list write will drop.
+      return problem === undefined ? 'already-readable' : 'partly-usable'
     }
     // An edit of this window's mirror like any other: remove what it lists, add nothing. Against the
     // unusable value (which reads as no repositories) that writes the empty list that heals it. If a
@@ -590,7 +651,8 @@ export default function App() {
     // when the list empties — and forcing a view/tab here would be a navigation decision made after
     // two awaits, which is exactly what `navigationGeneration` exists to stop: the sidebar is visible
     // from Global settings too, so a reset started there would otherwise yank the operator away from it.
-    await adoptRepairedRepoList().catch(() => {})
+    await adoptStoredRepoList().catch(() => {})
+    return 'replaced'
   }
 
   async function removeSelectedRepo() {
@@ -649,6 +711,7 @@ export default function App() {
         queueStoredStillUnreadable={!storeProblemsRead || storeProblems.some((problem) => problem.field === 'workflowTasks')}
         onRecoverQueue={recoverUnreadableQueue}
         onResaveQueue={resaveStoredQueue}
+        onClearPersistenceBroken={clearWorkflowPersistenceBroken}
         view={view}
         onViewChange={selectView}
       />

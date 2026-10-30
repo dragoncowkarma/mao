@@ -6,6 +6,7 @@ import App from './App'
 import { createElectronApiStub } from './test/electron-api-stub'
 import type { RepoRef } from '../core/workflow-engine'
 import type { StoredValueProblem } from '../core/store'
+import { storedValueProblem } from './test/store-problem'
 import type { QueueRecoveryOutcome } from '../core/workflow-engine'
 
 const ONE: RepoRef = { owner: 'acme', repo: 'one' }
@@ -30,24 +31,52 @@ const OTHER_TWO: RepoRef = { owner: 'other', repo: 'two' }
  * Node module the renderer may not import, and the renderer's job here is to render what it is handed,
  * whatever the wording turns out to be.
  */
-const UNUSABLE_REPO_LIST: StoredValueProblem = {
-  field: 'githubRepos',
-  source: '/data/config.json',
-  message:
-    '[store] "githubRepos" in /data/config.json is an object, not a JSON array of { owner, repo } ' +
+const UNUSABLE_REPO_LIST = storedValueProblem(
+  'githubRepos',
+  'value',
+  '[store] "githubRepos" in /data/config.json is an object, not a JSON array of { owner, repo } ' +
     'entries — ignoring it, so no repositories are tracked until it is replaced.',
-}
+)
+
+/**
+ * The same field, reported because some of its *entries* cannot name a repository while others can
+ * (issue #72).
+ *
+ * `nothingUsable: false` is the whole fixture: core answers it so a renderer never has to decide whether
+ * replacing a value loses anything, and here it is what must stop the reset from emptying a list whose
+ * readable rows the operator can already see.
+ */
+const PARTLY_USABLE_REPO_LIST = storedValueProblem(
+  'githubRepos',
+  'some-entries',
+  '[store] "githubRepos" in /data/config.json is a JSON array in which 1 entry of 2 does not name ' +
+    'a repository ({ owner, repo }, both non-empty): null.',
+)
+
+/**
+ * The same defect at a different count — two unusable entries of three rather than one of two.
+ *
+ * A *partial* hand-repair lands here: `some-entries` on both sides, so nothing coarser than the report
+ * text distinguishes them. Core puts the counts in the message for the operator's sake, and that is
+ * what makes the transition observable at all; this pair is the fixture that holds the renderer to it.
+ */
+const MOSTLY_UNUSABLE_REPO_LIST = storedValueProblem(
+  'githubRepos',
+  'some-entries',
+  '[store] "githubRepos" in /data/config.json is a JSON array in which 2 entries of 3 do not name ' +
+    'a repository ({ owner, repo }, both non-empty): null.',
+)
 
 /**
  * A report about a field this sidebar's reset does not touch. The reset deletes `githubRepos` and
  * nothing else, and `describeStoredProblems` is written to grow to the other array-typed fields
  * (issue #68) — so the card has to tell the difference before it offers a destructive button.
  */
-const UNUSABLE_PROVIDERS: StoredValueProblem = {
-  field: 'aiProviders',
-  source: '/data/config.json',
-  message: '[store] "aiProviders" in /data/config.json is an object, not a JSON array of providers.',
-}
+const UNUSABLE_PROVIDERS = storedValueProblem(
+  'aiProviders',
+  'value',
+  '[store] "aiProviders" in /data/config.json is an object, not a JSON array of providers.',
+)
 
 /**
  * What the main process answers for a `config.json` whose `workflowTasks` the schema cannot use.
@@ -63,19 +92,18 @@ const UNUSABLE_PROVIDERS: StoredValueProblem = {
  * late-case test cannot use `UNUSABLE_QUEUE` directly: it would arrive latched. This one is injected
  * after mount through `storeProblems`, which is exactly how the 30s poll surfaces it in production.
  */
-const UNUSABLE_QUEUE_LATE: StoredValueProblem = {
-  field: 'workflowTasks',
-  source: '/data/config.json',
-  message: '[store] "workflowTasks" in /data/config.json is an object, not a JSON array.',
-}
+const UNUSABLE_QUEUE_LATE = storedValueProblem(
+  'workflowTasks',
+  'value',
+  '[store] "workflowTasks" in /data/config.json is an object, not a JSON array.',
+)
 
-const UNUSABLE_QUEUE: StoredValueProblem = {
-  field: 'workflowTasks',
-  source: '/data/config.json',
-  message:
-    '[store] "workflowTasks" in /data/config.json is an object, not a JSON array of queued workflow ' +
+const UNUSABLE_QUEUE = storedValueProblem(
+  'workflowTasks',
+  'value',
+  '[store] "workflowTasks" in /data/config.json is an object, not a JSON array of queued workflow ' +
     'tasks — ignoring it, so the queue is empty and MAO will not start unattended work.',
-}
+)
 
 /**
  * Mounts the real App against a fake bridge, inside StrictMode because that is what `src/main.tsx`
@@ -220,6 +248,216 @@ describe('App unusable stored settings', () => {
     await waitFor(() => expect(screen.queryByText(/is an object, not a JSON array/)).toBeNull())
     expect(stub.setRepos).not.toHaveBeenCalled()
     expect(await screen.findByRole('button', { name: 'acme/one' })).toBeInTheDocument()
+  })
+
+  it('refuses to reset a list that has become partly usable, and adopts it instead', async () => {
+    // The sibling of the test above, for the state issue #72 made reachable. A hand-edit — or a `mao
+    // repos add` in a terminal — can rescue *some* entries after this card rendered, and the card goes
+    // on offering a button that writes an empty list. Blind, that deletes exactly what was rescued, and
+    // it is the one recovery an operator with no working token has left.
+    const { stub, user } = await renderApp([], [UNUSABLE_REPO_LIST])
+    await screen.findByText(/is an object, not a JSON array/)
+    stub.applyRepos([ONE])
+    stub.storeProblems.mockResolvedValue([PARTLY_USABLE_REPO_LIST])
+
+    await user.click(screen.getByRole('button', { name: 'Reset stored list' }))
+    await user.click(screen.getByRole('button', { name: 'Confirm reset' }))
+
+    // The signal that the pre-write re-read's continuation actually ran, rather than a bare wait on the
+    // assertion itself: the fresh report replaced the stale one, and a partly usable list offers no
+    // reset at all, so the control the operator just confirmed is gone.
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Confirm reset' })).toBeNull())
+    expect(stub.setRepos).not.toHaveBeenCalled()
+    expect(stub.storedRepos()).toEqual([ONE])
+    // And the rescued row is on screen rather than the sidebar going quiet: the abort adopts the list it
+    // just refused to delete.
+    expect(await screen.findByRole('button', { name: 'acme/one' })).toBeInTheDocument()
+    expect(screen.getByText(/1 entry of 2 does not name a repository/)).toBeInTheDocument()
+    // And it says so: a confirmed destructive click that quietly wrote nothing is indistinguishable
+    // from one that worked, and this is the case where the operator most needs to know which it was.
+    expect(screen.getByText(/would have deleted them/)).toBeInTheDocument()
+  })
+
+  it('drops rows that the store no longer holds, so the card and the list agree', async () => {
+    // The other direction of the same watch. Rows read before the corruption are not inert: the board's
+    // Refresh drives `github:refreshRepo`, which falls back to `{owner, repo}` when the stored list no
+    // longer matches and then preflights and polls it for real. Leaving them on screen under a card
+    // saying no repositories are tracked also arms the reset above a list the operator can still see.
+    vi.useFakeTimers()
+    try {
+      const stub = createElectronApiStub([ONE])
+      render(
+        <StrictMode>
+          <App />
+        </StrictMode>,
+      )
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(screen.getByRole('button', { name: 'acme/one' })).toBeInTheDocument()
+
+      stub.applyRepos([])
+      stub.storeProblems.mockResolvedValue([UNUSABLE_REPO_LIST])
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+
+      expect(screen.getByText(/is an object, not a JSON array/)).toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'acme/one' })).toBeNull()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('takes the repaired list when a partly usable one reads normally again', async () => {
+    // Review finding on this PR. `some-entries` and healthy are both `nothingUsable: false`, so a watch
+    // keyed on that flag saw no transition: the warning vanished and the rescued repository never
+    // arrived. The report is what sent the operator to `config.json` in the first place, so the repair
+    // it asks for has to be the one case that cannot be missed.
+    vi.useFakeTimers()
+    try {
+      const stub = createElectronApiStub([ONE], [PARTLY_USABLE_REPO_LIST])
+      render(
+        <StrictMode>
+          <App />
+        </StrictMode>,
+      )
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(screen.getByText(/1 entry of 2 does not name a repository/)).toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'acme/two' })).toBeNull()
+
+      stub.applyRepos([ONE, TWO])
+      stub.storeProblems.mockResolvedValue([])
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+
+      expect(screen.getByRole('button', { name: 'acme/two' })).toBeInTheDocument()
+      expect(screen.queryByText(/does not name a repository/)).toBeNull()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('takes a partial repair that leaves the list still unusable', async () => {
+    // Raised by the follow-up review, which verified this by hand: repairing *one* of two unusable
+    // entries leaves the defect at `'some-entries'`, so a watch keyed on the defect kind — the coarser
+    // key this fix was first sketched with — sees no transition and never re-reads. The report's counts
+    // are what change, which is why the key is the report text; and the consequence of missing it is
+    // the same one that made the original finding more than cosmetic, so the settings save is asserted
+    // here too.
+    vi.useFakeTimers()
+    try {
+      const stub = createElectronApiStub([ONE], [MOSTLY_UNUSABLE_REPO_LIST])
+      render(
+        <StrictMode>
+          <App />
+        </StrictMode>,
+      )
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(screen.queryByRole('button', { name: 'acme/two' })).toBeNull()
+
+      stub.applyRepos([ONE, TWO])
+      stub.storeProblems.mockResolvedValue([PARTLY_USABLE_REPO_LIST])
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+
+      expect(screen.getByRole('button', { name: 'acme/two' })).toBeInTheDocument()
+      // Still reported, and the whole-list reset still withheld: one entry is still unusable.
+      expect(screen.getByText(/1 entry of 2 does not name a repository/)).toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'Reset stored list' })).toBeNull()
+
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+      })
+      await act(async () => {
+        fireEvent.click(screen.getByRole('checkbox'))
+      })
+
+      // The base pins that the repaired row was re-read: with this PR's delta write (issue #73) a stale
+      // `[ONE]` mirror would no longer delete `TWO` from the store, so the stored list alone cannot tell.
+      expect(stub.setRepos).toHaveBeenCalledWith([{ ...ONE, autoTrigger: false }, TWO], [ONE, TWO])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not delete a repaired repository with the next settings save', async () => {
+    // The half of that finding which is not cosmetic. `persistRepos` sends the renderer's whole list,
+    // so a stale mirror is not merely out of date — the first settings toggle on a surviving row writes
+    // a list that omits the repaired entry, and `updateRepos` persists exactly that.
+    vi.useFakeTimers()
+    try {
+      const stub = createElectronApiStub([ONE], [PARTLY_USABLE_REPO_LIST])
+      render(
+        <StrictMode>
+          <App />
+        </StrictMode>,
+      )
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+
+      stub.applyRepos([ONE, TWO])
+      stub.storeProblems.mockResolvedValue([])
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+      })
+      await act(async () => {
+        fireEvent.click(screen.getByRole('checkbox'))
+      })
+
+      // The base pins that the repaired row was re-read: with this PR's delta write (issue #73) a stale
+      // `[ONE]` mirror would no longer delete `TWO` from the store, so the stored list alone cannot tell.
+      expect(stub.setRepos).toHaveBeenCalledWith([{ ...ONE, autoTrigger: false }, TWO], [ONE, TWO])
+      expect(stub.storedRepos()).toEqual([{ ...ONE, autoTrigger: false }, TWO])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('shows the repositories a partial hand-repair rescued, without waiting for a write', async () => {
+    // The transition `nothingUsable` exists to catch, and the one a report-presence watch misses: an
+    // all-invalid list hand-edited into a partly usable one still reports, so nothing else would re-read
+    // the list — and the rescued rows would stay off screen until the next repository-list write or a
+    // restart, under a card telling the operator to go and edit the file they just edited.
+    //
+    // Fake timers and no `userEvent`: the two deadlock (SKILL.md), so this drives the interval directly.
+    vi.useFakeTimers()
+    try {
+      const stub = createElectronApiStub([], [UNUSABLE_REPO_LIST])
+      render(
+        <StrictMode>
+          <App />
+        </StrictMode>,
+      )
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(screen.queryByRole('button', { name: 'acme/one' })).toBeNull()
+
+      stub.applyRepos([ONE])
+      stub.storeProblems.mockResolvedValue([PARTLY_USABLE_REPO_LIST])
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+
+      expect(screen.getByRole('button', { name: 'acme/one' })).toBeInTheDocument()
+      // The report stays up — those entries are still in the file — but the destructive recovery goes,
+      // because it would now delete the row that just appeared.
+      expect(screen.getByText(/1 entry of 2 does not name a repository/)).toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'Reset stored list' })).toBeNull()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('offers no reset for a report about a field the reset does not touch', async () => {
@@ -1057,6 +1295,37 @@ describe('App repository add and unsaved global settings', () => {
  * exactly where the repo-list reset does.
  */
 describe('App halted workflow queue', () => {
+  it('shows and clears a prior-process persistence marker through the Electron bridge', async () => {
+    const stub = createElectronApiStub()
+    stub.recoveryRequired.mockResolvedValue({
+      required: true,
+      reason:
+        'Workflow queue persistence has an unresolved write outcome. No further queue mutation or ' +
+        'repository polling is allowed. Verify the stored queue and GitHub state, clear the ' +
+        'persistence-broken marker only after that check, then restart MAO.',
+      restartRequired: false,
+      persistenceBroken: true,
+    })
+    const user = userEvent.setup()
+    render(
+      <StrictMode>
+        <App />
+      </StrictMode>,
+    )
+
+    expect(await screen.findByText('Workflow automation is halted')).toBeInTheDocument()
+    expect(screen.getByText(/unresolved write outcome/)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Recover readable tasks' })).toBeNull()
+    expect(screen.queryByRole('button', { name: /Save this session/ })).toBeNull()
+
+    await user.click(screen.getByRole('button', { name: 'Clear marker after verification' }))
+    expect(stub.clearPersistenceBroken).not.toHaveBeenCalled()
+    await user.click(screen.getByRole('button', { name: 'Confirm marker clear' }))
+
+    await waitFor(() => expect(stub.clearPersistenceBroken).toHaveBeenCalledTimes(1))
+    expect(screen.getByText(/marker is cleared/)).toBeInTheDocument()
+  })
+
   it('shows the store report and offers a two-step recovery', async () => {
     const { user, stub } = await renderApp([], [UNUSABLE_QUEUE])
 
@@ -1151,7 +1420,12 @@ describe('App halted workflow queue', () => {
   async function renderLateCorruption(outcome: QueueRecoveryOutcome, { healsAfter = false } = {}) {
     const user = userEvent.setup()
     const stub = createElectronApiStub([], [UNUSABLE_QUEUE_LATE])
-    stub.recoveryRequired.mockResolvedValue({ required: false, reason: undefined })
+    stub.recoveryRequired.mockResolvedValue({
+      required: false,
+      reason: undefined,
+      restartRequired: false,
+      persistenceBroken: false,
+    })
     stub.resaveQueue.mockResolvedValue(outcome)
     render(
       <StrictMode>
@@ -1187,6 +1461,7 @@ describe('App halted workflow queue', () => {
     const cases: Array<[QueueRecoveryOutcome, RegExp]> = [
       [{ kind: 'superseded' }, /changed while saving/],
       [{ kind: 'unverified', reason: 'could not read the config file' }, /could not read the config file/],
+      [{ kind: 'restart-required' }, /observed a whole-file read failure.*Nothing was written/s],
       [{ kind: 'write-failed' }, /what reached the config file is unknown/],
       [{ kind: 'invalid-replacement' }, /rejected this session's queue before writing.*Nothing was written/s],
     ]

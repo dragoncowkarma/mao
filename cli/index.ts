@@ -502,6 +502,16 @@ program
       }
     })
 
+    // The one way this engine stops on its own, so it must not stop silently. A queue write that keeps
+    // failing — most often another MAO host writing the same queue (issue #73), which the store now
+    // refuses rather than overwrites — trips persistenceBroken, and the `'change'` log above never sees
+    // that change: the persisting listener that threw runs first. The message is the store's own,
+    // value-free report.
+    workflowEngine.on('persistence-broken', (err: Error) => {
+      logErr(`queue persistence failed — this process will run no further stages: ${err.message}`)
+      logErr('Recorded as workflowPersistenceBroken (see `mao config show` and `mao config clear-persistence-broken`).')
+    })
+
     workflowEngine.resumeProcessing()
 
     process.on('SIGINT', () => {

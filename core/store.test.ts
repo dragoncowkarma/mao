@@ -14,6 +14,8 @@ import {
   describeHealedStoredValue,
   findStoredQueueProblem,
   createGuardedStore,
+  describeRefusedStoredWrite,
+  storedValueWitness,
   classifyStoreReadFailure,
   UnreadableStoreError,
   openGuardedStoreFile,
@@ -21,9 +23,11 @@ import {
   parseStoredSettings,
   createStoredFileParser,
   operatorSafeStoreMessage,
+  storeWriteRequiresRestart,
   type MaoStoreSchema,
   type StoredValueBackend,
 } from './store.ts'
+import { StoreLockError, createStoreWriteLock } from './store-file.ts'
 import { canonicalRepoList } from './repo-registry.ts'
 import { importProvidersFromFile } from './provider-import.ts'
 import type { AiProviderConfig } from './ai/types.ts'
@@ -1662,12 +1666,14 @@ describe('MaoStore.setIfUnchanged', () => {
 /**
  * The limit of `setIfUnchanged()`, pinned so it lives in the suite rather than only in a comment.
  *
- * Two revisions of this PR claimed the read-then-clobber window was closed. It is not: the comparison
- * narrows it to the compare -> write interval, and a repair landing *inside* that interval is still
- * overwritten. Asserting the real behaviour is what stops the claim drifting back — if someone later adds
- * a lock and genuinely closes it, this test fails and has to be rewritten deliberately.
+ * Two revisions of PR #69 claimed the read-then-clobber window was closed when it was only narrowed to
+ * the compare -> write interval. This suite said that if a lock ever genuinely closed it, the suite would
+ * have to be rewritten deliberately — and issue #73 added that lock, so this is the rewrite. What it now
+ * pins is the exact boundary: against another **MAO** process the interval is closed (both backends take
+ * the config file's write lock around it), and against a writer that takes no lock — a hand-edit, another
+ * tool — it is still open. Both halves are executable so neither claim can drift.
  */
-describe('setIfUnchanged — what it does not close', () => {
+describe('setIfUnchanged — what it does and does not close', () => {
   it('is atomic against other callers in this process', () => {
     // The half that IS guaranteed, and the reason: nothing may be inserted between the compare and the
     // write, so no other JavaScript here can interleave. A backend that counts reads proves the pair runs
@@ -1697,13 +1703,51 @@ describe('setIfUnchanged — what it does not close', () => {
     expect(reads).toEqual(['workflowTasks'])
   })
 
-  it('does NOT close the window against another OS process, and must not claim to', () => {
-    // The honest residue. This backend repairs the value *after* the compare read has answered, which is
-    // what another process doing it between our compare and our writeFileSync looks like from here. The
-    // repair is overwritten and the result is still 'written'.
+  it('closes the window against another MAO process: its write cannot land inside the interval', () => {
+    // The scenario the residue test below reproduces, but with the writer being another real `FileStore`
+    // on the same file — i.e. another MAO process. It tries to write while A sits between its compare
+    // and its rename; it has to take the lock A holds, so it waits and is refused instead of landing.
+    captureWarnings()
+    const { store: a, filePath } = storeHolding({ workflowTasks: { 'task-1': pendingTask } })
+    const b = new FileStore(filePath, { lock: { timeoutMs: 20 } })
+    const observedByA = a.inspect('workflowTasks')
+    const observedByB = b.inspect('workflowTasks')
+
+    let competing: unknown = 'never attempted'
+    let armed = true
+    const realReadFileSync = fs.readFileSync
+    vi.spyOn(fs, 'readFileSync').mockImplementation(((file: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+      const text = (realReadFileSync as (...args: unknown[]) => unknown)(file, ...rest)
+      if (armed && String(file) === filePath) {
+        // A's compare read has just answered. B's repair, attempted right here, is the interleaving.
+        armed = false
+        try {
+          b.set('workflowTasks', [pendingTask])
+          competing = 'landed'
+        } catch (err) {
+          competing = err
+        }
+      }
+      return text
+    }) as typeof fs.readFileSync)
+
+    expect(a.setIfUnchanged('workflowTasks', observedByA.witness, [])).toBe('written')
+    vi.restoreAllMocks()
+
+    expect(competing).toBeInstanceOf(StoreLockError)
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).workflowTasks).toEqual([])
+    // And B, retrying the conditional form of its write, is told the value moved rather than clobbering A.
+    expect(b.setIfUnchanged('workflowTasks', observedByB.witness, [pendingTask])).toBe('superseded')
+  })
+
+  it('does NOT close the window against a writer that takes no lock, and must not claim to', () => {
+    // The honest residue that remains. This backend has no `exclusive`, and repairs the value *after* the
+    // compare read has answered — which is what a hand-edit, or any tool that does not take MAO's lock,
+    // landing between our compare and our rename looks like from here. The repair is overwritten and the
+    // result is still 'written'.
     //
     // Keeping this as an executable assertion rather than prose is the point: it is the exact scenario
-    // review reproduced, and recording it stops the "window closed" wording coming back.
+    // review reproduced, and recording it stops "atomic" wording coming back.
     const data: Record<string, unknown> = { workflowTasks: { 'task-1': pendingTask } }
     let repairAfterNextRead = false
     const store = createGuardedStore(
@@ -1729,9 +1773,162 @@ describe('setIfUnchanged — what it does not close', () => {
     repairAfterNextRead = true
 
     expect(store.setIfUnchanged('workflowTasks', observed.witness, [])).toBe('written')
-    // The repair is gone. Closing this needs an advisory lock both writers take, or O_EXCL + rename
-    // keyed on a stored version — a primitive neither backend has. Tracked as issue #73.
+    // The repair is gone. The lock closes this only for writers that take it — see the test above.
     expect(data.workflowTasks).toEqual([])
+  })
+})
+
+/**
+ * Two `FileStore`s on one `config.json` — a long-running `mao run` (A, opened first and kept) beside a
+ * one-shot command in another terminal (B). Issue #73's reproduction, step for step.
+ *
+ * Before the fix A's every write rewrote the whole file from the snapshot it took at construction, so
+ * the moment its queue persisted, everything B had changed in the meantime was put back.
+ */
+describe('FileStore across processes (issue #73)', () => {
+  const changes: Array<[keyof MaoStoreSchema, unknown]> = [
+    ['githubRepos', [widgets]],
+    ['githubToken', 'ghp_changed_elsewhere'],
+    ['aiProviders', [claude]],
+    ['theme', 'dark'],
+    ['buildSha', 'abc123'],
+  ]
+
+  it.each(changes)('a stale writer of workflowTasks keeps another process\'s %s', (field, value) => {
+    const { store: a, filePath } = storeHolding({ githubRepos: [gadgets], githubToken: 'ghp_original' })
+    const b = new FileStore(filePath)
+
+    b.set(field, value as never)
+    a.set('workflowTasks', [pendingTask])
+
+    const onDisk = JSON.parse(fs.readFileSync(filePath, 'utf-8'))
+    expect(onDisk[field]).toEqual(value)
+    expect(onDisk.workflowTasks).toEqual([pendingTask])
+    // A fresh process reads both, which is what every later command sees.
+    expect(new FileStore(filePath).get(field)).toEqual(value)
+  })
+
+  it('does not put back an unusable githubRepos another process already repaired (PR #66)', () => {
+    // A boots holding the object-shaped list; B runs the recovery the store's own report names. Before
+    // the fix, A's next queue write restored the object and the recovery silently undid itself.
+    captureWarnings()
+    const unusable = { 'acme/widgets': widgets }
+    const { store: a, filePath } = storeHolding({ githubRepos: unusable })
+    const b = new FileStore(filePath)
+
+    b.set('githubRepos', [])
+    a.set('workflowTasks', [pendingTask])
+
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).githubRepos).toEqual([])
+    expect(new FileStore(filePath).problems()).toEqual([])
+  })
+
+  it('updates its own snapshot for the key it wrote', () => {
+    const { store, filePath } = storeHolding({})
+
+    store.set('theme', 'dark')
+
+    expect(store.get('theme')).toBe('dark')
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).theme).toBe('dark')
+  })
+
+  it('keeps keys it does not know about, as a newer build might have written them', () => {
+    const { store, filePath } = storeHolding({ futureSetting: { enabled: true } })
+
+    store.set('theme', 'dark')
+
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).futureSetting).toEqual({ enabled: true })
+  })
+
+  it('still creates a missing file, as a fresh install does', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mao-store-test-'))
+    tmpDirs.push(dir)
+    const filePath = path.join(dir, 'config.json')
+    const store = new FileStore(filePath)
+
+    store.set('theme', 'dark')
+
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8'))).toEqual({ ...MAO_STORE_DEFAULTS, theme: 'dark' })
+  })
+
+  it.each([
+    ['{"githubToken": "ghp_SENTINEL_SECRET", ', 'unparseable'],
+    ['null', 'not-an-object'],
+    ['[1, 2]', 'not-an-object'],
+    ['"ghp_SENTINEL_SECRET"', 'not-an-object'],
+  ] as const)(
+    'refuses to merge into %s when a lockless writer replaces the file after the write gate passed',
+    (unreadable, failure) => {
+      // The gate in `createGuardedStore.set()` reads the file under the write lock first, so only a writer
+      // that takes no lock — a hand-edit, another tool — can make the merge's own read fail. Merging into
+      // that read as `{}` would replace everything in the file with defaults, the token included, which
+      // exists nowhere else. So the merge refuses too, in the gate's own words: restart-required, and
+      // value-free, because a V8 parse error embeds the file's opening bytes.
+      const { store, filePath } = storeHolding({ githubToken: 'ghp_original' })
+      let reads = 0
+      const realReadFileSync = fs.readFileSync
+      vi.spyOn(fs, 'readFileSync').mockImplementation(((file: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+        // Read 1 is the gate's; read 2 is the merge's. The replacement lands between them.
+        if (String(file) === filePath && ++reads === 2) fs.writeFileSync(filePath, unreadable)
+        return (realReadFileSync as (...args: unknown[]) => unknown)(file, ...rest)
+      }) as typeof fs.readFileSync)
+
+      let refused: unknown
+      try {
+        store.set('theme', 'dark')
+      } catch (err) {
+        refused = err
+      }
+      vi.restoreAllMocks()
+
+      expect(reads).toBe(2)
+      expect(operatorSafeStoreMessage(refused)).toBe(describeRefusedStoredWrite('theme', filePath, failure))
+      expect(storeWriteRequiresRestart(refused)).toBe(true)
+      expect((refused as Error).message).not.toContain('ghp_SENTINEL_SECRET')
+      expect(fs.readFileSync(filePath, 'utf-8')).toBe(unreadable)
+      // A failed write does not claim the value either.
+      expect(store.get('theme')).toBe('system')
+    },
+  )
+
+  it('refuses the same way when it booted on the unreadable file', () => {
+    const { filePath } = storeHolding({})
+    fs.writeFileSync(filePath, 'not json at all')
+    const store = new FileStore(filePath)
+
+    expect(() => store.set('githubToken', 'ghp_x')).toThrow(/Refusing to write "githubToken"/)
+    expect(fs.readFileSync(filePath, 'utf-8')).toBe('not json at all')
+  })
+
+  it('writes only while it holds the file\'s write lock', () => {
+    // A second process mid-write holds the lock; this write waits for it and then refuses rather than
+    // landing beside it. Nothing is written.
+    const { store, filePath } = storeHolding({ theme: 'light' })
+    const waiting = new FileStore(filePath, { lock: { timeoutMs: 20 } })
+
+    let refused: unknown
+    createStoreWriteLock(filePath)(() => {
+      try {
+        waiting.set('theme', 'dark')
+      } catch (err) {
+        refused = err
+      }
+    })
+
+    expect(refused).toBeInstanceOf(StoreLockError)
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).theme).toBe('light')
+    expect(store.get('theme')).toBe('light')
+  })
+
+  it("predicts the witness a fresh read reports after a real write", () => {
+    // What lets the queue writer key each write on its own previous one without a read after every
+    // write. Optional members left undefined are the case that matters: JSON drops them on both sides.
+    const { store } = storeHolding({})
+    const task: QueuedTask = { ...pendingTask, error: undefined, providerOverride: undefined }
+
+    store.set('workflowTasks', [task])
+
+    expect(store.inspect('workflowTasks').witness).toBe(storedValueWitness([task]))
   })
 })
 
@@ -2222,6 +2419,37 @@ describe('openGuardedStoreFile — the backend reads again after the pre-check',
     expect(store.get('githubToken')).toBe(secret)
     expect(store.get('theme')).toBe('dark')
     expect(store.problems()).toEqual([])
+  })
+
+  it("writes only while it holds the file's write lock, as a CLI FileStore on the same path does", () => {
+    // Issue #73: the desktop app and a `mao` CLI pointed at one config.json must serialize against each
+    // other, so the composition `electron/store.ts` goes through takes the same lock `FileStore` does —
+    // without it a CLI write could land between this backend's compare and its write.
+    captureWarnings()
+    const filePath = rawConfigFile(JSON.stringify({ theme: 'light' }))
+    const store = openGuardedStoreFile(filePath, strictConfLike(filePath), undefined, { timeoutMs: 20 })
+    const observed = store.inspect('theme')
+
+    const refused: unknown[] = []
+    createStoreWriteLock(filePath)(() => {
+      for (const write of [
+        () => store.set('theme', 'dark'),
+        () => store.setIfUnchanged('theme', observed.witness, 'dark'),
+      ]) {
+        try {
+          write()
+        } catch (err) {
+          refused.push(err)
+        }
+      }
+    })
+
+    expect(refused).toHaveLength(2)
+    expect(refused.every((err) => err instanceof StoreLockError)).toBe(true)
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).theme).toBe('light')
+    // And once the other writer is done, the same write lands.
+    store.set('theme', 'dark')
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).theme).toBe('dark')
   })
 
   it('converts a parse failure raised by the backend while writing', () => {

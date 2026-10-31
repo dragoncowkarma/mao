@@ -4,6 +4,7 @@ import type { AppUpdateCheck } from '../electron'
 import type { AiProviderConfig } from '../../core/ai/types'
 import type { GithubTask } from '../../core/github-service'
 import type { RepoWorkflowCapability } from '../../core/repo-capabilities'
+import { applyRepoListEdit } from '../../core/repo-registry'
 import type { StoredValueProblem, ThemePreference } from '../../core/store'
 import type {
   QueuedTask,
@@ -43,8 +44,16 @@ export function createElectronApiStub(initialRepos: RepoRef[] = [], initialProbl
   // Copies on the way out as well as in: the renderer holds this list in state and spreads it into new
   // arrays, and a shared reference would let a component mutation silently rewrite the "store".
   const getRepos = vi.fn(async (): Promise<RepoRef[]> => stored.map((repo) => ({ ...repo })))
-  const setRepos = vi.fn(async (next: RepoRef[]): Promise<RepoWorkflowCapability[]> => {
-    stored = next.map((repo) => ({ ...repo }))
+  const setRepos = vi.fn(async (next: RepoRef[], base?: RepoRef[]): Promise<RepoWorkflowCapability[]> => {
+    // Applied the way `github:setRepos` applies it — core's own edit rule against what is stored now — so
+    // a test that changes the "store" behind the window's back sees what the real stack would keep. A
+    // seeded `githubRepos` problem whose defect is `'value'` stands for a stored value that is not a list,
+    // which the real store's read guard answers as an unusable `[]`; the stub models that rather than
+    // diffing against `stored`. A mixed or all-invalid *array* is still the list as stored, exactly as the
+    // registrar reads it (`observed.defect !== 'value'`), so it keeps the diff. A mirror of that rule, not a
+    // test of it: no renderer test tells the two apart, and `core/repo-registry.test.ts` is what pins it.
+    const usable = problems.find((problem) => problem.field === 'githubRepos')?.defect !== 'value'
+    stored = applyRepoListEdit(usable ? stored : [], base, next, usable).map((repo) => ({ ...repo }))
     // A repository-list write replaces `githubRepos` and nothing else — `store.set` writes one key, and
     // `describeStoredProblems` re-evaluates the rest — so a stub that healed every field would make the
     // natural mixed-state test fail against a *correct* renderer once a second field is guarded.
@@ -152,9 +161,16 @@ export function createElectronApiStub(initialRepos: RepoRef[] = [], initialProbl
     listWorkflowTasks,
     /** What the fake store holds right now — the assertion target for "did the write land". */
     storedRepos: () => stored.map((repo) => ({ ...repo })),
-    /** For a `setRepos` override that defers: apply the write the default implementation would have. */
+    /**
+     * For a `setRepos` override that defers: store `next` wholesale — the write the default implementation
+     * makes when nothing changed the store since the edit's base, which is the case those tests stage.
+     */
     applyRepos: (next: RepoRef[]) => {
       stored = next.map((repo) => ({ ...repo }))
+    },
+    /** Replaces what the fake store reports as unusable, as a hand-edit made while the window is open would. */
+    setStoreProblems: (next: StoredValueProblem[]) => {
+      problems = next
     },
     recoveryRequired,
     confirmQueueRecovery,

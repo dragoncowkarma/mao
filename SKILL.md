@@ -139,6 +139,58 @@ npm run cli -- swarm --repo-root /path/to/repo --status
 npm run cli -- swarm --repo-root /path/to/repo --dry-run --once
 ```
 
+**Several MAO processes on one config file (issue #73).** A long-running `mao run` (or the desktop
+app) beside one-shot commands in other terminals is supported. Every write replaces only the key it is
+for, merged into the file **as it is now** and swapped in atomically (a temporary file renamed over
+`config.json`), under a cross-process lock file `config.json.lock`. The CLI's write keeps the file's
+permission bits and owner, and writes *through* a symlinked `config.json` rather than replacing the link.
+A `config.json` that cannot be renamed over — a single-file bind mount such as `docker run -v
+./config.json:/data/config.json` — is rewritten in place instead, as every write was before; still under
+the lock, but a reader that takes no lock can catch that one write half-done. The desktop app writes through electron-store, which does not keep a tightened mode — a `chmod 600` there
+returns to the default on its next write, as it always has. So a
+`mao repos remove`, `config set-token`, `import-providers` or theme change made while `mao run` is up is
+no longer reverted by its next queue write — including the `githubRepos` recovery below. What each kind
+of value does when two processes change *the same* key:
+
+| Value | Policy |
+| --- | --- |
+| `githubToken`, `theme`, `buildSha`, `import-providers` | stated outright, so the last write wins |
+| tracked repositories (`repos add`/`remove`) | written only if unchanged since read; a list another process changed meanwhile is re-planned — your add or remove is applied to the current list and re-preflighted — up to three times, then "Nothing was written" |
+| tracked repositories (the desktop app) | the window sends the list its edit was based on, so only what you changed there is applied to the list as stored now: a repository added or removed in a terminal since the window loaded stays that way, and a setting changed elsewhere survives a toggle of a different one. A settings edit to a repository removed elsewhere is dropped rather than re-adding it |
+| provider list from Global settings | written only if the stored list is still the one the pane loaded (or last saved), else "reopen Global settings and apply the edit again" — so a `mao config import-providers` made while the pane is open is not deleted by its next Save |
+| workflow queue | written only if it is still the queue this process last read or wrote |
+
+The queue is the one to plan around. Two hosts running one queue are two engines able to repeat the same
+GitHub work, so a host whose queue another process changed **refuses to overwrite it**: the stage it was
+starting goes to `error` with "another MAO process changed the stored workflow queue…", and the engine
+stops running stages and records `workflowPersistenceBroken` (`mao run` prints why). Run one queue host
+per config file — `mao run`, the desktop app, or a one-shot `mao workflow enqueue`/`retry`/`advance`
+(which process the queue in the foreground). If it happens: stop the others, check `mao workflow list` and
+the target repos for work either may have repeated, run `mao config clear-persistence-broken`, and
+restart. A queue that becomes *unusable* (hand-corrupted) after a clean start is the exception — that
+session still rewrites it from the queue it holds, as described below, provided every readable task left
+in it is one that session itself loaded or wrote (an older copy of its own task, such as an editor buffer
+saved late, counts); a value still holding another host's *readable* task is refused like any other
+conflict. (An entry no build here can read cannot be told apart from corruption, so it is
+discarded either way.) An enqueue whose write is refused keeps nothing: the command (or the auto-trigger poll) fails, and
+the issue is picked up once a host whose queue is current enqueues it, as one task rather than two. A host
+that is idle when another process changes its queue is refused the same way but trips nothing — no stage
+was running — so it keeps refusing, and `mao run` logs the conflict on every poll, until it is restarted
+and loads the queue as it is now.
+
+A write that finds the lock held waits up to five seconds, then fails with "Nothing was written", the
+holder's pid and the lock path. A lock left by a process that died mid-write is broken automatically once
+its pid is gone from this host — or names the writing process's own pid on a lock it does not hold, which
+is a restart under the same pid — or after 30 s if it cannot be identified (another host on a shared
+volume); delete `config.json.lock` by hand only if no MAO process is running. A write to a `config.json`
+that exists but cannot be read is refused rather than merged into an empty file, so the token and
+everything else in it survive.
+
+`mao run` reads the repository list it polls fresh on every scheduler tick, so a `repos add` or `repos
+remove` from another terminal takes effect on its next tick. Its GitHub token and AI providers are still
+read at boot: a `set-token` or `import-providers` made while it is up is kept in the file, not undone, but
+`mao run` keeps using what it started with until it is restarted.
+
 **Repository write-permission preflight.** `repos add` refuses to register a repo the current
 GitHub credential cannot run the pipeline against, leaving the stored list untouched and printing
 the repo name plus every missing capability. It is one non-mutating `GET /repos/{owner}/{repo}` —
@@ -343,7 +395,7 @@ the file immediately before it writes, and reports only what that established:
 | --- | --- |
 | recovered the stored workflow queue | the value was still unusable right before the write; its fresh readable subset was retained, invalid entries were deleted, and the write did not throw. Durable readable entries are preserved as observed; in memory, a retained `running` task is restored as `pending` with `active` cleared. Confirmation itself does not resume tasks. The one-shot CLI exits, so use `mao run`; in an already-running host, later queue activity or an auto-trigger enqueue may process retained tasks after the latch is released |
 | reads normally — nothing written | something else repaired the file first (a hand-edit, or the same command in another terminal). **Nothing is written**, because this process still holds only its filtered startup subset and writing it would destroy that repair. Restart to load the real one |
-| restart required — nothing written | this process observed a whole-file read failure. Even if the file is readable now, its startup snapshot cannot safely write one field without overwriting the repaired token, providers, repositories or queue. Repair the file if needed, then restart MAO |
+| restart required — nothing written | this process observed a whole-file read failure. Even if the file is readable now, it keeps the halt rather than reconsider the repair from what it loaded at startup (its token, providers and queue). Repair the file if needed, then restart MAO |
 | the stored queue changed while confirming | the value moved between the check and the write, so the write refused and **nothing was written**. Something else is writing the file — re-check it and retry |
 | the replacement was invalid | prospective validation rejected the replacement before the comparison or backend write, so **nothing was written** and the halt remains |
 | the replacement write failed | the attempt threw, so what reached the file is unknown. MAO records the persistence-broken marker and blocks all queue work. Reconcile the stored queue with GitHub, clear the marker through the matching CLI/GUI recovery path, then restart |
@@ -351,18 +403,21 @@ the file immediately before it writes, and reports only what that established:
 None of those messages quotes the underlying error, because an I/O or parse failure can echo the file's
 own bytes and that file holds your GitHub token in plaintext.
 
-That check **narrows** the window; it does not close it. The comparison and the write are one
-synchronous step, so against anything else in the same process they are atomic — but another OS process
-repairing the file inside that step, or writing *after* it, still wins or still loses depending on
-timing, and the command will say `discarded` either way. That is the ordinary multi-process lost update
-every field in this single-blob config shares (issue #73). So: do not run two recoveries at once, and do
-not hand-edit the file while a recovery is running, and expect a clean winner.
+Against other MAO processes that check is exclusive: the comparison and the write run under the config
+file's write lock (`config.json.lock`, see "Several MAO processes on one config file" above), so a second
+recovery, a `mao run` or the desktop app cannot write between them. It is **not** exclusive against a
+writer that takes no lock — a hand-edit, or another tool — which can still land inside that step and be
+overwritten while the command reports success. So: do not hand-edit the file while a recovery is running
+and expect a clean winner. A recovery that finds another MAO process holding the lock for more than five
+seconds says "Nothing was written" and names the holder; retry once it has finished.
 
 **A wrong-shaped `workflowTasks` field found after a clean start does not halt that session — and
 `confirm-queue-recovery` is the wrong tool for it.** The latch is decided at boot, so if that one field
 is changed to an unusable shape in a file MAO can still load, the engine is still holding the queue it
-loaded and its next queue write can rewrite the field from it. The sidebar says exactly that, in its own
-words rather than repeating the store's boot-time "automation is halted" report.
+loaded and its next queue write can rewrite the field from it — unless the field now also holds readable
+tasks that session never loaded or wrote, in which case the write is refused rather than deleting them
+(see "Several MAO processes on one config file" above). The sidebar says exactly that, in its own words
+rather than repeating the store's boot-time "automation is halted" report.
 
 Do **not** reach for `mao workflow confirm-queue-recovery` in that state. It discards invalid entries,
 and run in a separate process it writes **that** process's corrected startup subset over the file — often
@@ -372,7 +427,10 @@ session's queue now**, which rewrites the file from the queue the running proces
 (`MaoApp.resaveStoredQueue()`). It is the *same* conditional write the discard uses — observe the store
 fresh, write only if the value has not moved, report what was established — and it refuses while that
 session is halted, because a halted session's queue is only a filtered startup subset and saving it would
-make this a silent discard. So it can also answer "nothing was written": if something repaired the file first,
+make this a silent discard. For the same reason as the automatic rewrite, it also refuses — "nothing was
+written", naming why — when the file holds readable tasks this session never loaded or wrote, and tells you
+to stop every MAO host before recovering. So it can also
+answer "nothing was written": if something repaired the file first,
 you are told rather than left assuming the click saved anything.
 With no GUI open, the safe equivalent for this **field-only** state is to let the running `mao run` reach
 its next queue write, or to stop it and then recover — not to discard from a second terminal while it is
@@ -384,8 +442,9 @@ every store write is refused. Both long-lived hosts give auto-trigger a fresh `i
 rather than `FileStore.get()`'s boot snapshot, so repository polling latches the process before any
 GitHub call. Every public queue mutation performs the same fresh readiness check before changing memory;
 an in-flight workflow stops when it next tries to persist. Once observed, this halt is monotone even if
-the file becomes readable again: a live `FileStore` still holds its complete boot snapshot and must not
-overwrite the repair. The engine remembers that whole-file origin separately from the current problem
+the file becomes readable again: what the process loaded at boot — its token, providers and queue — may
+predate the repair, so it does not carry on from it. (Each write itself merges into a fresh read of the
+file since issue #73, so that is now the conservative choice rather than the only safe one.) The engine remembers that whole-file origin separately from the current problem
 shape, so repairing into a file whose `workflowTasks` alone is still malformed does not make the recovery
 button safe again. There is no usable **Save this session's queue** or
 `confirm-queue-recovery` action in that process. Stop the headless process if one is running, repair the
@@ -439,8 +498,9 @@ Any write exits 1 and changes nothing:
 ```
 $ mao config set-theme dark
 [mao] [store] Refusing to write "theme" to /path/to/config.json, because the file could not be read.
-A write replaces the whole file, so it would overwrite the stored GitHub token, AI providers, tracked
-repositories and workflow queue with schema defaults. Nothing has been written ...
+A write carries every other setting over from the file, so writing one it cannot read would overwrite the
+stored GitHub token, AI providers, tracked repositories and workflow queue with schema defaults. Nothing
+has been written ...
 ```
 
 Before this, that same command exited **0**, printed `Theme preference set to dark`, and replaced the file
@@ -710,7 +770,14 @@ Two traps:
    the report gates a destructive control in a shell, flatten that decision into `StoredValueProblem` in
    core (as `nothingUsable` does) rather than letting the shell compare defect kinds, so a new kind fails
    closed. A per-shape table test in `core/store.test.ts` goes with every new rule.
-3. Renderer needs it? Add get/set IPC channels (recipe above). CLI needs it?
+3. Decide what happens when two processes change it at once (issue #73) — `MaoStore.set` already keeps
+   every *other* key intact, so this is only about the field itself. A value the operator states outright
+   (a token, a theme) can use plain `set`: last writer wins. A value **derived from a read** — a list
+   edited in place, anything an engine advances — must write with `setIfUnchanged`, keyed on the
+   `inspect()` it was derived from, and decide what `'superseded'` means for it: re-plan (as
+   `createRepoRegistrar` does) or refuse (as the queue does). A plain `set` there loses another process's
+   change without a word.
+4. Renderer needs it? Add get/set IPC channels (recipe above). CLI needs it?
    Extend `cli/index.ts` (keep `config show` redaction for anything secret).
 
 ### Add a pipeline stage
@@ -900,6 +967,8 @@ are fresh observations limited to recovery, auto-trigger and imminent public-wri
 report's scope match the correction's (reported more than corrected is allowed, the reverse is not), and
 does every destructive control the report offers gate on `nothingUsable` rather than on the problem
 merely existing?,
+a new store write — does a value derived from a read write conditionally, and does a new backend
+merge into the file as it is now and take `withFileWriteLock`?,
 domain invariants (maker-checker, CI gate, timeouts, error-not-crash), secrets
 hygiene, then style (match surrounding code — there is no autoformatter).
 

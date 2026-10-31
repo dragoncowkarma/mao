@@ -22,7 +22,8 @@ declare global {
       }
       ai: {
         list: () => Promise<AiProviderConfig[]>
-        save: (providers: AiProviderConfig[]) => Promise<AiProviderConfig[]>
+        /** `base` is the list the editor loaded: the save is refused if the stored list moved since. */
+        save: (providers: AiProviderConfig[], base?: AiProviderConfig[]) => Promise<AiProviderConfig[]>
         run: (providerId: string, prompt: string) => Promise<string>
       }
       github: {
@@ -33,8 +34,11 @@ declare global {
          * Rejects (leaving the stored list untouched) when a newly added repo fails the write-permission
          * preflight. Resolves with the verdict for each newly registered repo, whose `unverified` grants
          * the caller should surface — a pass is not proof of write access.
+         *
+         * `base` is the list the edit was computed from; core applies only what changed between the two to
+         * the list stored now, so a stale mirror cannot revert another process's change (issue #73).
          */
-        setRepos: (repos: RepoRef[]) => Promise<RepoWorkflowCapability[]>
+        setRepos: (repos: RepoRef[], base?: RepoRef[]) => Promise<RepoWorkflowCapability[]>
         getRepos: () => Promise<RepoRef[]>
         autoTriggerStatus: (owner: string, repo: string) => Promise<AutoTriggerStatus>
         refreshRepo: (owner: string, repo: string) => Promise<GithubTask[]>

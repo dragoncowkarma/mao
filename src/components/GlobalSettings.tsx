@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { electronApi } from '../electron-api'
 import type { AgentStage, AiProviderConfig, ModelEffortPreset, ProviderKindId } from '../../core/ai/types'
 import { PROVIDER_OPTIONS } from '../../core/ai/provider-options'
@@ -383,41 +383,131 @@ function ProviderCard({ provider: p, onUpdate, onRemove }: ProviderCardProps) {
 export default function GlobalSettings({ theme, onThemeChange }: GlobalSettingsProps) {
   const [githubToken, setGithubToken] = useState('')
   const [providers, setProviders] = useState<AiProviderConfig[]>([])
+  /**
+   * The provider list as stored when this pane last loaded or saved it — what the edits in `providers` are
+   * derived from. Sent with every save so core refuses one that would land over a list another process
+   * changed meanwhile (a `mao config import-providers` in a terminal, say), instead of deleting it and its
+   * API keys (issue #73). A JSON copy, never a shared reference, so no edit can reach it, and so it
+   * compares the way core compares stored values.
+   */
+  const [loadedProviders, setLoadedProviders] = useState<AiProviderConfig[] | undefined>(undefined)
   const [savedMessage, setSavedMessage] = useState('')
   const [saveError, setSaveError] = useState('')
+  /**
+   * A save is in flight. Both clicks of a double-click would otherwise carry the same base, and the second
+   * would be refused as "another process changed the list" — by the first click's own write.
+   */
+  const [saving, setSaving] = useState(false)
+  /**
+   * The provider list could not be loaded. Its own state rather than `saveError`, which every Save clears:
+   * a token-only Save used to wipe the warning and leave "Saved" beside an empty pane — exactly the "no
+   * providers yet" misreading the warning exists to prevent.
+   */
+  const [loadFailed, setLoadFailed] = useState(false)
+  /**
+   * Ids of providers the operator added in this pane and has not saved yet — the only editor entries a
+   * reload may carry over. Anything else the editor holds came from a load, and keeping it across a newer
+   * load would resurrect a provider deleted elsewhere in between, API key and all.
+   */
+  const unsavedAdditions = useRef(new Set<string>())
+  /** Bumped per load; only the most recently started load's answer is applied (Retry clicks, StrictMode). */
+  const loadGeneration = useRef(0)
+  /** Whether the save error on screen is the never-loaded refusal — the one a successful load makes moot. */
+  const saveErrorIsBlindRefusal = useRef(false)
 
-  useEffect(() => {
-    electronApi().ai.list().then(setProviders)
-  }, [])
+  function showSaveError(message: string, blindRefusal = false) {
+    setSaveError(message)
+    saveErrorIsBlindRefusal.current = blindRefusal
+  }
+
+  function loadProviders() {
+    const generation = (loadGeneration.current += 1)
+    electronApi()
+      .ai.list()
+      .then(
+        (list) => {
+          if (generation !== loadGeneration.current) return
+          // A provider the operator added while the load had failed is kept as an unsaved edit on top of
+          // the list now loaded, rather than silently discarded with its API key; the next Save writes both
+          // against this load.
+          setProviders((current) => [
+            ...list,
+            ...current.filter((p) => unsavedAdditions.current.has(p.id) && !list.some((loaded) => loaded.id === p.id)),
+          ])
+          setLoadedProviders(JSON.parse(JSON.stringify(list)) as AiProviderConfig[])
+          setLoadFailed(false)
+          // The refusal a Save gave while the list was missing no longer applies once it is here. Any other
+          // error — a token write that failed, say — still does, and stays.
+          if (saveErrorIsBlindRefusal.current) showSaveError('')
+        },
+        // Said, not swallowed: an empty pane after a failed load reads exactly like "no providers yet",
+        // and saving from it would replace the real list blind. The error text is not shown — a parse
+        // failure can quote the config file, and the GitHub token is stored in it in plain text.
+        () => {
+          if (generation === loadGeneration.current) setLoadFailed(true)
+        },
+      )
+  }
+
+  useEffect(loadProviders, [])
 
   function updateProvider(id: string, patch: Partial<AiProviderConfig>) {
     setProviders((prev) => prev.map((p) => (p.id === id ? { ...p, ...patch } : p)))
   }
 
   function addProvider() {
-    setProviders((prev) => [...prev, emptyProvider()])
+    const added = emptyProvider()
+    unsavedAdditions.current.add(added.id)
+    setProviders((prev) => [...prev, added])
   }
 
   function removeProvider(id: string) {
+    unsavedAdditions.current.delete(id)
     setProviders((prev) => prev.filter((p) => p.id !== id))
   }
 
   async function saveAll() {
-    setSaveError('')
+    if (saving) return
+    showSaveError('')
 
     const errors = validateProviders(providers)
     if (errors.length > 0) {
-      setSaveError(errors.join(' '))
+      showSaveError(errors.join(' '))
       return
     }
 
+    // Only a provider list that was edited is written. An unchanged one has nothing to say, and writing it
+    // anyway let an unrelated change made elsewhere (an import in a terminal) refuse a token-only save.
+    const providersChanged =
+      loadedProviders === undefined
+        ? providers.length > 0
+        : JSON.stringify(providers) !== JSON.stringify(loadedProviders)
+    if (providersChanged && loadedProviders === undefined) {
+      showSaveError(
+        'The stored AI provider list was never loaded, so saving these providers would replace it blind. ' +
+          'Nothing was saved. Retry loading providers, then save again.',
+        true,
+      )
+      return
+    }
+
+    setSaving(true)
     try {
-      await electronApi().ai.save(providers)
+      if (providersChanged) {
+        await electronApi().ai.save(providers, loadedProviders)
+        // What is stored now is what was just saved, so it is the base the next save is derived from — and
+        // nothing in the editor is an unsaved addition any more.
+        setLoadedProviders(JSON.parse(JSON.stringify(providers)) as AiProviderConfig[])
+        unsavedAdditions.current.clear()
+      }
       if (githubToken) await electronApi().github.setToken(githubToken)
-      setSavedMessage('Saved')
+      // Only claim a save that happened.
+      setSavedMessage(providersChanged || githubToken ? 'Saved' : 'Nothing to save')
       setTimeout(() => setSavedMessage(''), 1500)
     } catch (err) {
-      setSaveError(err instanceof Error ? err.message : String(err))
+      showSaveError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setSaving(false)
     }
   }
 
@@ -471,11 +561,23 @@ export default function GlobalSettings({ theme, onThemeChange }: GlobalSettingsP
             onRemove={() => removeProvider(p.id)}
           />
         ))}
-        {providers.length === 0 && <p className="text-muted">No AI providers registered yet.</p>}
+        {loadFailed ? (
+          <div className="flex flex-col items-start gap-2">
+            <p className="text-xs" style={{ color: 'var(--color-accent-700)' }}>
+              The AI provider list could not be loaded, so providers cannot be saved from this pane until it
+              is. Fix the config file, then retry.
+            </p>
+            <button onClick={loadProviders} className="btn btn-secondary text-xs">
+              Retry loading providers
+            </button>
+          </div>
+        ) : (
+          providers.length === 0 && <p className="text-muted">No AI providers registered yet.</p>
+        )}
       </div>
 
       <div className="flex items-center gap-3">
-        <button onClick={saveAll} className="btn btn-primary">
+        <button onClick={saveAll} className="btn btn-primary" disabled={saving}>
           Save changes
         </button>
         {savedMessage && (

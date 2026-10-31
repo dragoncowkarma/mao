@@ -6,13 +6,15 @@ import {
   assertReposRegistrable,
   canonicalRepoList,
   isRepoRef,
+  applyRepoListEdit,
   createRepoRegistrar,
+  MAX_REPO_LIST_ATTEMPTS,
   repoRefKey,
   reposNeedingCapabilityCheck,
   sameRepoRef,
 } from './repo-registry.ts'
 import { RepoCapabilityError, evaluateRepoCapability } from './repo-capabilities.ts'
-import { FileStore } from './store.ts'
+import { FileStore, type MaoStore } from './store.ts'
 import type { GithubService } from './github-service.ts'
 import type { RepoRef } from './workflow-engine.ts'
 
@@ -40,6 +42,29 @@ function makeRealStore(contents?: unknown): FileStore {
 /** The store's read guard reports an unusable list through console.warn; keep it out of test output. */
 function silenceStoreWarnings() {
   return vi.spyOn(console, 'warn').mockImplementation(() => {})
+}
+
+/**
+ * A preflight the test can hold mid-flight. `release()` also opens every *later* call, because a
+ * queued update does not even reach its preflight until the one ahead of it finishes.
+ */
+function deferredGithub() {
+  let open = false
+  const waiting: Array<() => void> = []
+  const github = {
+    assertRepoWorkflowWritable: vi.fn(
+      (owner: string, repo: string) =>
+        new Promise((resolve) => {
+          const settle = () =>
+            resolve(
+              evaluateRepoCapability({ owner, repo, repository: { has_issues: true, permissions: { push: true } } }),
+            )
+          if (open) settle()
+          else waiting.push(settle)
+        }),
+    ),
+  } as unknown as Pick<GithubService, 'assertRepoWorkflowWritable'>
+  return { github, release: () => { open = true; waiting.splice(0).forEach((settle) => settle()) } }
 }
 
 const widgets: RepoRef = { owner: 'acme', repo: 'widgets' }
@@ -379,29 +404,6 @@ describe('assertReposRegistrable', () => {
 })
 
 describe('createRepoRegistrar', () => {
-  /**
-   * A preflight the test can hold mid-flight. `release()` also opens every *later* call, because a
-   * queued update does not even reach its preflight until the one ahead of it finishes.
-   */
-  function deferredGithub() {
-    let open = false
-    const waiting: Array<() => void> = []
-    const github = {
-      assertRepoWorkflowWritable: vi.fn(
-        (owner: string, repo: string) =>
-          new Promise((resolve) => {
-            const settle = () =>
-              resolve(
-                evaluateRepoCapability({ owner, repo, repository: { has_issues: true, permissions: { push: true } } }),
-              )
-            if (open) settle()
-            else waiting.push(settle)
-          }),
-      ),
-    } as unknown as Pick<GithubService, 'assertRepoWorkflowWritable'>
-    return { github, release: () => { open = true; waiting.splice(0).forEach((settle) => settle()) } }
-  }
-
   it('does not resurrect a repo removed while its registration was still being preflighted', async () => {
     // The regression the review asked for, in the shape the GUI actually produces: the renderer sends
     // the whole list each time, computed from what it is optimistically showing. Before serialization
@@ -731,5 +733,252 @@ describe('createRepoRegistrar', () => {
     // A removal introduces nothing new, so it still never preflights — that exemption must survive here
     // too, or a repo whose access was revoked would be unremovable on top of being unreadable.
     expect(github.assertRepoWorkflowWritable).not.toHaveBeenCalled()
+  })
+})
+
+/**
+ * The registrar beside another MAO process on the same `config.json` — issue #73.
+ *
+ * Its in-process queue serializes one process's updates. Two processes each read, preflight for a
+ * second, and write, so without a conditional write the slower one put back a repository the other had
+ * just removed — the very resurrection the queue exists to prevent, one process boundary further out.
+ */
+describe('createRepoRegistrar across processes (issue #73)', () => {
+  const filePathOf = (store: FileStore) => (store as unknown as { filePath: string }).filePath
+
+  it('re-plans against a removal another process made during its preflight, instead of undoing it', async () => {
+    const store = makeRealStore({ githubRepos: [gadgets] })
+    const { github, release } = deferredGithub()
+    const adding = createRepoRegistrar(github, store)((previous) => [...previous, widgets])
+
+    // `mao repos remove acme gadgets`, from another terminal, while the add above is still preflighting.
+    const other = new FileStore(filePathOf(store))
+    await createRepoRegistrar(passingGithub(), other)((previous) => previous.filter((r) => !sameRepoRef(r, gadgets)))
+    expect(new FileStore(filePathOf(store)).get('githubRepos')).toEqual([])
+
+    release()
+    await adding
+
+    // The add landed on the list as it is now: gadgets stays removed, widgets is added.
+    expect(new FileStore(filePathOf(store)).get('githubRepos')).toEqual([widgets])
+    // Re-planned, so the entry new relative to the fresh list was preflighted again before the write.
+    expect(github.assertRepoWorkflowWritable).toHaveBeenCalledTimes(2)
+  })
+
+  it('gives up, writing nothing, when the list keeps moving', async () => {
+    let attempts = 0
+    const store: Pick<MaoStore, 'inspect' | 'setIfUnchanged'> = {
+      inspect: () => ({ value: [], problem: undefined, readable: true, witness: '[]' }) as never,
+      setIfUnchanged: () => {
+        attempts += 1
+        return 'superseded'
+      },
+    }
+    const updateRepos = createRepoRegistrar(passingGithub(), store)
+
+    await expect(updateRepos((previous) => [...previous, widgets])).rejects.toThrow(/Nothing was written/)
+    expect(attempts).toBe(MAX_REPO_LIST_ATTEMPTS)
+  })
+
+  it('refuses outright when the stored list cannot be read, before planning or preflighting anything', async () => {
+    // Merging a list into a file that could not be read would replace everything in it with defaults —
+    // the token included. An add is the discriminating case: without the up-front refusal it would read
+    // as an empty list, count widgets as new, spend a preflight on it, and only then fail at the compare.
+    silenceStoreWarnings()
+    const store = makeRealStore({ githubRepos: [gadgets] })
+    fs.writeFileSync(filePathOf(store), '{"githubToken": "ghp_SENTINEL_SECRET", ')
+    const github = passingGithub()
+
+    const outcome = createRepoRegistrar(github, store)((previous) => [...previous, widgets])
+
+    await expect(outcome).rejects.toThrow(/Nothing was written\. \[store\] MAO could not read "githubRepos"/)
+    await expect(outcome).rejects.not.toThrow(/ghp_SENTINEL_SECRET/)
+    expect(fs.readFileSync(filePathOf(store), 'utf-8')).toBe('{"githubToken": "ghp_SENTINEL_SECRET", ')
+    expect(github.assertRepoWorkflowWritable).not.toHaveBeenCalled()
+  })
+})
+
+/**
+ * `applyRepoListEdit` — how a whole-list edit from the GUI, computed against its own mirror, lands on the
+ * list stored now (issue #73). Each rule is the one a stale mirror would otherwise break.
+ */
+describe('applyRepoListEdit', () => {
+  it('is the edit itself while the stored list is still the one it was computed from', () => {
+    const next = [{ ...gadgets, pollIntervalMs: 9 }, widgets]
+    expect(applyRepoListEdit([gadgets], [gadgets], next)).toBe(next)
+  })
+
+  it('is the edit itself for a caller that sends no base', () => {
+    const next = [widgets]
+    expect(applyRepoListEdit([gadgets], undefined, next)).toBe(next)
+  })
+
+  it('removes what the edit removed and keeps what another process added', () => {
+    const third: RepoRef = { owner: 'acme', repo: 'third' }
+    expect(applyRepoListEdit([gadgets, widgets, third], [gadgets, widgets], [gadgets])).toEqual([gadgets, third])
+  })
+
+  it('does not put back a repository another process removed when the edit changes a different one', () => {
+    // The reviewer's reproduction: a settings toggle on gadgets used to re-send widgets too.
+    expect(applyRepoListEdit([gadgets], [gadgets, widgets], [{ ...gadgets, autoTrigger: false }, widgets])).toEqual([
+      { ...gadgets, autoTrigger: false },
+    ])
+  })
+
+  it('drops a settings edit to a repository another process removed, rather than re-adding it', () => {
+    expect(applyRepoListEdit([gadgets], [gadgets, widgets], [gadgets, { ...widgets, pollIntervalMs: 5 }])).toEqual([
+      gadgets,
+    ])
+  })
+
+  it('applies only the fields the edit changed, so a setting changed elsewhere survives', () => {
+    // Another process turned polling off; the window changed only the interval.
+    const stored = [{ ...gadgets, autoTrigger: false }]
+    expect(applyRepoListEdit(stored, [gadgets], [{ ...gadgets, pollIntervalMs: 60_000 }])).toEqual([
+      { ...gadgets, autoTrigger: false, pollIntervalMs: 60_000 },
+    ])
+  })
+
+  it('deletes a field the edit cleared', () => {
+    const stored = [{ ...gadgets, pollIntervalMs: 5, autoTrigger: false }]
+    expect(applyRepoListEdit(stored, [{ ...gadgets, pollIntervalMs: 5 }], [gadgets])).toEqual([
+      { ...gadgets, autoTrigger: false },
+    ])
+  })
+
+  it('appends an added repository, and leaves one added elsewhere too for canonicalRepoList to fold', () => {
+    const stored = [gadgets, { ...widgets, autoTrigger: false }]
+    const edited = applyRepoListEdit(stored, [gadgets], [gadgets, widgets])
+    expect(edited).toEqual([gadgets, { ...widgets, autoTrigger: false }, widgets])
+    // The fold keeps the stored entry's settings, autoTrigger: false included — as a bare Add always has.
+    expect(canonicalRepoList(stored, edited)).toEqual([gadgets, { ...widgets, autoTrigger: false }])
+  })
+
+  it('replaces a repository listed more than once wholesale, since a field edit names no occurrence', () => {
+    const stored = [gadgets, widgetsShouted, widgets, { owner: 'acme', repo: 'third' }]
+    const base = [gadgets, widgetsShouted, widgets]
+    const next = [gadgets, { ...widgetsShouted, autoTrigger: false }, widgets]
+    expect(applyRepoListEdit(stored, base, next)).toEqual([
+      gadgets,
+      { ...widgetsShouted, autoTrigger: false },
+      widgets,
+      { owner: 'acme', repo: 'third' },
+    ])
+  })
+
+  it('carries forward a row the stored list may have mangled, rather than dropping it', () => {
+    // A mangled row may be what is left of a repository the window still shows; reading that repository
+    // as removed elsewhere would drop it from the window's edit.
+    const mangled = { ownr: 'acme', repo: 'widgets' } as unknown as RepoRef
+    const next = [gadgets, { ...widgets, pollIntervalMs: 9 }]
+    expect(canonicalRepoList([gadgets, mangled], applyRepoListEdit([gadgets, mangled], [gadgets, widgets], next))).toEqual(
+      next,
+    )
+  })
+
+  it('keeps stored settings and additions when the stored list also holds a mangled row', () => {
+    // The fourth review's reproduction: one hand-edit turned polling off for gadgets, added extra, left
+    // tools out — and mangled the widgets row. The window then changed its own copy of widgets. Returning
+    // the window's whole list reverted autoTrigger: false (unattended polling back on) and dropped extra.
+    // Now every usable stored entry is kept as stored. What stays ambiguous is a repository the window
+    // lists that the stored list does not name — tools here as much as widgets — since "removed" and
+    // "mangled" look the same; those are carried forward in the window's version and preflighted.
+    const tools: RepoRef = { owner: 'acme', repo: 'tools' }
+    const extra: RepoRef = { owner: 'acme', repo: 'extra' }
+    const mangled = { ownr: 'acme', repo: 'widgets' } as unknown as RepoRef
+    const previous = [{ ...gadgets, autoTrigger: false }, mangled, extra]
+    const base = [gadgets, widgets, tools]
+    const next = [gadgets, { ...widgets, pollIntervalMs: 60_000 }, tools]
+
+    expect(canonicalRepoList(previous, applyRepoListEdit(previous, base, next))).toEqual([
+      { ...gadgets, autoTrigger: false },
+      extra,
+      { ...widgets, pollIntervalMs: 60_000 },
+      tools,
+    ])
+  })
+  it('is the whole edit over a stored value that was not a list, rather than a diff against nothing', () => {
+    // The guard answers an unusable value as [], which read as a list would make every repository the
+    // window shows look removed elsewhere — and a settings toggle would then write [] unpreflighted.
+    const next = [{ ...gadgets, pollIntervalMs: 9 }, widgets]
+    expect(applyRepoListEdit([], [gadgets, widgets], next, false)).toBe(next)
+  })
+})
+
+describe('createRepoRegistrar with the GUI-shaped edit (issue #73)', () => {
+  const filePathOf = (store: FileStore) => (store as unknown as { filePath: string }).filePath
+
+  it('rewrites the window list, preflighted, when a settings edit lands on an unusable stored value', async () => {
+    // The second review's reproduction. The window still lists [gadgets{autoTrigger:false}, widgets] while
+    // a hand-edit has left githubRepos an object. Diffing against the guard's [] dropped the edit and every
+    // untouched row, so the toggle wrote [] with no preflight — losing the only usable copy of the list and
+    // gadgets' autoTrigger: false with it.
+    silenceStoreWarnings()
+    const store = makeRealStore({ githubRepos: { broken: true } })
+    const github = passingGithub()
+    const base = [{ ...gadgets, autoTrigger: false }, widgets]
+    const next = [{ ...gadgets, autoTrigger: false, pollIntervalMs: 60_000 }, widgets]
+
+    await createRepoRegistrar(github, store)((previous, stored) => applyRepoListEdit(previous, base, next, stored.usable))
+
+    expect(new FileStore(filePathOf(store)).get('githubRepos')).toEqual(next)
+    // Every entry counts as a first registration, exactly as before the base existed.
+    expect(github.assertRepoWorkflowWritable).toHaveBeenCalledTimes(2)
+  })
+
+  it('rewrites the window list when the stored list holds only entries that are not repositories', async () => {
+    // The container passes the guard, so this is "usable" to the registrar — but it names no repository.
+    silenceStoreWarnings()
+    const store = makeRealStore({ githubRepos: [null] })
+    const github = passingGithub()
+    const base = [gadgets, widgets]
+    const next = [gadgets, { ...widgets, pollIntervalMs: 60_000 }]
+
+    await createRepoRegistrar(github, store)((previous, stored) => applyRepoListEdit(previous, base, next, stored.usable))
+
+    expect(new FileStore(filePathOf(store)).get('githubRepos')).toEqual(next)
+    expect(github.assertRepoWorkflowWritable).toHaveBeenCalledTimes(2)
+  })
+
+  it('keeps the field-level merge when the stored list is mixed, rather than writing the window list', async () => {
+    // The review of the main merge. Since #93 the read guard reports a *mixed* array too, so keying
+    // `usable` on "no problem" sent this list down the whole-list path: the window's stale [A] deleted B
+    // and turned A's hand-set `autoTrigger: false` back on. A mixed array is still the list as stored —
+    // only a value that is not an array at all leaves nothing to diff against.
+    silenceStoreWarnings()
+    const stored = { ...gadgets, autoTrigger: false, pollIntervalMs: 30_000 }
+    const store = makeRealStore({ githubRepos: [stored, widgets, null] })
+    const github = passingGithub()
+    const base = [{ ...gadgets, autoTrigger: true, pollIntervalMs: 30_000 }]
+    const next = [{ ...gadgets, autoTrigger: true, pollIntervalMs: 60_000 }]
+
+    await createRepoRegistrar(github, store)((previous, observed) =>
+      applyRepoListEdit(previous, base, next, observed.usable),
+    )
+
+    expect(new FileStore(filePathOf(store)).get('githubRepos')).toEqual([
+      { ...gadgets, autoTrigger: false, pollIntervalMs: 60_000 },
+      widgets,
+    ])
+    // Both are already tracked, so nothing is a first registration.
+    expect(github.assertRepoWorkflowWritable).not.toHaveBeenCalled()
+  })
+
+  it('does not resurrect a repository a terminal removed while a window add was preflighting', async () => {
+    // `github:setRepos` hands core a whole list. Wrapped in applyRepoListEdit with the list it was computed
+    // from, the re-plan applies only "add widgets" to the fresh list, instead of re-sending gadgets.
+    const store = makeRealStore({ githubRepos: [gadgets] })
+    const { github, release } = deferredGithub()
+    const base = [gadgets]
+    const next = [gadgets, widgets]
+    const adding = createRepoRegistrar(github, store)((previous) => applyRepoListEdit(previous, base, next))
+
+    const other = new FileStore(filePathOf(store))
+    await createRepoRegistrar(passingGithub(), other)((previous) => previous.filter((r) => !sameRepoRef(r, gadgets)))
+
+    release()
+    await adding
+
+    expect(new FileStore(filePathOf(store)).get('githubRepos')).toEqual([widgets])
   })
 })

@@ -53,6 +53,9 @@ const configPath = path.join(app.getPath('userData'), 'config.json')
  * Typed as `MaoStore` rather than as the electron-store instance, and the instance is deliberately not
  * exported: the only thing the main process may do with persistence is the core contract, and a handler
  * that reached past it would read unvalidated values with nothing to flag it.
+ *
+ * `openGuardedStoreFile` also gives it the cross-process write lock `FileStore` takes for the same path
+ * (issue #73), so the desktop app and a `mao` CLI pointed at one `config.json` serialize their writes.
  */
 export const store: MaoStore = openGuardedStoreFile(configPath, () =>
   new Store<MaoStoreSchema>({

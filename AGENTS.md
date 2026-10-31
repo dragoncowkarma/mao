@@ -31,20 +31,21 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
 | `core/agent-selection.ts` | Pure, renderer-importable agent routing: `resolveStageAgent()` (maker-checker + role pins + `allowedStages` + model/effort resolution), `isStageEligible()`, `eligibleAgentsForRun()`, `previewStageAgent()`, plus the `WorkflowRole`/`STAGE_ROLE`/`ProviderOverride`/`RunOverride` definitions (re-exported by `core/workflow-engine.ts`, so `core/assignment.ts` and the shells import them unchanged) |
 | `core/github-service.ts` | Octokit REST wrapper (issues, PRs, labels, reviews, merge, CI status) — plus the read-only `checkRepoWorkflowCapability()` / `assertRepoWorkflowWritable()` preflight |
 | `core/repo-capabilities.ts` | Pure verdict logic for "can this credential run the pipeline in this repo?" — `evaluateRepoCapability()`, `describeRepoCapability()`, `describeUnverifiedGrants()`, `RepoCapabilityError` |
-| `core/repo-registry.ts` | Pure, renderer-importable repository identity plus the single definition of "this repo entry is newly registered" — `repoRefKey()`/`sameRepoRef()` (case-insensitive, as GitHub resolves owner/repo), `canonicalRepoList()`, `reposNeedingCapabilityCheck()` / `assertReposRegistrable()`, and the serialized `createRepoRegistrar()` both `github:setRepos` and `mao repos add`/`remove` write through |
+| `core/repo-registry.ts` | Pure, renderer-importable repository identity plus the single definition of "this repo entry is newly registered" — `repoRefKey()`/`sameRepoRef()` (case-insensitive, as GitHub resolves owner/repo), `canonicalRepoList()`, `reposNeedingCapabilityCheck()` / `assertReposRegistrable()`, `applyRepoListEdit()` (a whole-list GUI edit re-applied to the list stored now), and the serialized `createRepoRegistrar()` both `github:setRepos` and `mao repos add`/`remove` write through |
 | `core/provider-import.ts` | CLI-only provider-file import for `mao config import-providers` (no IPC channel): reads and parses input, validates through the store write guard, persists, then logs imported IDs; rejection messages omit parser/backend errors and provider values |
 | `core/git-workspace.ts` | Local git clone/branch/commit/push via `execFile` (no shell) |
 | `core/swarm-runner.ts` | Shell-free launcher and repository/asset validation for the autonomous Swarm Orchestrator |
 | `core/auto-trigger.ts` | Per-repo polling scheduler; auto-enqueues new open issues |
 | `core/assignment.ts` | Issue/PR body directive parser — `parseAssignmentTags()` for swarm_orchestrator-style `[Worker: id]`/`[Reviewer: id]`/`[Maintainer: id]` role tags, and `parseProviderOverride()` which folds those plus task-level `[Model: id]`/`[Effort: level]` tags into a `ProviderOverride` |
-| `core/store.ts` | `MaoStoreSchema`, `MAO_STORE_DEFAULTS`, the `MaoStore` interface, `FileStore` (JSON impl for the CLI), `createStoredReadGuard()` — the read-path guard every backend applies so a field's declared type survives contact with unvalidated JSON — `describeStoredProblems()` behind `MaoStore.problems()`, which answers which stored values the schema cannot fully use, reported whether the guard replaced them, filtered them, or (for `githubRepos`) handed them through; `StoredValueDefect` / `StoredValueProblem.nothingUsable`, the single core-side answer to whether replacing a whole value loses anything, and `describeHealedStoredValue()`, so every operator-facing store string lives here rather than in a shell; and the whole-file tier below all of those — `classifyStoreReadFailure()`/`UnreadableStoreError` plus the write refusal in `createGuardedStore.set()` that closes issue #67 |
+| `core/store.ts` | `MaoStoreSchema`, `MAO_STORE_DEFAULTS`, the `MaoStore` interface, `FileStore` (JSON impl for the CLI, which merges each write into a fresh read of the file), `createStoredReadGuard()` — the read-path guard every backend applies so a field's declared type survives contact with unvalidated JSON — `describeStoredProblems()` behind `MaoStore.problems()`, which answers which stored values the schema cannot fully use, reported whether the guard replaced them, filtered them, or (for `githubRepos`) handed them through; `StoredValueDefect` / `StoredValueProblem.nothingUsable`, the single core-side answer to whether replacing a whole value loses anything, and `describeHealedStoredValue()`, so every operator-facing store string lives here rather than in a shell; the whole-file tier below all of those — `classifyStoreReadFailure()`/`UnreadableStoreError` plus the write refusal in `createGuardedStore.set()` that closes issue #67; and `withFileWriteLock()`, which gives a backend its file's cross-process write lock (issue #73) |
+| `core/store-file.ts` | File-level primitives for the single-blob `config.json` (issue #73): `createStoreWriteLock()` — the `O_EXCL` lock file both backends take around every write, with bounded waits and abandoned-lock breaking — and `writeStoreFileAtomic()`, the temp-file + rename replace `FileStore` writes through |
 | `core/app.ts` | `createMaoApp()` — the **single composition root** both frontends call |
 | `core/paths.ts` | Platform-appropriate data dir for the CLI (mirrors Electron's `userData`) |
 | `core/ai/` | `AiProvider` interface + adapters: `api-provider.ts` (Anthropic / OpenAI-compatible HTTP) and `cli-provider.ts` (spawns `claude`, `codex`, …) |
 | `electron/main.ts` | BrowserWindow, external-link handling, dev/prod load |
 | `electron/ipc.ts` | All `ipcMain.handle` channels — thin delegations only |
 | `electron/preload.ts` | `contextBridge` exposing `window.electronAPI` |
-| `electron/store.ts` | One call: `openGuardedStoreFile(configPath, () => new Store(…))`. The file is judged before conf is constructed, because conf writes merged defaults from its own constructor; the instance is never bound to a name, exported, or read anywhere else |
+| `electron/store.ts` | One call: `openGuardedStoreFile(configPath, () => new Store(…))`. The file is judged before conf is constructed, because conf writes merged defaults from its own constructor; `openGuardedStoreFile` also gives it the same cross-process write lock `FileStore` takes (issue #73); the instance is never bound to a name, exported, or read anywhere else |
 | `src/` | React 18 renderer (Vite + Tailwind); `App.tsx` owns all cross-view state |
 | `src/electron-api.ts` | The renderer's only door to the preload bridge: `setElectronApi()` binds it (production from `src/main.tsx`, tests from a stub), `electronApi()` reads it |
 | `src/test/` | Renderer test harness — `setup.ts` (jsdom polyfills, unmount + unbind between tests) and `electron-api-stub.ts` (a typed fake bridge, `satisfies ElectronApi`) |
@@ -216,7 +217,11 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   `electron/ipc.ts`'s `github:setRepos` and `cli/index.ts`'s `repos add`/`repos remove` must all stay
   thin delegations to `createMaoApp()`'s `updateRepos`. Re-implementing the diff in either shell is how the two paths silently drift.
   A shell's update callback may match entries with core's `sameRepoRef`, but must never normalise or
-  deduplicate the list itself — `updateRepos` owns that (see the identity invariant below).
+  deduplicate the list itself — `updateRepos` owns that (see the identity invariant below). The callback
+  must be a pure function of the list it is handed, because the registrar re-applies it when another
+  process changed the list (issue #73): the CLI's are deltas, and the GUI's whole-list edit travels as
+  `github:setRepos(next, base)` and is wrapped in `applyRepoListEdit(previous, base, next)` — never as a
+  bare `() => next`, which re-plans to the same stale mirror.
   Both shells must also surface `describeUnverifiedGrants()` for the verdicts it returns — a passing
   preflight is not proof of write access, and a shell that stays silent about that claims more than
   the check established.
@@ -241,6 +246,11 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   the guard compiles and then hands every reader a value of the wrong shape — so `core/store.test.ts`
   reads `electron/store.ts`'s source and fails if the instance is referenced anywhere but the
   composition. A field whose shape is checked goes in `STORED_SHAPE_RULES`, not only in the pair above.
+  Its `set` must write that one key into the file **as it is now** (`StoredValueBackend.set`), never put
+  back a snapshot of the others, and a backend over a file must take that file's lock through
+  `withFileWriteLock` — otherwise it reverts, or races, every other process's writes (issue #73).
+  `openGuardedStoreFile` (the Electron path) applies that lock itself, so a backend opened through it gets
+  it without a second wrapper.
 - **Repository capability policy** → `core/repo-capabilities.ts` and the intentionally
   duplicated policy tables/verdict logic in `.agents/workflows/swarm_orchestrator.py` must be
   audited together. Gap ids and reasons, remedy kinds/ranking, public-vs-private scope rules,
@@ -603,15 +613,22 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   emitting the persistence write; that method runs one fresh whole-file readiness probe supplied by
   `createMaoApp`. It probes before returning even an existing field-only latch, so a later whole-file
   outage upgrades that latch to restart-only. Auto-trigger likewise keeps making only this fresh
-  observation while a field-only latch blocks polling. A failure latches before mutation. This is required
-  for snapshot-backed `FileStore`: if a repaired process continued, its next write would replace the
-  complete repair with its startup token, providers, repositories and queue. `runStage()` repeats the
+  observation while a field-only latch blocks polling. A failure latches before mutation. This was
+  required for snapshot-backed `FileStore`: if a repaired process continued, its next write would replace
+  the complete repair with its startup token, providers, repositories and queue. (Since issue #73
+  `FileStore` merges each write into a fresh read, so that overwrite no longer happens; the
+  restart-required latch is kept as the conservative policy, and loosening it is its own change.) `runStage()` repeats the
   same readiness assertion after long awaits and before each external write, so auto-trigger or the stage
   itself can stop an in-flight run before its next side effect. Composite helpers must preserve that last
   boundary internally: `GithubService.createBranch()` and `commitFile()` invoke the engine's guard after
   their awaited reads and immediately before the REST write, while `commitAndPush()` invokes it after the
   local commit and before spawning `git push`. A caller-side check only after those helpers return is too
-  late. Do **not** move the probe into `notify()`:
+  late. The listener's own write, `persistQueue()`, also reads the stored queue — its conditional compare
+  (see the issue #73 bullets below) — but that is a write checking its precondition, not a gate: it
+  decides whether *this* write lands. Every refusal it decides (another process changed the queue, the
+  write lock stayed held, the compare could not read the file) is decided before the backend writes, so
+  it reaches the engine as a `'not-written'` `QueuePersistenceError`; a compare that could not read the
+  file also latches restart-required, as the probe would have. Do **not** move the probe into `notify()`:
   recovery writes do not emit, and a generic emitter cannot distinguish storage from other observers.
   The composition root's `'change'` listener reads the monotone field and throws a nominal,
   value-free `QueuePersistenceError` while halted. Public mutators roll back only a guard refusal known
@@ -648,7 +665,10 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   the swallowing `load()`, and deliberately so: boot coerces, which is what keeps every read-only command
   answering while the file is broken. Issue #67 is answered on the **write** side instead — see the
   write-refusal rail below — which is what the earlier reservation here ("do not quietly change what every
-  boot does while fixing a write path") was asking for.
+  boot does while fixing a write path") was asking for. The same strict loader is what `FileStore.set`
+  merges into (issue #73), so a write that meets an unreadable file even after the write gate passed — a
+  writer that takes no lock replaced it in between — refuses with the gate's own restart-required report
+  rather than merging into `{}` and replacing everything in it.
 - **One observation decides the latch and feeds `restore()`.** `createMaoApp` calls
   `store.inspect(QUEUE_GATING_FIELD)` once (through one guarded helper) and uses that single result for
   both. `get()` and `problems()` are two reads and conf re-reads and re-parses the whole file on every
@@ -658,12 +678,14 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   original. `inspect()` also answers a third state, `readable: false` (the store could not be read at
   all), which is **not** a flavour of "unusable": a caller about to write must refuse on it rather than
   assume the value is the corrupt one it last saw.
-- **`workflowTasks` has two writers, both in `core/app.ts`.** The engine's `'change'` listener, and
-  `healStoredQueue()`'s conditional replacement — the single write behind *both* operator actions. It
-  cannot go through the listener, because it must be refused when the stored value has moved and `emit()`
-  cannot report that back; and it must not go through the engine, which holds no store reference (rule 3).
-  Two call sites in the composition root, and still nothing outside it: no shell, and no other `core/`
-  module, writes the field.
+- **`workflowTasks` has two writers, both in `core/app.ts`, and both are conditional.** The engine's
+  `'change'` listener (`persistQueue()`), and `healStoredQueue()`'s conditional replacement — the single
+  write behind *both* operator actions. The recovery cannot go through the listener, because it must be
+  refused when the stored value has moved and `emit()` cannot report that back; and it must not go through
+  the engine, which holds no store reference (rule 3). Two call sites in the composition root, and still
+  nothing outside it: no shell, and no other `core/` module, writes the field. Both record what they wrote
+  in `persistedQueueWitness`, the base the next write is keyed on — a recovery that forgot to would have
+  the engine's very next change refuse its own recovery as another process's work.
 - **The recovery and the late re-save share one implementation, deliberately.** They use the same
   observe/conditional-write sequence with different preconditions and replacement sources. A halted
   confirmation writes the *fresh observation's* valid subset, then restores the engine from that subset
@@ -705,16 +727,82 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   the raw value the observation saw, and answers `'superseded'` without writing if it moved. A still-mixed
   value can contain a newer valid subset, so halted confirmation must derive its replacement from that
   same observation rather than from the queue captured at boot.
-  It does **not** close the race, and must not be described as doing so. Two residues remain, both real
-  and both pinned as tests: a repair landing inside the compare → `writeFileSync` interval is still
-  overwritten and still reported `'written'` (the pair is atomic only against callers *in this process*),
-  and so is a write landing *after* this one. Both are the multi-process lost update every field in this
-  single-blob file shares (issue #73). A real cross-process
-  postcondition needs a primitive neither backend has (an advisory lock, or `O_EXCL` + rename keyed on a
-  stored version with a retry loop); a `version` token on `MaoStore` would not be one either, since
-  read-compare-write still leaves a window before the write lands. So keep the word *atomic* out of the
-  comments, the operator-facing text and the member names — `inspect` and `setIfUnchanged` say exactly
-  what they do, and `MaoStore.setIfUnchanged`'s doc states the limit where a reader will meet it.
+  Against other **MAO** processes the compare → rename interval is now closed: both backends take the
+  config file's cross-process write lock (`core/store-file.ts`, issue #73) around every compare-and-write,
+  so no MAO write can land inside it — pinned by a test whose competing writer is a second real
+  `FileStore`. It is still **not** closed against a writer that takes no lock — a hand-edit, another tool,
+  electron-store's constructor-time merge of its defaults — or against a lock broken as abandoned while its
+  holder was in fact alive (frozen for longer than `STORE_LOCK_STALE_MS`, or two breakers racing over one
+  dead lock); the lockless case is pinned as a test too. A write landing *after* this one is not a race at
+  all: it is the next writer, and whether it may overwrite is that writer's own policy (see the next
+  bullet). So keep the word *atomic* out of the comments, the operator-facing text and the member names —
+  `inspect` and `setIfUnchanged` say exactly what they do, and `MaoStore.setIfUnchanged`'s doc states the
+  limit where a reader will meet it.
+- **Every write replaces one key of the file *as it is now*, and same-key policy is per field (issue
+  #73).** Both backends persist one JSON blob, so a write must put every other key back, and the question is
+  which copy. `FileStore` used to write its constructor snapshot, so a `mao run` up for a day rewrote the
+  whole file from what it read at boot on every queue change — reverting a `mao repos remove`, `set-token`,
+  provider import or theme change made from another terminal, including the very `githubRepos` repair PR
+  #66's report recommends. Now `FileStore.set` merges into a strict fresh read and replaces the file with
+  `writeStoreFileAtomic()` (temp file + fsync + rename, keeping the file's permission bits and — where the
+  writer may — its owner, and writing through a symlink to the file it names rather than replacing the
+  link; a target the kernel will not rename over — `EBUSY`/`EXDEV`, above all a single-file bind mount — is
+  overwritten in place instead, since refusing made every write in that deployment fail and tripped the
+  persistence-broken marker over a file never touched), under the write lock, which is keyed on that same
+  resolved file; conf already re-reads before it
+  writes and writes atomically, though with its own default mode. Same-key concurrency is an
+  explicit choice per field, never left to timing:
+  - **Stated values** — `githubToken`, `theme`, `buildSha`, and `mao config import-providers`' complete
+    replacement — use plain `set`: last writer wins, because the latest statement is the operator's intent.
+  - **Derived values** must never use plain `set`: a change landing between the read they were derived
+    from and the write would be lost without a word. `workflowTasks` is written by `persistQueue()`
+    conditionally on `persistedQueueWitness`; a moved usable queue is refused with
+    `describeQueueWriteConflict()`, which the engine reads as a persistence failure — task to `'error'`,
+    one retry, then `persistenceBroken` and the durable marker, i.e. the existing safeguard stops a second
+    engine advancing the same queue. The one exception is a queue that went *unusable* after a clean boot,
+    which the session repairs from its own queue as the late-corruption card promises — but only while
+    every readable task left in it is in a form this process has itself loaded or written
+    (`onlyHoldsTasksThisProcessWrote` over `ownTaskForms`: hashes of each task's guard-normalized
+    serialization, from the boot observation and every write — including tasks this process has since
+    cleared or capped away — bounded by recency to `OWN_TASK_FORM_IDS` task ids), so a stale copy of its
+    own past state — an editor buffer saved late — is still its own. A mixed value
+    still holding a readable task this process never loaded or wrote is a conflict like any other, and
+    `resaveStoredQueue()` refuses it the same way, without pointing at the discard while a host is live. An
+    entry this build cannot read is indistinguishable from corruption and is discarded either way. `githubRepos` is
+    written by `createRepoRegistrar` conditionally on its observation, and a moved list is **re-planned**
+    (the same pure update re-applied to the fresh list, newly-new entries preflighted again) up to
+    `MAX_REPO_LIST_ATTEMPTS` — the cross-process form of its in-process queue. A derived value's base is
+    whatever the caller derived it from, and for the GUI that is the renderer's view, not the save
+    instant: `github:setRepos` carries the list the edit was computed from (`applyRepoListEdit`), and
+    `ai:save` carries the list Global settings loaded, which `MaoApp.saveProviders(providers, base)`
+    refuses to write over once the stored list has moved. Keying either on a save-time observation alone
+    let a stale window delete a terminal's `repos add` or `import-providers`, API keys included. The
+    registrar hands an update `{ usable }` alongside the stored list — keyed on the observation's
+    `defect !== 'value'`, never on a report existing, because since #72 a mixed array is reported too and
+    is still the list as stored — and `applyRepoListEdit` treats an
+    unusable value (the guard's `[]` stand-in) as nothing to diff against — the edit is then the whole
+    list, preflighted as before — since diffing against it made a settings toggle write `[]`. A list that
+    is usable but holds entries `isRepoRef` rejects keeps the diff, with one rule relaxed: a repository the
+    window lists and the stored list no longer names may have been mangled rather than removed, so it is
+    carried forward in the window's version and preflighted. Taking the whole edit there instead let the
+    window's stale list revert a hand-set `autoTrigger: false` and drop a hand-added repository. Global
+    settings writes the provider list only when it was edited, never without a loaded base (a failed load
+    is shown in its own state with a Retry, never read as "no providers", and no Save clears it; a provider
+    typed meanwhile survives the Retry as an unsaved edit), claims "Saved" only when something was
+    written, and disables Save while one is in flight.
+  A write that cannot take the lock within `STORE_LOCK_TIMEOUT_MS` throws `StoreLockError` and writes
+  nothing; a lock whose owner pid is gone from this host, or that is older than `STORE_LOCK_STALE_MS`, is
+  broken rather than left to wedge every write (a lock naming this process's own pid counts as abandoned
+  unless its token is one this process holds — a restart under the same pid). Every one of those refusals
+  is decided before the backend writes, so `persistQueue()` reports it as a `'not-written'`
+  `QueuePersistenceError` and the public mutator that emitted it rolls its change back
+  (`notifyPublicMutation`) — `appendTask()` included, which is the case that matters: auto-trigger labels
+  nothing after a failed enqueue, so a task kept in memory was persisted alongside its own re-enqueue once
+  writes recovered, and both ran. `get()` on a long-running `FileStore` still answers from its snapshot,
+  but the repository list `mao run` polls is not read through it: both hosts hand auto-trigger
+  `() => store.inspect('githubRepos')`, a fresh read on every tick (#94), so a `repos add`/`remove` from
+  another terminal takes effect on the next tick. Only the token and providers are read at boot; that is
+  read staleness, not a lost update, and no write carries it back any more.
 - **What the halt does *not* cover, so it is not read as more than it is.** A `config.json` that is not
   valid JSON at all no longer slips past the *queue* latch, and that changed with the fresh read: the boot
   observation goes through `inspect()` → `getFresh()` → `loadStrict()`, which throws on a file that exists

@@ -363,6 +363,32 @@ describe('WorkflowEngine', () => {
     expect(github.createPullRequest).not.toHaveBeenCalled()
   })
 
+  it('does not keep a task whose enqueue was refused by the persisting listener', async () => {
+    // Issue #73 made refused queue writes an expected outcome (another host changed the queue, the write
+    // lock timed out). A task left in memory after one was persisted alongside its own re-enqueue once the
+    // write path recovered — auto-trigger labels nothing after a failed enqueue — and both copies ran.
+    const github = makeFakeGithub()
+    const engine = new WorkflowEngine(github)
+    engine.setProviders([makeProvider('agent-a'), makeProvider('agent-b')])
+    let refuse = true
+    const persisted: string[][] = []
+    engine.on('change', (tasks: QueuedTask[]) => {
+      if (refuse) throw new QueuePersistenceError('write refused', 'not-written')
+      persisted.push(tasks.map((t) => t.title))
+    })
+
+    expect(() => engine.enqueueFromIssue(7, 'https://example.test/7', 'Issue 7', repo, false)).toThrow('write refused')
+    expect(engine.getTasks()).toEqual([])
+
+    refuse = false
+    engine.enqueueFromIssue(7, 'https://example.test/7', 'Issue 7', repo, false)
+    await waitFor(() => engine.getTasks()[0]?.status === 'paused')
+
+    expect(engine.getTasks().map((t) => t.title)).toEqual(['Issue 7'])
+    expect(persisted.every((titles) => titles.length === 1)).toBe(true)
+    expect(github.createBranch).toHaveBeenCalledTimes(1)
+  })
+
   it('retry() rejects tasks that are not currently in an error state', () => {
     const engine = new WorkflowEngine(makeFakeGithub())
     engine.setProviders([makeProvider('agent-a')])

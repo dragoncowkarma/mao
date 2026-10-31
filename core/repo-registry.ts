@@ -1,6 +1,6 @@
 import type { GithubService } from './github-service.ts'
 import type { RepoWorkflowCapability } from './repo-capabilities.ts'
-import type { MaoStore } from './store.ts'
+import type { ConditionalWriteResult, MaoStore } from './store.ts'
 import type { RepoRef } from './workflow-engine.ts'
 
 /**
@@ -212,6 +212,136 @@ export function reposNeedingCapabilityCheck(previous: RepoRef[], next: RepoRef[]
   )
 }
 
+/** Groups a list's usable entries by repository identity, keeping every occurrence in order. */
+function entriesByRepo(list: RepoRef[]): Map<string, RepoRef[]> {
+  const grouped = new Map<string, RepoRef[]>()
+  for (const ref of list) {
+    if (!isRepoRef(ref)) continue
+    const key = repoRefKey(ref)
+    grouped.set(key, [...(grouped.get(key) ?? []), ref])
+  }
+  return grouped
+}
+
+/** `stored`, with exactly the fields that differ between `before` and `after` set (or deleted) as in `after`. */
+function patchEntry(stored: RepoRef, before: RepoRef, after: RepoRef): RepoRef {
+  const patched: Record<string, unknown> = { ...stored }
+  const fields = new Set([...Object.keys(before), ...Object.keys(after)])
+  for (const field of fields) {
+    const was = (before as unknown as Record<string, unknown>)[field]
+    const now = (after as unknown as Record<string, unknown>)[field]
+    if (JSON.stringify(was) === JSON.stringify(now)) continue
+    if (now === undefined) delete patched[field]
+    else patched[field] = now
+  }
+  return patched as unknown as RepoRef
+}
+
+/**
+ * Re-applies a whole-list edit, made against the list `base`, to the list stored *now* — so an edit
+ * planned from a stale view changes only what it changed (issue #73).
+ *
+ * The GUI cannot send an update callback: the renderer edits its own mirror of the list (read at mount,
+ * and after this window's own writes) and sends the whole result. Persisting that as-is made the mirror's
+ * staleness everyone's problem. A repository removed by `mao repos remove` in a terminal came back with
+ * the next settings toggle in the window — re-preflighted as "new", then polled and enqueued from again by
+ * the window's own auto-trigger — and one added in a terminal vanished the same way. The registrar's
+ * conditional write cannot see that window, because it lies between the renderer's read and the IPC
+ * call, so its re-plan would only re-apply the same stale list.
+ *
+ * Sending the list the edit was based on as well turns it back into the pure function of the stored list
+ * the registrar re-plans with, with three rules that keep it conservative:
+ *
+ * - A repository the edit **removed** (in `base`, absent from `next`) is dropped from the stored list.
+ * - A repository whose entry the edit **changed** gets only the fields that changed, applied to the
+ *   stored entry, so a setting changed elsewhere in the meantime survives a toggle of another one. If it
+ *   is no longer stored, the edit is dropped: a settings edit must never re-add a repository someone
+ *   else removed, which is the resurrection this exists to prevent.
+ * - A repository the edit **added** (absent from `base`) is appended. If it is already stored, both
+ *   occurrences reach `canonicalRepoList`, which folds them by its usual rule — the stored entry keeps
+ *   its settings and `autoTrigger: false` wins — exactly as a bare Add-form submission always has.
+ *
+ * Everything the edit did not touch is kept **as stored now**. When the stored list still is `base`
+ * (the ordinary case) `next` is returned unchanged, so nothing about a window that is the only writer
+ * changes; and with no `base` at all — a caller that predates it — or a stored value that is not a list
+ * (`previousUsable: false`), the edit is the whole list, as before. A stored list that holds entries which
+ * are not repositories keeps every rule above but one: a repository the window lists and the stored list no
+ * longer names may have been mangled rather than removed, so it is carried forward rather than dropped.
+ * A repository listed more than once is replaced wholesale rather than patched field by field, since
+ * which occurrence a field edit meant is not knowable; `canonicalRepoList` then folds it as it always has.
+ */
+export function applyRepoListEdit(
+  previous: RepoRef[],
+  base: RepoRef[] | undefined,
+  next: RepoRef[],
+  previousUsable = true,
+): RepoRef[] {
+  // An unusable stored value is not a list anyone wrote, so there is nothing to diff against: the guard's
+  // `[]` stand-in would make every repository the window shows look removed elsewhere, and a settings
+  // toggle or Remove would write an empty list — unpreflighted, since nothing in it is new — over the only
+  // usable copy, the window's own. The edit is then the whole list, as before base existed: every entry
+  // counts as a first registration and is preflighted, and Reset still writes the empty list it sends.
+  if (!previousUsable) return next
+  if (base === undefined || !Array.isArray(base) || !Array.isArray(next) || !Array.isArray(previous)) return next
+  if (JSON.stringify(previous) === JSON.stringify(base)) return next
+  // A stored list with entries `isRepoRef` rejects is ambiguous about what happened to a repository the
+  // window lists but the stored list no longer names: removed elsewhere, or mangled into one of those
+  // entries (`{ ownr: … }`, a `null`). The guard checks only the container, so such a list reaches here as
+  // usable. Dropping those rows would delete repositories the window still shows; returning the whole edit
+  // instead lets the window's stale list overwrite everything else stored — a hand-set `autoTrigger: false`
+  // reverted, a hand-removed repository resurrected, a hand-added one dropped. So only that one rule
+  // changes: such a row is carried forward in the window's version, and preflighted like any new entry,
+  // while every usable stored entry is still kept and patched as below.
+  const ambiguous = previous.some((ref) => !isRepoRef(ref))
+
+  const before = entriesByRepo(base)
+  const after = entriesByRepo(next)
+  const removed = new Set([...before.keys()].filter((key) => !after.has(key)))
+  const changed = new Map<string, RepoRef[]>()
+  const added: RepoRef[] = []
+  for (const [key, entries] of after) {
+    const was = before.get(key)
+    if (was === undefined) added.push(...entries)
+    else if (JSON.stringify(was) !== JSON.stringify(entries)) changed.set(key, entries)
+  }
+
+  const storedCount = new Map<string, number>()
+  for (const ref of previous) {
+    if (isRepoRef(ref)) storedCount.set(repoRefKey(ref), (storedCount.get(repoRefKey(ref)) ?? 0) + 1)
+  }
+
+  const result: RepoRef[] = []
+  const replaced = new Set<string>()
+  for (const ref of previous) {
+    // Unusable entries pass through untouched, for `canonicalRepoList` to drop as it does on every path.
+    if (!isRepoRef(ref)) {
+      result.push(ref)
+      continue
+    }
+    const key = repoRefKey(ref)
+    if (removed.has(key)) continue
+    const edit = changed.get(key)
+    if (edit === undefined) {
+      result.push(ref)
+      continue
+    }
+    const was = before.get(key)!
+    if (was.length === 1 && edit.length === 1 && storedCount.get(key) === 1) {
+      result.push(patchEntry(ref, was[0]!, edit[0]!))
+    } else if (!replaced.has(key)) {
+      replaced.add(key)
+      result.push(...edit)
+    }
+  }
+  const carried: RepoRef[] = []
+  if (ambiguous) {
+    for (const [key, entries] of after) {
+      if (before.has(key) && !storedCount.has(key)) carried.push(...entries)
+    }
+  }
+  return [...result, ...carried, ...added]
+}
+
 /**
  * Guards a repository-list write: throws before the caller touches the store if any newly registered
  * entry fails the non-mutating preflight (`GithubService.assertRepoWorkflowWritable()`).
@@ -241,8 +371,37 @@ export async function assertReposRegistrable(
   return capabilities
 }
 
-/** Computes the list to persist from the list currently in the store. */
-export type RepoListUpdate = (previous: RepoRef[]) => RepoRef[]
+/**
+ * Computes the list to persist from the list currently in the store. Must be pure — it can be re-applied.
+ *
+ * `stored.usable` is false when the stored value was not a list at all, so `previous` is the read guard's
+ * empty stand-in rather than a list anyone wrote. An update that diffs against `previous` (see
+ * `applyRepoListEdit`) must not read that `[]` as "every repository was removed". An array that holds
+ * entries which name no repository is still usable — the guard hands it through as stored, so it is the
+ * list to diff against, and `canonicalRepoList` drops those entries on the way out.
+ */
+export type RepoListUpdate = (previous: RepoRef[], stored: { usable: boolean }) => RepoRef[]
+
+/**
+ * How many times one update re-plans against a list another process keeps changing before it gives up.
+ * Each attempt can preflight over the network, so this bounds the time as well as the loop.
+ */
+export const MAX_REPO_LIST_ATTEMPTS = 3
+
+/** Why a planned repository-list write did not happen; in every case nothing was written. */
+function describeUnwrittenRepoList(result: Exclude<ConditionalWriteResult, 'written'>): string {
+  if (result === 'superseded') {
+    return (
+      'Nothing was written: another MAO process kept changing the tracked-repository list while this ' +
+      `update was being checked (${MAX_REPO_LIST_ATTEMPTS} attempts). Run \`mao repos list\` and retry.`
+    )
+  }
+  if (result === 'invalid') return 'Nothing was written: the planned tracked-repository list was rejected before writing.'
+  return (
+    'Nothing was written: the stored tracked-repository list could not be read back to check that no other ' +
+    'process had changed it. Check the config file and the permissions on it, then retry.'
+  )
+}
 
 /**
  * Serializes read -> preflight -> write of the tracked-repository list, and owns that sequence so
@@ -261,24 +420,50 @@ export type RepoListUpdate = (previous: RepoRef[]) => RepoRef[]
  * update is applied to the list read *inside* the critical section, so a queued call never plans
  * against a list that has since changed, and `assertReposRegistrable()` still preflights whatever is
  * new relative to that fresh read.
+ *
+ * That queue serializes this process only, and the list is shared by every MAO process on the config
+ * file — a `mao repos add` and a `mao repos remove` from two terminals, or either beside the desktop app,
+ * each read, preflight for a second, and write (issue #73). So the write is conditional on the stored
+ * list still being the one read, and a list that moved is **re-planned**, not overwritten: the same
+ * `update` is applied to the fresh list, anything newly new is preflighted, and the write is tried again
+ * — the cross-process form of the queue's own rule. `update` must therefore be a pure function of the
+ * list it is handed. The CLI's callbacks are deltas by construction; the GUI sends a whole list, so its
+ * handler wraps it in `applyRepoListEdit()` with the list the edit was based on. A list that keeps moving
+ * gives up after
+ * `MAX_REPO_LIST_ATTEMPTS` rather than looping, and one that cannot be read at all refuses outright,
+ * since merging into a file that could not be read would replace everything in it.
  */
 export function createRepoRegistrar(
   github: Pick<GithubService, 'assertRepoWorkflowWritable'>,
-  store: Pick<MaoStore, 'get' | 'set'>,
+  store: Pick<MaoStore, 'inspect' | 'setIfUnchanged'>,
 ) {
   let queue: Promise<unknown> = Promise.resolve()
 
   return function updateRepos(update: RepoListUpdate): Promise<RepoWorkflowCapability[]> {
     const run = queue.then(async () => {
-      const previous = store.get('githubRepos')
-      // Canonicalised inside the critical section, before the preflight — so the list that gets
-      // checked is byte-for-byte the list that gets stored. This is the single chokepoint that keeps
-      // a differently capitalised duplicate from reaching the store unchecked, which is why neither
-      // shell has to know the rule exists (see canonicalRepoList()).
-      const next = canonicalRepoList(previous, update(previous))
-      const checked = await assertReposRegistrable(github, previous, next)
-      store.set('githubRepos', next)
-      return checked
+      for (let attempt = 1; ; attempt += 1) {
+        // A fresh observation, not `get()`: on `FileStore` that answers from a snapshot taken when the
+        // command started, and this read is the one the write below is keyed on.
+        const observed = store.inspect('githubRepos')
+        if (!observed.readable) {
+          throw new Error(`Nothing was written. ${observed.problem ?? 'The stored repository list could not be read.'}`)
+        }
+        const previous = observed.value
+        // Canonicalised inside the critical section, before the preflight — so the list that gets
+        // checked is byte-for-byte the list that gets stored. This is the single chokepoint that keeps
+        // a differently capitalised duplicate from reaching the store unchecked, which is why neither
+        // shell has to know the rule exists (see canonicalRepoList()).
+        // `usable` is about the container, not about whether a report exists: a mixed array is still
+        // the list as stored (the guard hands it through), and only a value that was not an array at
+        // all came back as the empty stand-in an edit cannot be diffed against.
+        const usable = observed.defect !== 'value'
+        const next = canonicalRepoList(previous, update(previous, { usable }))
+        const checked = await assertReposRegistrable(github, previous, next)
+        const result = store.setIfUnchanged('githubRepos', observed.witness, next)
+        if (result === 'written') return checked
+        if (result === 'superseded' && attempt < MAX_REPO_LIST_ATTEMPTS) continue
+        throw new Error(describeUnwrittenRepoList(result))
+      }
     })
     // A rejected update must not wedge the queue for every update after it, and its rejection belongs
     // to its own caller — so the chain follows the settled promise while `run` keeps the error.

@@ -376,7 +376,9 @@ export async function assertReposRegistrable(
  *
  * `stored.usable` is false when the stored value was not a list at all, so `previous` is the read guard's
  * empty stand-in rather than a list anyone wrote. An update that diffs against `previous` (see
- * `applyRepoListEdit`) must not read that `[]` as "every repository was removed".
+ * `applyRepoListEdit`) must not read that `[]` as "every repository was removed". An array that holds
+ * entries which name no repository is still usable — the guard hands it through as stored, so it is the
+ * list to diff against, and `canonicalRepoList` drops those entries on the way out.
  */
 export type RepoListUpdate = (previous: RepoRef[], stored: { usable: boolean }) => RepoRef[]
 
@@ -451,7 +453,11 @@ export function createRepoRegistrar(
         // checked is byte-for-byte the list that gets stored. This is the single chokepoint that keeps
         // a differently capitalised duplicate from reaching the store unchecked, which is why neither
         // shell has to know the rule exists (see canonicalRepoList()).
-        const next = canonicalRepoList(previous, update(previous, { usable: observed.problem === undefined }))
+        // `usable` is about the container, not about whether a report exists: a mixed array is still
+        // the list as stored (the guard hands it through), and only a value that was not an array at
+        // all came back as the empty stand-in an edit cannot be diffed against.
+        const usable = observed.defect !== 'value'
+        const next = canonicalRepoList(previous, update(previous, { usable }))
         const checked = await assertReposRegistrable(github, previous, next)
         const result = store.setIfUnchanged('githubRepos', observed.witness, next)
         if (result === 'written') return checked

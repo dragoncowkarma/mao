@@ -47,9 +47,11 @@ export function createElectronApiStub(initialRepos: RepoRef[] = [], initialProbl
   const setRepos = vi.fn(async (next: RepoRef[], base?: RepoRef[]): Promise<RepoWorkflowCapability[]> => {
     // Applied the way `github:setRepos` applies it — core's own edit rule against what is stored now — so
     // a test that changes the "store" behind the window's back sees what the real stack would keep. A
-    // seeded `githubRepos` problem stands for a stored value that is not a list, which the real store's
-    // read guard answers as an unusable `[]`; the stub models that rather than diffing against `stored`.
-    const usable = !problems.some((problem) => problem.field === 'githubRepos')
+    // seeded `githubRepos` problem whose defect is `'value'` stands for a stored value that is not a list,
+    // which the real store's read guard answers as an unusable `[]`; the stub models that rather than
+    // diffing against `stored`. A mixed or all-invalid *array* is still the list as stored, exactly as the
+    // registrar reads it (`observed.defect !== 'value'`), so it keeps the diff.
+    const usable = problems.find((problem) => problem.field === 'githubRepos')?.defect !== 'value'
     stored = applyRepoListEdit(usable ? stored : [], base, next, usable).map((repo) => ({ ...repo }))
     // A repository-list write replaces `githubRepos` and nothing else — `store.set` writes one key, and
     // `describeStoredProblems` re-evaluates the rest — so a stub that healed every field would make the

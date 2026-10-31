@@ -111,6 +111,7 @@ function observeStoredQueue(store: MaoStore): StoredObservation<typeof QUEUE_GAT
     return {
       value: [],
       problem: describeUninspectableStore(QUEUE_GATING_FIELD, 'the config file'),
+      defect: undefined,
       readable: false,
       witness: undefined,
     }

@@ -23,7 +23,7 @@ afterEach(() => {
 })
 
 function observedRepos(value: RepoRef[]): StoredObservation<'githubRepos'> {
-  return { value, problem: undefined, readable: true, witness: JSON.stringify(value) }
+  return { value, problem: undefined, defect: undefined, readable: true, witness: JSON.stringify(value) }
 }
 
 function inspectRepos(value: RepoRef[]): () => StoredObservation<'githubRepos'> {

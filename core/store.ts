@@ -1244,6 +1244,17 @@ export interface StoredObservation<K extends keyof MaoStoreSchema> {
   /** The operator-facing report when the guard had to replace or filter the value, else `undefined`. */
   problem: string | undefined
   /**
+   * Which part of the raw value the schema cannot use, from the same classification as `problem` —
+   * `undefined` when there is no problem, or when the read failed and no value was observed.
+   *
+   * `problem` alone cannot tell a caller what `value` *is*. Since issue #72 a mixed `githubRepos` array
+   * is reported too, yet the guard hands it through as stored, while a value that is not an array at
+   * all comes back as the empty default. Only the second leaves a caller nothing to diff an edit
+   * against — reading every report as that case made a GUI settings edit over a mixed list write the
+   * window's whole stale list, deleting repositories it did not show (issue #73).
+   */
+  defect: StoredValueDefect | undefined
+  /**
    * False when the backend read itself failed, so nothing about the stored value was established.
    * `value` is then the schema default and `problem` is `describeUninspectableStore()`'s report.
    * Callers that are about to **write** must treat this as "unknown" and refuse, not as "corrupt".
@@ -1628,6 +1639,7 @@ export function createGuardedStore(
         return {
           value: structuredClone(MAO_STORE_DEFAULTS[key]),
           problem: describeUninspectableStore(key, source, storeReadFailureOf(error)),
+          defect: undefined,
           readable: false,
           witness: undefined,
         }
@@ -1635,9 +1647,11 @@ export function createGuardedStore(
       // Guarded through the same `guardRead` as `get()`, deliberately — including its once-per-field
       // warning — so an observation and a plain read cannot disagree about the value or about whether
       // the operator was told. The problem is derived from the SAME `raw`, not from a second read.
+      const problem = storedValueProblem(key, raw, source)
       return {
         value: guardRead(key, raw),
-        problem: storedValueProblem(key, raw, source)?.message,
+        problem: problem?.message,
+        defect: problem?.defect,
         readable: true,
         witness: witnessOf(raw),
       }

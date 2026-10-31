@@ -774,7 +774,9 @@ There is no codegen — these couplings are maintained by hand and only `npm run
     `ai:save` carries the list Global settings loaded, which `MaoApp.saveProviders(providers, base)`
     refuses to write over once the stored list has moved. Keying either on a save-time observation alone
     let a stale window delete a terminal's `repos add` or `import-providers`, API keys included. The
-    registrar hands an update `{ usable }` alongside the stored list, and `applyRepoListEdit` treats an
+    registrar hands an update `{ usable }` alongside the stored list — keyed on the observation's
+    `defect !== 'value'`, never on a report existing, because since #72 a mixed array is reported too and
+    is still the list as stored — and `applyRepoListEdit` treats an
     unusable value (the guard's `[]` stand-in) as nothing to diff against — the edit is then the whole
     list, preflighted as before — since diffing against it made a settings toggle write `[]`. A list that
     is usable but holds entries `isRepoRef` rejects keeps the diff, with one rule relaxed: a repository the

@@ -12,7 +12,11 @@ afterEach(() => {
 })
 
 function tempConfigPath(): string {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mao-store-file-test-'))
+  // Real-pathed, because the lock and the atomic write resolve symlinks before they touch the file
+  // (`resolveStoreFilePath`). macOS's default `os.tmpdir()` is `/var/folders/…`, a symlink into
+  // `/private/var`, so an unresolved path here never equals the path a spy or a message sees there —
+  // and the race test below would quietly stop injecting its race.
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'mao-store-file-test-')))
   tmpDirs.push(dir)
   return path.join(dir, 'config.json')
 }
@@ -185,6 +189,8 @@ describe('createStoreWriteLock', () => {
 
     // The live holder keeps its lock, so this acquisition waits it out instead of entering beside it.
     expect(() => lock(() => 'ran')).toThrow(StoreLockError)
+    // And the race was really injected — a path that never matched the spy would skip it silently.
+    expect(raced).toBe(true)
     expect(JSON.parse(fs.readFileSync(lockPath, 'utf-8')).nonce).toBe('live')
     expect(fs.readdirSync(path.dirname(filePath))).toEqual(['config.json.lock'])
   })

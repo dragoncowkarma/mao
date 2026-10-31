@@ -940,6 +940,30 @@ describe('createRepoRegistrar with the GUI-shaped edit (issue #73)', () => {
     expect(github.assertRepoWorkflowWritable).toHaveBeenCalledTimes(2)
   })
 
+  it('keeps the field-level merge when the stored list is mixed, rather than writing the window list', async () => {
+    // The review of the main merge. Since #93 the read guard reports a *mixed* array too, so keying
+    // `usable` on "no problem" sent this list down the whole-list path: the window's stale [A] deleted B
+    // and turned A's hand-set `autoTrigger: false` back on. A mixed array is still the list as stored —
+    // only a value that is not an array at all leaves nothing to diff against.
+    silenceStoreWarnings()
+    const stored = { ...gadgets, autoTrigger: false, pollIntervalMs: 30_000 }
+    const store = makeRealStore({ githubRepos: [stored, widgets, null] })
+    const github = passingGithub()
+    const base = [{ ...gadgets, autoTrigger: true, pollIntervalMs: 30_000 }]
+    const next = [{ ...gadgets, autoTrigger: true, pollIntervalMs: 60_000 }]
+
+    await createRepoRegistrar(github, store)((previous, observed) =>
+      applyRepoListEdit(previous, base, next, observed.usable),
+    )
+
+    expect(new FileStore(filePathOf(store)).get('githubRepos')).toEqual([
+      { ...gadgets, autoTrigger: false, pollIntervalMs: 60_000 },
+      widgets,
+    ])
+    // Both are already tracked, so nothing is a first registration.
+    expect(github.assertRepoWorkflowWritable).not.toHaveBeenCalled()
+  })
+
   it('does not resurrect a repository a terminal removed while a window add was preflighting', async () => {
     // `github:setRepos` hands core a whole list. Wrapped in applyRepoListEdit with the list it was computed
     // from, the re-plan applies only "add widgets" to the fresh list, instead of re-sending gadgets.

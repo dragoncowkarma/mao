@@ -50,7 +50,8 @@ export function createElectronApiStub(initialRepos: RepoRef[] = [], initialProbl
     // seeded `githubRepos` problem whose defect is `'value'` stands for a stored value that is not a list,
     // which the real store's read guard answers as an unusable `[]`; the stub models that rather than
     // diffing against `stored`. A mixed or all-invalid *array* is still the list as stored, exactly as the
-    // registrar reads it (`observed.defect !== 'value'`), so it keeps the diff.
+    // registrar reads it (`observed.defect !== 'value'`), so it keeps the diff. A mirror of that rule, not a
+    // test of it: no renderer test tells the two apart, and `core/repo-registry.test.ts` is what pins it.
     const usable = problems.find((problem) => problem.field === 'githubRepos')?.defect !== 'value'
     stored = applyRepoListEdit(usable ? stored : [], base, next, usable).map((repo) => ({ ...repo }))
     // A repository-list write replaces `githubRepos` and nothing else — `store.set` writes one key, and

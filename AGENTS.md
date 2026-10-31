@@ -746,7 +746,10 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   #66's report recommends. Now `FileStore.set` merges into a strict fresh read and replaces the file with
   `writeStoreFileAtomic()` (temp file + fsync + rename, keeping the file's permission bits and — where the
   writer may — its owner, and writing through a symlink to the file it names rather than replacing the
-  link), under the write lock, which is keyed on that same resolved file; conf already re-reads before it
+  link; a target the kernel will not rename over — `EBUSY`/`EXDEV`, above all a single-file bind mount — is
+  overwritten in place instead, since refusing made every write in that deployment fail and tripped the
+  persistence-broken marker over a file never touched), under the write lock, which is keyed on that same
+  resolved file; conf already re-reads before it
   writes and writes atomically, though with its own default mode. Same-key concurrency is an
   explicit choice per field, never left to timing:
   - **Stated values** — `githubToken`, `theme`, `buildSha`, and `mao config import-providers`' complete
@@ -795,9 +798,11 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   `QueuePersistenceError` and the public mutator that emitted it rolls its change back
   (`notifyPublicMutation`) — `appendTask()` included, which is the case that matters: auto-trigger labels
   nothing after a failed enqueue, so a task kept in memory was persisted alongside its own re-enqueue once
-  writes recovered, and both ran. `get()` on a long-running
-  `FileStore` still answers from its snapshot, so `mao run` keeps polling the repositories it booted with
-  until it restarts; that is read staleness, not a lost update, and no write carries it back any more.
+  writes recovered, and both ran. `get()` on a long-running `FileStore` still answers from its snapshot,
+  but the repository list `mao run` polls is not read through it: both hosts hand auto-trigger
+  `() => store.inspect('githubRepos')`, a fresh read on every tick (#94), so a `repos add`/`remove` from
+  another terminal takes effect on the next tick. Only the token and providers are read at boot; that is
+  read staleness, not a lost update, and no write carries it back any more.
 - **What the halt does *not* cover, so it is not read as more than it is.** A `config.json` that is not
   valid JSON at all no longer slips past the *queue* latch, and that changed with the fresh read: the boot
   observation goes through `inspect()` → `getFresh()` → `loadStrict()`, which throws on a file that exists

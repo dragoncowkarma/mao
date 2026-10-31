@@ -559,6 +559,14 @@ export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOp
       // Another MAO process held the write lock throughout: nothing was written, which is a stronger
       // statement than `'write-failed'` makes, and its message is value-free by construction.
       if (err instanceof StoreLockError) return { kind: 'unverified', reason: err.message }
+      // The store refused because the file could not be read — a writer that takes no lock replaced it
+      // between the compare and the write's own merge read. That refusal is decided before anything is
+      // written, so this is the whole-file outage the observation above would have caught a moment later,
+      // not an unknown outcome: latch restart-required, as the queue listener does, and record no marker.
+      if (storeWriteRequiresRestart(err)) {
+        workflowEngine.requireQueueRecovery(STORE_RESTART_REQUIRED, { restartRequired: true })
+        return { kind: 'restart-required' }
+      }
       // What reached the file is unknown. Promote this to the same durable persistence block as a
       // failed ordinary queue write: a restart must not normalize and resume a queue whose recovery
       // write may or may not have landed. The backend's error text is deliberately not carried because

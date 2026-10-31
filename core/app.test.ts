@@ -1546,6 +1546,46 @@ describe('mao run queue persistence beside another process (issue #73)', () => {
     expect(hasPersistenceBrokenMarker(dataDir)).toBe(false)
   })
 
+  it('reports a lockless replacement landing inside a recovery as restart-required, writing nothing', () => {
+    // The compare passed, then a writer that takes no lock replaced the file before the write's own merge
+    // read. FileStore refuses that read before writing anything, so this is a whole-file outage — not an
+    // unknown outcome to record as persistence-broken.
+    captureWarnings()
+    const { dataDir, filePath, app } = bootLongRunning({ githubToken: 'ghp_keep', workflowTasks: [pausedTask(), null] })
+    expect(app.workflowEngine.isQueueRecoveryLatched()).toBe(true)
+    let reads = 0
+    const realReadFileSync = fs.readFileSync
+    vi.spyOn(fs, 'readFileSync').mockImplementation(((file: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+      // 1: healStoredQueue's observation; 2: setIfUnchanged's compare; 3: FileStore.writeKey's merge read.
+      if (String(file) === filePath && ++reads === 3) fs.writeFileSync(filePath, '{ truncated')
+      return (realReadFileSync as (...args: unknown[]) => unknown)(file, ...rest)
+    }) as typeof fs.readFileSync)
+
+    const outcome = app.confirmQueueRecovery()
+    vi.restoreAllMocks()
+
+    expect(reads).toBe(3)
+    expect(outcome).toEqual({ kind: 'restart-required' })
+    expect(fs.readFileSync(filePath, 'utf-8')).toBe('{ truncated')
+    expect(app.workflowEngine.isQueueRecoveryRestartRequired()).toBe(true)
+    expect(hasPersistenceBrokenMarker(dataDir)).toBe(false)
+  })
+
+  it("refuses to overwrite a healthy queue another process changed, even when it holds only this one's tasks", () => {
+    // Another terminal ran `clear-completed` on this host's queue. Every task left in the file is one
+    // this process wrote, but the value is healthy — the repair exception is for an unusable value only —
+    // so writing over it would bring back the tasks the other process cleared.
+    captureWarnings()
+    const done: QueuedTask = { ...pausedTask('task-2'), status: 'done' }
+    const { filePath, app } = bootLongRunning({ workflowTasks: [pausedTask(), done] })
+    app.workflowEngine.setAutoAdvance('task-1', true)
+    const cleared = [{ ...pausedTask(), autoAdvance: true }]
+    new FileStore(filePath).set('workflowTasks', cleared)
+
+    expect(() => app.workflowEngine.setAutoAdvance('task-1', false)).toThrow(describeQueueWriteConflict())
+    expect(onDisk(filePath).workflowTasks).toEqual(cleared)
+  })
+
   it('treats its own queue recovery as the base of its next write', () => {
     // Without recording the recovery's write as this process's own, the very next queue change would see
     // a queue it did not write and refuse — wedging the host the moment it was released.

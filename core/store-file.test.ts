@@ -262,6 +262,18 @@ describe('createStoreWriteLock', () => {
     expect(refused).toBeInstanceOf(StoreLockError)
   })
 
+  it.skipIf(process.platform === 'win32')('gives up at its deadline on a lock path no read can open', () => {
+    // A dangling symlink at the lock path exists for `O_EXCL` but not for a read, so every pass answered
+    // "retry" — and the retry skipped the deadline, spinning this synchronous loop forever.
+    const filePath = tempConfigPath()
+    fs.symlinkSync(path.join(path.dirname(filePath), 'nowhere'), `${filePath}.lock`)
+    const lock = createStoreWriteLock(filePath, { timeoutMs: 50 })
+
+    const startedAt = Date.now()
+    expect(() => lock(() => 'ran')).toThrow(StoreLockError)
+    expect(Date.now() - startedAt).toBeLessThan(2_000)
+  })
+
   it('leaves a lock it no longer owns in place on release', () => {
     // If this holder's lock was broken as abandoned and someone else took the slot, unlinking on release
     // would remove the other holder's lock mid-write.
@@ -396,4 +408,27 @@ describe('writeStoreFileAtomic', () => {
     expect(fs.statSync(filePath).isDirectory()).toBe(true)
     expect(fs.readdirSync(path.dirname(filePath))).toEqual(['config.json'])
   })
+
+  it.skipIf(process.platform === 'win32')(
+    'writes in place when the target cannot be replaced, as a single-file bind mount cannot',
+    () => {
+      // The kernel refuses to rename over a mount point (`docker run -v ./config.json:/data/config.json`).
+      // Refusing the write made every write in that deployment fail; the file is rewritten in place
+      // instead — the same inode, so the same mode — and the temporary file is still cleaned up.
+      const filePath = tempConfigPath()
+      fs.writeFileSync(filePath, JSON.stringify({ theme: 'light', githubToken: 'ghp_keep' }, null, 2))
+      fs.chmodSync(filePath, 0o600)
+      const inode = fs.statSync(filePath).ino
+      vi.spyOn(fs, 'renameSync').mockImplementation(() => {
+        throw Object.assign(new Error('EBUSY: resource busy or locked, rename'), { code: 'EBUSY' })
+      })
+
+      writeStoreFileAtomic(filePath, '{"theme":"dark"}')
+
+      expect(fs.readFileSync(filePath, 'utf-8')).toBe('{"theme":"dark"}')
+      expect(fs.statSync(filePath).ino).toBe(inode)
+      expect(fs.statSync(filePath).mode & 0o777).toBe(0o600)
+      expect(fs.readdirSync(path.dirname(filePath))).toEqual(['config.json'])
+    },
+  )
 })

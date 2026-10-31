@@ -143,8 +143,10 @@ npm run cli -- swarm --repo-root /path/to/repo --dry-run --once
 app) beside one-shot commands in other terminals is supported. Every write replaces only the key it is
 for, merged into the file **as it is now** and swapped in atomically (a temporary file renamed over
 `config.json`), under a cross-process lock file `config.json.lock`. The CLI's write keeps the file's
-permission bits and owner, and writes *through* a symlinked `config.json` rather than replacing the link;
-the desktop app writes through electron-store, which does not keep a tightened mode — a `chmod 600` there
+permission bits and owner, and writes *through* a symlinked `config.json` rather than replacing the link.
+A `config.json` that cannot be renamed over — a single-file bind mount such as `docker run -v
+./config.json:/data/config.json` — is rewritten in place instead, as every write was before; still under
+the lock, but a reader that takes no lock can catch that one write half-done. The desktop app writes through electron-store, which does not keep a tightened mode — a `chmod 600` there
 returns to the default on its next write, as it always has. So a
 `mao repos remove`, `config set-token`, `import-providers` or theme change made while `mao run` is up is
 no longer reverted by its next queue write — including the `githubRepos` recovery below. What each kind
@@ -171,7 +173,10 @@ in it is one that session itself loaded or wrote (an older copy of its own task,
 saved late, counts); a value still holding another host's *readable* task is refused like any other
 conflict. (An entry no build here can read cannot be told apart from corruption, so it is
 discarded either way.) An enqueue whose write is refused keeps nothing: the command (or the auto-trigger poll) fails, and
-the issue is picked up once writes succeed again, as one task rather than two.
+the issue is picked up once a host whose queue is current enqueues it, as one task rather than two. A host
+that is idle when another process changes its queue is refused the same way but trips nothing — no stage
+was running — so it keeps refusing, and `mao run` logs the conflict on every poll, until it is restarted
+and loads the queue as it is now.
 
 A write that finds the lock held waits up to five seconds, then fails with "Nothing was written", the
 holder's pid and the lock path. A lock left by a process that died mid-write is broken automatically once
@@ -181,8 +186,10 @@ volume); delete `config.json.lock` by hand only if no MAO process is running. A 
 that exists but cannot be read is refused rather than merged into an empty file, so the token and
 everything else in it survive.
 
-`mao run` still reads the repository list it polls and its token/providers at boot, so it keeps polling
-what it started with until it is restarted — the change is no longer *undone*, it just is not picked up.
+`mao run` reads the repository list it polls fresh on every scheduler tick, so a `repos add` or `repos
+remove` from another terminal takes effect on its next tick. Its GitHub token and AI providers are still
+read at boot: a `set-token` or `import-providers` made while it is up is kept in the file, not undone, but
+`mao run` keeps using what it started with until it is restarted.
 
 **Repository write-permission preflight.** `repos add` refuses to register a repo the current
 GitHub credential cannot run the pipeline against, leaving the stored list untouched and printing

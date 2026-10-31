@@ -266,6 +266,7 @@ export function createStoreWriteLock(filePath: string, options: StoreWriteLockOp
     const token = JSON.stringify({ pid: process.pid, host: os.hostname(), nonce: randomBytes(12).toString('hex') })
     const startedAt = Date.now()
     let delayMs = 2
+    let retryStreak = 0
     fs.mkdirSync(path.dirname(lockPath), { recursive: true })
     for (;;) {
       if (tryCreate(lockPath, token)) {
@@ -273,9 +274,15 @@ export function createStoreWriteLock(filePath: string, options: StoreWriteLockOp
         return token
       }
       const { retry, owner } = breakIfAbandoned(lockPath)
-      if (retry) continue
+      // The deadline is checked on every pass, retries included. A lock path that `O_EXCL` sees but a read
+      // does not — a dangling symlink — answers "retry" forever, and skipping the check for it spun this
+      // synchronous loop at full CPU with no end, freezing the Electron main process.
       const waited = Date.now() - startedAt
       if (waited >= timeoutMs) throw new StoreLockError(lockPath, describeOwner(owner), waited)
+      // A lock just broken or released frees the slot, so the first retry goes straight back; one that
+      // keeps answering "retry" backs off like any other wait.
+      retryStreak = retry ? retryStreak + 1 : 0
+      if (retryStreak === 1) continue
       sleepSync(Math.min(delayMs, timeoutMs - waited))
       delayMs = Math.min(delayMs * 2, 50)
     }
@@ -311,6 +318,31 @@ export function createStoreWriteLock(filePath: string, options: StoreWriteLockOp
 const TRANSIENT_RENAME_CODES = new Set(['EPERM', 'EBUSY', 'EACCES'])
 
 /**
+ * Errors a POSIX rename raises when the target cannot be *replaced*, only written: `EBUSY` for a mount
+ * point (a single-file bind mount such as `docker run -v ./config.json:/data/config.json`), `EXDEV` for a
+ * target on another filesystem than its directory entry suggests.
+ */
+const UNREPLACEABLE_TARGET_CODES = new Set(['EBUSY', 'EXDEV'])
+
+/**
+ * Overwrites `target` in place: the same inode, so the same mode and owner. Written from offset 0 and then
+ * truncated, rather than truncated first, so a reader never sees an empty file — though one reading
+ * mid-write can still see new bytes followed by old ones, which is why this is only the fallback.
+ */
+function overwriteInPlace(target: string, text: string): void {
+  const bytes = Buffer.from(text, 'utf-8')
+  const fd = fs.openSync(target, 'r+')
+  try {
+    let written = 0
+    while (written < bytes.length) written += fs.writeSync(fd, bytes, written, bytes.length - written, written)
+    fs.ftruncateSync(fd, bytes.length)
+    fs.fsyncSync(fd)
+  } finally {
+    fs.closeSync(fd)
+  }
+}
+
+/**
  * Replaces `filePath` with `text` so that no reader can ever observe a partial file: the bytes go to a
  * temporary file in the same directory, are flushed, and are then renamed over the target — the file a
  * symlink points to, not the link (`resolveStoreFilePath`).
@@ -321,7 +353,14 @@ const TRANSIENT_RENAME_CODES = new Set(['EPERM', 'EBUSY', 'EACCES'])
  * (An in-place `writeFileSync`, which this replaces, kept the mode implicitly.) A new file gets the same
  * default an in-place write would have.
  *
- * A failure removes the temporary file and leaves the target exactly as it was.
+ * A failure removes the temporary file and leaves the target exactly as it was — with one exception. A
+ * target the rename cannot replace (`UNREPLACEABLE_TARGET_CODES` — above all a single-file bind mount,
+ * where the kernel refuses to rename over the mount point) is overwritten in place instead, which is what
+ * every write did before issue #73. Refusing there made every write in that deployment fail, and the first
+ * queue write tripped the persistence-broken marker over a file it never touched. The caller still holds
+ * the write lock, so no other MAO write interleaves; a reader that takes no lock can see a partial file
+ * during that one write, and a failure part-way leaves the target partly written — which callers already
+ * treat as an unknown outcome.
  */
 export function writeStoreFileAtomic(filePath: string, text: string): void {
   const target = resolveStoreFilePath(filePath)
@@ -365,6 +404,11 @@ export function writeStoreFileAtomic(filePath: string, text: string): void {
         break
       } catch (err) {
         const code = (err as NodeJS.ErrnoException).code
+        if (process.platform !== 'win32' && code && UNREPLACEABLE_TARGET_CODES.has(code) && existing) {
+          overwriteInPlace(target, text)
+          fs.rmSync(tempPath, { force: true })
+          break
+        }
         if (process.platform !== 'win32' || !code || !TRANSIENT_RENAME_CODES.has(code) || attempt >= 10) throw err
         sleepSync(10 * attempt)
       }

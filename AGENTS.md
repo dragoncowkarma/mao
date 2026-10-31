@@ -790,11 +790,12 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   A write that cannot take the lock within `STORE_LOCK_TIMEOUT_MS` throws `StoreLockError` and writes
   nothing; a lock whose owner pid is gone from this host, or that is older than `STORE_LOCK_STALE_MS`, is
   broken rather than left to wedge every write (a lock naming this process's own pid counts as abandoned
-  unless its token is one this process holds — a restart under the same pid). A refused write inside
-  `appendTask()` rolls the task back out of memory before rethrowing: auto-trigger labels nothing after a
-  failed enqueue, so a task kept in memory was persisted alongside its own re-enqueue once writes
-  recovered, and both ran. Other mutators (`retry`, `advance`, `setAutoAdvance`, `clearCompleted`) still
-  keep their in-memory change when their write is refused; that duplicates nothing. `get()` on a long-running
+  unless its token is one this process holds — a restart under the same pid). Every one of those refusals
+  is decided before the backend writes, so `persistQueue()` reports it as a `'not-written'`
+  `QueuePersistenceError` and the public mutator that emitted it rolls its change back
+  (`notifyPublicMutation`) — `appendTask()` included, which is the case that matters: auto-trigger labels
+  nothing after a failed enqueue, so a task kept in memory was persisted alongside its own re-enqueue once
+  writes recovered, and both ran. `get()` on a long-running
   `FileStore` still answers from its snapshot, so `mao run` keeps polling the repositories it booted with
   until it restarts; that is read staleness, not a lost update, and no write carries it back any more.
 - **What the halt does *not* cover, so it is not read as more than it is.** A `config.json` that is not

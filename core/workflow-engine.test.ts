@@ -1428,7 +1428,7 @@ describe('WorkflowEngine queue-recovery latch', () => {
     }
   })
 
-  it('runs no stage when resumeProcessing is called, which is what `mao run` does unconditionally', async () => {
+  it("runs no stage when resumeProcessing is called anyway — the engine backstop behind mao run's own refusal", async () => {
     const { engine, github } = latchedEngine()
     engine.restore([{ ...makePendingQueueTask('leftover') }])
 

@@ -2,14 +2,21 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { createMaoApp, describeQueueWriteConflict } from './app.ts'
+import { createMaoApp, describeQueueWriteConflict, type MaoApp } from './app.ts'
+import { startAutoTrigger } from './auto-trigger.ts'
+import type { GithubTask } from './github-service.ts'
 import {
   FileStore,
   STORE_RESTART_REQUIRED,
   createGuardedStore,
   type MaoStoreSchema,
 } from './store.ts'
-import { hasPersistenceBrokenMarker, writePersistenceBrokenMarker } from './persistence-guard.ts'
+import {
+  clearPersistenceBrokenMarker,
+  hasPersistenceBrokenMarker,
+  writePersistenceBrokenMarker,
+} from './persistence-guard.ts'
+import { evaluateRepoCapability } from './repo-capabilities.ts'
 import type { AiProviderConfig } from './ai/types.ts'
 import { QUEUE_PERSISTENCE_BROKEN, QueuePersistenceError, type QueuedTask } from './workflow-engine.ts'
 import { createStoreWriteLock } from './store-file.ts'
@@ -280,8 +287,8 @@ describe('createMaoApp', () => {
     })
     const { workflowEngine } = app
 
-    // Give any (incorrectly) auto-started processing a chance to run — with no AI providers
-    // registered, a resumed task would immediately flip to 'error'. It must stay untouched instead.
+    // Give any (incorrectly) auto-started processing a chance to run — with no GitHub token configured,
+    // a resumed stage would fail its repository preflight and flip to 'error'. It must stay untouched.
     await new Promise((r) => setTimeout(r, 20))
 
     const task = workflowEngine.getTasks().find((t) => t.id === 'leftover-task')!
@@ -418,6 +425,189 @@ describe('createMaoApp', () => {
     expect(persisted).toHaveLength(1)
     expect(persisted[0]!.repo).toEqual({ owner: 'acme', repo: 'widgets' })
     expect(workflowEngine.isPersistenceBroken()).toBe(false)
+    expect(hasPersistenceBrokenMarker(dataDir)).toBe(false)
+  })
+})
+
+/**
+ * Issue #76: the durable persistence-broken marker against each long-lived host's *own* boot calls.
+ *
+ * The marker once reached only `safeToResume`, which `mao run` never relies on: it boots with
+ * `resume: false` (architecture rule 4) and calls `startAutoTrigger(...)` and `resumeProcessing()` itself.
+ * The shell now refuses first (source order pinned in core/shell-queue-gate.test.ts, the process itself in
+ * core/cli-run-refusal.test.ts), but that gate reads `isPersistenceBroken()`, which holds only because
+ * `createMaoApp` carries the marker into the engine for every `resume` value — and neither pin can say what
+ * the engine does if the gate is moved or lost. These run each host's calls past its gate, against a real
+ * FileStore and the real marker.
+ *
+ * No token and no AI provider is configured anywhere here, so even a bypass cannot reach GitHub or an AI
+ * CLI (GithubService builds no Octokit without a token, so every unstubbed call fails locally, and with no
+ * provider selectAgent fails before any CLI is spawned); a bypass can only show up in what is asserted
+ * below.
+ */
+describe('host boot paths beside a persistence-broken marker (issue #76)', () => {
+  const tracked = { owner: 'acme', repo: 'widgets' }
+  const handles: Array<ReturnType<typeof setInterval>> = []
+
+  // startAutoTrigger owns a setInterval that would otherwise outlive the test.
+  afterEach(() => {
+    while (handles.length) clearInterval(handles.pop()!)
+  })
+
+  /**
+   * One tracked repository with auto-trigger at its default (on) and never polled, plus one pending task,
+   * beside the marker. The repository is what makes "no fetchTasks" mean something: `tick()` runs inside
+   * `startAutoTrigger` and polls any repository whose last poll is older than its interval, so a tick past
+   * the block *would* reach it.
+   */
+  function markedDataDir(taskId: string) {
+    const held = makeRealDataDirHolding({ githubRepos: [tracked], workflowTasks: [makePendingTask(taskId)] })
+    writePersistenceBrokenMarker(held.dataDir, new Error('disk full'))
+    return held
+  }
+
+  /** Every entry in `dir` with its bytes, so "nothing was written" covers the marker and any new file. */
+  function snapshot(dir: string): Record<string, string> {
+    return Object.fromEntries(
+      fs.readdirSync(dir, { withFileTypes: true }).map((entry) => [
+        entry.name,
+        entry.isFile() ? fs.readFileSync(path.join(dir, entry.name), 'utf-8') : '<directory>',
+      ]),
+    )
+  }
+
+  /**
+   * What each host does right after `createMaoApp`, in its order: the poller first — its first tick runs
+   * inside the call — then, for `mao run` only, `resumeProcessing()`; the desktop app relies on
+   * `resume: true` instead (electron/ipc.ts). The 60s scheduler interval keeps later ticks out of the test
+   * window; the immediate one is the tick both of #76's reproductions used.
+   */
+  function startLikeHost(app: MaoApp, store: FileStore, host: 'mao run' | 'desktop app') {
+    // Spied so a test can tell where the tick stopped: the entry check returns before this fresh read,
+    // the loop guard after it.
+    const inspectRepos = vi.fn(() => store.inspect('githubRepos'))
+    const trigger = startAutoTrigger(app.githubService, app.workflowEngine, inspectRepos, 60_000)
+    handles.push(trigger.handle)
+    if (host === 'mao run') app.workflowEngine.resumeProcessing()
+    return { ...trigger, inspectRepos }
+  }
+
+  const writable = () =>
+    evaluateRepoCapability({
+      owner: 'acme',
+      repo: 'widgets',
+      repository: { has_issues: true, permissions: { push: true } },
+    })
+
+  const openIssue: GithubTask = {
+    id: 7,
+    number: 7,
+    title: 'Issue 7',
+    type: 'issue',
+    state: 'open',
+    url: 'https://github.com/acme/widgets/issues/7',
+    updatedAt: '2026-10-01T00:00:00Z',
+    urgent: false,
+    labels: [],
+    body: '',
+  }
+
+  it.each([
+    { host: 'mao run' as const, resume: false },
+    { host: 'desktop app' as const, resume: true },
+  ])('$host: its own boot calls start no stage and no poll', async ({ host, resume }) => {
+    const { dataDir, store } = markedDataDir('stale-pending')
+    const before = snapshot(dataDir)
+    const app = createMaoApp({ store, workspaceRoot: path.join(dataDir, 'workspaces'), dataDir, resume })
+    // Stubbed to *pass*, so a bypassed poll would get as far as fetchTasks, enqueue and label rather than
+    // stopping at a token-missing verdict — which would make "fetchTasks was not called" vacuous.
+    const preflight = vi.spyOn(app.githubService, 'assertRepoWorkflowWritable').mockResolvedValue(writable())
+    const fetchTasks = vi.spyOn(app.githubService, 'fetchTasks').mockResolvedValue([openIssue])
+    const addLabel = vi.spyOn(app.githubService, 'addLabel').mockResolvedValue()
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const changes = vi.fn()
+    // Prepended: createMaoApp's persisting listener throws while the marker stands, and an emitter stops at
+    // the first listener that throws, so one appended after it could never observe an emission.
+    app.workflowEngine.prependListener('change', changes)
+
+    // What cli/index.ts's own gate reads. It has to hold for resume: false — the shape #76 was filed against.
+    expect(app.workflowEngine.isPersistenceBroken()).toBe(true)
+
+    const trigger = startLikeHost(app, store, host)
+    await new Promise((resolve) => setTimeout(resolve, 20))
+
+    expect(preflight).not.toHaveBeenCalled()
+    expect(fetchTasks).not.toHaveBeenCalled()
+    expect(addLabel).not.toHaveBeenCalled()
+    expect(changes).not.toHaveBeenCalled()
+    expect(app.workflowEngine.getTasks()).toEqual([
+      expect.objectContaining({ id: 'stale-pending', status: 'pending', stage: 'issue' }),
+    ])
+    // Stopped at tick() entry: not inside pollRepo, which would record and log a refusal per repo, and not
+    // at the per-repository guard either, which runs only after a fresh read of the tracked list.
+    expect(trigger.getStatus('acme', 'widgets')).toMatchObject({ lastPolledAt: null, lastError: null })
+    expect(consoleError).not.toHaveBeenCalled()
+    expect(trigger.inspectRepos).not.toHaveBeenCalled()
+    // config.json and the marker byte for byte, and nothing new beside them (no workspaces/, no lock file).
+    expect(snapshot(dataDir)).toEqual(before)
+  })
+
+  it('mao run: resumes only in a fresh process after the marker is cleared', async () => {
+    const { dataDir, store, filePath } = markedDataDir('verified-pending')
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    const blocked = createMaoApp({
+      store,
+      workspaceRoot: path.join(dataDir, 'workspaces'),
+      dataDir,
+      resume: false,
+    })
+    // Pass-through: with no token the real preflight answers without a request, so nothing needs stubbing.
+    const blockedPreflight = vi.spyOn(blocked.githubService, 'assertRepoWorkflowWritable')
+    const blockedTrigger = startLikeHost(blocked, store, 'mao run')
+
+    // The operator's `mao config clear-persistence-broken`, run from another terminal while this host is up.
+    expect(clearPersistenceBrokenMarker(dataDir)).toBe(true)
+
+    // Releases nothing in the process that booted with it: that engine still holds the stale snapshot the
+    // operator was asked to reconcile against, so only a restart may resume it.
+    blocked.workflowEngine.resumeProcessing()
+    await expect(blockedTrigger.pollNow(tracked)).rejects.toThrow(QUEUE_PERSISTENCE_BROKEN)
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(blockedPreflight).not.toHaveBeenCalled()
+    expect(blocked.workflowEngine.getTasks()).toEqual([
+      expect.objectContaining({ id: 'verified-pending', status: 'pending' }),
+    ])
+
+    // A fresh `mao run` on the same data directory, with nothing stubbed.
+    const freshStore = new FileStore(filePath)
+    const fresh = createMaoApp({
+      store: freshStore,
+      workspaceRoot: path.join(dataDir, 'workspaces'),
+      dataDir,
+      resume: false,
+    })
+    expect(fresh.workflowEngine.isPersistenceBroken()).toBe(false)
+    // Why no request can leave this test: GithubService builds no Octokit without a token.
+    expect(freshStore.get('githubToken')).toBe('')
+    const freshTrigger = startLikeHost(fresh, freshStore, 'mao run')
+
+    // The stage preflight rejecting is what proves processing started — an untouched task reads 'pending'.
+    // Awaited on disk, which the blocked process could never have written.
+    await vi.waitFor(() =>
+      expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).workflowTasks).toEqual([
+        expect.objectContaining({ id: 'verified-pending', status: 'error' }),
+      ]),
+    )
+    expect(fresh.workflowEngine.getTasks()[0]).toMatchObject({
+      id: 'verified-pending',
+      stage: 'issue',
+      error: expect.stringMatching(/no GitHub token is configured/),
+    })
+    // The poller is released too: its immediate tick reached the same token-missing preflight.
+    await vi.waitFor(() =>
+      expect(freshTrigger.getStatus('acme', 'widgets').lastError).toMatch(/no GitHub token is configured/),
+    )
     expect(hasPersistenceBrokenMarker(dataDir)).toBe(false)
   })
 })
@@ -857,6 +1047,10 @@ describe('core/app.ts and the engine, as source order', () => {
     const checks = [...body.matchAll(/this\.queueRecoveryReason !== undefined\) return/g)]
 
     expect(checks).toHaveLength(2)
+    // The persistenceBroken pair the comment above mirrors, counted too: deleting both lets a marker-booted
+    // engine start a stage (the 'change' backstop then parks it in 'error' before its preflight, which the
+    // issue #76 block's 'pending' assertion sees), but neither alone is observable.
+    expect([...body.matchAll(/if \(this\.persistenceBroken\) return/g)]).toHaveLength(2)
   })
 
   it('does not gate notify() itself', () => {

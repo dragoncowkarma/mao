@@ -50,9 +50,11 @@ function resolveDataDir(): string {
 
 /**
  * Every command boots a fresh app instance against the on-disk store — the CLI is stateless between
- * invocations. `resume` defaults to false so that inspecting or reconfiguring state (e.g. `mao config
- * show`) never has the side effect of resuming real GitHub/AI-provider calls left over from a
- * previous `mao run`; only `run` itself opts in.
+ * invocations. `resume` is false for every command, so that inspecting or reconfiguring state (e.g. `mao
+ * config show`) never has the side effect of resuming real GitHub/AI-provider calls left over from a
+ * previous `mao run`. `run` boots with false too, so it can attach its stdout `'change'` listener before it
+ * calls `resumeProcessing()` itself (a resume inside createMaoApp would emit before the listener exists);
+ * its exit-1 refusal on a persistence marker or queue latch runs before both (AGENTS.md rule 4).
  */
 function loadApp(resume = false): MaoApp {
   const dataDir = resolveDataDir()
@@ -130,9 +132,12 @@ config
   .command('clear-persistence-broken')
   .description(
     'Clear the marker that blocks queue mutation, polling and resume after a confirmed queue ' +
-      'persistence failure (see ' +
-      'AGENTS.md). Only run this after verifying by hand — via `mao workflow list` and the target ' +
-      "repo's actual GitHub state — that no queued task will duplicate work if resumed.",
+      'persistence failure (workflow-persistence-broken.marker in the data directory; while it exists ' +
+      '`mao run` starts nothing and exits 1). Only run this after verifying by hand — via `mao workflow ' +
+      "list` and the target repo's actual GitHub state — that no queued task will duplicate work if " +
+      'resumed — and with every MAO process on this data directory stopped: clearing releases none of ' +
+      'them. One that recorded or booted with the marker stays blocked until it exits, and one that ' +
+      'booted before the marker was written was never blocked by it.',
   )
   .action(() => {
     const dataDir = resolveDataDir()
@@ -146,11 +151,16 @@ config
     // "cleared" that would let the operator believe auto-resume is safe again when it isn't.
     if (!clearPersistenceBrokenMarker(dataDir)) {
       throw new Error(
-        `Failed to clear workflowPersistenceBroken — the marker file is still present at ${dataDir}. ` +
-          'Queue mutation, polling and resume remain blocked. Check filesystem permissions and try again.',
+        `Failed to clear workflowPersistenceBroken — the marker file is still present at ${dataDir}, ` +
+          'or its presence could not be checked. Queue mutation, polling and resume remain blocked. ' +
+          'Check filesystem permissions and try again.',
       )
     }
-    log('Cleared workflowPersistenceBroken. Restart MAO to reload and resume the verified queue.')
+    log(
+      'Cleared workflowPersistenceBroken. This releases no running MAO process: one that recorded or ' +
+        'booted with the marker stays blocked until it exits, and one that booted before it was written ' +
+        'was never blocked. Start `mao run` again to reload and resume the verified queue.',
+    )
   })
 
 /**
@@ -454,7 +464,8 @@ program
   .description(
     'Run the engine in the foreground: restores the queue, polls tracked repos for new issues, and ' +
       'streams stage transitions to stdout/stderr until interrupted (Ctrl+C). Intended for unattended ' +
-      'shell/cron invocation.',
+      'shell/cron invocation. Starts nothing and exits 1 while `mao config show` reports ' +
+      'workflowPersistenceBroken or workflowQueueRecoveryRequired.',
   )
   .action(() => {
     // resume: false here — the queue is only resumed below, after the stdout log listener is
@@ -468,7 +479,12 @@ program
     // failure it can act on.
     if (workflowEngine.isPersistenceBroken()) {
       logErr(QUEUE_PERSISTENCE_BROKEN)
-      logErr('Nothing was started.')
+      // CLI-only guidance: the shared message is also the GUI's, which clears through its own action.
+      logErr(
+        'Nothing was started. Stop every other MAO process on this data directory, check `mao workflow ' +
+          'list` against the target repositories, then run `mao config clear-persistence-broken` and ' +
+          'start `mao run` again.',
+      )
       process.exitCode = 1
       return
     }

@@ -29,19 +29,27 @@ export interface MaoAppOptions {
   /**
    * Per-user app data directory (Electron's `app.getPath('userData')`, or the CLI's resolved
    * `defaultDataDir()`/`MAO_DATA_DIR`) — passed explicitly rather than derived from `workspaceRoot`
-   * so its location doesn't depend on an incidental relationship between the two. Used only to
-   * durably record a confirmed queue-persistence failure via a marker file independent of
-   * `MaoStore` (see core/persistence-guard.ts) — both shipped `MaoStore` backends rewrite their
-   * entire JSON blob on every `set()`, so a flag written *through* `store` would retry the exact
-   * write that just failed.
+   * so its location doesn't depend on an incidental relationship between the two. Used only for a
+   * marker file independent of `MaoStore` (see core/persistence-guard.ts): read at boot to carry a prior
+   * process's confirmed queue-persistence failure into the engine, and written when this process confirms
+   * one — both shipped `MaoStore` backends rewrite their entire JSON blob on every `set()`, so a flag
+   * written *through* `store` would retry the exact write that just failed.
    */
   dataDir: string
   /**
-   * Whether to immediately resume processing any leftover 'pending'/'running' tasks from a previous
-   * session. Required (no default) on purpose: a long-lived process (the Electron main process, or
-   * `mao run`) should pass true so it picks back up where it left off, but a one-shot CLI command
-   * (e.g. `mao config show`) MUST pass false — otherwise loading the app to answer an unrelated
-   * question would silently make real GitHub/AI-provider calls and mutate the persisted queue.
+   * Whether `restore()` should immediately resume processing any leftover 'pending'/'running' tasks from
+   * a previous session. Required (no default) on purpose: a one-shot CLI command (e.g. `mao config show`)
+   * MUST pass false — otherwise loading the app to answer an unrelated question would silently make real
+   * GitHub/AI-provider calls and mutate the persisted queue. The Electron main process passes true. `mao
+   * run` passes false as well, so it can attach its stdout `'change'` listener before it calls
+   * `workflowEngine.resumeProcessing()` itself: a resume inside this function emits the first stage's
+   * `'running'` transition synchronously, before that listener exists. Its refusal (exit 1, nothing
+   * started) while the engine reports `isPersistenceBroken()` or a queue-recovery reason runs before both
+   * steps, and would hold with `true` too, for the reason below.
+   *
+   * `true` is a request, not a guarantee: it is ANDed with "no persistence-broken marker" and "queue not
+   * latched" (`safeToResume` below), and `processQueue()` refuses on both regardless, so neither this flag
+   * nor a later `resumeProcessing()` can run a stage while either block stands.
    */
   resume: boolean
 }
@@ -392,10 +400,14 @@ export function createMaoApp({ store, workspaceRoot, dataDir, resume }: MaoAppOp
   // A prior process confirmed it could no longer durably persist queue state (see above) and may
   // have advanced a task's stage in memory — including real GitHub writes — without that advance
   // reaching workflowTasks. The on-disk snapshot can therefore predate work that already happened.
-  // Carry the marker into persistenceBroken before restore: merely setting resume=false is insufficient,
-  // because auto-trigger's immediate enqueue (or a later click) calls processQueue and would wake every
-  // restored pending task. Mutation, polling and resume all stay blocked until an operator verifies the
-  // queue, clears the marker (`mao config clear-persistence-broken`) and starts a fresh process.
+  // The marker was carried into persistenceBroken at the top of this function, before any listener and
+  // before restore, and for every `resume` value: a resume flag guards only this one call, so
+  // auto-trigger's immediate enqueue, a later click, or `mao run`'s own resumeProcessing() (it boots with
+  // resume: false) would otherwise wake every restored pending task (issue #76). processQueue() refuses
+  // on both blocks by itself; the two terms below keep restore() from even being asked to resume a queue
+  // either block distrusts. Mutation, polling and resume all stay blocked until an operator verifies the
+  // queue, clears the marker (`mao config clear-persistence-broken`, or the GUI's Clear marker after
+  // verification, each against its own data directory) and starts a fresh process.
   // Two independent facts, deliberately not conflated: the marker means a prior process could no longer
   // *write*, the latch means this process cannot *read* the queue. `mao config show` reports them
   // separately so neither is diagnosed as the other.

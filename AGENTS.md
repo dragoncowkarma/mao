@@ -40,6 +40,7 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
 | `core/store.ts` | `MaoStoreSchema`, `MAO_STORE_DEFAULTS`, the `MaoStore` interface, `FileStore` (JSON impl for the CLI, which merges each write into a fresh read of the file), `createStoredReadGuard()` — the read-path guard every backend applies so a field's declared type survives contact with unvalidated JSON — `describeStoredProblems()` behind `MaoStore.problems()`, which answers which stored values the schema cannot fully use, reported whether the guard replaced them, filtered them, or (for `githubRepos`) handed them through; `StoredValueDefect` / `StoredValueProblem.nothingUsable`, the single core-side answer to whether replacing a whole value loses anything, and `describeHealedStoredValue()`, so every operator-facing store string lives here rather than in a shell; the whole-file tier below all of those — `classifyStoreReadFailure()`/`UnreadableStoreError` plus the write refusal in `createGuardedStore.set()` that closes issue #67; and `withFileWriteLock()`, which gives a backend its file's cross-process write lock (issue #73) |
 | `core/store-file.ts` | File-level primitives for the single-blob `config.json` (issue #73): `createStoreWriteLock()` — the `O_EXCL` lock file both backends take around every write, with bounded waits and abandoned-lock breaking — and `writeStoreFileAtomic()`, the temp-file + rename replace `FileStore` writes through |
 | `core/app.ts` | `createMaoApp()` — the **single composition root** both frontends call |
+| `core/persistence-guard.ts` | The durable `workflow-persistence-broken.marker` in the data directory, deliberately outside `MaoStore`: `writePersistenceBrokenMarker()` (from `createMaoApp`'s `'persistence-broken'` listener), the presence-only, fail-closed `hasPersistenceBrokenMarker()` (read at boot into `requirePersistenceRecovery()`, by `mao config show` and `clear-persistence-broken`, and as the clear's postcondition), the postcondition-checked `clearPersistenceBrokenMarker()`, and the GUI's active-stage refusal `assertCanClearPersistenceBroken()` |
 | `core/paths.ts` | Platform-appropriate data dir for the CLI (mirrors Electron's `userData`) |
 | `core/ai/` | `AiProvider` interface + adapters: `api-provider.ts` (Anthropic / OpenAI-compatible HTTP) and `cli-provider.ts` (spawns `claude`, `codex`, …) |
 | `electron/main.ts` | BrowserWindow, external-link handling, dev/prod load |
@@ -53,6 +54,8 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
 | `.agents/workflows/swarm_orchestrator.py` | Autonomous Worker/Reviewer/Maintainer lifecycle, credential-aligned write preflight, origin fetch/push identity binding, isolated worktrees, process registry, retry/cooldown, and safe merged-task cleanup; copied beside the CLI bundle by `scripts/build-cli.mjs` |
 | `.agents/workflows/swarm_orchestrator_test.py` | Standalone Python preflight, credential non-disclosure, dry-run, and worktree-safety regressions, included in `npm run test` |
 | `core/node-environment.test.ts` | Architecture rule 8 as a test: asserts the `core` vitest project still runs with no DOM in scope |
+| `core/shell-queue-gate.test.ts` | Source-text pins for shell call sites no `core` test can import: `mao run` must consult `isPersistenceBroken()` and the queue latch before `startAutoTrigger(`/`resumeProcessing()`, exit 1 and name its CLI way out; `electron/ipc.ts` must expose the latch and clear the marker in its own `userData` |
+| `core/cli-run-refusal.test.ts` | Rule 4's refusal as a process: bundles `cli/index.ts` with `scripts/build-cli.mjs`'s esbuild options into a temp dir and spawns only *refusing* `mao run`s (marker; unusable queue), plus `config show` and `config clear-persistence-broken`, in an isolated HOME with no token, requiring exit 1 and a byte-identical HOME. Lives under `core/` only until issue #83 gives `cli/` a vitest project |
 | `src/electron-ipc-surface.test.ts` | The IPC lockstep's untypeable half as a test: channel strings in `electron/ipc.ts` and `electron/preload.ts` must be the same set, registered and exposed once each, and each named after the bridge method that calls it — plus a pin that the bridge still carries `satisfies Window['electronAPI']` |
 | `scripts/test-workflow.ts` | Standalone e2e harness against a real (throwaway) repo |
 | `scripts/check-origin.mjs` | Publish-preflight guard: validates every effective `origin` fetch/push URL against an expected host/owner/repo; failure output is fixed-category-only, never remote-derived strings (see SKILL.md) |
@@ -80,12 +83,32 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
    `'change'` event, and restores tasks. Workflow mutations must go through
    `WorkflowEngine` so persistence happens automatically — never write
    `workflowTasks` to the store directly.
-4. **The `resume` flag is deliberately required (no default).** One-shot commands
-   must pass `false` so inspecting config never side-effect-resumes real GitHub/AI
-   calls. Current reality: `electron/ipc.ts` passes `resume: true`; `mao run` passes
-   `false` and instead calls `workflowEngine.resumeProcessing()` **after** attaching
-   its `'change'` stdout listener, so no transition is missed. (The docstring in
-   `core/app.ts` claiming `mao run` passes `true` is stale — trust the code.)
+4. **The `resume` flag is deliberately required (no default), and it is a request, not a
+   guarantee.** One-shot commands must pass `false` so inspecting config never side-effect-resumes
+   real GitHub/AI calls. `createMaoApp()` carries a persistence-broken marker into the engine for
+   **every** `resume` value, ANDs `true` with "no marker" and "queue not latched" (`safeToResume`),
+   and `processQueue()` refuses on both anyway — so neither `resume: true` nor a later
+   `resumeProcessing()` can run a stage while either block stands. Issue #76 was exactly the gap
+   between those: the marker once reached only `safeToResume`, which `mao run` never relies on.
+   Current reality: `electron/ipc.ts` passes `resume: true` and starts the poller regardless (each
+   tick refuses; the sidebar shows the block through `workflow:recoveryRequired`). `mao run` passes
+   `false` and runs, in this order: (1) if `workflowEngine.isPersistenceBroken()` or
+   `getQueueRecoveryReason()` is set, print the reason and the CLI way out — `mao config
+   clear-persistence-broken` for the marker (checked first, so a queue latch is not reported beside
+   it), `mao workflow confirm-queue-recovery` for a field-only queue latch, "repair the config file,
+   then restart" for a whole-file one — set exit code 1 and return, with no poller and no resume, so
+   cron or a supervisor sees a failure rather than an idle success; (2) `startAutoTrigger()`; (3)
+   attach its `'change'` stdout and `'persistence-broken'` stderr listeners; (4)
+   `workflowEngine.resumeProcessing()`, so no transition is missed. Verify with:
+
+   ```bash
+   npx vitest run --project core core/shell-queue-gate.test.ts core/app.test.ts core/cli-run-refusal.test.ts
+   ```
+
+   The first pins (1) before (2) and (4) as source text, the second runs each host's own boot calls
+   past its gate against a real marker, the third runs the bundled `mao run` as a process and
+   requires exit 1 with nothing on disk changed — the only one of the three that sees a gate
+   disabled while its text stays in place.
 5. **Never start the auto-trigger poller inside `createMaoApp()`.** Its
    `setInterval` keeps the process alive forever; only long-lived hosts
    (`electron/ipc.ts`, `mao run`) start it themselves.
@@ -268,6 +291,11 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   directory name itself lives in `vite.config.ts` (`outDir`) and `package.json`
   (`main`, `build.files`), while the renderer's `dist/` is Vite's implicit
   default. Renaming any output means auditing all three files.
+- **CLI bundle options** → `scripts/build-cli.mjs`'s `build({…})` and `BUNDLE_OPTIONS` in
+  `core/cli-run-refusal.test.ts` (`bundle`, `platform`, `format`, `target`). The test cannot import
+  the script, which builds at top level, so it compares the two as text: change one alone and
+  `npx vitest run --project core core/cli-run-refusal.test.ts` fails rather than CI quietly
+  exercising a bundle production no longer ships.
 
 ## Workflow-engine domain invariants
 
@@ -597,7 +625,15 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   while persistence is fine, and it is sticky and operator-gated where this heals itself. The two are
   reported as separate fields. A real persistence marker is carried into `WorkflowEngine` before
   restore and blocks public queue mutation, auto-trigger/manual polling and stage processing until the
-  operator reconciles GitHub with the durable queue, clears the marker and starts a fresh process. The
+  operator reconciles GitHub with the durable queue, clears the marker and starts a fresh process.
+  The two long-lived hosts react differently, both deliberately (rule 4): `mao run` starts nothing and
+  exits 1, while Electron starts its poller anyway and shows the block. The presence check
+  (`hasPersistenceBrokenMarker()`) fails **closed**: it uses `lstatSync(…, { throwIfNoEntry: false })`,
+  never `existsSync`, because `existsSync` answers `false` for every error — a marker in a directory the
+  process cannot search, a transient EIO, or a dangling symlink read as "no marker" and let a fresh
+  process resume the stale queue. Only ENOENT and ENOTDIR (a data directory that is a file, where no
+  marker can exist and the store's whole-file latch names the real fault) mean absent. Verify with
+  `npx vitest run --project core core/persistence-guard.test.ts`. The
   CLI clears its own data directory with `mao config clear-persistence-broken`; the GUI has a two-step
   **Clear marker after verification** action wired to Electron's actual `userData` directory. These are
   deliberately separate because a packaged GUI need not ship the CLI and their default directories can
@@ -1120,8 +1156,10 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   not a GitHub-enforced merge gate — treat it as required anyway. (Separate
   concept: the *app's own* merge stage checks the target repo's CI via
   `getChecksStatus` — that gate lives in the workflow engine, not in this repo's
-  settings.) CI does **not** build the CLI bundle — run `npm run build:cli`
-  yourself when touching `cli/` or `core/`.
+  settings.) CI does **not** run `scripts/build-cli.mjs` — it only bundles `cli/index.ts`
+  in a temp dir for `core/cli-run-refusal.test.ts` — so the asset copy, the executable
+  bits and `--help` are unexercised: run `npm run build:cli` and
+  `node dist-cli/index.cjs --help` yourself when touching `cli/` or `core/`.
 
 ## Agent roles & division of labor
 
@@ -1137,8 +1175,6 @@ Mirror the product's own maker-checker principle in how you work:
 
 ## Known documentation drift — do not trust these
 
-- `core/app.ts` docstring says `mao run` passes `resume: true` — it doesn't (see
-  rule 4 above).
 - README says "Copy the env template", but no `.env.example` exists — the only
   template is the inline block in the README.
 - `src/index.css` references the 'Archivo' font, but nothing loads it; the UI

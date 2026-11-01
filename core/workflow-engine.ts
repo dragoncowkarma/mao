@@ -505,7 +505,9 @@ export class WorkflowEngine extends EventEmitter {
    * own — callers that are only inspecting or reconfiguring state (e.g. a one-shot CLI command like
    * `mao config show`) must not have that trigger real GitHub/AI-provider calls as a side effect.
    * Pass resume: true (or call resumeProcessing() once ready) for long-lived processes that should
-   * pick back up where they left off, such as the Electron main process or `mao run`.
+   * pick back up where they left off, such as the Electron main process or `mao run`. Either is a no-op
+   * while `isPersistenceBroken()` or `isQueueRecoveryLatched()`: processQueue() returns before touching
+   * a task.
    *
    * This method normalizes migrations but does not validate task shapes. Production callers must pass
    * the already-filtered subset returned by the store read guard.
@@ -522,7 +524,10 @@ export class WorkflowEngine extends EventEmitter {
     if (options.resume) this.resumeProcessing()
   }
 
-  /** Kicks off processing of any 'pending' tasks currently in the queue. Safe to call when already processing. */
+  /**
+   * Kicks off processing of any 'pending' tasks currently in the queue. Safe to call when already
+   * processing, and a no-op while persistence is broken or the queue is latched for recovery.
+   */
   resumeProcessing() {
     void this.processQueue()
   }
@@ -706,13 +711,18 @@ export class WorkflowEngine extends EventEmitter {
 
   private async processQueue() {
     if (this.processing) return
-    // Persistence is confirmed broken (see `persistenceBroken`) — refuse to run more stages until
-    // the process restarts. Continuing would only produce more in-memory state the store can't
-    // durably reflect.
+    // A queue write could not be durably recorded — an unknown outcome, or a refusal after the stage's
+    // external work — in this process, or in a prior one whose durable marker createMaoApp() carried in
+    // through requirePersistenceRecovery(). Memory, disk and GitHub may disagree, so run no stage until an
+    // operator reconciles, clears the marker and starts a fresh process; a restart alone rehydrates this
+    // block whenever the best-effort marker write landed. Continuing would only produce more in-memory
+    // state the store can't durably reflect.
     if (this.persistenceBroken) return
     // The stored queue is unreadable, so this process cannot tell what was already in flight. Refuse to
-    // run any stage — this is the chokepoint `mao run` reaches through its unconditional
-    // resumeProcessing(), and every GitHub write in the repo is reachable only from here.
+    // run any stage. `mao run` refuses before it ever calls resumeProcessing(), so this is the backstop for
+    // every other caller (Electron's resume: true, a one-shot enqueue/retry/advance, a later poll), and
+    // every stage's GitHub write is reachable only from here. Auto-trigger's workflow-active label is gated
+    // separately, by its own assertLabelWriteAllowed().
     if (this.queueRecoveryReason !== undefined) return
     this.processing = true
     try {

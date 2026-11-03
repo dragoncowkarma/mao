@@ -32,6 +32,14 @@
 
   --radius-md: 0px;
   --shadow-sm: 0 1px 2px rgb(45 43 43 / 0.14);
+
+  /* Commit-graph lane colors (CommitGraph.tsx cycles through them by lane index). */
+  --graph-lane-0: #ec3013;
+  --graph-lane-1: #2f6fdb;
+  --graph-lane-2: #1f9d55;
+  --graph-lane-3: #b7791f;
+  --graph-lane-4: #8e44ad;
+  --graph-lane-5: #0f8b8d;
 }
 
 /*
@@ -60,6 +68,13 @@
   --color-accent-800: #ffd3c4;
 
   --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.4);
+
+  --graph-lane-0: #ff6a4a;
+  --graph-lane-1: #6f9ff5;
+  --graph-lane-2: #4cc985;
+  --graph-lane-3: #e0a84a;
+  --graph-lane-4: #c08ae0;
+  --graph-lane-5: #4ec3c5;
 }
 
 html,
@@ -291,6 +306,55 @@ a {
 .card-active {
   box-shadow: 0 0 0 2px var(--color-accent), var(--shadow-sm);
   animation: card-active-pulse 1.8s ease-in-out infinite;
+}
+
+/*
+ * Commit graph (Graph tab). Every row is the same height so each row's own SVG strip joins the next
+ * one seamlessly — the lane lines are drawn per row, not as one tall picture.
+ */
+.graph-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.graph-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  height: 28px;
+  font-size: 13px;
+}
+
+.graph-row:hover {
+  background: rgb(var(--color-text-rgb) / 0.05);
+}
+
+.graph-lanes {
+  flex: none;
+  overflow: visible;
+}
+
+.graph-message {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--color-text);
+}
+
+.graph-meta {
+  flex: none;
+  margin-left: auto;
+  font-size: 11px;
+  color: rgb(var(--color-text-rgb) / 0.55);
+}
+
+.graph-ref {
+  flex: none;
+  padding: 1px 6px;
+  font-size: 11px;
+  border: 1px solid currentColor;
 }
 
 @keyframes card-active-pulse {

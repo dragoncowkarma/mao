@@ -1,0 +1,229 @@
+name: Milestone Auto Release
+
+on:
+  issues:
+    types: [closed, demilestoned]
+  milestone:
+    types: [closed]
+  workflow_dispatch:
+    inputs:
+      milestone:
+        description: 'Milestone title to release (e.g. v0.1.1, v0.2.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: milestone-release-${{ github.event.milestone.title || github.event.issue.milestone.title || inputs.milestone || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  check-milestone:
+    name: Check Milestone Completion
+    runs-on: ubuntu-latest
+    outputs:
+      should_deploy: ${{ steps.evaluate.outputs.should_deploy }}
+      tag: ${{ steps.evaluate.outputs.tag }}
+      version: ${{ steps.evaluate.outputs.version }}
+      milestone_number: ${{ steps.evaluate.outputs.milestone_number }}
+    steps:
+      - name: Evaluate milestone state
+        id: evaluate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_MILESTONE_NUMBER: ${{ github.event.milestone.number || github.event.issue.milestone.number || '' }}
+          DISPATCH_MILESTONE_TITLE: ${{ inputs.milestone || '' }}
+        run: |
+          set -euo pipefail
+
+          MILESTONE_NUMBER="${EVENT_MILESTONE_NUMBER}"
+
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ] && [ -z "${MILESTONE_NUMBER}" ]; then
+            MILESTONE_NUMBER="$(
+              gh api "repos/${REPO}/milestones?state=all&per_page=100" \
+                | jq -r --arg title "${DISPATCH_MILESTONE_TITLE}" '.[] | select(.title == $title) | .number' \
+                | head -n 1
+            )"
+          fi
+
+          if [ -z "${MILESTONE_NUMBER}" ]; then
+            echo "No milestone associated with this event; skipping release."
+            echo "should_deploy=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          MILESTONE_JSON="$(gh api "repos/${REPO}/milestones/${MILESTONE_NUMBER}")"
+          TITLE="$(printf '%s' "${MILESTONE_JSON}" | jq -r '.title')"
+          OPEN_ISSUES="$(printf '%s' "${MILESTONE_JSON}" | jq -r '.open_issues')"
+          CLOSED_ISSUES="$(printf '%s' "${MILESTONE_JSON}" | jq -r '.closed_issues')"
+
+          echo "Milestone #${MILESTONE_NUMBER} (${TITLE}): open=${OPEN_ISSUES}, closed=${CLOSED_ISSUES}"
+
+          if ! printf '%s\n' "${TITLE}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "Milestone title '${TITLE}' is not a semver tag (vX.Y.Z); skipping release."
+            echo "should_deploy=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          if [ "${OPEN_ISSUES}" -ne 0 ] || [ "${CLOSED_ISSUES}" -le 0 ]; then
+            echo "Milestone '${TITLE}' is not yet satisfied (open_issues=${OPEN_ISSUES}, closed_issues=${CLOSED_ISSUES})."
+            echo "should_deploy=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          if gh api "repos/${REPO}/releases/tags/${TITLE}" >/dev/null 2>&1; then
+            echo "Release '${TITLE}' already exists; skipping duplicate deployment."
+            echo "should_deploy=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          VERSION="${TITLE#v}"
+          echo "Milestone '${TITLE}' is satisfied! Proceeding to release version ${VERSION}."
+          {
+            echo "should_deploy=true"
+            echo "tag=${TITLE}"
+            echo "version=${VERSION}"
+            echo "milestone_number=${MILESTONE_NUMBER}"
+          } >> "${GITHUB_OUTPUT}"
+
+  verify:
+    name: Verify (Lint & Tests)
+    needs: check-milestone
+    if: needs.check-milestone.outputs.should_deploy == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run test
+      - run: npm run test:origin
+      - run: npx vite build
+
+  build-electron:
+    name: Build Electron (${{ matrix.os }})
+    needs: [check-milestone, verify]
+    if: needs.check-milestone.outputs.should_deploy == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            platform_flag: --mac
+          - os: windows-latest
+            platform_flag: --win
+          - os: ubuntu-latest
+            platform_flag: --linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Set release version
+        env:
+          VERSION: ${{ needs.check-milestone.outputs.version }}
+        run: npm version "${VERSION}" --no-git-tag-version --allow-same-version
+      - name: Build Electron distributables
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: npx vite build && npx electron-builder ${{ matrix.platform_flag }} --publish never
+      - name: Upload Electron release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: electron-${{ matrix.os }}
+          if-no-files-found: error
+          path: |
+            release/*.dmg
+            release/*.zip
+            release/*.AppImage
+
+  build-cli:
+    name: Build CLI Bundle
+    needs: [check-milestone, verify]
+    if: needs.check-milestone.outputs.should_deploy == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Set release version and build CLI
+        env:
+          VERSION: ${{ needs.check-milestone.outputs.version }}
+        run: |
+          set -euo pipefail
+          npm version "${VERSION}" --no-git-tag-version --allow-same-version
+          npm run build:cli
+          node dist-cli/index.cjs --help >/dev/null
+          mkdir -p release-cli
+          tar -czf "release-cli/MAO-${VERSION}-cli.tar.gz" -C dist-cli index.cjs swarm_orchestrator.py
+          (cd dist-cli && zip -q "../release-cli/MAO-${VERSION}-cli.zip" index.cjs swarm_orchestrator.py)
+      - name: Upload CLI release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-bundle
+          if-no-files-found: error
+          path: |
+            release-cli/MAO-*-cli.tar.gz
+            release-cli/MAO-*-cli.zip
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: [check-milestone, build-electron, build-cli]
+    if: needs.check-milestone.outputs.should_deploy == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Create GitHub Release and close milestone
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.check-milestone.outputs.tag }}
+          MILESTONE_NUMBER: ${{ needs.check-milestone.outputs.milestone_number }}
+        run: |
+          set -euo pipefail
+
+          if gh api "repos/${REPO}/releases/tags/${TAG}" >/dev/null 2>&1; then
+            echo "Release '${TAG}' already exists; skipping creation."
+          else
+            gh release create "${TAG}" release-assets/* \
+              --repo "${REPO}" \
+              --target main \
+              --title "MAO ${TAG}" \
+              --generate-notes
+          fi
+
+          MILESTONE_STATE="$(gh api "repos/${REPO}/milestones/${MILESTONE_NUMBER}" --jq '.state')"
+          if [ "${MILESTONE_STATE}" = "open" ]; then
+            gh api --method PATCH "repos/${REPO}/milestones/${MILESTONE_NUMBER}" -f state=closed >/dev/null
+            echo "Closed milestone #${MILESTONE_NUMBER} (${TAG})."
+          fi

@@ -3,6 +3,8 @@ name: Milestone Auto Release
 on:
   issues:
     types: [closed, demilestoned]
+  pull_request:
+    types: [closed, demilestoned]
   milestone:
     types: [closed]
   workflow_dispatch:
@@ -16,8 +18,12 @@ permissions:
   contents: write
   issues: write
 
+defaults:
+  run:
+    shell: bash
+
 concurrency:
-  group: milestone-release-${{ github.event.milestone.title || github.event.issue.milestone.title || inputs.milestone || github.run_id }}
+  group: milestone-release-${{ github.event.milestone.title || github.event.issue.milestone.title || github.event.pull_request.milestone.title || inputs.milestone || github.run_id }}
   cancel-in-progress: false
 
 jobs:
@@ -29,6 +35,7 @@ jobs:
       tag: ${{ steps.evaluate.outputs.tag }}
       version: ${{ steps.evaluate.outputs.version }}
       milestone_number: ${{ steps.evaluate.outputs.milestone_number }}
+      target_sha: ${{ steps.evaluate.outputs.target_sha }}
     steps:
       - name: Evaluate milestone state
         id: evaluate
@@ -36,7 +43,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           EVENT_NAME: ${{ github.event_name }}
-          EVENT_MILESTONE_NUMBER: ${{ github.event.milestone.number || github.event.issue.milestone.number || '' }}
+          EVENT_MILESTONE_NUMBER: ${{ github.event.milestone.number || github.event.issue.milestone.number || github.event.pull_request.milestone.number || '' }}
           DISPATCH_MILESTONE_TITLE: ${{ inputs.milestone || '' }}
         run: |
           set -euo pipefail
@@ -82,13 +89,20 @@ jobs:
             exit 0
           fi
 
+          TARGET_SHA="$(gh api "repos/${REPO}/git/ref/heads/main" --jq '.object.sha')"
+          if ! printf '%s\n' "${TARGET_SHA}" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "Failed to resolve a valid 40-character commit SHA for refs/heads/main." >&2
+            exit 1
+          fi
+
           VERSION="${TITLE#v}"
-          echo "Milestone '${TITLE}' is satisfied! Proceeding to release version ${VERSION}."
+          echo "Milestone '${TITLE}' is satisfied! Proceeding to release version ${VERSION} at ${TARGET_SHA}."
           {
             echo "should_deploy=true"
             echo "tag=${TITLE}"
             echo "version=${VERSION}"
             echo "milestone_number=${MILESTONE_NUMBER}"
+            echo "target_sha=${TARGET_SHA}"
           } >> "${GITHUB_OUTPUT}"
 
   verify:
@@ -99,7 +113,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ needs.check-milestone.outputs.target_sha }}
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -131,17 +145,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ needs.check-milestone.outputs.target_sha }}
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
-      - run: npm ci
+      - shell: bash
+        run: npm ci
       - name: Set release version
+        shell: bash
         env:
           VERSION: ${{ needs.check-milestone.outputs.version }}
         run: npm version "${VERSION}" --no-git-tag-version --allow-same-version
       - name: Build Electron distributables
+        shell: bash
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
         run: npx vite build && npx electron-builder ${{ matrix.platform_flag }} --publish never
@@ -163,7 +180,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ needs.check-milestone.outputs.target_sha }}
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -197,7 +214,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ needs.check-milestone.outputs.target_sha }}
       - name: Download all release artifacts
         uses: actions/download-artifact@v4
         with:
@@ -208,6 +225,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           TAG: ${{ needs.check-milestone.outputs.tag }}
+          TARGET_SHA: ${{ needs.check-milestone.outputs.target_sha }}
           MILESTONE_NUMBER: ${{ needs.check-milestone.outputs.milestone_number }}
         run: |
           set -euo pipefail
@@ -217,7 +235,7 @@ jobs:
           else
             gh release create "${TAG}" release-assets/* \
               --repo "${REPO}" \
-              --target main \
+              --target "${TARGET_SHA}" \
               --title "MAO ${TAG}" \
               --generate-notes
           fi

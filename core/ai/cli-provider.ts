@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process'
+import { buildModelEffortArgs } from './provider-options.ts'
 import type { AiProvider, AiProviderConfig, AiRunOptions } from './types.ts'
 
 const DEFAULT_SYSTEM_PROMPT =
@@ -44,13 +45,7 @@ export class CliProvider implements AiProvider {
 
     const commandName = command.split('/').pop() ?? command
 
-    const extraModelArgs: string[] = []
-    if (effectiveModel && !args.includes('--model') && !args.includes('-m')) {
-      extraModelArgs.push('--model', effectiveModel)
-    }
-    if (effectiveEffort && !args.includes('--effort')) {
-      extraModelArgs.push('--effort', effectiveEffort)
-    }
+    const extraModelArgs = buildModelEffortArgs(commandName, effectiveModel, effectiveEffort, args)
 
     let finalArgs: string[]
     let stdinInput: string

@@ -1,7 +1,28 @@
 import { describe, expect, it } from 'vitest'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import { CliProvider } from './cli-provider.ts'
 
 describe('CliProvider', () => {
+  it('sends Codex reasoning explicitly through the shared config flag builder', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'mao-codex-flags-'))
+    try {
+      const command = path.join(directory, 'codex')
+      fs.symlinkSync(process.execPath, command)
+      const provider = new CliProvider({
+        id: 'codex', name: 'Codex', kind: 'cli', command,
+        args: ['-e', 'process.stdout.write(JSON.stringify(process.argv.slice(1)))', '--'],
+        model: 'gpt-5.6-luna', effort: 'ultra',
+      })
+      expect(JSON.parse(await provider.run('prompt'))).toEqual([
+        '--model', 'gpt-5.6-luna', '-c', 'model_reasoning_effort=max',
+      ])
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
   it('throws an error synchronously when command is not configured', () => {
     const provider = new CliProvider({
       id: 'test-cli',

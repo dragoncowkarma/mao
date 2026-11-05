@@ -15,10 +15,11 @@
     "build:dir": "vite build && electron-builder --dir",
     "preview": "vite preview",
     "lint": "tsc --noEmit",
-    "test": "vitest run --project core && vitest run --project renderer && python3 -m unittest discover -s .agents/workflows -p \"*_test.py\"",
+    "test": "vitest run --project core && vitest run --project renderer",
     "test:origin": "node scripts/check-origin.test.mjs",
     "cli": "npm run build:cli --silent && node dist-cli/index.cjs",
-    "build:cli": "node scripts/build-cli.mjs"
+    "build:cli": "node scripts/build-cli.mjs",
+    "test:swarm-bundle": "node scripts/test-swarm-bundle.mjs"
   },
   "dependencies": {
     "commander": "^12.1.0",

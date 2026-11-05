@@ -11,7 +11,6 @@ that first; this file assumes you have.
 
 ```bash
 npm ci             # locked graph, same as CI; Node 22 is what CI uses (CLI bundle targets node18)
-python3 --version   # Python 3.11 in CI; required by the Swarm asset/tests
 ```
 
 Use `npm install` only when intentionally changing dependencies + lockfile.
@@ -22,19 +21,19 @@ Use `npm install` only when intentionally changing dependencies + lockfile.
 | --- | --- |
 | `npm run dev` | Electron + Vite dev server with hot reload |
 | `npm run lint` | `tsc --noEmit` — the only automated style/type gate (no ESLint/Prettier) |
-| `npm run test` | Vitest, one run per project — `core` (`core/**/*.test.ts`, plain Node) then `renderer` (`src/**/*.test.ts(x)`, jsdom + Testing Library) — plus Python Swarm worktree-safety tests. Two runs on purpose: a combined run exits 0 when a project's `include` matches nothing |
+| `npm run test` | Vitest, one run per project — `core` (`core/**/*.test.ts`, plain Node) then `renderer` (`src/**/*.test.ts(x)`, jsdom + Testing Library) including native Swarm regressions. Two runs on purpose: a combined run exits 0 when a project's `include` matches nothing |
 | `npm run test:origin` | Standalone matrix for `scripts/check-origin.mjs` (verdicts + no-credential-leak contract) |
 | `npm run build` | `vite build` + `electron-builder --dir` (fast unpacked build → `release/`) |
 | `npm run dist` | Full distributable (dmg/zip on mac) |
-| `npm run build:cli` | Bundle `cli/index.ts` → `dist-cli/index.cjs` (CJS, node18) and copy the Swarm Python asset beside it |
+| `npm run build:cli` | Bundle `cli/index.ts` → `dist-cli/index.cjs` (CJS, node18) including the native Swarm engine |
 | `npm run cli -- <args>` | Build the CLI bundle, then run it (e.g. `npm run cli -- config show`) |
 | `npm run preview` | Vite preview of the built renderer |
 
 **Never run the CLI via `tsx`** — it fails on `@octokit/app`
 (`ERR_PACKAGE_PATH_NOT_EXPORTED`). Always go through the esbuild bundle
 (`npm run cli` / `npm run build:cli`). The Node build script applies executable
-bits only on non-Windows platforms and always copies `swarm_orchestrator.py` into
-`dist-cli/`, so a built `mao swarm` does not depend on the source tree layout.
+bits only on non-Windows platforms. Swarm is part of the single bundle and needs no
+external script or Python runtime.
 
 ## Verification workflow
 
@@ -54,17 +53,18 @@ git worktree add --detach "<dir>" "<sha>"
 then run `npm ci` and the matrix below inside `<dir>`.
 
 CI runs, in order, `npm ci` → `npm run lint` → `npm run test` →
-`npm run test:origin` → `npx vite build` on Node 22 for pushes to `main` and
+`npm run test:origin` → `npx vite build` → `npm run build:cli` → `npm run test:swarm-bundle` on Node 22 for pushes to `main` and
 all PRs. Locally (dependencies already installed):
 
 ```bash
 npm run lint && npm run test && npm run test:origin && npx vite build
 ```
 
-Additionally, because CI does **not** cover them:
+Additional targeted checks:
 
 - Touched `cli/` or `core/`? → also run `npm run build:cli` and smoke-test
-  `node dist-cli/index.cjs --help` (CLI bundle breakage is invisible to CI).
+  `node dist-cli/index.cjs --help` and `npm run test:swarm-bundle`. The latter runs
+  a copied standalone bundle against local fake GitHub fixtures with no Python on PATH.
 - Iterating on the engine? → focused run: `npx vitest run core/workflow-engine.test.ts`.
 - Touched `src/`? → focused run: `npx vitest run --project renderer`. Nothing else in
   the matrix sees renderer *behaviour*: `tsc --noEmit` reads types, `npx vite build`
@@ -74,8 +74,8 @@ Additionally, because CI does **not** cover them:
 - Touched `scripts/`? → note `scripts/` is not in `tsconfig.json`'s `include`, so
   tsc/CI never typechecks it — verify by actually running the harness. For
   `scripts/build-cli.mjs`, `npm run build:cli` is the required execution check.
-- Touched `.agents/workflows/swarm_orchestrator.py`? → `npm run test` must run its
-  Python worktree-safety matrix; also smoke-test the bundled `mao swarm --status`.
+- Touched `core/swarm/`? → run the core Vitest security/lifecycle matrix and
+  smoke-test the bundled `mao swarm --status`.
 - Touched the IPC surface? → focused run:
   `npx vitest run --project renderer src/electron-ipc-surface.test.ts`, and read what it
   does **not** cover before trusting a green run.
@@ -546,8 +546,9 @@ unattended** (real GitHub writes) in the foreground with no progress output; onl
 `run` streams status. Use `--no-auto-advance` + `workflow advance` to step through
 stages one at a time.
 
-`mao swarm` is the autonomous multi-agent path. It requires Python 3, `git`, an
-authenticated `gh` CLI, and the AI CLIs named by its role tags. The target defaults
+`mao swarm` is the autonomous multi-agent path. It requires `git`, an
+authenticated `gh` CLI, and the AI CLIs named by its role tags. The native engine is bundled into `dist-cli/index.cjs`. Legacy dispatch registries remain
+readable; obsolete `MAO_SWARM_SCRIPT` / `MAO_SWARM_PYTHON` asset overrides no longer apply. The target defaults
 to the Git checkout containing the current directory; use `--repo-root` with any path
 inside another checkout when invoking it elsewhere. It creates
 task worktrees under `<repo>/.worktrees`, persists process history under

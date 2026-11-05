@@ -80,7 +80,7 @@ function stripFencedCodeBlocks(text: string): string {
  * `[Worker: id]` format (in a code fence, inline code, or an issue-template HTML-comment hint) would
  * have that example text parsed as a real directive.
  */
-function stripQuotedText(text: string): string {
+export function stripQuotedText(text: string): string {
   return stripFencedCodeBlocks(text)
     .replace(/`[^`\n]*`/g, ' ')
     .replace(/<!--[\s\S]*?-->/g, ' ')

@@ -34,7 +34,7 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
 | `core/repo-registry.ts` | Pure, renderer-importable repository identity plus the single definition of "this repo entry is newly registered" — `repoRefKey()`/`sameRepoRef()` (case-insensitive, as GitHub resolves owner/repo), `canonicalRepoList()`, `reposNeedingCapabilityCheck()` / `assertReposRegistrable()`, `applyRepoListEdit()` (a whole-list GUI edit re-applied to the list stored now), and the serialized `createRepoRegistrar()` both `github:setRepos` and `mao repos add`/`remove` write through |
 | `core/provider-import.ts` | CLI-only provider-file import for `mao config import-providers` (no IPC channel): reads and parses input, validates through the store write guard, persists, then logs imported IDs; rejection messages omit parser/backend errors and provider values |
 | `core/git-workspace.ts` | Local git clone/branch/commit/push via `execFile` (no shell) |
-| `core/swarm-runner.ts` | Shell-free launcher and repository/asset validation for the autonomous Swarm Orchestrator |
+| `core/swarm-runner.ts` | Repository/options validation and native Swarm entrypoint |
 | `core/auto-trigger.ts` | Per-repo polling scheduler; auto-enqueues new open issues |
 | `core/assignment.ts` | Issue/PR body directive parser — `parseAssignmentTags()` for swarm_orchestrator-style `[Worker: id]`/`[Reviewer: id]`/`[Maintainer: id]` role tags, and `parseProviderOverride()` which folds those plus task-level `[Model: id]`/`[Effort: level]` tags into a `ProviderOverride` |
 | `core/store.ts` | `MaoStoreSchema`, `MAO_STORE_DEFAULTS`, the `MaoStore` interface, `FileStore` (JSON impl for the CLI, which merges each write into a fresh read of the file), `createStoredReadGuard()` — the read-path guard every backend applies so a field's declared type survives contact with unvalidated JSON — `describeStoredProblems()` behind `MaoStore.problems()`, which answers which stored values the schema cannot fully use, reported whether the guard replaced them, filtered them, or (for `githubRepos`) handed them through; `StoredValueDefect` / `StoredValueProblem.nothingUsable`, the single core-side answer to whether replacing a whole value loses anything, and `describeHealedStoredValue()`, so every operator-facing store string lives here rather than in a shell; the whole-file tier below all of those — `classifyStoreReadFailure()`/`UnreadableStoreError` plus the write refusal in `createGuardedStore.set()` that closes issue #67; and `withFileWriteLock()`, which gives a backend its file's cross-process write lock (issue #73) |
@@ -50,8 +50,8 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
 | `src/electron-api.ts` | The renderer's only door to the preload bridge: `setElectronApi()` binds it (production from `src/main.tsx`, tests from a stub), `electronApi()` reads it |
 | `src/test/` | Renderer test harness — `setup.ts` (jsdom polyfills, unmount + unbind between tests) and `electron-api-stub.ts` (a typed fake bridge, `satisfies ElectronApi`) |
 | `cli/index.ts` | Commander CLI: `config` / `repos` / `github` / `workflow` / `run` / `swarm` |
-| `.agents/workflows/swarm_orchestrator.py` | Autonomous Worker/Reviewer/Maintainer lifecycle, credential-aligned write preflight, origin fetch/push identity binding, isolated worktrees, process registry, retry/cooldown, and safe merged-task cleanup; copied beside the CLI bundle by `scripts/build-cli.mjs` |
-| `.agents/workflows/swarm_orchestrator_test.py` | Standalone Python preflight, credential non-disclosure, dry-run, and worktree-safety regressions, included in `npm run test` |
+| `core/swarm/` | Native autonomous lifecycle, process supervision, registry, transport/worktree guards, shared capability preflight, model resolution and cooldown parsing; bundled into the CLI |
+| `core/swarm/*.test.ts` | Swarm security, lifecycle, worktree and provider regressions in the plain Node Vitest project |
 | `core/node-environment.test.ts` | Architecture rule 8 as a test: asserts the `core` vitest project still runs with no DOM in scope |
 | `src/electron-ipc-surface.test.ts` | The IPC lockstep's untypeable half as a test: channel strings in `electron/ipc.ts` and `electron/preload.ts` must be the same set, registered and exposed once each, and each named after the bridge method that calls it — plus a pin that the bridge still carries `satisfies Window['electronAPI']` |
 | `scripts/test-workflow.ts` | Standalone e2e harness against a real (throwaway) repo |
@@ -68,13 +68,9 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
    `electron/ipc.ts` and every CLI action in `cli/index.ts` must stay a thin
    delegation to the store / `GithubService` / `WorkflowEngine` / auto-trigger. A
    feature added only in one shell breaks GUI↔CLI parity.
-   The one scoped exception is Issue #31's CLI-only autonomous Swarm engine:
-   `.agents/workflows/swarm_orchestrator.py` owns that long-lived process lifecycle,
-   while `cli/index.ts` must remain a thin delegation to `core/swarm-runner.ts` for
-   validation and shell-free launch. Its repository write preflight also stays in Python:
-   Swarm writes with the active `gh` CLI credential, not the store's `githubToken`, so routing
-   this check through `GithubService` would validate the wrong credential. Do not duplicate
-   Swarm behavior in the CLI shell.
+   The CLI-only autonomous Swarm engine lives in `core/swarm/`, with the CLI delegating
+   through `core/swarm-runner.ts`. It checks the active `gh` credential rather than the
+   store's token, and calls the same pure capability policy as `GithubService`.
 3. **`createMaoApp()` (`core/app.ts`) is the only boot path.** Both shells call it;
    it wires token/providers/workspace, subscribes queue persistence to the engine's
    `'change'` event, and restores tasks. Workflow mutations must go through
@@ -134,11 +130,8 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
    never reaches an inline project, and neither does a root plugin (vitest builds each
    project's server from that project's own plugin list). A stray plugin therefore leaves
    nothing for a test to observe; keep that one out by reading the config.
-   Two test suites sit outside vitest entirely: `scripts/check-origin.test.mjs`, a
-   dependency-free standalone matrix invoked as `npm run test:origin`, and the autonomous
-   Swarm asset's worktree-safety regressions in
-   `.agents/workflows/swarm_orchestrator_test.py`, which run through `npm run test` — so
-   Python 3 is required for the repository test matrix.
+   The dependency-free origin matrix in `scripts/check-origin.test.mjs` runs separately
+   through `npm run test:origin`. Swarm regressions run in the `core` Vitest project.
 
 ## Files that must change together
 
@@ -251,12 +244,9 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   `withFileWriteLock` — otherwise it reverts, or races, every other process's writes (issue #73).
   `openGuardedStoreFile` (the Electron path) applies that lock itself, so a backend opened through it gets
   it without a second wrapper.
-- **Repository capability policy** → `core/repo-capabilities.ts` and the intentionally
-  duplicated policy tables/verdict logic in `.agents/workflows/swarm_orchestrator.py` must be
-  audited together. Gap ids and reasons, remedy kinds/ranking, public-vs-private scope rules,
-  three-state `permissions.push`, and the unverified pipeline grants must stay aligned, with
-  regressions in both TypeScript and Python suites. Credential acquisition and command-failure
-  classification deliberately differ because Swarm checks the active `gh` credential.
+- **Repository capability policy** → `core/repo-capabilities.ts` is shared by
+  `GithubService` and `core/swarm/platform.ts`. Credential acquisition and command-failure
+  classification differ because Swarm checks the active `gh` credential.
 - **New pipeline stage** → the ordered `AGENT_STAGES` (both the `AgentStage` union and workflow-engine
   stage order derive from it) in `core/ai/types.ts`, then `buildPromptForStage` + `applyGithubAction` in
   `core/workflow-engine.ts`, **plus** the `STAGE_LABELS` record in
@@ -815,7 +805,7 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   deliberately does not add semantic policy such as requiring non-empty credentials, known models, or a
   PR number at a particular stage; those remain the owning settings/engine paths' errors. `mao swarm`
   reads none of this: it is a separate
-  Python engine with a separate credential, so "the queue is latched" must never be read as "this host
+  core engine with a separate credential, so "the queue is latched" must never be read as "this host
   performs no unattended GitHub writes".
 - **A write is refused when the file it would rewrite could not be read (issue #67).** Both backends
   persist the whole schema as one JSON blob on every `set()`, so a write performed while the load failed
@@ -950,7 +940,7 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   the same check before `fetchTasks`, so an unauthorized repo yields zero `enqueueFromIssue` and
   zero `workflow-active` label writes. Never add an exemption list.
 - **Real `mao swarm` runs have their own credential-aligned preflight.** Before Git sync, worktree
-  creation, AI dispatch, or direct `gh` writes, the Python orchestrator performs one non-mutating
+  creation, AI dispatch, or direct `gh` writes, the native Swarm orchestrator performs one non-mutating
   repository GET with the same active `gh` CLI credential inherited by dispatched agents. It runs at
   startup and again before each later polling cycle so revoked access stops new lifecycle work. The
   explicit `--reset` history clear is the only local mutation allowed before the network gate, so it
@@ -1114,14 +1104,14 @@ There is no codegen — these couplings are maintained by hand and only `npm run
 - **Branches**: `<type>/<issue-number>-<kebab-description>` for manual branches.
   AI-agent branches (`claude/`, `codex/`) and engine branches (`workflow/`)
   keep their automated patterns. PRs merge into `main` via merge commits.
-- **CI runs on every PR and push to `main`** (Node 22, Python 3.11): `npm ci`, `npm run lint`,
-  `npm run test`, `npm run test:origin`, `npx vite build`. As of 2026-08 `main` has **no branch
+- **CI runs on every PR and push to `main`** (Node 22): `npm ci`, `npm run lint`,
+  `npm run test`, `npm run test:origin`, `npx vite build`, and CLI build/bundle smoke tests. As of 2026-08 `main` has **no branch
   protection** (no required checks, no rulesets), so a green CI is convention,
   not a GitHub-enforced merge gate — treat it as required anyway. (Separate
   concept: the *app's own* merge stage checks the target repo's CI via
   `getChecksStatus` — that gate lives in the workflow engine, not in this repo's
-  settings.) CI does **not** build the CLI bundle — run `npm run build:cli`
-  yourself when touching `cli/` or `core/`.
+  settings.) Run `npm run build:cli` and `npm run test:swarm-bundle` locally too
+  when touching `cli/` or `core/`.
 
 ## Agent roles & division of labor
 

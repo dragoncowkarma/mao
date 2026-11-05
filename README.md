@@ -49,8 +49,11 @@ node dist-cli/index.cjs swarm --repo-root /path/to/repo --status
 node dist-cli/index.cjs swarm --repo-root /path/to/repo --dry-run --once
 ```
 
-The Swarm command requires Python 3, `git`, an authenticated `gh` CLI, and the AI CLIs named by
-the repository's role tags. It can perform real Git/GitHub writes unless `--dry-run` or `--status`
+The Swarm command requires `git`, an authenticated `gh` CLI, and the AI CLIs named by
+the repository's role tags. The native TypeScript engine is included in `dist-cli/index.cjs`;
+Python and separate script assets are unnecessary. Dispatch requires POSIX process groups.
+Existing `.agents/.process_registry.json` records migrate on read, including provider cooldowns;
+`--reset` explicitly discards that dispatch history. It can perform real Git/GitHub writes unless `--dry-run` or `--status`
 is supplied. Runtime worktrees, logs, prompts, and the process registry stay inside the target
 repository's ignored `.worktrees/` and `.agents/` paths.
 The first real run records those runtime patterns only in the target checkout's local
@@ -77,7 +80,8 @@ core/
   github-service.ts GitHub REST calls: issue/PR fetch, branch/commit/review/merge/CI-status
   git-workspace.ts  Local git clone/branch/commit/push (child_process, no Electron dep)
   workflow-engine.ts Core state machine: queue, stage progression, agent routing, CI gate
-  swarm-runner.ts   Shell-free launcher for the autonomous Swarm CLI asset
+  swarm-runner.ts   Native autonomous Swarm entrypoint
+  swarm/            Lifecycle, supervision, registry, transport/worktrees and provider resolution
   auto-trigger.ts   Per-repo polling scheduler
   store.ts          Shared persistence schema and FileStore
 electron/
@@ -85,8 +89,6 @@ electron/
   main.ts / preload.ts  Electron entry points
 cli/
   index.ts          Headless `mao` commands backed by core services
-.agents/workflows/
-  swarm_orchestrator.py  Autonomous role lifecycle, worktrees, process tracking, retry/cooldown
 src/
   App.tsx           Sidebar + project tabs (Board / Queue / Settings) shell
   components/
@@ -105,7 +107,7 @@ scripts/
 ## Unit tests
 
 ```bash
-npm run test        # one vitest run per project, then the Python Swarm matrix:
+npm run test        # one vitest run per project, including native Swarm regressions:
                     #   core     — WorkflowEngine stage progression, maker-checker, retry,
                     #              CI gating and manual pause/advance, all against fakes
                     #   renderer — src/ mounted in jsdom (Testing Library) against a fake

@@ -3,7 +3,7 @@ name: Milestone Auto Release
 on:
   issues:
     types: [closed, demilestoned]
-  pull_request:
+  pull_request_target:
     types: [closed, demilestoned]
   milestone:
     types: [closed]

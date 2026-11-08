@@ -388,9 +388,8 @@ describe('App unusable stored settings', () => {
   })
 
   it('does not delete a repaired repository with the next settings save', async () => {
-    // The half of that finding which is not cosmetic. `persistRepos` sends the renderer's whole list,
-    // so a stale mirror is not merely out of date — the first settings toggle on a surviving row writes
-    // a list that omits the repaired entry, and `updateRepos` persists exactly that.
+    // A stale mirror would hide the repaired row until this save; the base asserted below pins that it
+    // was re-read first.
     vi.useFakeTimers()
     try {
       const stub = createElectronApiStub([ONE], [PARTLY_USABLE_REPO_LIST])
@@ -430,7 +429,8 @@ describe('App unusable stored settings', () => {
     // the list — and the rescued rows would stay off screen until the next repository-list write or a
     // restart, under a card telling the operator to go and edit the file they just edited.
     //
-    // Fake timers and no `userEvent`: the two deadlock (SKILL.md), so this drives the interval directly.
+    // Fake timers and no `userEvent`: the two deadlock (ipc-and-renderer-testing.md), so this drives
+    // the interval directly.
     vi.useFakeTimers()
     try {
       const stub = createElectronApiStub([], [UNUSABLE_REPO_LIST])
@@ -576,8 +576,8 @@ describe('App unusable stored settings', () => {
     // hand-edit made there is invisible until the next repository-list write — which is the thing that
     // destroys the value. Reading it only after a write cannot warn anyone in time.
     //
-    // Fake timers here and no `userEvent`: the two deadlock (SKILL.md), so this drives the interval
-    // directly and asserts on what the operator sees.
+    // Fake timers here and no `userEvent`: the two deadlock (ipc-and-renderer-testing.md), so this
+    // drives the interval directly and asserts on what the operator sees.
     vi.useFakeTimers()
     try {
       const stub = createElectronApiStub([ONE])
@@ -741,7 +741,7 @@ describe('App unusable stored settings', () => {
   it("discards a repaired list this window's own write has superseded", async () => {
     // The other half of the same race: the newer information is not a report but a write from here.
     // `fireEvent` rather than `userEvent` because fake timers are needed to drive the poll and the two
-    // deadlock (SKILL.md).
+    // deadlock (ipc-and-renderer-testing.md).
     vi.useFakeTimers()
     try {
       const stub = createElectronApiStub([], [UNUSABLE_REPO_LIST])

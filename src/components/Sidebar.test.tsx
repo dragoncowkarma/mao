@@ -17,8 +17,8 @@ import { storedValueProblem } from '../test/store-problem'
  * The queue-recovery rules are prop-level — "offer recovery only while the file still holds the
  * unreadable value" is a decision about two inputs, not about a round trip — and App's own poll runs on a
  * 30s interval, so asserting them through a mounted App would mean either faking timers (which deadlocks
- * with user-event, per SKILL.md) or clicking something to force a re-read. Rendering the component
- * directly states the rule precisely.
+ * with user-event, per ipc-and-renderer-testing.md) or clicking something to force a re-read. Rendering
+ * the component directly states the rule precisely.
  */
 /**
  * The **real** report, from core's own describer rather than a one-line stand-in.
@@ -202,10 +202,10 @@ describe('Sidebar queue recovery', () => {
   })
 
   it('says a confirmed reset wrote nothing, and keeps saying it after the card goes', async () => {
-    // AGENTS.md: an action's result must outlive the condition it reports on. `already-readable` means
-    // the file is genuinely repaired, so the refresh that follows empties the problem list and unmounts
-    // the card — and a sentence rendered inside it would vanish with the thing it was explaining,
-    // leaving a confirmed destructive click that looked like it had done nothing at all.
+    // store-and-recovery.md: an action's result must outlive the condition it reports on.
+    // `already-readable` means the file is genuinely repaired, so the refresh that follows empties the
+    // problem list and unmounts the card — and a sentence rendered inside it would vanish with the thing
+    // it was explaining, leaving a confirmed destructive click that looked like it had done nothing at all.
     const onResetRepoList = vi.fn(async (): Promise<RepoListResetOutcome> => 'already-readable')
     const { user, rerender } = renderSidebar({
       storeProblems: [NOTHING_USABLE_REPO_LIST],

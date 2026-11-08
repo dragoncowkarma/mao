@@ -474,7 +474,7 @@ describe('startAutoTrigger when the stored repository list cannot be read', () =
 
   it('skips the tick and lets nothing escape', async () => {
     // Asserted on a counted listener rather than left to vitest's unhandled-rejection reporter, which
-    // SKILL.md warns reads as a passing suite with a non-zero exit — that would not discriminate.
+    // reads as a passing suite with a non-zero exit — that would not discriminate.
     const rejections: unknown[] = []
     const onRejection = (reason: unknown) => rejections.push(reason)
     process.on('unhandledRejection', onRejection)

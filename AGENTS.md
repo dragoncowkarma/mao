@@ -29,6 +29,7 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
 | --- | --- |
 | `core/workflow-engine.ts` | The state machine: queue, stage progression, CI gate, pause/advance/retry (agent routing itself lives in `core/agent-selection.ts`) |
 | `core/agent-selection.ts` | Pure, renderer-importable agent routing: `resolveStageAgent()` (maker-checker + role pins + `allowedStages` + model/effort resolution), `isStageEligible()`, `eligibleAgentsForRun()`, `previewStageAgent()`, plus the `WorkflowRole`/`STAGE_ROLE`/`ProviderOverride`/`RunOverride` definitions (re-exported by `core/workflow-engine.ts`, so `core/assignment.ts` and the shells import them unchanged) |
+| `core/design-system.ts` | Pure, renderer-importable design system contract (issue #108): selectable `DESIGN_IDS` (`'classic'`, `'crimson'`, `'console'`), `DEFAULT_DESIGN_ID`, `DESIGN_PRESETS` (with light/dark swatches matching `src/index.css`), `EXPLORED_DESIGN_CANDIDATES` (`'minimal'`, `'editorial'`), `isDesignId()`, `normalizeDesignId()`, and `getDesignPreset()` |
 | `core/github-service.ts` | Octokit REST wrapper (issues, PRs, labels, reviews, merge, CI status) — plus the read-only `checkRepoWorkflowCapability()` / `assertRepoWorkflowWritable()` preflight |
 | `core/repo-capabilities.ts` | Pure verdict logic for "can this credential run the pipeline in this repo?" — `evaluateRepoCapability()`, `describeRepoCapability()`, `describeUnverifiedGrants()`, `RepoCapabilityError` |
 | `core/repo-registry.ts` | Pure, renderer-importable repository identity plus the single definition of "this repo entry is newly registered" — `repoRefKey()`/`sameRepoRef()` (case-insensitive, as GitHub resolves owner/repo), `canonicalRepoList()`, `reposNeedingCapabilityCheck()` / `assertReposRegistrable()`, `applyRepoListEdit()` (a whole-list GUI edit re-applied to the list stored now), and the serialized `createRepoRegistrar()` both `github:setRepos` and `mao repos add`/`remove` write through |
@@ -98,9 +99,9 @@ TypeScript throughout, `strict: true`. License: Apache-2.0.
    component wired to the global is a component no renderer test can hand a fake. From
    `core/` it imports
    types, plus values from the modules marked *renderer-importable* in the
-   architecture map above — `core/agent-selection.ts`, `core/ai/provider-options.ts`
-   and `core/repo-registry.ts`, which are pure and whose own `core/` imports are all
-   `import type`, so nothing Node-side is pulled into the bundle. Importing a value
+   architecture map above — `core/agent-selection.ts`, `core/ai/provider-options.ts`,
+   `core/design-system.ts` and `core/repo-registry.ts`, which are pure and whose own
+   `core/` imports are all `import type`, so nothing Node-side is pulled into the bundle. Importing a value
    from any other `core/` module is not allowed; re-implementing one of these rules
    in `src/` instead is worse, and is what let the board and the registry disagree
    about whether two spellings were the same repository. Imports stay extensionless. There are no IPC push events — the
@@ -742,7 +743,7 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   #73).** Both backends persist one JSON blob, so a write must put every other key back, and the question is
   which copy. `FileStore` used to write its constructor snapshot, so a `mao run` up for a day rewrote the
   whole file from what it read at boot on every queue change — reverting a `mao repos remove`, `set-token`,
-  provider import or theme change made from another terminal, including the very `githubRepos` repair PR
+  provider import, theme or design change made from another terminal, including the very `githubRepos` repair PR
   #66's report recommends. Now `FileStore.set` merges into a strict fresh read and replaces the file with
   `writeStoreFileAtomic()` (temp file + fsync + rename, keeping the file's permission bits and — where the
   writer may — its owner, and writing through a symlink to the file it names rather than replacing the
@@ -752,7 +753,7 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   resolved file; conf already re-reads before it
   writes and writes atomically, though with its own default mode. Same-key concurrency is an
   explicit choice per field, never left to timing:
-  - **Stated values** — `githubToken`, `theme`, `buildSha`, and `mao config import-providers`' complete
+  - **Stated values** — `githubToken`, `theme`, `design`, `buildSha`, and `mao config import-providers`' complete
     replacement — use plain `set`: last writer wins, because the latest statement is the operator's intent.
   - **Derived values** must never use plain `set`: a change landing between the read they were derived
     from and the write would be lost without a word. `workflowTasks` is written by `persistQueue()`

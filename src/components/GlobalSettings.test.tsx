@@ -273,3 +273,75 @@ describe('GlobalSettings saves only what it can stand behind', () => {
     expect(screen.getByText('The GitHub token could not be written.')).toBeInTheDocument()
   })
 })
+
+describe('GlobalSettings design system selector', () => {
+  it('renders all 3 selectable design presets with aria-pressed and invokes onDesignChange when clicked', async () => {
+    const stub = createElectronApiStub()
+    stub.listProviders.mockResolvedValue([])
+    const onDesignChange = vi.fn()
+    const user = userEvent.setup()
+
+    const { rerender } = render(
+      <GlobalSettings theme="system" onThemeChange={() => {}} design="classic" onDesignChange={onDesignChange} />,
+    )
+
+    const group = screen.getByRole('group', { name: 'Design system' })
+    expect(group).toBeInTheDocument()
+
+    const classicBtn = screen.getByRole('button', { name: /Classic/ })
+    const crimsonBtn = screen.getByRole('button', { name: /Crimson Signal/ })
+    const consoleBtn = screen.getByRole('button', { name: /Developer Console/ })
+
+    expect(classicBtn).toHaveAttribute('aria-pressed', 'true')
+    expect(crimsonBtn).toHaveAttribute('aria-pressed', 'false')
+    expect(consoleBtn).toHaveAttribute('aria-pressed', 'false')
+
+    await user.click(crimsonBtn)
+    expect(onDesignChange).toHaveBeenLastCalledWith('crimson')
+
+    rerender(
+      <GlobalSettings theme="system" onThemeChange={() => {}} design="crimson" onDesignChange={onDesignChange} />,
+    )
+    expect(classicBtn).toHaveAttribute('aria-pressed', 'false')
+    expect(crimsonBtn).toHaveAttribute('aria-pressed', 'true')
+    expect(consoleBtn).toHaveAttribute('aria-pressed', 'false')
+
+    await user.click(consoleBtn)
+    expect(onDesignChange).toHaveBeenLastCalledWith('console')
+
+    rerender(
+      <GlobalSettings theme="system" onThemeChange={() => {}} design="console" onDesignChange={onDesignChange} />,
+    )
+    expect(classicBtn).toHaveAttribute('aria-pressed', 'false')
+    expect(crimsonBtn).toHaveAttribute('aria-pressed', 'false')
+    expect(consoleBtn).toHaveAttribute('aria-pressed', 'true')
+
+    await user.click(classicBtn)
+    expect(onDesignChange).toHaveBeenLastCalledWith('classic')
+  })
+
+  it('displays appearanceError in an alert without clearing unsaved GitHub token or AI provider inputs', async () => {
+    const stub = createElectronApiStub()
+    stub.listProviders.mockResolvedValue([{ id: 'claude', name: 'Claude', kind: 'cli', command: 'claude' }])
+    const user = userEvent.setup()
+
+    const { rerender } = render(<GlobalSettings theme="system" onThemeChange={() => {}} design="classic" />)
+
+    const providerName = await screen.findByDisplayValue('Claude')
+    await user.type(providerName, ' Code')
+    await user.type(screen.getByPlaceholderText('ghp_...'), 'ghp_unsaved_token')
+
+    rerender(
+      <GlobalSettings
+        theme="system"
+        onThemeChange={() => {}}
+        design="classic"
+        appearanceError="Cannot write config.json: EACCES"
+      />,
+    )
+
+    expect(screen.getByRole('alert')).toHaveTextContent('Cannot write config.json: EACCES')
+    expect(screen.getByPlaceholderText('ghp_...')).toHaveValue('ghp_unsaved_token')
+    expect(screen.getByDisplayValue('Claude Code')).toBeInTheDocument()
+  })
+})

@@ -1791,6 +1791,7 @@ describe('FileStore across processes (issue #73)', () => {
     ['githubToken', 'ghp_changed_elsewhere'],
     ['aiProviders', [claude]],
     ['theme', 'dark'],
+    ['design', 'crimson'],
     ['buildSha', 'abc123'],
   ]
 
@@ -2538,5 +2539,102 @@ describe('parseStoredSettings', () => {
     } catch (error) {
       expect((error as UnreadableStoreError).source).toBe('/tmp/mine.json')
     }
+  })
+})
+
+describe('FileStore and createGuardedStore design preset setting', () => {
+  it('defaults to classic when config.json has no design field', () => {
+    const warn = captureWarnings()
+    const { store } = storeHolding({ githubToken: 'ghp_x', theme: 'dark' })
+
+    expect(store.get('design')).toBe('classic')
+    expect(store.inspect('design')).toMatchObject({
+      value: 'classic',
+      problem: undefined,
+      readable: true,
+    })
+    expect(store.problems()).toEqual([])
+    expect(warn).not.toHaveBeenCalled()
+  })
+
+  it('falls back to classic on unknown or non-string design values without adding a storeProblems entry', () => {
+    for (const invalid of ['unknown-design', 'minimal', 'editorial', '', 42, null, {}, ['crimson']]) {
+      const warn = captureWarnings()
+      const { store } = storeHolding({ design: invalid })
+
+      expect(store.get('design'), String(invalid)).toBe('classic')
+      expect(store.inspect('design').value, String(invalid)).toBe('classic')
+      expect(store.inspect('design').problem, String(invalid)).toBeUndefined()
+      expect(store.problems(), String(invalid)).toEqual([])
+      expect(warn).not.toHaveBeenCalled()
+
+      warn.mockRestore()
+    }
+  })
+
+  it('persists each valid design preset and preserves all other settings across processes (issue #73)', () => {
+    const { store: a, filePath } = storeHolding({
+      githubToken: 'ghp_keep',
+      theme: 'dark',
+      githubRepos: [widgets],
+      aiProviders: [claude],
+      workflowTasks: [pendingTask],
+    })
+    const b = new FileStore(filePath)
+
+    for (const preset of ['crimson', 'console', 'classic'] as const) {
+      b.set('design', preset)
+      expect(b.get('design')).toBe(preset)
+      expect(new FileStore(filePath).get('design')).toBe(preset)
+    }
+
+    b.set('githubToken', 'ghp_updated_by_b')
+    a.set('design', 'crimson')
+
+    const onDisk = JSON.parse(fs.readFileSync(filePath, 'utf-8'))
+    expect(onDisk.design).toBe('crimson')
+    expect(onDisk.githubToken).toBe('ghp_updated_by_b')
+    expect(onDisk.theme).toBe('dark')
+    expect(onDisk.githubRepos).toEqual([widgets])
+    expect(onDisk.aiProviders).toEqual([claude])
+    expect(onDisk.workflowTasks).toEqual([pendingTask])
+  })
+
+  it('refuses invalid design writes via set and setIfUnchanged before touching disk', () => {
+    const { store, filePath } = storeHolding({ design: 'crimson', githubToken: 'ghp_keep' })
+    const beforeBytes = fs.readFileSync(filePath, 'utf-8')
+    const observed = store.inspect('design')
+
+    expect(store.validateWrite('design', 'minimal' as never)).toContain(
+      'expected one of classic, crimson, console, received a string. Nothing was written.',
+    )
+    expect(() => store.set('design', 'invalid' as never)).toThrow(
+      /Refusing to write "design".*expected one of classic, crimson, console, received a string\. Nothing was written\./,
+    )
+    expect(store.setIfUnchanged('design', observed.witness, 'invalid' as never)).toBe('invalid')
+
+    expect(fs.readFileSync(filePath, 'utf-8')).toBe(beforeBytes)
+    expect(store.get('design')).toBe('crimson')
+  })
+
+  it('refuses to write design to an unreadable or corrupt config.json so credentials survive (issue #67)', () => {
+    captureWarnings()
+    const corrupt = '{\n  "githubToken": "ghp_SENTINEL",\n}\n'
+    const filePath = rawConfigFile(corrupt)
+    const store = new FileStore(filePath)
+
+    let refused: unknown
+    try {
+      store.set('design', 'crimson')
+    } catch (error) {
+      refused = error
+    }
+
+    expect(operatorSafeStoreMessage(refused)).toBe(
+      describeRefusedStoredWrite('design', filePath, 'unparseable'),
+    )
+    expect(storeWriteRequiresRestart(refused)).toBe(true)
+    expect(String((refused as Error).message)).not.toContain('ghp_SENTINEL')
+    expect(fs.readFileSync(filePath, 'utf-8')).toBe(corrupt)
   })
 })

@@ -402,7 +402,7 @@ export default function Sidebar({
                   uncertain. Check the stored queue and target repositories before clearing the marker.
                 </p>
                 {persistenceMarkerCleared ? (
-                  <p className="text-[11px] leading-snug" style={{ color: 'var(--color-accent-700)' }}>
+                  <p className="text-danger text-[11px] leading-snug">
                     The marker is cleared. This process remains halted; restart MAO to load the verified
                     queue.
                   </p>
@@ -514,7 +514,7 @@ export default function Sidebar({
         {queueError && (
           <div className="card mb-2 gap-1.5 p-2">
             <p className="card-title text-[13px]">Workflow queue</p>
-            <p className="text-xs" style={{ color: 'var(--color-accent-700)' }}>
+            <p className="text-danger text-xs">
               {queueError}
             </p>
             <button onClick={() => setQueueError('')} className="btn btn-secondary self-start text-xs">
@@ -572,7 +572,7 @@ export default function Sidebar({
                 </button>
               ))}
             {resetError && (
-              <p className="text-xs" style={{ color: 'var(--color-accent-700)' }}>
+              <p className="text-danger text-xs">
                 {resetError}
               </p>
             )}
@@ -600,7 +600,7 @@ export default function Sidebar({
               {checking ? 'Checking access…' : 'Add'}
             </button>
             {addError && (
-              <p className="text-xs" style={{ color: 'var(--color-accent-700)' }}>
+              <p className="text-danger text-xs">
                 {addError}
               </p>
             )}
@@ -630,7 +630,7 @@ export default function Sidebar({
         )}
       </div>
 
-      <div className="sidebar-section border-t-2" style={{ borderColor: 'var(--color-divider)' }}>
+      <div className="sidebar-section border-t-2 border-divider">
         <button
           onClick={() => onViewChange('global-settings')}
           className={`sidebar-item ${view === 'global-settings' ? 'active' : ''}`}

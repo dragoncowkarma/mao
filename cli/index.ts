@@ -3,7 +3,15 @@ import path from 'node:path'
 import { Command } from 'commander'
 import { createMaoApp, type MaoApp } from '../core/app.ts'
 import { startAutoTrigger } from '../core/auto-trigger.ts'
-import { describeHealedStoredValue, FileStore, type StoredValueProblem } from '../core/store.ts'
+import {
+  describeHealedStoredValue,
+  DESIGN_IDS,
+  FileStore,
+  isDesignId,
+  type DesignId,
+  type StoredValueProblem,
+  type ThemePreference,
+} from '../core/store.ts'
 import { defaultDataDir } from '../core/paths.ts'
 import { clearPersistenceBrokenMarker, hasPersistenceBrokenMarker } from '../core/persistence-guard.ts'
 import { runSwarm, SwarmRepositoryPathError } from '../core/swarm-runner.ts'
@@ -17,7 +25,6 @@ import {
   type RepoRef,
   type RunOverride,
 } from '../core/workflow-engine.ts'
-import type { ThemePreference } from '../core/store.ts'
 
 function log(...args: unknown[]) {
   console.log('[mao]', ...args)
@@ -103,6 +110,18 @@ config
   })
 
 config
+  .command('set-design <design>')
+  .description(`Set the UI design preset (${DESIGN_IDS.join(', ')}) — read by the Electron GUI`)
+  .action((design: string) => {
+    if (!isDesignId(design)) {
+      throw new Error(`Invalid design "${design}" — expected one of: ${DESIGN_IDS.join(', ')}`)
+    }
+    const { store } = loadApp()
+    store.set('design', design as DesignId)
+    log(`Design preset set to ${design}`)
+  })
+
+config
   .command('show')
   .description('Print the current stored config (secrets redacted)')
   .action(() => {
@@ -112,6 +131,7 @@ config
       githubRepos: store.get('githubRepos'),
       aiProviders: store.get('aiProviders').map((p) => ({ ...p, apiKey: p.apiKey ? '[set]' : undefined })),
       theme: store.get('theme'),
+      design: store.get('design'),
       workflowPersistenceBroken: hasPersistenceBrokenMarker(resolveDataDir()),
       // A separate fact from the line above, never folded into it: that one means a prior process could
       // no longer *write* the queue, this one that this process cannot *read* it. Reporting a read-shape

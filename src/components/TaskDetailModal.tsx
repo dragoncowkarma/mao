@@ -205,7 +205,7 @@ export default function TaskDetailModal({
 
         {loading && <p className="text-muted text-sm">Loading…</p>}
         {error && (
-          <p className="text-sm" style={{ color: 'var(--color-accent-700)' }}>
+          <p className="text-danger text-sm">
             {error}
           </p>
         )}
@@ -225,7 +225,7 @@ export default function TaskDetailModal({
                   {detail.comments.length} comment{detail.comments.length === 1 ? '' : 's'}
                 </p>
                 {detail.comments.map((comment) => (
-                  <div key={comment.id} className="card gap-1 p-2">
+                  <div key={comment.id} className="card card-subtle gap-1 p-2">
                     <p className="card-meta">
                       {comment.author} · {new Date(comment.createdAt).toLocaleString()}
                     </p>
@@ -238,7 +238,7 @@ export default function TaskDetailModal({
         )}
 
         {type === 'issue' && !alreadyQueued && (
-          <div className="flex flex-col gap-2 border-t pt-3" style={{ borderColor: 'var(--color-divider)' }}>
+          <div className="flex flex-col gap-2 border-t border-divider pt-3">
             <label className="flex items-center gap-2 text-xs">
               <input
                 type="checkbox"
@@ -252,7 +252,7 @@ export default function TaskDetailModal({
               {enqueueing ? 'Adding…' : 'Add to workflow'}
             </button>
             {enqueueError && (
-              <p className="text-sm" style={{ color: 'var(--color-accent-700)' }}>
+              <p className="text-danger text-sm">
                 {enqueueError}
               </p>
             )}

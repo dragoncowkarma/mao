@@ -10,7 +10,7 @@ import type {
   RunOverride,
 } from '../core/workflow-engine.ts'
 import type { AutoTriggerStatus } from '../core/auto-trigger.ts'
-import type { StoredValueProblem, ThemePreference } from '../core/store.ts'
+import type { DesignId, StoredValueProblem, ThemePreference } from '../core/store.ts'
 import type { SelfUpdateCheck } from '../core/self-update.ts'
 
 export interface AppUpdateCheck extends SelfUpdateCheck {
@@ -102,5 +102,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   ui: {
     getTheme: (): Promise<ThemePreference> => ipcRenderer.invoke('ui:getTheme'),
     setTheme: (theme: ThemePreference): Promise<void> => ipcRenderer.invoke('ui:setTheme', theme),
+    getDesign: (): Promise<DesignId> => ipcRenderer.invoke('ui:getDesign'),
+    setDesign: (design: DesignId): Promise<void> => ipcRenderer.invoke('ui:setDesign', design),
   },
 } satisfies Window['electronAPI'])

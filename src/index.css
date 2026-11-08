@@ -3,25 +3,62 @@
 @tailwind utilities;
 
 @layer base {
-:root {
+/*
+ * Design preset + theme polarity token matrix (Issue #108).
+ *
+ * `data-design` on <html> selects the visual language (`classic` | `crimson` | `console`, defaulting
+ * to `classic`), while `data-theme="dark"` selects dark polarity. Every block below defines the full
+ * 1:1 semantic token surface so switching either axis at runtime never leaks a stale fallback from
+ * another preset or polarity.
+ */
+:root,
+:root[data-design='classic'] {
   --color-bg: #f3f2f2;
   --color-surface: #eae9e9;
+  --color-bg-subtle: #e2e0df;
+  --color-backdrop: rgb(32 30 29 / 0.55);
+
   --color-text: #201e1d;
   --color-text-rgb: 32 30 29;
+  --color-text-muted: #5c5755;
+
+  --color-border: #cfcaca;
+  --color-divider: rgb(var(--color-text-rgb) / 0.4);
+  --border-structural-width: 2px;
+
   --color-accent: #ec3013;
   --color-accent-2: #e15b47;
-  --color-divider: rgb(var(--color-text-rgb) / 0.4);
-
-  --color-neutral-100: #f8f4f4;
-  --color-neutral-800: #444141;
-
   --color-accent-100: #fff2ef;
   --color-accent-600: #dd2b0f;
   --color-accent-700: #ae1800;
   --color-accent-800: #7c1405;
+  --color-highlight: #e15b47;
 
-  --font-heading: 'Archivo', system-ui, sans-serif;
-  --font-body: 'Archivo', system-ui, sans-serif;
+  --color-action-bg: var(--color-accent);
+  --color-action-hover: var(--color-accent-600);
+  --color-action-text: var(--color-bg);
+  --color-action-border: transparent;
+
+  --color-focus: #ec3013;
+
+  --color-danger-bg: #fce8e6;
+  --color-danger-text: #9e1600;
+  --color-danger-border: #d93025;
+
+  --color-warn-bg: #fef3c7;
+  --color-warn-text: #854d0e;
+  --color-warn-border: #d97706;
+
+  --color-success-bg: #dcfce7;
+  --color-success-text: #14532d;
+  --color-success-border: #16a34a;
+
+  --color-neutral-100: #f8f4f4;
+  --color-neutral-800: #444141;
+
+  --font-heading: 'Archivo', system-ui, -apple-system, sans-serif;
+  --font-body: 'Archivo', system-ui, -apple-system, sans-serif;
+  --font-mono: 'SFMono-Regular', 'JetBrains Mono', 'Menlo', 'Consolas', monospace;
 
   --space-1: 4px;
   --space-2: 8px;
@@ -35,31 +72,279 @@
 }
 
 /*
- * Dark variant of the tokens above. Applied via a `data-theme="dark"` attribute on <html>, set by
- * App.tsx from the persisted theme preference (light/dark/system — see core/store.ts). Keep this
- * block a 1:1 override of every token in :root above so nothing falls back to a light value by
- * accident; --color-text-rgb backs every `rgb(var(--color-text-rgb) / alpha)` usage below so opacity-
- * based grays (muted text, dividers, hover tints) invert along with --color-text instead of stalling
- * on the light literal.
+ * Classic Dark — 1:1 dark override for the default warm stone + vermilion preset.
  */
-:root[data-theme='dark'] {
+:root[data-theme='dark'],
+:root[data-design='classic'][data-theme='dark'] {
   --color-bg: #1a1817;
   --color-surface: #262322;
+  --color-bg-subtle: #1f1c1b;
+  --color-backdrop: rgb(10 9 9 / 0.72);
+
   --color-text: #f3f2f2;
   --color-text-rgb: 243 242 242;
+  --color-text-muted: #b8b2b0;
+
+  --color-border: #3d3836;
+  --color-divider: rgb(243 242 242 / 0.16);
+  --border-structural-width: 2px;
+
   --color-accent: #ff6a4a;
   --color-accent-2: #ff8f78;
-  --color-divider: rgb(243 242 242 / 0.16);
-
-  --color-neutral-100: #2c2928;
-  --color-neutral-800: #d8d4d4;
-
   --color-accent-100: #3a1c14;
   --color-accent-600: #ff8465;
   --color-accent-700: #ffab94;
   --color-accent-800: #ffd3c4;
+  --color-highlight: #ff8f78;
+
+  --color-action-bg: var(--color-accent);
+  --color-action-hover: var(--color-accent-600);
+  --color-action-text: var(--color-bg);
+  --color-action-border: transparent;
+
+  --color-focus: #ff8465;
+
+  --color-danger-bg: #3b1414;
+  --color-danger-text: #fca5a5;
+  --color-danger-border: #ef4444;
+
+  --color-warn-bg: #38260b;
+  --color-warn-text: #fcd34d;
+  --color-warn-border: #f59e0b;
+
+  --color-success-bg: #0f2e1c;
+  --color-success-text: #86efac;
+  --color-success-border: #22c55e;
+
+  --color-neutral-100: #2c2928;
+  --color-neutral-800: #d8d4d4;
+
+  --font-heading: 'Archivo', system-ui, -apple-system, sans-serif;
+  --font-body: 'Archivo', system-ui, -apple-system, sans-serif;
+  --font-mono: 'SFMono-Regular', 'JetBrains Mono', 'Menlo', 'Consolas', monospace;
 
   --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.4);
+}
+
+/*
+ * Crimson Signal Light — low-glare burgundy/oxide surfaces with deep crimson structure and warm
+ * amber-gold primary actions/selections. Semantic danger/warn/success tokens are kept distinct from
+ * the brand crimson & yellow palette so status badges never collide with brand chrome.
+ */
+:root[data-design='crimson'] {
+  --color-bg: #f6eeee;
+  --color-surface: #ede0e0;
+  --color-bg-subtle: #e5d4d5;
+  --color-backdrop: rgb(38 18 20 / 0.58);
+
+  --color-text: #261214;
+  --color-text-rgb: 38 18 20;
+  --color-text-muted: #664246;
+
+  --color-border: #cfb3b5;
+  --color-divider: rgb(var(--color-text-rgb) / 0.36);
+  --border-structural-width: 2px;
+
+  --color-accent: #9e1b24;
+  --color-accent-2: #c98a00;
+  --color-accent-100: #fff4d1;
+  --color-accent-600: #82141c;
+  --color-accent-700: #6b0f16;
+  --color-accent-800: #4a0a0f;
+  --color-highlight: #f5b82e;
+
+  --color-action-bg: #f5b82e;
+  --color-action-hover: #e5a519;
+  --color-action-text: #261214;
+  --color-action-border: #9e1b24;
+
+  --color-focus: #b87d00;
+
+  --color-danger-bg: #fde8e8;
+  --color-danger-text: #8c0b15;
+  --color-danger-border: #b91c1c;
+
+  --color-warn-bg: #fff3cd;
+  --color-warn-text: #784200;
+  --color-warn-border: #b45309;
+
+  --color-success-bg: #dcfce7;
+  --color-success-text: #14532d;
+  --color-success-border: #15803d;
+
+  --color-neutral-100: #f5e6e7;
+  --color-neutral-800: #422528;
+
+  --font-heading: 'Archivo', system-ui, -apple-system, sans-serif;
+  --font-body: 'Archivo', system-ui, -apple-system, sans-serif;
+  --font-mono: 'SFMono-Regular', 'JetBrains Mono', 'Menlo', 'Consolas', monospace;
+
+  --shadow-sm: 0 1px 2px rgb(38 18 20 / 0.16);
+}
+
+/*
+ * Crimson Signal Dark — deep oxblood/burgundy base paired with warm amber-gold primary actions,
+ * selections, and focus rings.
+ */
+:root[data-design='crimson'][data-theme='dark'] {
+  --color-bg: #180c0e;
+  --color-surface: #251317;
+  --color-bg-subtle: #1e0f12;
+  --color-backdrop: rgb(10 4 5 / 0.76);
+
+  --color-text: #f7ecec;
+  --color-text-rgb: 247 236 236;
+  --color-text-muted: #c9aeb0;
+
+  --color-border: #4a232a;
+  --color-divider: rgb(247 236 236 / 0.2);
+  --border-structural-width: 2px;
+
+  --color-accent: #f5b82e;
+  --color-accent-2: #ffd24c;
+  --color-accent-100: #3d270a;
+  --color-accent-600: #ffd24c;
+  --color-accent-700: #ffe07d;
+  --color-accent-800: #fff0b8;
+  --color-highlight: #c92a3a;
+
+  --color-action-bg: #f5b82e;
+  --color-action-hover: #e5a519;
+  --color-action-text: #180c0e;
+  --color-action-border: #ffd24c;
+
+  --color-focus: #ffd24c;
+
+  --color-danger-bg: #451219;
+  --color-danger-text: #fecdd3;
+  --color-danger-border: #fb7185;
+
+  --color-warn-bg: #3b2607;
+  --color-warn-text: #fde68a;
+  --color-warn-border: #fbbf24;
+
+  --color-success-bg: #0d2e1b;
+  --color-success-text: #86efac;
+  --color-success-border: #34d399;
+
+  --color-neutral-100: #331a20;
+  --color-neutral-800: #ebd8da;
+
+  --font-heading: 'Archivo', system-ui, -apple-system, sans-serif;
+  --font-body: 'Archivo', system-ui, -apple-system, sans-serif;
+  --font-mono: 'SFMono-Regular', 'JetBrains Mono', 'Menlo', 'Consolas', monospace;
+
+  --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.5);
+}
+
+/*
+ * Developer Console Light — cool technical slate surfaces, crisp 1px framing, monospace headings,
+ * and cobalt/cyan telemetry accents for dense multi-agent queue monitoring.
+ */
+:root[data-design='console'] {
+  --color-bg: #eef1f5;
+  --color-surface: #e2e7ee;
+  --color-bg-subtle: #d6dde7;
+  --color-backdrop: rgb(17 24 34 / 0.55);
+
+  --color-text: #111822;
+  --color-text-rgb: 17 24 34;
+  --color-text-muted: #475569;
+
+  --color-border: #c1cbd7;
+  --color-divider: rgb(var(--color-text-rgb) / 0.28);
+  --border-structural-width: 1px;
+
+  --color-accent: #0b6bcb;
+  --color-accent-2: #0891b2;
+  --color-accent-100: #dff0ff;
+  --color-accent-600: #0958a8;
+  --color-accent-700: #074787;
+  --color-accent-800: #053363;
+  --color-highlight: #0891b2;
+
+  --color-action-bg: var(--color-accent);
+  --color-action-hover: var(--color-accent-600);
+  --color-action-text: #f8fafc;
+  --color-action-border: transparent;
+
+  --color-focus: #0b6bcb;
+
+  --color-danger-bg: #fee2e2;
+  --color-danger-text: #991b1b;
+  --color-danger-border: #dc2626;
+
+  --color-warn-bg: #fef3c7;
+  --color-warn-text: #92400e;
+  --color-warn-border: #d97706;
+
+  --color-success-bg: #dcfce7;
+  --color-success-text: #166534;
+  --color-success-border: #16a34a;
+
+  --color-neutral-100: #f4f6f9;
+  --color-neutral-800: #334155;
+
+  --font-heading: 'SFMono-Regular', 'JetBrains Mono', 'Menlo', 'Consolas', monospace;
+  --font-body: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'SFMono-Regular', 'JetBrains Mono', 'Menlo', 'Consolas', monospace;
+
+  --shadow-sm: 0 1px 2px rgb(17 24 34 / 0.12);
+}
+
+/*
+ * Developer Console Dark — low-glare charcoal-slate canvas with sky-cyan interactive accents and
+ * amber secondary telemetry.
+ */
+:root[data-design='console'][data-theme='dark'] {
+  --color-bg: #0f1318;
+  --color-surface: #171d24;
+  --color-bg-subtle: #12171d;
+  --color-backdrop: rgb(5 8 12 / 0.76);
+
+  --color-text: #e6edf3;
+  --color-text-rgb: 230 237 243;
+  --color-text-muted: #94a3b8;
+
+  --color-border: #2a3441;
+  --color-divider: rgb(230 237 243 / 0.16);
+  --border-structural-width: 1px;
+
+  --color-accent: #38bdf8;
+  --color-accent-2: #f59e0b;
+  --color-accent-100: #0c2d48;
+  --color-accent-600: #7dd3fc;
+  --color-accent-700: #bae6fd;
+  --color-accent-800: #e0f2fe;
+  --color-highlight: #f59e0b;
+
+  --color-action-bg: var(--color-accent);
+  --color-action-hover: var(--color-accent-600);
+  --color-action-text: #09111a;
+  --color-action-border: transparent;
+
+  --color-focus: #38bdf8;
+
+  --color-danger-bg: #3b1219;
+  --color-danger-text: #fca5a5;
+  --color-danger-border: #ef4444;
+
+  --color-warn-bg: #382408;
+  --color-warn-text: #fcd34d;
+  --color-warn-border: #f59e0b;
+
+  --color-success-bg: #0c2d1c;
+  --color-success-text: #86efac;
+  --color-success-border: #22c55e;
+
+  --color-neutral-100: #202934;
+  --color-neutral-800: #cbd5e1;
+
+  --font-heading: 'SFMono-Regular', 'JetBrains Mono', 'Menlo', 'Consolas', monospace;
+  --font-body: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'SFMono-Regular', 'JetBrains Mono', 'Menlo', 'Consolas', monospace;
+
+  --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.5);
 }
 
 html,
@@ -109,11 +394,23 @@ a {
 
 @layer components {
 .text-muted {
-  color: rgb(var(--color-text-rgb) / 0.55);
+  color: var(--color-text-muted);
+}
+
+.text-danger {
+  color: var(--color-danger-text);
+}
+
+.text-accent {
+  color: var(--color-accent);
+}
+
+.border-divider {
+  border-color: var(--color-divider);
 }
 
 .hr {
-  height: 2px;
+  height: var(--border-structural-width);
   border: 0;
   margin: var(--space-4) 0;
   background: var(--color-divider);
@@ -124,7 +421,7 @@ a {
   align-items: center;
   gap: var(--space-4);
   padding: var(--space-3) var(--space-4);
-  border-bottom: 2px solid var(--color-divider);
+  border-bottom: var(--border-structural-width) solid var(--color-divider);
 }
 
 .nav-brand {
@@ -152,18 +449,32 @@ a {
   border-radius: var(--radius-md);
 }
 
+.btn:focus-visible,
+.input:focus-visible,
+.tab:focus-visible,
+.sidebar-item:focus-visible,
+.link-button:focus-visible,
+.design-option:focus-visible,
+.card[role='button']:focus-visible,
+button.tag:focus-visible,
+a:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 2px;
+}
+
 .btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
 }
 
 .btn-primary {
-  background: var(--color-accent);
-  color: var(--color-bg);
+  background: var(--color-action-bg);
+  color: var(--color-action-text);
+  border-color: var(--color-action-border);
 }
 
 .btn-primary:hover:not(:disabled) {
-  background: var(--color-accent-600);
+  background: var(--color-action-hover);
 }
 
 .btn-secondary {
@@ -197,7 +508,7 @@ a {
 }
 
 .input::placeholder {
-  color: rgb(var(--color-text-rgb) / 0.45);
+  color: var(--color-text-muted);
 }
 
 /*
@@ -219,9 +530,24 @@ a {
   padding: var(--space-3);
   border-radius: var(--radius-md);
   background: var(--color-surface);
+  border: 1px solid var(--color-border);
+}
+
+.card-subtle {
+  background: var(--color-bg-subtle);
+  border: 1px solid var(--color-border);
+}
+
+.code-block {
+  font-family: var(--font-mono);
+  background: var(--color-bg-subtle);
+  border: 1px solid var(--color-border);
+  padding: var(--space-2);
+  border-radius: var(--radius-md);
 }
 
 .card-kicker {
+  font-family: var(--font-mono);
   font-size: 10px;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -240,7 +566,8 @@ a {
   align-items: center;
   gap: 6px;
   font-size: 11px;
-  color: rgb(var(--color-text-rgb) / 0.5);
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text-muted);
 }
 
 .elev-sm {
@@ -259,11 +586,13 @@ a {
 .tag-accent {
   background: var(--color-accent-100);
   color: var(--color-accent-800);
+  border: 1px solid var(--color-accent);
 }
 
 .tag-neutral {
   background: var(--color-neutral-100);
   color: var(--color-neutral-800);
+  border: 1px solid var(--color-border);
 }
 
 .tag-outline {
@@ -271,15 +600,46 @@ a {
   color: var(--color-accent);
 }
 
+.tag-danger {
+  background: var(--color-danger-bg);
+  color: var(--color-danger-text);
+  border: 1px solid var(--color-danger-border);
+}
+
+.tag-danger::before {
+  content: '✕ ';
+  font-weight: 800;
+  margin-right: 3px;
+}
+
 .tag-warn {
-  border: 1px solid var(--color-accent-2);
-  color: var(--color-accent-2);
+  background: var(--color-warn-bg);
+  color: var(--color-warn-text);
+  border: 1px solid var(--color-warn-border);
+}
+
+.tag-warn::before {
+  content: '⚠ ';
+  font-weight: 800;
+  margin-right: 3px;
+}
+
+.tag-success {
+  background: var(--color-success-bg);
+  color: var(--color-success-text);
+  border: 1px solid var(--color-success-border);
+}
+
+.tag-success::before {
+  content: '✓ ';
+  font-weight: 800;
+  margin-right: 3px;
 }
 
 .tag-stage {
   background: transparent;
-  border: 1px solid rgb(var(--color-text-rgb) / 0.3);
-  color: rgb(var(--color-text-rgb) / 0.7);
+  border: 1px solid var(--color-border);
+  color: var(--color-text-muted);
 }
 
 /*
@@ -311,7 +671,7 @@ a {
   display: block;
   margin-bottom: var(--space-1);
   font-size: 13px;
-  color: rgb(var(--color-text-rgb) / 0.7);
+  color: var(--color-text-muted);
 }
 
 .sidebar {
@@ -320,7 +680,7 @@ a {
   width: 260px;
   flex-shrink: 0;
   min-height: 100vh;
-  border-right: 2px solid var(--color-divider);
+  border-right: var(--border-structural-width) solid var(--color-divider);
   background: var(--color-surface);
 }
 
@@ -332,7 +692,7 @@ a {
   font-size: 11px;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: rgb(var(--color-text-rgb) / 0.5);
+  color: var(--color-text-muted);
   padding: 0 var(--space-2);
   margin-bottom: var(--space-1);
 }
@@ -349,7 +709,7 @@ a {
   font-family: var(--font-body);
   color: var(--color-text);
   background: transparent;
-  border: 0;
+  border: 1px solid transparent;
   border-radius: var(--radius-md);
   cursor: pointer;
 }
@@ -359,8 +719,10 @@ a {
 }
 
 .sidebar-item.active {
-  background: var(--color-accent);
-  color: var(--color-bg);
+  background: var(--color-action-bg);
+  color: var(--color-action-text);
+  border-color: var(--color-action-border);
+  font-weight: 700;
 }
 
 .live-dot {
@@ -380,7 +742,7 @@ a {
 .tabs {
   display: flex;
   gap: var(--space-1);
-  border-bottom: 2px solid var(--color-divider);
+  border-bottom: var(--border-structural-width) solid var(--color-divider);
   margin-bottom: var(--space-4);
 }
 
@@ -389,11 +751,11 @@ a {
   font-family: var(--font-heading);
   font-weight: 800;
   font-size: 14px;
-  color: rgb(var(--color-text-rgb) / 0.55);
+  color: var(--color-text-muted);
   background: transparent;
   border: 0;
-  border-bottom: 2px solid transparent;
-  margin-bottom: -2px;
+  border-bottom: var(--border-structural-width) solid transparent;
+  margin-bottom: calc(-1 * var(--border-structural-width));
   cursor: pointer;
 }
 
@@ -415,6 +777,75 @@ a {
   padding: 0;
   font: inherit;
   cursor: pointer;
+}
+
+.preset-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  background: var(--color-bg-subtle);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+}
+
+.preset-row-active {
+  background: var(--color-bg);
+  border-color: var(--color-accent);
+}
+
+.badge-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: var(--space-1);
+  padding: 1px 6px;
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 1.2;
+  background: var(--color-action-bg);
+  color: var(--color-action-text);
+  border: 1px solid var(--color-action-border);
+  border-radius: var(--radius-md);
+}
+
+.design-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: var(--space-3);
+}
+
+.design-option {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-2);
+  width: 100%;
+  padding: var(--space-3);
+  text-align: left;
+  font-family: var(--font-body);
+  color: var(--color-text);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+}
+
+.design-option:hover {
+  border-color: var(--color-accent);
+}
+
+.design-option-active {
+  border: 2px solid var(--color-accent);
+  box-shadow: var(--shadow-sm);
+}
+
+.design-swatch-bar {
+  display: flex;
+  width: 100%;
+  height: 10px;
+  border: 1px solid var(--color-border);
+  overflow: hidden;
 }
 
 .update-banner {
@@ -439,7 +870,7 @@ a {
 .update-banner-meta {
   margin-top: 2px;
   font-size: 12px;
-  color: rgb(var(--color-text-rgb) / 0.65);
+  color: var(--color-text-muted);
 }
 
 .modal-backdrop {
@@ -451,7 +882,7 @@ a {
   justify-content: center;
   overflow-y: auto;
   padding: var(--space-8) var(--space-4);
-  background: rgb(32 30 29 / 0.55);
+  background: var(--color-backdrop);
 }
 
 .modal {

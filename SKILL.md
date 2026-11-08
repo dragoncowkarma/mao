@@ -121,6 +121,8 @@ State lives at `$MAO_DATA_DIR/config.json` (default: the platform data dir from
 ```bash
 npm run cli -- config set-token <token>          # store GitHub token
 npm run cli -- config import-providers <file>    # JSON array of AiProviderConfig
+npm run cli -- config set-theme <light|dark|system>          # set light/dark/system polarity
+npm run cli -- config set-design <classic|crimson|console>   # set UI design preset
 npm run cli -- config show                       # secrets redacted as '[set]'
 npm run cli -- repos add <owner> <repo> [--no-auto-trigger] [--poll-interval-ms <ms>]  # preflights write access
 npm run cli -- repos list
@@ -148,13 +150,13 @@ A `config.json` that cannot be renamed over — a single-file bind mount such as
 ./config.json:/data/config.json` — is rewritten in place instead, as every write was before; still under
 the lock, but a reader that takes no lock can catch that one write half-done. The desktop app writes through electron-store, which does not keep a tightened mode — a `chmod 600` there
 returns to the default on its next write, as it always has. So a
-`mao repos remove`, `config set-token`, `import-providers` or theme change made while `mao run` is up is
+`mao repos remove`, `config set-token`, `import-providers`, theme or design change made while `mao run` is up is
 no longer reverted by its next queue write — including the `githubRepos` recovery below. What each kind
 of value does when two processes change *the same* key:
 
 | Value | Policy |
 | --- | --- |
-| `githubToken`, `theme`, `buildSha`, `import-providers` | stated outright, so the last write wins |
+| `githubToken`, `theme`, `design`, `buildSha`, `import-providers` | stated outright, so the last write wins |
 | tracked repositories (`repos add`/`remove`) | written only if unchanged since read; a list another process changed meanwhile is re-planned — your add or remove is applied to the current list and re-preflighted — up to three times, then "Nothing was written" |
 | tracked repositories (the desktop app) | the window sends the list its edit was based on, so only what you changed there is applied to the list as stored now: a repository added or removed in a terminal since the window loaded stays that way, and a setting changed elsewhere survives a toggle of a different one. A settings edit to a repository removed elsewhere is dropped rather than re-adding it |
 | provider list from Global settings | written only if the stored list is still the one the pane loaded (or last saved), else "reopen Global settings and apply the edit again" — so a `mao config import-providers` made while the pane is open is not deleted by its next Save |

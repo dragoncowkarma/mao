@@ -29,7 +29,8 @@ function findWorkflowTask(task: GithubTask, workflowTasks: QueuedTask[]): Queued
 }
 
 function workflowBadgeClass(task: QueuedTask): string {
-  if (task.status === 'error') return 'tag-accent'
+  if (task.status === 'error') return 'tag-danger'
+  if (task.status === 'done') return 'tag-success'
   if (task.status === 'running') return 'tag-outline'
   if (task.status === 'paused') return 'tag-warn'
   return 'tag-neutral'
@@ -217,7 +218,7 @@ function Column({
                         {step?.prompt && (
                           <details>
                             <summary className="cursor-pointer text-xs text-muted">Prompt</summary>
-                            <pre className="mt-1 max-h-40 overflow-y-auto whitespace-pre-wrap text-xs">
+                            <pre className="code-block mt-1 max-h-40 overflow-y-auto whitespace-pre-wrap text-xs">
                               {step.prompt}
                             </pre>
                           </details>
@@ -388,7 +389,7 @@ export default function KanbanBoard({ repo }: KanbanBoardProps) {
         </div>
       </div>
 
-      {error && <p className="mt-2 text-xs" style={{ color: 'var(--color-accent-700)' }}>{error}</p>}
+      {error && <p className="text-danger mt-2 text-xs">{error}</p>}
       <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2">
         <Column
           title="Issues"

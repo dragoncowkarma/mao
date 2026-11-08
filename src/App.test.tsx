@@ -1489,3 +1489,173 @@ describe('App halted workflow queue', () => {
     expect(screen.queryByRole('button', { name: 'Recover readable tasks' })).toBeNull()
   })
 })
+
+describe('Selectable design system and color mode', () => {
+  it('applies classic by default, restores saved crimson or console on mount, and falls back on unknown values', async () => {
+    await renderApp([ONE])
+    expect(document.documentElement.getAttribute('data-design')).toBe('classic')
+    cleanup()
+
+    const stubCrimson = createElectronApiStub([ONE])
+    stubCrimson.getDesign.mockResolvedValue('crimson')
+    render(
+      <StrictMode>
+        <App />
+      </StrictMode>,
+    )
+    await projectHeading(ONE)
+    await waitFor(() => expect(document.documentElement.getAttribute('data-design')).toBe('crimson'))
+    cleanup()
+
+    const stubConsole = createElectronApiStub([ONE])
+    stubConsole.getDesign.mockResolvedValue('console')
+    render(
+      <StrictMode>
+        <App />
+      </StrictMode>,
+    )
+    await projectHeading(ONE)
+    await waitFor(() => expect(document.documentElement.getAttribute('data-design')).toBe('console'))
+    cleanup()
+
+    const stubUnknown = createElectronApiStub([ONE])
+    stubUnknown.getDesign.mockResolvedValue('unknown-theme' as never)
+    render(
+      <StrictMode>
+        <App />
+      </StrictMode>,
+    )
+    await projectHeading(ONE)
+    await waitFor(() => expect(document.documentElement.getAttribute('data-design')).toBe('classic'))
+  })
+
+  it('switches immediately across Crimson Signal, Developer Console, and back to Classic', async () => {
+    const { stub, user } = await renderApp([ONE])
+
+    await user.click(globalSettingsNav())
+    expect(document.documentElement.getAttribute('data-design')).toBe('classic')
+
+    await user.click(screen.getByRole('button', { name: /Crimson Signal/ }))
+    expect(document.documentElement.getAttribute('data-design')).toBe('crimson')
+    expect(stub.setDesign).toHaveBeenLastCalledWith('crimson')
+
+    await user.click(screen.getByRole('button', { name: /Developer Console/ }))
+    expect(document.documentElement.getAttribute('data-design')).toBe('console')
+    expect(stub.setDesign).toHaveBeenLastCalledWith('console')
+
+    await user.click(screen.getByRole('button', { name: /Classic/ }))
+    expect(document.documentElement.getAttribute('data-design')).toBe('classic')
+    expect(stub.setDesign).toHaveBeenLastCalledWith('classic')
+  })
+
+  it('keeps design and color mode orthogonal across light, dark, and live system media changes', async () => {
+    const originalMatchMedia = window.matchMedia
+    let osDark = false
+    const listeners = new Set<() => void>()
+    window.matchMedia = (query: string): MediaQueryList => ({
+      get matches() {
+        return osDark
+      },
+      media: query,
+      onchange: null,
+      addEventListener: (_type: string, cb: EventListenerOrEventListenerObject) => {
+        if (typeof cb === 'function') listeners.add(cb as () => void)
+      },
+      removeEventListener: (_type: string, cb: EventListenerOrEventListenerObject) => {
+        if (typeof cb === 'function') listeners.delete(cb as () => void)
+      },
+      addListener: () => {},
+      removeListener: () => {},
+      dispatchEvent: () => false,
+    })
+
+    try {
+      const { user } = await renderApp([ONE])
+      await user.click(globalSettingsNav())
+
+      await user.click(screen.getByRole('button', { name: /Crimson Signal/ }))
+      expect(document.documentElement.getAttribute('data-design')).toBe('crimson')
+      expect(document.documentElement.getAttribute('data-theme')).toBeNull()
+
+      await user.click(screen.getByRole('button', { name: 'Dark' }))
+      expect(document.documentElement.getAttribute('data-design')).toBe('crimson')
+      expect(document.documentElement.getAttribute('data-theme')).toBe('dark')
+
+      await user.click(screen.getByRole('button', { name: /Developer Console/ }))
+      expect(document.documentElement.getAttribute('data-design')).toBe('console')
+      expect(document.documentElement.getAttribute('data-theme')).toBe('dark')
+
+      await user.click(screen.getByRole('button', { name: 'Light' }))
+      expect(document.documentElement.getAttribute('data-design')).toBe('console')
+      expect(document.documentElement.getAttribute('data-theme')).toBeNull()
+
+      await user.click(screen.getByRole('button', { name: 'System' }))
+      expect(document.documentElement.getAttribute('data-design')).toBe('console')
+      expect(document.documentElement.getAttribute('data-theme')).toBeNull()
+
+      act(() => {
+        osDark = true
+        listeners.forEach((cb) => cb())
+      })
+      expect(document.documentElement.getAttribute('data-design')).toBe('console')
+      expect(document.documentElement.getAttribute('data-theme')).toBe('dark')
+
+      act(() => {
+        osDark = false
+        listeners.forEach((cb) => cb())
+      })
+      expect(document.documentElement.getAttribute('data-design')).toBe('console')
+      expect(document.documentElement.getAttribute('data-theme')).toBeNull()
+    } finally {
+      window.matchMedia = originalMatchMedia
+    }
+  })
+
+  it('preserves unsaved GlobalSettings inputs, keeps the selected repo, and triggers zero workflow/github mutations', async () => {
+    const { stub, user } = await renderApp([ONE, TWO])
+    await user.click(sidebarProject(TWO))
+    await projectHeading(TWO)
+
+    await user.click(globalSettingsNav())
+    await user.type(tokenField(), 'ghp_unsaved_token')
+    await user.click(screen.getByRole('button', { name: '+ Add provider' }))
+    await user.type(screen.getByPlaceholderText('Name'), 'Unsaved Agent')
+
+    await user.click(screen.getByRole('button', { name: /Crimson Signal/ }))
+    await user.click(screen.getByRole('button', { name: /Developer Console/ }))
+    await user.click(screen.getByRole('button', { name: /Classic/ }))
+
+    expect(tokenField()).toHaveValue('ghp_unsaved_token')
+    expect(screen.getByDisplayValue('Unsaved Agent')).toBeInTheDocument()
+    expect(stub.setRepos).not.toHaveBeenCalled()
+    expect(stub.api.workflow.enqueue).not.toHaveBeenCalled()
+    expect(stub.api.workflow.enqueueFromIssue).not.toHaveBeenCalled()
+    expect(stub.api.workflow.retry).not.toHaveBeenCalled()
+    expect(stub.api.workflow.advance).not.toHaveBeenCalled()
+
+    await user.click(sidebarProject(TWO))
+    expect(await projectHeading(TWO)).toBeInTheDocument()
+  })
+
+  it('rolls back data-design and active button state and shows an alert when setDesign fails', async () => {
+    const { stub, user } = await renderApp([ONE])
+    stub.setDesign.mockRejectedValueOnce(new Error('Cannot write config.json: EACCES'))
+
+    await user.click(globalSettingsNav())
+    const classicBtn = screen.getByRole('button', { name: /Classic/ })
+    const crimsonBtn = screen.getByRole('button', { name: /Crimson Signal/ })
+
+    await user.click(crimsonBtn)
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Cannot write config.json: EACCES')
+    expect(document.documentElement.getAttribute('data-design')).toBe('classic')
+    expect(classicBtn).toHaveAttribute('aria-pressed', 'true')
+    expect(crimsonBtn).toHaveAttribute('aria-pressed', 'false')
+
+    await user.click(crimsonBtn)
+    await waitFor(() => expect(screen.queryByRole('alert')).toBeNull())
+    expect(document.documentElement.getAttribute('data-design')).toBe('crimson')
+    expect(crimsonBtn).toHaveAttribute('aria-pressed', 'true')
+    expect(classicBtn).toHaveAttribute('aria-pressed', 'false')
+  })
+})

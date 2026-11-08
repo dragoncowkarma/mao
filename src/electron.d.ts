@@ -3,7 +3,7 @@ import type { GithubTask, GithubTaskDetail } from '../core/github-service'
 import type { RepoWorkflowCapability } from '../core/repo-capabilities'
 import type { QueueRecoveryOutcome, QueueRecoveryState, QueuedTask, RepoRef, RunOverride } from '../core/workflow-engine'
 import type { AutoTriggerStatus } from '../core/auto-trigger'
-import type { StoredValueProblem, ThemePreference } from '../core/store'
+import type { DesignId, StoredValueProblem, ThemePreference } from '../core/store'
 import type { SelfUpdateCheck } from '../core/self-update'
 
 export interface AppUpdateCheck extends SelfUpdateCheck {
@@ -68,6 +68,8 @@ declare global {
       ui: {
         getTheme: () => Promise<ThemePreference>
         setTheme: (theme: ThemePreference) => Promise<void>
+        getDesign: () => Promise<DesignId>
+        setDesign: (design: DesignId) => Promise<void>
       }
     }
   }

@@ -7,7 +7,7 @@ import { applyRepoListEdit, isRepoRef } from '../core/repo-registry.ts'
 import { assertCanRelaunchForUpdate, checkForUpdates, countRunningWorkflowTasks } from '../core/self-update.ts'
 import { createAiProvider, type AiProviderConfig } from '../core/ai/index.ts'
 import { QUEUE_PERSISTENCE_BROKEN, type RepoRef, type RunOverride } from '../core/workflow-engine.ts'
-import type { ThemePreference } from '../core/store.ts'
+import type { DesignId, ThemePreference } from '../core/store.ts'
 import {
   assertCanClearPersistenceBroken,
   clearPersistenceBrokenMarker,
@@ -190,5 +190,11 @@ export function registerIpcHandlers() {
 
   ipcMain.handle('ui:setTheme', (_event, theme: ThemePreference) => {
     store.set('theme', theme)
+  })
+
+  ipcMain.handle('ui:getDesign', () => store.get('design'))
+
+  ipcMain.handle('ui:setDesign', (_event, design: DesignId) => {
+    store.set('design', design)
   })
 }

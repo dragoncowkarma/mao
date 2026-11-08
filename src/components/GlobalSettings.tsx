@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { electronApi } from '../electron-api'
 import type { AgentStage, AiProviderConfig, ModelEffortPreset, ProviderKindId } from '../../core/ai/types'
 import { PROVIDER_OPTIONS } from '../../core/ai/provider-options'
+import { DEFAULT_DESIGN_ID, DESIGN_PRESETS, type DesignId } from '../../core/design-system'
 import type { ThemePreference } from '../../core/store'
 
 const ALL_STAGES: AgentStage[] = ['issue', 'pr', 'review', 'merge']
@@ -9,7 +10,10 @@ const STAGE_LABELS: Record<AgentStage, string> = { issue: 'Issue', pr: 'PR', rev
 
 interface GlobalSettingsProps {
   theme: ThemePreference
-  onThemeChange: (theme: ThemePreference) => void
+  onThemeChange: (theme: ThemePreference) => void | Promise<void>
+  design?: DesignId
+  onDesignChange?: (design: DesignId) => void | Promise<void>
+  appearanceError?: string
 }
 
 const THEME_OPTIONS: { value: ThemePreference; label: string }[] = [
@@ -77,7 +81,7 @@ function PresetRow({ preset, kindId, isSelected, onSelect, onChange, onRemove }:
   const showEffort = effortOpts.length > 0 && !noEffort
 
   return (
-    <div className={`flex items-center gap-2 rounded border px-3 py-2 ${isSelected ? 'border-[var(--color-accent)] bg-[var(--color-bg)]' : 'border-[var(--color-border)] bg-[var(--color-bg-subtle)]'}`}>
+    <div className={`preset-row ${isSelected ? 'preset-row-active' : ''}`}>
       <input
         type="radio"
         checked={isSelected}
@@ -343,11 +347,7 @@ function ProviderCard({ provider: p, onUpdate, onRemove }: ProviderCardProps) {
           >
             <span style={{ display: 'inline-block', transform: presetsExpanded ? 'rotate(90deg)' : 'none', transition: 'transform 0.15s' }}>▶</span>
             Model / Effort presets
-            {presetCount > 0 && (
-              <span className="ml-1 rounded-full bg-[var(--color-accent)] px-1.5 py-0.5 text-[10px] text-white">
-                {presetCount}
-              </span>
-            )}
+            {presetCount > 0 && <span className="badge-count">{presetCount}</span>}
           </button>
           <button onClick={addPreset} className="btn btn-secondary text-xs">
             + Add preset
@@ -380,7 +380,13 @@ function ProviderCard({ provider: p, onUpdate, onRemove }: ProviderCardProps) {
 
 // ─── GlobalSettings ────────────────────────────────────────────────────────────
 
-export default function GlobalSettings({ theme, onThemeChange }: GlobalSettingsProps) {
+export default function GlobalSettings({
+  theme,
+  onThemeChange,
+  design = DEFAULT_DESIGN_ID,
+  onDesignChange,
+  appearanceError,
+}: GlobalSettingsProps) {
   const [githubToken, setGithubToken] = useState('')
   const [providers, setProviders] = useState<AiProviderConfig[]>([])
   /**
@@ -518,6 +524,42 @@ export default function GlobalSettings({ theme, onThemeChange }: GlobalSettingsP
 
       <div className="mb-4">
         <h3 className="!mb-2">Appearance</h3>
+        <div className="design-grid mb-4" role="group" aria-label="Design system">
+          {DESIGN_PRESETS.map((preset) => (
+            <button
+              type="button"
+              key={preset.id}
+              className={`design-option ${design === preset.id ? 'design-option-active' : ''}`}
+              aria-pressed={design === preset.id}
+              onClick={() => onDesignChange?.(preset.id)}
+            >
+              <div className="w-full flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <span className="font-bold text-sm">{preset.name}</span>
+                  {preset.badge && <span className="tag tag-neutral">{preset.badge}</span>}
+                </div>
+                {design === preset.id && <span className="tag tag-success">Active</span>}
+              </div>
+              <span className="text-muted text-xs">{preset.summary}</span>
+              <div className="w-full flex flex-col gap-1 mt-1" aria-hidden="true">
+                <div className="design-swatch-bar" title={`${preset.name} light palette`}>
+                  <span className="flex-1" style={{ background: preset.swatches.light.bg }} />
+                  <span className="flex-1" style={{ background: preset.swatches.light.surface }} />
+                  <span className="flex-1" style={{ background: preset.swatches.light.text }} />
+                  <span className="flex-1" style={{ background: preset.swatches.light.accent }} />
+                  <span className="flex-1" style={{ background: preset.swatches.light.highlight }} />
+                </div>
+                <div className="design-swatch-bar" title={`${preset.name} dark palette`}>
+                  <span className="flex-1" style={{ background: preset.swatches.dark.bg }} />
+                  <span className="flex-1" style={{ background: preset.swatches.dark.surface }} />
+                  <span className="flex-1" style={{ background: preset.swatches.dark.text }} />
+                  <span className="flex-1" style={{ background: preset.swatches.dark.accent }} />
+                  <span className="flex-1" style={{ background: preset.swatches.dark.highlight }} />
+                </div>
+              </div>
+            </button>
+          ))}
+        </div>
         <div className="tabs">
           {THEME_OPTIONS.map((opt) => (
             <button
@@ -532,6 +574,11 @@ export default function GlobalSettings({ theme, onThemeChange }: GlobalSettingsP
         <p className="text-muted -mt-2 text-xs">
           "System" follows your OS light/dark setting and updates automatically if it changes.
         </p>
+        {appearanceError && (
+          <p className="mt-2 text-xs text-danger" role="alert">
+            {appearanceError}
+          </p>
+        )}
       </div>
 
       <div className="field mb-4 max-w-[420px]">
@@ -563,7 +610,7 @@ export default function GlobalSettings({ theme, onThemeChange }: GlobalSettingsP
         ))}
         {loadFailed ? (
           <div className="flex flex-col items-start gap-2">
-            <p className="text-xs" style={{ color: 'var(--color-accent-700)' }}>
+            <p className="text-xs text-danger">
               The AI provider list could not be loaded, so providers cannot be saved from this pane until it
               is. Fix the config file, then retry.
             </p>
@@ -580,17 +627,9 @@ export default function GlobalSettings({ theme, onThemeChange }: GlobalSettingsP
         <button onClick={saveAll} className="btn btn-primary" disabled={saving}>
           Save changes
         </button>
-        {savedMessage && (
-          <span className="text-xs" style={{ color: 'var(--color-accent)' }}>
-            {savedMessage}
-          </span>
-        )}
+        {savedMessage && <span className="text-xs text-accent">{savedMessage}</span>}
       </div>
-      {saveError && (
-        <p className="mt-2 text-xs" style={{ color: 'var(--color-accent-700)' }}>
-          {saveError}
-        </p>
-      )}
+      {saveError && <p className="mt-2 text-xs text-danger">{saveError}</p>}
     </div>
   )
 }

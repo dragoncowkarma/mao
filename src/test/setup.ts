@@ -28,6 +28,8 @@ afterEach(() => {
   // leaked tree keeps firing them into the next test's bridge. The repo runs vitest without `globals`,
   // so Testing Library never finds an ambient `afterEach` to register its own auto-cleanup on.
   cleanup()
+  document.documentElement.removeAttribute('data-design')
+  document.documentElement.removeAttribute('data-theme')
   // Then drop the bridge, so anything that outlived cleanup fails with the accessor's message instead
   // of quietly recording calls against a stub the next test is asserting on.
   setElectronApi(null)

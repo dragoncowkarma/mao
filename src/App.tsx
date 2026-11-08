@@ -9,6 +9,7 @@ import { electronApi } from './electron-api'
 import type { QueueRecoveryState, RepoRef } from '../core/workflow-engine'
 import type { RepoWorkflowCapability } from '../core/repo-capabilities'
 import { sameRepoRef } from '../core/repo-registry'
+import { DEFAULT_DESIGN_ID, normalizeDesignId, type DesignId } from '../core/design-system'
 import type { StoredValueProblem, ThemePreference } from '../core/store'
 import type { AppUpdateCheck } from './electron'
 
@@ -33,6 +34,8 @@ export default function App() {
   const [view, setView] = useState<View>('project')
   const [projectTab, setProjectTab] = useState<ProjectTab>('board')
   const [theme, setThemeState] = useState<ThemePreference>('system')
+  const [design, setDesignState] = useState<DesignId>(DEFAULT_DESIGN_ID)
+  const [appearanceError, setAppearanceError] = useState('')
   const [update, setUpdate] = useState<AppUpdateCheck | null>(null)
   const [dismissedUpdateSha, setDismissedUpdateSha] = useState<string | null>(null)
   /** Surfaces a failed settings edit or removal, which are otherwise silent (no preflight, no form). */
@@ -263,8 +266,19 @@ export default function App() {
   }, [])
 
   useEffect(() => {
-    electronApi().ui.getTheme().then(setThemeState)
+    electronApi()
+      .ui.getTheme()
+      .then(setThemeState)
+      .catch(() => {})
+    electronApi()
+      .ui.getDesign()
+      .then((saved) => setDesignState(normalizeDesignId(saved)))
+      .catch(() => setDesignState(DEFAULT_DESIGN_ID))
   }, [])
+
+  useEffect(() => {
+    document.documentElement.setAttribute('data-design', design)
+  }, [design])
 
   // Applies the effective light/dark scheme to <html data-theme>, which src/index.css keys its dark
   // token overrides off of. 'system' has no fixed effective value, so it tracks the OS-level media
@@ -290,8 +304,34 @@ export default function App() {
   }, [theme])
 
   async function setTheme(next: ThemePreference) {
+    setAppearanceError('')
+    const previous = theme
     setThemeState(next)
-    await electronApi().ui.setTheme(next)
+    try {
+      await electronApi().ui.setTheme(next)
+    } catch (err) {
+      const actual = await electronApi()
+        .ui.getTheme()
+        .catch(() => previous)
+      setThemeState(actual)
+      setAppearanceError(err instanceof Error ? err.message : String(err))
+    }
+  }
+
+  async function setDesign(next: DesignId) {
+    setAppearanceError('')
+    const previous = design
+    setDesignState(next)
+    try {
+      await electronApi().ui.setDesign(next)
+    } catch (err) {
+      const actual = await electronApi()
+        .ui.getDesign()
+        .then(normalizeDesignId)
+        .catch(() => previous)
+      setDesignState(actual)
+      setAppearanceError(err instanceof Error ? err.message : String(err))
+    }
   }
 
   useEffect(() => {
@@ -729,7 +769,13 @@ export default function App() {
         )}
 
         {view === 'global-settings' ? (
-          <GlobalSettings theme={theme} onThemeChange={setTheme} />
+          <GlobalSettings
+            theme={theme}
+            onThemeChange={setTheme}
+            design={design}
+            onDesignChange={setDesign}
+            appearanceError={appearanceError}
+          />
         ) : !selected ? (
           <div>
             <h2>Welcome to MAO</h2>
@@ -745,11 +791,7 @@ export default function App() {
               </h2>
             </div>
 
-            {repoError && (
-              <p className="mb-3 text-xs" style={{ color: 'var(--color-accent-700)' }}>
-                {repoError}
-              </p>
-            )}
+            {repoError && <p className="mb-3 text-xs text-danger">{repoError}</p>}
 
             <div className="tabs">
               <button

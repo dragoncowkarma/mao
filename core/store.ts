@@ -9,6 +9,13 @@ import {
 } from './ai/types.ts'
 import { isRepoRef } from './repo-registry.ts'
 import {
+  DEFAULT_DESIGN_ID,
+  DESIGN_IDS,
+  isDesignId,
+  normalizeDesignId,
+  type DesignId,
+} from './design-system.ts'
+import {
   createStoreWriteLock,
   writeStoreFileAtomic,
   type StoreWriteLock,
@@ -16,6 +23,8 @@ import {
 } from './store-file.ts'
 import { WORKFLOW_ACTIVE_LABEL, WORKFLOW_TASK_STATUSES } from './workflow-engine.ts'
 import type { QueuedTask, RepoRef } from './workflow-engine.ts'
+
+export { DEFAULT_DESIGN_ID, DESIGN_IDS, isDesignId, normalizeDesignId, type DesignId }
 
 /**
  * UI color scheme preference. 'system' follows the OS-level `prefers-color-scheme` media query and
@@ -35,6 +44,7 @@ export interface MaoStoreSchema {
    */
   buildSha: string
   theme: ThemePreference
+  design: DesignId
 }
 
 export const MAO_STORE_DEFAULTS: MaoStoreSchema = {
@@ -44,6 +54,7 @@ export const MAO_STORE_DEFAULTS: MaoStoreSchema = {
   workflowTasks: [],
   buildSha: '',
   theme: 'system',
+  design: DEFAULT_DESIGN_ID,
 }
 
 type UnknownRecord = Record<string, unknown>
@@ -641,6 +652,7 @@ function storedValueDefect(
  * point).
  */
 function usableStoredValue<K extends keyof MaoStoreSchema>(key: K, raw: MaoStoreSchema[K]): MaoStoreSchema[K] {
+  if (key === 'design') return normalizeDesignId(raw) as MaoStoreSchema[K]
   const rule = storedShapeRule(key)
   if (rule === undefined) return raw
   if (!Array.isArray(raw)) return structuredClone(MAO_STORE_DEFAULTS[key])
@@ -702,6 +714,13 @@ function describeInvalidStoredWrite<K extends keyof MaoStoreSchema>(
   value: MaoStoreSchema[K],
   source: string,
 ): string | null {
+  if (key === 'design') {
+    if (isDesignId(value)) return null
+    return (
+      `[store] Refusing to write "design" in ${source}: expected one of ${DESIGN_IDS.join(', ')}, ` +
+      `received ${describeStoredType(value)}. Nothing was written.`
+    )
+  }
   const predicate =
     key === 'aiProviders' ? isAiProviderConfig : key === 'workflowTasks' ? isQueuedTask : undefined
   if (predicate === undefined) return null

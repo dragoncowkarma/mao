@@ -21,8 +21,8 @@ const STAGE_LABELS: Record<QueuedTask['stage'], string> = {
 }
 
 function statusTagClass(task: QueuedTask): string {
-  if (task.status === 'error') return 'tag-accent'
-  if (task.status === 'done') return 'tag-neutral'
+  if (task.status === 'error') return 'tag-danger'
+  if (task.status === 'done') return 'tag-success'
   if (task.status === 'paused') return 'tag-warn'
   return 'tag-outline'
 }
@@ -142,7 +142,7 @@ function TaskCard({
       )}
 
       {task.status === 'running' && task.active && (
-        <div className="card gap-1 p-2">
+        <div className="card card-subtle gap-1 p-2">
           <div className="flex items-center gap-2">
             <span className="live-dot" />
             <AgentBadge
@@ -155,7 +155,7 @@ function TaskCard({
           </div>
           <details>
             <summary className="cursor-pointer text-xs text-muted">Prompt</summary>
-            <pre className="mt-1 max-h-64 overflow-y-auto whitespace-pre-wrap text-xs">{task.active.prompt}</pre>
+            <pre className="code-block mt-1 max-h-64 overflow-y-auto whitespace-pre-wrap text-xs">{task.active.prompt}</pre>
           </details>
         </div>
       )}
@@ -183,11 +183,11 @@ function TaskCard({
                 <div className="flex flex-col gap-2 pl-1">
                   <div>
                     <p className="text-muted text-[10px] uppercase tracking-wide">Prompt</p>
-                    <pre className="max-h-64 overflow-y-auto whitespace-pre-wrap text-xs">{step.prompt}</pre>
+                    <pre className="code-block max-h-64 overflow-y-auto whitespace-pre-wrap text-xs">{step.prompt}</pre>
                   </div>
                   <div>
                     <p className="text-muted text-[10px] uppercase tracking-wide">Output</p>
-                    <pre className="max-h-64 overflow-y-auto whitespace-pre-wrap text-xs">{step.output}</pre>
+                    <pre className="code-block max-h-64 overflow-y-auto whitespace-pre-wrap text-xs">{step.output}</pre>
                   </div>
                 </div>
               )}
@@ -227,7 +227,7 @@ function TaskCard({
 
       {task.error && (
         <div className="mt-1 flex flex-col gap-1.5">
-          <p className="text-xs" style={{ color: 'var(--color-accent-700)' }}>
+          <p className="text-danger text-xs">
             {task.error}
           </p>
           <AgentRunControls
@@ -394,7 +394,7 @@ export default function WorkflowQueue({ repo }: WorkflowQueueProps) {
       </div>
 
       {error && (
-        <p className="mt-2 text-xs" style={{ color: 'var(--color-accent-700)' }}>
+        <p className="text-danger mt-2 text-xs">
           {error}
         </p>
       )}

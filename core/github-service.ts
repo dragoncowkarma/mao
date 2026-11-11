@@ -6,6 +6,12 @@ import {
   type RepoCapabilitySnapshot,
   type RepoWorkflowCapability,
 } from './repo-capabilities.ts'
+import {
+  COMMIT_GRAPH_LIMITS,
+  type CommitGraphData,
+  type GraphBranch,
+  type GraphCommit,
+} from './commit-graph.ts'
 
 /**
  * A stalled GitHub socket would otherwise block every repository behind the single-flight queue.
@@ -344,6 +350,66 @@ export class GithubService {
     if (!this.octokit) throw new Error('GitHub token is not set')
     const { data } = await this.octokit.rest.repos.get({ owner, repo })
     return data.default_branch
+  }
+
+  /**
+   * A bounded, read-only window onto the repository's branch history for the Graph tab and
+   * `mao github graph`. Only GETs: `repos.get`, one page of `repos.listBranches`, and one
+   * `repos.listCommits` page per drawn branch — so at most `2 + maxBranches` calls, each under this
+   * class's per-attempt deadline, and none of them a write, a clone or a label change.
+   *
+   * REST has no "every commit on every branch" endpoint, so each branch's recent history is read from its
+   * own head and the pages are merged by SHA. A branch whose head is already among the commits read is
+   * not fetched again: a merged or freshly created `workflow/*` branch costs nothing.
+   */
+  async fetchCommitGraph(owner: string, repo: string): Promise<CommitGraphData> {
+    const octokit = this.octokit
+    if (!octokit) throw new Error('GitHub token is not set')
+
+    const [{ data: repoData }, { data: listed }] = await Promise.all([
+      octokit.rest.repos.get({ owner, repo }),
+      octokit.rest.repos.listBranches({ owner, repo, per_page: COMMIT_GRAPH_LIMITS.branchListPage }),
+    ])
+    const defaultBranch = repoData.default_branch
+    const all: GraphBranch[] = listed.map((branch) => ({ name: branch.name, sha: branch.commit.sha }))
+    const defaultEntry = all.find((branch) => branch.name === defaultBranch)
+    const others = all.filter((branch) => branch.name !== defaultBranch)
+    const branches = [
+      ...(defaultEntry ? [defaultEntry] : []),
+      ...others.slice(0, COMMIT_GRAPH_LIMITS.maxBranches - (defaultEntry ? 1 : 0)),
+    ]
+
+    const commits = new Map<string, GraphCommit>()
+    const readBranch = async (branch: GraphBranch, perPage: number) => {
+      const { data } = await octokit.rest.repos.listCommits({ owner, repo, sha: branch.name, per_page: perPage })
+      for (const item of data) {
+        if (commits.has(item.sha)) continue
+        commits.set(item.sha, {
+          sha: item.sha,
+          parents: item.parents.map((parent) => parent.sha),
+          message: item.commit.message.split('\n', 1)[0],
+          author: item.commit.author?.name ?? item.author?.login ?? 'unknown',
+          date: item.commit.committer?.date ?? item.commit.author?.date ?? '',
+          url: item.html_url,
+        })
+      }
+    }
+
+    // The default branch first, so its page can make the other branches' heads already known.
+    if (defaultEntry) await readBranch(defaultEntry, COMMIT_GRAPH_LIMITS.defaultBranchCommits)
+    await Promise.all(
+      branches
+        .filter((branch) => branch !== defaultEntry && !commits.has(branch.sha))
+        .map((branch) => readBranch(branch, COMMIT_GRAPH_LIMITS.branchCommits)),
+    )
+
+    return {
+      defaultBranch,
+      branches,
+      commits: [...commits.values()],
+      omittedBranches: all.length - branches.length,
+      branchListComplete: listed.length < COMMIT_GRAPH_LIMITS.branchListPage,
+    }
   }
 
   /** Fetches the commit SHA currently pointed to by a branch ref. */

@@ -28,6 +28,11 @@ const REPO_ROOT = path.join(
 )
 
 const SKILL = '.agents/skills/mao-development/SKILL.md'
+/**
+ * Codex and Antigravity discover `.agents/skills/`; Claude Code looks only in `.claude/skills/`. A pointer
+ * rather than a symlink, because a Windows checkout without symlink support turns a link into a text file.
+ */
+const CLAUDE_SKILL = '.claude/skills/mao-development/SKILL.md'
 const REFERENCE_DIR = '.agents/skills/mao-development/references'
 const REFERENCES = [
   'store-and-recovery.md',
@@ -76,8 +81,22 @@ function markdownFilesUnder(directory: string): string[] {
   })
 }
 
+/** A skill's frontmatter fields, which are what a tool reads to list and choose the skill. */
+function frontmatter(document: string): Record<string, string> {
+  const block = /^---\n([\s\S]*?)\n---\n/.exec(read(document))?.[1] ?? ''
+  const fields = [...block.matchAll(/^([\w-]+):[ \t]*(.*)$/gm)]
+  return Object.fromEntries(fields.map((match) => [match[1], match[2]]))
+}
+
 function agentDocuments(): string[] {
-  const roots = ['AGENTS.md', 'CLAUDE.md', 'codex.md', 'SKILL.md', '.github/pull_request_template.md']
+  const roots = [
+    'AGENTS.md',
+    'CLAUDE.md',
+    'codex.md',
+    'SKILL.md',
+    CLAUDE_SKILL,
+    '.github/pull_request_template.md',
+  ]
   return [...roots.filter(exists), ...markdownFilesUnder('.agents')]
 }
 
@@ -121,7 +140,7 @@ function atImports(markdown: string): string[] {
  * list rather than "anything with a slash", because prose also backticks `owner/repo` and `git push`.
  */
 function backtickedRepoPaths(markdown: string): string[] {
-  const rooted = /^(?:\.agents|\.codex|\.github|cli|core|electron|scripts|src)\/[\w./-]*$/
+  const rooted = /^(?:\.agents|\.claude|\.codex|\.github|cli|core|electron|scripts|src)\/[\w./-]*$/
   const rootFiles = new Set([
     'AGENTS.md',
     'CLAUDE.md',
@@ -196,9 +215,16 @@ describe('the reference scanners', () => {
 
   it('finds backticked repository paths and skips placeholders, globs and prose', () => {
     const markdown =
-      '`core/app.ts` `core/app.ts:41` `.agents/rules/` `AGENTS.md` `src/components/<Name>.test.tsx` ' +
-      '`core/**/*.test.ts` `owner/repo` `git push` `config.json` `dist-cli/index.cjs`'
-    expect(backtickedRepoPaths(markdown)).toEqual(['core/app.ts', 'core/app.ts', '.agents/rules/', 'AGENTS.md'])
+      '`core/app.ts` `core/app.ts:41` `.agents/rules/` `.claude/skills/` `AGENTS.md` ' +
+      '`src/components/<Name>.test.tsx` `core/**/*.test.ts` `owner/repo` `git push` `config.json` ' +
+      '`dist-cli/index.cjs`'
+    expect(backtickedRepoPaths(markdown)).toEqual([
+      'core/app.ts',
+      'core/app.ts',
+      '.agents/rules/',
+      '.claude/skills/',
+      'AGENTS.md',
+    ])
   })
 
   it('finds the document paths the orchestrator used to name, including a bare directory', () => {
@@ -224,7 +250,7 @@ describe('the context budgets', () => {
   })
 
   it('keeps the tool entry points as pointers', () => {
-    for (const entry of ['CLAUDE.md', 'codex.md', 'SKILL.md']) {
+    for (const entry of ['CLAUDE.md', 'codex.md', 'SKILL.md', CLAUDE_SKILL]) {
       expect(read(entry).trimEnd().split('\n').length, entry).toBeLessThanOrEqual(10)
     }
   })
@@ -236,6 +262,7 @@ describe('re-inlining', () => {
     expect(atImports(read('codex.md'))).toEqual([])
     expect(atImports(read('SKILL.md'))).toEqual([])
     expect(atImports(read(SKILL))).toEqual([])
+    expect(atImports(read(CLAUDE_SKILL))).toEqual([])
   })
 
   it('never re-inlines a root document from anywhere under .agents', () => {
@@ -274,6 +301,7 @@ describe('reference integrity', () => {
         'codex.md',
         '.github/pull_request_template.md',
         SKILL,
+        CLAUDE_SKILL,
         ...REFERENCES.map((name) => `${REFERENCE_DIR}/${name}`),
       ]),
     )
@@ -309,10 +337,16 @@ describe('reference integrity', () => {
     expect(agentsLinks).toContain(SKILL)
   })
 
-  it('keeps the skill loadable', () => {
-    const frontmatter = /^---\n([\s\S]*?)\n---\n/.exec(read(SKILL))
-    expect(frontmatter?.[1]).toMatch(/^name: mao-development$/m)
-    expect(frontmatter?.[1]).toMatch(/^description: \S/m)
+  it.each([SKILL, CLAUDE_SKILL])('keeps %s loadable as the mao-development skill', (document) => {
+    expect(frontmatter(document).name).toBe('mao-development')
+    expect(frontmatter(document).description).toMatch(/^\S/)
+  })
+
+  it('gives Claude Code a pointer to the playbook rather than a second copy of it', () => {
+    // The tools choose a skill by its description, so a drifted copy would route Claude differently.
+    expect(frontmatter(CLAUDE_SKILL).description).toBe(frontmatter(SKILL).description)
+    const links = relativeLinks(read(CLAUDE_SKILL))
+    expect(links.map((target) => resolvesInsideRepo(CLAUDE_SKILL, target))).toContain(SKILL)
   })
 })
 

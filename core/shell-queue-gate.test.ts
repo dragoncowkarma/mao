@@ -64,6 +64,18 @@ describe('cli run refuses before it can start anything', () => {
     expect(gated).toContain('return')
   })
 
+  it('names the CLI way out of a persistence marker, which the shared message cannot', () => {
+    // QUEUE_PERSISTENCE_BROKEN is also the GUI card's text and the GUI clears through its own action, so
+    // the command has to come from this shell — issue #76 asks `mao run` to point at it.
+    const gated = runAction.slice(
+      runAction.indexOf('isPersistenceBroken()'),
+      runAction.indexOf('getQueueRecoveryReason()'),
+    )
+
+    expect(gated).toContain('mao config clear-persistence-broken')
+    expect(gated).not.toContain('confirm-queue-recovery')
+  })
+
   it('exits non-zero rather than idling, so a cron caller can see it', () => {
     // An unattended invocation that reports success while nothing polls is worse than a failure it can
     // act on, and `mao run` exists to be called from cron.

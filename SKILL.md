@@ -64,7 +64,11 @@ npm run lint && npm run test && npm run test:origin && npx vite build
 Additionally, because CI does **not** cover them:
 
 - Touched `cli/` or `core/`? → also run `npm run build:cli` and smoke-test
-  `node dist-cli/index.cjs --help` (CLI bundle breakage is invisible to CI).
+  `node dist-cli/index.cjs --help`. CI type-checks `cli/` (`npm run lint`) and bundles
+  `cli/index.ts` only inside `core/cli-run-refusal.test.ts`, into a temp dir, where it spawns
+  only refusing `mao run`s plus `config show` and `config clear-persistence-broken` —
+  `scripts/build-cli.mjs` itself (the Swarm asset copy, the executable bits), `--help` and every
+  other command's runtime behaviour stay invisible to CI.
 - Iterating on the engine? → focused run: `npx vitest run core/workflow-engine.test.ts`.
 - Touched `src/`? → focused run: `npx vitest run --project renderer`. Nothing else in
   the matrix sees renderer *behaviour*: `tsc --noEmit` reads types, `npx vite build`
@@ -122,6 +126,7 @@ State lives at `$MAO_DATA_DIR/config.json` (default: the platform data dir from
 npm run cli -- config set-token <token>          # store GitHub token
 npm run cli -- config import-providers <file>    # JSON array of AiProviderConfig
 npm run cli -- config show                       # secrets redacted as '[set]'
+npm run cli -- config clear-persistence-broken   # after reconciling with GitHub; unblocks the next start only
 npm run cli -- repos add <owner> <repo> [--no-auto-trigger] [--poll-interval-ms <ms>]  # preflights write access
 npm run cli -- repos list
 npm run cli -- github check <owner> <repo>       # open issues/PRs as JSON
@@ -134,7 +139,7 @@ npm run cli -- workflow retry <taskId> [--provider <id>] [--model <model>] [--ef
 npm run cli -- workflow advance <taskId> [--provider <id>] [--model <model>] [--effort <level>]
 npm run cli -- workflow clear-completed
 npm run cli -- workflow confirm-queue-recovery   # retain readable tasks, delete invalid entries, release the engine
-npm run cli -- run                               # foreground: auto-trigger + resume queue
+npm run cli -- run                               # foreground: auto-trigger + resume queue; exits 1 if blocked (below)
 npm run cli -- swarm --repo-root /path/to/repo --status
 npm run cli -- swarm --repo-root /path/to/repo --dry-run --once
 ```
@@ -163,7 +168,10 @@ of value does when two processes change *the same* key:
 The queue is the one to plan around. Two hosts running one queue are two engines able to repeat the same
 GitHub work, so a host whose queue another process changed **refuses to overwrite it**: the stage it was
 starting goes to `error` with "another MAO process changed the stored workflow queue…", and the engine
-stops running stages and records `workflowPersistenceBroken` (`mao run` prints why). Run one queue host
+stops running stages and records `workflowPersistenceBroken` (`mao run` prints why, then stays up idle —
+no polling, no stages — rather than exiting, and its Ctrl+C/SIGINT handler still exits 0, so a supervisor
+sees no failure status either way; watch stderr for `queue persistence failed`, or `mao config show`,
+which reads the marker file this process writes best-effort). Run one queue host
 per config file — `mao run`, the desktop app, or a one-shot `mao workflow enqueue`/`retry`/`advance`
 (which process the queue in the foreground). If it happens: stop the others, check `mao workflow list` and
 the target repos for work either may have repeated, run `mao config clear-persistence-broken`, and
@@ -364,11 +372,41 @@ show` reports `workflowQueueRecoveryRequired: true` — a **separate** field fro
 `mao config clear-persistence-broken` for this; it cannot describe or fix it.
 
 When `workflowPersistenceBroken` itself is true, treat the durable queue as potentially older than work
-already performed on GitHub. MAO blocks queue mutations, automatic/manual repository polling and stage
-processing in both the process that observed the failure and later starts that see the marker. This is
-stronger than `resume: false`: an auto-trigger enqueue or operator click would otherwise wake every
-restored pending task. Inspect `mao workflow list` and the actual issues, branches and pull requests;
-only then run `mao config clear-persistence-broken` and start a fresh MAO process. In the GUI, use its
+already performed on GitHub. The marker is the file `workflow-persistence-broken.marker` in the data
+directory — `$MAO_DATA_DIR` (or the `core/paths.ts` default) for the CLI, Electron's `userData` for the
+GUI. Its presence is the block, not its contents: a marker that is a dangling symlink counts as present,
+and so does a presence check that cannot be answered (a directory MAO may not search, an I/O error). MAO
+blocks queue
+mutations, automatic/manual repository polling and stage processing in both the process that observed
+the failure and later starts that see the marker:
+
+```
+$ mao run
+[mao] Workflow queue persistence has an unresolved write outcome. No further queue mutation or repository
+polling is allowed. Verify the stored queue and GitHub state, clear the persistence-broken marker only
+after that check, then restart MAO.
+[mao] Nothing was started. Stop every other MAO process on this data directory, check
+`mao workflow list` against the target repositories, then run `mao config clear-persistence-broken`
+and start `mao run` again.
+$ echo $?
+1
+```
+
+`mao run` exits **1** (so cron or a supervisor sees it) without starting the poller or resuming.
+`workflow enqueue`, `enqueue-existing` (after its one issue read), `retry`,
+`advance` and `clear-completed` refuse with the same first line; `workflow confirm-queue-recovery`
+answers "Nothing was written" with it; the board's **Refresh** rejects. This is stronger than
+`resume: false`: an auto-trigger enqueue, an operator click, or `mao run`'s own `resumeProcessing()` would
+otherwise wake every restored pending task (issue #76). `mao run` reports only the marker when the queue
+is also latched, so read `mao config show`'s `workflowQueueRecoveryRequired` and `storeProblems` too.
+
+To clear it from the CLI, first stop every MAO process on that data directory: the one that recorded the
+marker stays blocked for the rest of its life, and `mao config clear-persistence-broken` runs in a process
+of its own, so — unlike the GUI action, which refuses while a stage of *its* process is active — it cannot
+tell whether a stage is still in flight elsewhere. Then inspect
+`mao workflow list` and the actual issues, branches and pull requests — a task listed `pending` may have
+been mid-stage when the marker was written, because boot normalizes `running` to `pending`; only then run
+`mao config clear-persistence-broken` and start a fresh `mao run`. In the GUI, use its
 two-step **Clear marker after verification** action instead: it targets Electron's actual `userData`,
 whereas the CLI's default data directory can differ and a packaged GUI may not include the CLI at all.
 The GUI refuses to clear while any stage is still active in that process. Neither route releases the
@@ -386,7 +424,8 @@ running its real queue):
    PR for the same issue.
 3. `mao workflow confirm-queue-recovery`, or the sidebar's two-step **Recover readable tasks**.
 
-That command is the only queue path that is not gated, and it is deliberately **not**
+That command is the only queue path the *queue* latch does not gate (the persistence marker still does —
+see the "Nothing was written" row), and it is deliberately **not**
 `clear-completed` — `clear-completed` also writes the queue, so it is refused too; leaving it open would
 let a GUI click replace the unreadable value with no confirmation at all. It takes a fresh observation of
 the file immediately before it writes, and reports only what that established:
@@ -399,6 +438,7 @@ the file immediately before it writes, and reports only what that established:
 | the stored queue changed while confirming | the value moved between the check and the write, so the write refused and **nothing was written**. Something else is writing the file — re-check it and retry |
 | the replacement was invalid | prospective validation rejected the replacement before the comparison or backend write, so **nothing was written** and the halt remains |
 | the replacement write failed | the attempt threw, so what reached the file is unknown. MAO records the persistence-broken marker and blocks all queue work. Reconcile the stored queue with GitHub, clear the marker through the matching CLI/GUI recovery path, then restart |
+| Nothing was written. *reason* (the GUI shows *reason* alone) — any reason other than the whole-file one above | the action could not establish a safe replacement, so **nothing was written** and the halt stands; the reason says why: another MAO process held `config.json.lock`, or the persistence-broken message. For the latter, a prior queue write could not be durably recorded: stop every MAO process on the data directory, reconcile the stored queue with GitHub, clear the marker (`mao config clear-persistence-broken`, or the GUI's **Clear marker after verification**), restart, then recover |
 
 None of those messages quotes the underlying error, because an I/O or parse failure can echo the file's
 own bytes and that file holds your GitHub token in plaintext.

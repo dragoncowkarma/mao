@@ -17,7 +17,7 @@ export interface ProviderOptions {
   efforts: EffortOption[]
 }
 
-/** Lowest-to-highest dispatch effort; legacy stored spellings fold onto this ladder. */
+/** Lowest-to-highest Swarm effort ladder. Saved provider values are passed through separately. */
 export const REASONING_LADDER = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const
 export type ReasoningLevel = (typeof REASONING_LADDER)[number]
 
@@ -37,20 +37,23 @@ export function resolveReasoning(reasoning: string, supported: readonly string[]
   return [...allowed].reverse().find((level) => REASONING_LADDER.indexOf(level) <= ceiling) ?? allowed[0] ?? wanted
 }
 
-/** Shared flag construction: Codex reads reasoning from a config key, never an --effort flag. */
+/**
+ * Encode the operator's resolved configuration without interpreting model or effort names.
+ * Swarm normalizes its prose tags before calling this helper; ordinary providers (including
+ * custom wrappers named after a built-in CLI) retain their saved values verbatim. Codex's
+ * config-key syntax is the only command-specific effort encoding here.
+ */
 export function buildModelEffortArgs(command: string, model?: string, effort?: string, args: readonly string[] = []): string[] {
   const result: string[] = []
-  const effectiveModel = command === 'agy' && model && effort
-    ? `${model.replace(/-(low|medium|high)$/, '')}-${resolveReasoning(effort, REASONING_LADDER.slice(0, 3))}`
-    : model
-  if (effectiveModel && !args.includes('--model') && !args.includes('-m')) result.push('--model', effectiveModel)
-  if (effort && command !== 'agy' && !args.includes('--effort')) {
+  if (model && !args.includes('--model') && !args.includes('-m')) result.push('--model', model)
+  const kind = command === 'agy' ? 'antigravity' : command === 'claude' ? 'claude' : undefined
+  const noEffort = kind && PROVIDER_OPTIONS[kind].models.find((entry) => entry.value === model)?.noEffort
+  if (effort && !noEffort && !args.includes('--effort')) {
     if (command === 'codex') {
       const hasConfig = args.some((arg) => /^model_reasoning_effort\s*=/.test(arg))
-      if (!hasConfig) result.push('-c', `model_reasoning_effort=${resolveReasoning(effort,
-        model === 'gpt-5.6-sol' || model === 'gpt-5.6-terra' ? REASONING_LADDER : REASONING_LADDER.slice(0, 5))}`)
+      if (!hasConfig) result.push('-c', `model_reasoning_effort=${effort}`)
     } else {
-      result.push('--effort', command === 'claude' ? resolveReasoning(effort, REASONING_LADDER.slice(0, 5)) : effort)
+      result.push('--effort', effort)
     }
   }
   return result
@@ -66,8 +69,11 @@ export const PROVIDER_OPTIONS: Record<ProviderKindId, ProviderOptions> = {
   },
   claude: {
     models: [
-      ...['claude-opus-5', 'claude-sonnet-5', 'claude-fable-5', 'claude-haiku-4-5'].map((value) => ({ value, label: value })),
-      { value: 'haiku', label: 'Haiku (legacy)', noEffort: true },
+      ...['claude-opus-5', 'claude-sonnet-5', 'claude-fable-5'].map((value) => ({ value, label: value })),
+      // Keep no-effort metadata for stored legacy ids as well as the current model. Removing an
+      // old catalog entry must not turn a formerly suppressed effort into an unsupported flag.
+      ...['claude-haiku-4-5', 'claude-haiku-4-5-20251001', 'claude-3-5-haiku', 'claude-3.5-haiku', 'haiku']
+        .map((value) => ({ value, label: value, noEffort: true })),
     ],
     efforts: efforts(REASONING_LADDER.slice(0, 5)),
   },

@@ -14,7 +14,7 @@ const envelope = (body: unknown, status = 200, headers = '') =>
   `HTTP/2.0 ${status} OK\r\n${headers}\r\n\r\n${JSON.stringify(body)}`
 function fixture(options: {
   fetch?: string[]; push?: string[]; ssh?: string; snapshot?: unknown; response?: CommandResult
-  config?: Record<string, string>; env?: NodeJS.ProcessEnv; branch?: string; dryRun?: boolean
+  config?: Record<string, string>; env?: NodeJS.ProcessEnv; branch?: string
 } = {}) {
   const calls: { command: string; args: string[]; cwd: string; env: NodeJS.ProcessEnv }[] = []
   const run: CommandRunner = async (command, args, cwd, env) => {
@@ -32,7 +32,7 @@ function fixture(options: {
     }
     return ok()
   }
-  return { platform: new SwarmPlatform('/repo', { run, env: options.env ?? {}, dryRun: options.dryRun }), calls }
+  return { platform: new SwarmPlatform('/repo', { run, env: options.env ?? {} }), calls }
 }
 
 describe('Swarm origin and credential binding', () => {
@@ -50,12 +50,12 @@ describe('Swarm origin and credential binding', () => {
     const { platform, calls } = fixture({ push: [
       'https://github.com/acme/widgets', 'https://github.com/other/widgets',
     ] })
-    await expect(platform.initialize()).rejects.toThrow('different repositories')
+    await expect(platform.bindOrigin().then(() => platform.assertRepoWritable())).rejects.toThrow('different repositories')
     expect(calls.some(({ command }) => command === 'gh')).toBe(false)
   })
   it('reads the complete API body and passes three-state permissions through shared core policy', async () => {
     const { platform, calls } = fixture({ snapshot: { full_name: 'acme/widgets', permissions: { push: 'true' } } })
-    await expect(platform.initialize()).rejects.toThrow('permissions block')
+    await expect(platform.bindOrigin().then(() => platform.assertRepoWritable())).rejects.toThrow('permissions block')
     const probe = calls.find(({ command }) => command === 'gh')!
     expect(probe.args).toEqual(['api', '--include', '--method', 'GET', 'repos/{owner}/{repo}'])
     expect(probe.env).toMatchObject({ GH_HOST: 'github.com', GH_REPO: 'github.com/acme/widgets' })
@@ -69,35 +69,35 @@ describe('Swarm origin and credential binding', () => {
     [{ permissions: { push: null } }, 'permissions block'],
   ])('preserves negative shared capability verdict %#', async (snapshot, reason) => {
     const { platform } = fixture({ snapshot: { full_name: 'acme/widgets', ...snapshot } })
-    await expect(platform.initialize()).rejects.toThrow(reason)
+    await expect(platform.bindOrigin().then(() => platform.assertRepoWritable())).rejects.toThrow(reason)
   })
   it('honors private classic-token scope restrictions', async () => {
     const { platform } = fixture({ response: ok(envelope({
       full_name: 'acme/widgets', private: true, permissions: { push: true },
     }, 200, 'x-oauth-scopes: public_repo')) })
-    await expect(platform.initialize()).rejects.toThrow('classic token')
+    await expect(platform.bindOrigin().then(() => platform.assertRepoWritable())).rejects.toThrow('classic token')
   })
   it.each([401, 404, 451])('reports definitive HTTP %s failures', async (status) => {
     const { platform } = fixture({ response: { code: 1, stdout: envelope({}, status), stderr: '' } })
-    await expect(platform.initialize()).rejects.toThrow(SwarmPreflightConfigError)
+    await expect(platform.bindOrigin().then(() => platform.assertRepoWritable())).rejects.toThrow(SwarmPreflightConfigError)
   })
   it.each([403, 429, 500])('keeps HTTP %s inconclusive failures transient', async (status) => {
     const { platform } = fixture({ response: { code: 1, stdout: envelope({}, status), stderr: 'secret-value' } })
-    await expect(platform.initialize()).rejects.toThrow(SwarmPreflightTransientError)
+    await expect(platform.bindOrigin().then(() => platform.assertRepoWritable())).rejects.toThrow(SwarmPreflightTransientError)
   })
   it('keeps a rate-limited resource error transient', async () => {
     const { platform } = fixture({ response: { code: 1, stdout: envelope({
       message: 'Resource not accessible by integration',
     }, 403, 'x-ratelimit-remaining: 0'), stderr: '' } })
-    await expect(platform.initialize()).rejects.toThrow(SwarmPreflightTransientError)
+    await expect(platform.bindOrigin().then(() => platform.assertRepoWritable())).rejects.toThrow(SwarmPreflightTransientError)
   })
   it('rejects mismatched API identity', async () => {
     const { platform } = fixture({ snapshot: { full_name: 'other/widgets', permissions: { push: true } } })
-    await expect(platform.initialize()).rejects.toThrow('identity differs')
+    await expect(platform.bindOrigin().then(() => platform.assertRepoWritable())).rejects.toThrow('identity differs')
   })
   it('dry run binds origin without a capability probe', async () => {
-    const { platform, calls } = fixture({ dryRun: true, env: { GH_REPO: 'other/repo', GH_HOST: 'evil.example' } })
-    await platform.initialize()
+    const { platform, calls } = fixture({ env: { GH_REPO: 'other/repo', GH_HOST: 'evil.example' } })
+    await platform.bindOrigin(false)
     expect(calls.some(({ command }) => command === 'gh')).toBe(false)
     expect(platform.boundEnvironment()).toMatchObject({ GH_HOST: 'github.com', GH_REPO: 'github.com/acme/widgets' })
   })
@@ -122,13 +122,13 @@ describe('Swarm origin and credential binding', () => {
   })
   it('rejects command-scope configuration parameters before probing', async () => {
     const { platform, calls } = fixture({ env: { GIT_CONFIG_PARAMETERS: "'remote.pushDefault=other'" } })
-    await expect(platform.initialize()).rejects.toThrow('GIT_CONFIG_PARAMETERS')
+    await expect(platform.bindOrigin()).rejects.toThrow('GIT_CONFIG_PARAMETERS')
     expect(calls).toHaveLength(0)
   })
   it('pins highest-precedence selectors while preserving credential environment', async () => {
     const { platform } = fixture({ env: { GH_TOKEN: 'private-value', GIT_CONFIG_COUNT: '1',
-      GIT_CONFIG_KEY_0: 'remote.pushDefault', GIT_CONFIG_VALUE_0: 'other' }, dryRun: true })
-    await platform.initialize()
+      GIT_CONFIG_KEY_0: 'remote.pushDefault', GIT_CONFIG_VALUE_0: 'other' } })
+    await platform.bindOrigin(false)
     const env = await platform.prepareDispatch('/repo')
     expect(env).toMatchObject({ GH_TOKEN: 'private-value', GIT_CONFIG_COUNT: '4',
       GIT_CONFIG_KEY_1: 'remote.pushDefault', GIT_CONFIG_VALUE_1: 'origin',
@@ -136,18 +136,18 @@ describe('Swarm origin and credential binding', () => {
       GIT_CONFIG_KEY_3: 'branch.main.remote', GIT_CONFIG_VALUE_3: 'origin' })
   })
   it.each(['local', 'worktree'])('rejects effective %s push selector override', async (scope) => {
-    const { platform } = fixture({ dryRun: true, config: { 'remote.pushDefault': `${scope}\tother\n` } })
-    await platform.initialize()
+    const { platform } = fixture({ config: { 'remote.pushDefault': `${scope}\tother\n` } })
+    await platform.bindOrigin(false)
     await expect(platform.prepareDispatch('/repo')).rejects.toThrow('other than origin')
   })
   it('allows global selectors because child command scope overrides them', async () => {
-    const { platform } = fixture({ dryRun: true, config: { 'remote.pushDefault': 'global\tother\n' } })
-    await platform.initialize()
+    const { platform } = fixture({ config: { 'remote.pushDefault': 'global\tother\n' } })
+    await platform.bindOrigin(false)
     expect((await platform.prepareDispatch('/repo')).GIT_CONFIG_VALUE_0).toBe('origin')
   })
   it('permits detached repository-root checker but refuses detached worker', async () => {
-    const { platform } = fixture({ dryRun: true, branch: '' })
-    await platform.initialize()
+    const { platform } = fixture({ branch: '' })
+    await platform.bindOrigin(false)
     await expect(platform.prepareDispatch('/repo')).resolves.toMatchObject({ GIT_CONFIG_COUNT: '1' })
     await expect(platform.prepareDispatch('/worker', 'worker/1-task')).rejects.toThrow('expected branch')
   })
@@ -172,12 +172,15 @@ describe('parser and comment trust boundaries', () => {
     expect(isTrustedComment({ author: { login: 'me' } }, 'me')).toBe(true)
     expect(isTrustedComment({ author: { login: 'other' }, authorAssociation: 'MEMBER' }, 'me')).toBe(true)
     expect(isTrustedComment({ authorAssociation: 'OWNER' }, 'me')).toBe(false)
+    expect(isTrustedComment({ author: null, authorAssociation: 'OWNER' }, 'me')).toBe(false)
+    expect(isTrustedComment({ author: { login: '' }, authorAssociation: 'OWNER' }, 'me')).toBe(false)
+    expect(isTrustedComment({ author: { login: 'other' }, authorAssociation: 'OWNER' }, '')).toBe(false)
     expect(isTrustedComment({ author: { login: 'other' }, authorAssociation: 'CONTRIBUTOR' }, 'me')).toBe(false)
   })
 })
 
 const roots: string[] = []
-afterEach(() => { roots.splice(0).forEach((root) => fs.rmSync(root, { recursive: true, force: true })) })
+afterEach(() => { vi.restoreAllMocks(); roots.splice(0).forEach((root) => fs.rmSync(root, { recursive: true, force: true })) })
 function repository() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-platform-'))
   roots.push(root)
@@ -265,7 +268,7 @@ describe('real Git worktree preservation', () => {
 describe('dispatch revalidation and immutable revision boundaries', () => {
   it('does not normalize suspicious whitespace away from effective remote URLs', async () => {
     const { platform } = fixture({ fetch: [' https://github.com/acme/widgets'] })
-    await expect(platform.initialize()).rejects.toThrow(SwarmPreflightConfigError)
+    await expect(platform.bindOrigin().then(() => platform.assertRepoWritable())).rejects.toThrow(SwarmPreflightConfigError)
   })
   it('refuses dot-segment remote paths before URL normalization', async () => {
     const { platform } = fixture()
@@ -274,8 +277,8 @@ describe('dispatch revalidation and immutable revision boundaries', () => {
   })
   it('rechecks origin after binding at the dispatch boundary', async () => {
     const fetch = ['https://github.com/acme/widgets']
-    const { platform } = fixture({ dryRun: true, fetch })
-    await platform.initialize()
+    const { platform } = fixture({ fetch })
+    await platform.bindOrigin(false)
     fetch[0] = 'https://github.com/other/widgets'
     await expect(platform.prepareDispatch('/repo')).rejects.toThrow()
   })
@@ -290,8 +293,8 @@ describe('dispatch revalidation and immutable revision boundaries', () => {
       if (args[0] === 'rev-parse') return ok(head)
       return ok()
     }
-    const platform = new SwarmPlatform('/repo', { run: runner, env: {}, dryRun: true })
-    await platform.initialize()
+    const platform = new SwarmPlatform('/repo', { run: runner, env: {} })
+    await platform.bindOrigin(false)
     expect(await platform.fetchPrHead(5, head)).toBe(head)
     expect(calls).toContainEqual(['fetch', '--no-tags', 'origin', 'refs/pull/5/head'])
     await expect(platform.fetchPrHead(5, 'b'.repeat(40))).rejects.toThrow('head changed')
@@ -407,5 +410,57 @@ describe('issue 64 checkout-specific dispatch contract', () => {
   it('does not equate a lookalike SSH host with the documented alternate endpoint', async () => {
     const { platform } = fixture({ ssh: 'hostname ssh.github.com.evil.example\nuser git\nport 443\n' })
     await expect(platform.parseRemote('git@alias:acme/widgets')).rejects.toThrow('Non-standard SSH endpoint')
+  })
+})
+
+describe('unverified grant diagnostic transitions', () => {
+  const unknown = () => envelope({ full_name: 'acme/widgets', permissions: { push: true } })
+  it('keeps every boundary probe while suppressing identical caveats until the verdict changes', async () => {
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const response = ok(unknown())
+    const { platform, calls } = fixture({ response })
+    await platform.bindOrigin()
+    for (let i = 0; i < 4; i++) await platform.assertRepoWritable()
+    expect(warning).toHaveBeenCalledTimes(1)
+    expect(calls.filter(({ command }) => command === 'gh')).toHaveLength(4)
+
+    response.stdout = envelope({ full_name: 'acme/widgets', permissions: { push: false } })
+    await expect(platform.assertRepoWritable()).rejects.toThrow('read-only')
+    response.stdout = unknown()
+    await platform.assertRepoWritable()
+    expect(warning).toHaveBeenCalledTimes(2)
+
+    response.stdout = envelope({ full_name: 'acme/widgets', permissions: { push: true } }, 200, 'x-oauth-scopes: repo')
+    await platform.assertRepoWritable()
+    expect(warning).toHaveBeenCalledTimes(2)
+    response.stdout = unknown()
+    await platform.assertRepoWritable()
+    expect(warning).toHaveBeenCalledTimes(3)
+    expect(calls.filter(({ command }) => command === 'gh')).toHaveLength(8)
+    expect(warning.mock.calls.every(([message]) => String(message).includes('remain unverified'))).toBe(true)
+  })
+  it('does not mistake an inconclusive network failure for a newly observed capability verdict', async () => {
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const response = ok(unknown())
+    const { platform, calls } = fixture({ response })
+    await platform.bindOrigin()
+    await platform.assertRepoWritable()
+    response.code = 1
+    response.stdout = envelope({}, 500)
+    await expect(platform.assertRepoWritable()).rejects.toThrow(SwarmPreflightTransientError)
+    response.code = 0
+    response.stdout = unknown()
+    await platform.assertRepoWritable()
+    expect(warning).toHaveBeenCalledTimes(1)
+    expect(calls.filter(({ command }) => command === 'gh')).toHaveLength(3)
+  })
+  it('starts each independent platform instance with a visible caveat', async () => {
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    for (let i = 0; i < 2; i++) {
+      const { platform } = fixture()
+      await platform.bindOrigin()
+      await platform.assertRepoWritable()
+    }
+    expect(warning).toHaveBeenCalledTimes(2)
   })
 })

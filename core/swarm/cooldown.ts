@@ -62,8 +62,3 @@ export function classifyProviderFailure(text: string, startedAt: Date, now = new
     scope: provider ? 'provider' : 'event',
   }
 }
-
-/** Status prints the operator's local clock alongside the durable UTC deadline. */
-export function describeRetryAfter(date: Date): string {
-  return `${date.toLocaleString()} (${date.toISOString()})`
-}

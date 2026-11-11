@@ -110,14 +110,29 @@ describe('command construction', () => {
       expect(argv).toContain('read-only')
       expect(argv).not.toContain('--approve-for-me')
       expect(argv).not.toContain('--dangerously-bypass-approvals-and-sandbox')
-      expect(argv.at(-1)).toBe('literal $(touch /tmp/no)')
+      expect(argv).not.toContain('literal $(touch /tmp/no)')
+      expect(argv.at(-1)).toBe('-')
       expect(argv).toContain('/a b')
     }
     expect(buildAiArgv({ ai: 'codex', model: 'terra', reasoning: 'ultra' }, 'prompt', true))
       .toContain('model_reasoning_effort=ultra')
   })
 
+  it.each(['codex', 'claude', 'antigravity'] as const)('keeps a large private %s prompt out of argv', (ai) => {
+    const prompt = 'Private issue, PR and diff: 한글\n'.repeat(10_000)
+    const argv = buildAiArgv(DEFAULT_AI_CONFIG[ai], prompt, false)
+    expect(argv.join(' ')).not.toContain('Private issue')
+    expect(Buffer.byteLength(argv.join(' '))).toBeLessThan(1000)
+    if (ai === 'antigravity') expect(argv.slice(-4)).toEqual(['--input-format', 'text', '--print', ''])
+    if (ai === 'codex') expect(argv.at(-1)).toBe('-')
+    if (ai === 'claude') expect(argv).toContain('-p')
+  })
+
   it('keeps read-only permission flags separate from Worker flags', () => {
+    const codexRead = buildAiArgv(DEFAULT_AI_CONFIG.codex, 'prompt', false)
+    expect(codexRead).toContain('read-only')
+    expect(codexRead).not.toContain('--dangerously-bypass-approvals-and-sandbox')
+    expect(buildAiArgv(DEFAULT_AI_CONFIG.codex, 'prompt', true)).toContain('--dangerously-bypass-approvals-and-sandbox')
     const claudeRead = buildAiArgv(DEFAULT_AI_CONFIG.claude, 'prompt', false)
     expect(claudeRead).toContain('--allowed-tools')
     expect(claudeRead).not.toContain('--dangerously-skip-permissions')
@@ -126,9 +141,20 @@ describe('command construction', () => {
     expect(buildAiArgv(DEFAULT_AI_CONFIG.antigravity, 'prompt', true)).not.toContain('--sandbox')
   })
 
+  it('normalizes and clamps Swarm prose tags before encoding CLI flags', () => {
+    expect(buildAiArgv({ ai: 'claude', model: 'sonnet 5', reasoning: 'ultra' }, 'prompt', true))
+      .toEqual(expect.arrayContaining(['--model', 'claude-sonnet-5', '--effort', 'max']))
+    expect(buildAiArgv({ ai: 'codex', model: 'luna', reasoning: 'ultra' }, 'prompt', true))
+      .toContain('model_reasoning_effort=max')
+    expect(buildAiArgv({ ai: 'antigravity', model: 'gemini 4 argon', reasoning: '울트라' }, 'prompt', true))
+      .toContain('gemini-4-argon-high')
+    expect(buildAiArgv({ ai: 'claude', model: 'haiku 4.5', reasoning: 'high' }, 'prompt', true))
+      .not.toContain('--effort')
+  })
+
   it('uses shared flags without duplicating an existing operator model/effort choice', () => {
     expect(buildModelEffortArgs('codex', 'gpt-5.6-terra', 'ultra', ['-m', 'override', '-c', 'model_reasoning_effort=low'])).toEqual([])
-    expect(buildModelEffortArgs('claude', 'claude-sonnet-5', 'ultra')).toEqual(['--model', 'claude-sonnet-5', '--effort', 'max'])
-    expect(buildModelEffortArgs('agy', 'gemini-4-argon-low', 'ultra')).toEqual(['--model', 'gemini-4-argon-high'])
+    expect(buildModelEffortArgs('claude', 'claude-sonnet-5', 'ultra')).toEqual(['--model', 'claude-sonnet-5', '--effort', 'ultra'])
+    expect(buildModelEffortArgs('agy', 'gemini-4-argon-low', 'ultra')).toEqual(['--model', 'gemini-4-argon-low'])
   })
 })

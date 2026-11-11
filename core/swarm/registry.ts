@@ -116,6 +116,7 @@ export class ProcessTracker {
   readonly states = new Map<string, LifecycleState>()
   readonly cooldowns = new Map<string, string>()
   readonly active = new Map<number, { child: ChildProcess, record: TrackedProcess }>()
+  private readonly falseDeferrals = new Map<string, Set<string>>()
 
   constructor(readonly file: string) {
     let data: Record<string, unknown> = {}
@@ -151,7 +152,9 @@ export class ProcessTracker {
     }
     if (data.provider_cooldowns && typeof data.provider_cooldowns === 'object') {
       for (const [provider, until] of Object.entries(data.provider_cooldowns)) {
-        if (typeof until === 'string' && Number.isFinite(Date.parse(until))) this.cooldowns.set(provider, until)
+        if (!this.falseDeferrals.get(provider)?.has(String(until)) && typeof until === 'string' && Number.isFinite(Date.parse(until))) {
+          this.cooldowns.set(provider, until)
+        }
       }
     }
     // Replace obsolete provider-map deadlines, retaining the maximum among current role states.
@@ -167,6 +170,19 @@ export class ProcessTracker {
 
   private healDeferred(record: TrackedProcess): void {
     if (record.status !== 'failed' && record.status !== 'deferred') return
+    // Exit status is authoritative. A successful review can quote quota errors as task content.
+    if (record.exit_code === 0) {
+      if (record.status === 'deferred' && record.retry_after) {
+        const deadlines = this.falseDeferrals.get(record.ai_name) ?? new Set<string>()
+        deadlines.add(record.retry_after)
+        this.falseDeferrals.set(record.ai_name, deadlines)
+      }
+      record.status = 'completed'
+      delete record.retry_after
+      delete record.defer_scope
+      delete record.failure_reason
+      return
+    }
     const ended = new Date(timestamp(record))
     const failure = classifyProviderFailure(readLogTail(record.log_file), new Date(record.started_at), ended)
     if (!failure) return
@@ -288,7 +304,8 @@ export class ProcessTracker {
       }
       record.ended_at = new Date().toISOString()
       record.exit_code = child.exitCode
-      const failure = classifyProviderFailure(readLogTail(record.log_file), new Date(record.started_at), new Date(record.ended_at))
+      const failure = child.exitCode === 0 ? null
+        : classifyProviderFailure(readLogTail(record.log_file), new Date(record.started_at), new Date(record.ended_at))
       record.status = failure ? 'deferred' : child.exitCode === 0 ? 'completed' : 'failed'
       if (failure) {
         record.retry_after = failure.retryAfter.toISOString()

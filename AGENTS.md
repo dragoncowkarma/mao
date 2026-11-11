@@ -1013,8 +1013,10 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   hard leader crash remains recoverable, and then persisted once more as removed or stuck; this
   fallback performs at most two atomic writes. Dispatched agents
   require isolated POSIX process groups; unsupported platforms fail before the write preflight or
-  runtime-file creation. Shutdown and normal leader exit signal all eligible process groups in a
-  batch, then terminate residual descendants within one shared supervision deadline and one shared
+  runtime-file creation. A normal `--once` waits for its dispatched children to finish and harvests
+  their actual exit status; it does not terminate them at the end of its single polling cycle.
+  Shutdown and abnormal leader exit signal all eligible process groups in a batch, then
+  terminate residual descendants within one shared supervision deadline and one shared
   forced-exit grace. Polling and `--once` share the same signal controller. A shutdown signal
   arriving during the narrow spawn-to-in-memory-adoption ownership transfer defers its exception
   until the child is supervised, even when spawn or adoption raises; checkout/environment preflight

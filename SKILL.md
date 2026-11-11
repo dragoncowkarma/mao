@@ -555,7 +555,9 @@ task worktrees under `<repo>/.worktrees`, persists process history under
 `<repo>/.agents/.process_registry.json`, and can create issues/PR comments, push,
 review, merge, and close issues. `--dry-run` and `--status` do not modify the target
 checkout, its Git metadata, or GitHub; `--dry-run` performs GitHub reads only.
-`--once` still performs real dispatch and GitHub/Git operations. `--reset` clears only
+`--once` performs one GitHub polling cycle, then waits for the agents it dispatched to finish
+under process supervision and records their real exit statuses. It performs real Git/GitHub
+operations; SIGINT/SIGTERM still stop owned process groups. `--reset` clears only
 the persisted dispatch history, not Git branches or worktrees, and that explicit local clear runs
 even if the following GitHub preflight fails. On the first real run it
 adds only these runtime paths to the checkout's local `.git/info/exclude`; it never edits
@@ -628,7 +630,8 @@ is shorter than the 1,000-item query limit and therefore complete; live/stuck ow
 preserved. Provider cooldowns use their own bounded map, and legacy history is collapsed into this
 schema on load. Each agent requires an
 isolated POSIX process group, so unsupported platforms fail before the write preflight or runtime
-file creation. Normal leader exit as well as shutdown signals eligible groups in a batch and removes
+file creation. Normal `--once` completion drains owned children without killing them. Shutdown or abnormal
+leader exit signals eligible groups in a batch and removes
 residual descendants within a shared bounded cleanup deadline plus one shared forced-exit grace.
 Polling and `--once` use the same signal controller. A shutdown signal during spawn-to-in-memory-
 adoption ownership transfer defers its exception until the child is supervised even if spawn or

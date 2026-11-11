@@ -2,6 +2,8 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { EventEmitter } from 'node:events'
+import { Writable } from 'node:stream'
+import { spawn as nativeSpawn } from 'node:child_process'
 import type { ChildProcess, spawn } from 'node:child_process'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { determinePrAction, issueNumberFromPrTitle, reviewerContext, SwarmEngine, trustedComments } from './engine.ts'
@@ -59,6 +61,10 @@ describe('lifecycle signal and trust boundaries', () => {
     expect(trustedComments([own], 'operator')).toEqual([own])
     expect(trustedComments([own], '')).toEqual([])
   })
+  it('rejects trusted-looking associations without an author login', () => {
+    expect(trustedComments([comment('feedback', { author: undefined })], 'operator')).toEqual([])
+    expect(trustedComments([comment('feedback', { author: { login: '' } })], 'operator')).toEqual([])
+  })
 
   it.each(['not approved', 'changes requested', 'needs further changes', 'conditionally approved', 'conditional approval', '수정 필요',
     'Approved once CI passes', 'not yet approved', 'needs fixes', 'not ready', 'LGTM if tests pass',
@@ -109,10 +115,12 @@ describe('native scheduler', () => {
     const base = fixture(false)
     fs.mkdirSync(path.join(base.root, '.agents', 'logs'), { recursive: true })
     fs.mkdirSync(path.join(base.root, '.agents', '.prompts'), { recursive: true })
-    const child = Object.assign(new EventEmitter(), { pid: 888001, exitCode: null, signalCode: null }) as ChildProcess
+    let prompt = ''
+    const stdin = new Writable({ write(chunk, _encoding, done) { prompt += chunk.toString(); done() } })
+    const child = Object.assign(new EventEmitter(), { pid: 888001, exitCode: null, signalCode: null, stdin }) as ChildProcess
     const spawnProcess = vi.fn(() => child)
     const engine = new SwarmEngine(base.root, { once: true }, base.platform, spawnProcess as unknown as typeof spawn)
-    return { ...base, engine, child, spawnProcess }
+    return { ...base, engine, child, spawnProcess, prompt: () => prompt }
   }
   it('registers the isolated child with writer permission only for a Worker', async () => {
     const { engine, spawnProcess } = dispatchFixture()
@@ -137,17 +145,18 @@ describe('native scheduler', () => {
     await engine.tracker.killAll()
   })
   it('keeps the Reviewer read-only and injects the PR diff and description', async () => {
-    const { engine, platform, spawnProcess } = dispatchFixture()
+    const { engine, platform, spawnProcess, prompt } = dispatchFixture()
     await engine.processPr(pr, 'operator')
     expect(spawnProcess).toHaveBeenCalledWith('codex', expect.arrayContaining(['-s', 'read-only']), expect.anything())
     const args = spawnProcess.mock.calls[0] as unknown as [string, string[]]
-    expect(args[1].at(-1)).toContain('diff content')
-    expect(args[1].at(-1)).toContain(pr.body)
+    expect(prompt()).toContain('diff content')
+    expect(prompt()).toContain(pr.body)
+    expect(args[1].join(' ')).not.toContain('diff content')
     expect(platform.prepareDispatch).toHaveBeenCalledWith(engine.repoRoot, undefined)
     await engine.tracker.killAll()
   })
   it('keeps Maintainer sandboxed and includes Draft-ready and merge verification instructions', async () => {
-    const { engine, platform, spawnProcess } = dispatchFixture()
+    const { engine, platform, spawnProcess, prompt } = dispatchFixture()
     vi.mocked(platform.json).mockImplementation(async (args) => {
       if (args[0] === 'issue') return issue as never
       return restPages(comment(`${REVIEWER}\nApproved\n${MAINTAINER}`)) as never
@@ -156,8 +165,8 @@ describe('native scheduler', () => {
     const args = spawnProcess.mock.calls[0] as unknown as [string, string[]]
     expect(args[0]).toBe('agy')
     expect(args[1]).toContain('--sandbox')
-    expect(args[1].at(-1)).toContain('gh pr ready 42')
-    expect(args[1].at(-1)).toContain('passing CI')
+    expect(prompt()).toContain('gh pr ready 42')
+    expect(prompt()).toContain('passing CI')
     await engine.tracker.killAll()
   })
   it('rejects approval from a different Reviewer even when actual Worker/Reviewer/Maintainer roles are distinct', async () => {
@@ -251,6 +260,106 @@ describe('native scheduler', () => {
     expect(engine.tracker.active.size).toBe(0)
     expect(engine.tracker.history.at(-1)?.status).toBe('failed')
     expect(save.mock.calls.length).toBeLessThanOrEqual(3)
+  })
+  it('streams a large Unicode prompt to a real child and drains --once to genuine completion', async () => {
+    const { root, platform } = dispatchFixture()
+    const body = `${WORKER}\n${'한글🦊'.repeat(100_000)}`
+    const output = path.join(root, 'received.txt')
+    const spawnProcess: typeof nativeSpawn = ((_command: string, args: string[], options: object) => {
+      expect(args.join(' ')).not.toContain('한글')
+      return nativeSpawn(process.execPath, ['-e',
+        'let s="";process.stdin.setEncoding("utf8");process.stdin.on("data",x=>s+=x);process.stdin.on("end",()=>setTimeout(()=>require("fs").writeFileSync(process.argv[1],s),80))', output],
+      { ...options, env: process.env })
+    }) as typeof nativeSpawn
+    vi.mocked(platform.json).mockImplementation(async (args) => args[0] === 'issue' && args[1] === 'list'
+      ? [{ ...issue, body }] as never : [] as never)
+    const engine = new SwarmEngine(root, { once: true }, platform, spawnProcess)
+    expect(await engine.cycle()).toBe(0)
+    expect(fs.readFileSync(output, 'utf8')).toContain(body)
+    expect(engine.tracker.active.size).toBe(0)
+    expect(engine.tracker.history.at(-1)?.status).toBe('completed')
+    expect([...engine.tracker.states.values()][0].failure_count).toBe(0)
+  })
+  it('handles prompt-pipe errors under supervision without leaving a live child or unhandled error', async () => {
+    const { engine, child } = dispatchFixture()
+    Object.assign(child, { stdin: new Writable({ write(_chunk, _encoding, done) {
+      done(Object.assign(new Error('broken pipe'), { code: 'EPIPE' }))
+    } }) })
+    await expect(engine.processIssue(issue, [])).rejects.toThrow('Could not deliver AI prompt')
+    expect(engine.tracker.active.size).toBe(0)
+    expect(engine.tracker.history.at(-1)?.status).toBe('failed')
+  })
+  it.each([0, 500_000])('shuts down a supervised real child while draining or delivering %i Unicode repetitions', async (repetitions) => {
+    const { root, platform } = dispatchFixture()
+    const body = `${WORKER}\n${'한글'.repeat(repetitions)}`
+    let child: ChildProcess | undefined
+    const spawnProcess = ((_command: string, _args: string[], options: object) => {
+      child = nativeSpawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { ...options, env: process.env })
+      setTimeout(() => process.emit('SIGINT'), 100)
+      return child
+    }) as typeof nativeSpawn
+    vi.mocked(platform.json).mockImplementation(async (args) => args[0] === 'issue' && args[1] === 'list'
+      ? [{ ...issue, body }] as never : [] as never)
+    const engine = new SwarmEngine(root, { once: true }, platform, spawnProcess)
+    vi.spyOn(engine as unknown as { enableRuntimeWrites(): Promise<void> }, 'enableRuntimeWrites').mockResolvedValue()
+    const started = Date.now()
+    expect(await engine.run()).toBe(130)
+    expect(Date.now() - started).toBeLessThan(4000)
+    expect(child?.pid).toBeTruthy()
+    expect(engine.tracker.active.size).toBe(0)
+    expect(platform.json).not.toHaveBeenCalledWith(expect.arrayContaining(['merged']))
+  })
+  it('bounds a prompt delivery when the child never reads stdin', async () => {
+    const { engine, child } = dispatchFixture()
+    Object.assign(child, { stdin: new Writable({ write() { /* Deliberately never acknowledge input. */ } }) })
+    vi.useFakeTimers()
+    try {
+      const failure = engine.processIssue(issue, []).then(() => undefined, (error: unknown) => error)
+      await vi.waitFor(() => expect(engine.tracker.active.size).toBe(1))
+      await vi.advanceTimersByTimeAsync(60_000)
+      expect(await failure).toEqual(expect.objectContaining({ message: expect.stringContaining('deadline') }))
+      expect(engine.tracker.active.size).toBe(0)
+    } finally { vi.useRealTimers() }
+  })
+  it('keeps a completed startup preflight for the first cycle only', async () => {
+    const { engine, platform } = fixture(false)
+    vi.spyOn(engine as unknown as { enableRuntimeWrites(): Promise<void> }, 'enableRuntimeWrites').mockResolvedValue()
+    expect(await engine.run()).toBe(0)
+    expect(platform.assertRepoWritable).toHaveBeenCalledTimes(1)
+    await engine.cycle()
+    expect(platform.assertRepoWritable).toHaveBeenCalledTimes(2)
+  })
+  it('prints safe actionable preflight messages while scrubbing arbitrary failure text', async () => {
+    const { engine, platform } = fixture()
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+    vi.mocked(platform.bindOrigin).mockRejectedValue(new SwarmPreflightConfigError('Unset GIT_CONFIG_PARAMETERS before dispatch'))
+    expect(await engine.run()).toBe(1)
+    expect(log.mock.calls.flat().join('\n')).toContain('Unset GIT_CONFIG_PARAMETERS')
+    log.mockClear()
+    vi.mocked(platform.bindOrigin).mockRejectedValue(new Error('https://token-secret@example.invalid/repo'))
+    expect(await engine.run()).toBe(1)
+    expect(log.mock.calls.flat().join('\n')).not.toContain('token-secret')
+  })
+  it('deduplicates unchanged dispatch blockers and resets after a clean no-dispatch transition', async () => {
+    const { engine } = fixture()
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+    vi.spyOn(engine.tracker, 'shouldDispatch').mockReturnValue([false, 'already running'])
+    await engine.processIssue(issue, [])
+    await engine.processIssue(issue, [])
+    expect(log).toHaveBeenCalledTimes(1)
+    await engine.processIssue(issue, [pr])
+    await engine.processIssue(issue, [])
+    expect(log).toHaveBeenCalledTimes(2)
+  })
+  it('retains the preflight before setup and rechecks after setup before spawning', async () => {
+    const { engine, platform } = dispatchFixture()
+    const calls: string[] = []
+    vi.mocked(platform.assertRepoWritable).mockImplementation(async () => { calls.push('preflight') })
+    vi.mocked(platform.createWorktree).mockImplementation(async () => { calls.push('worktree'); return engine.repoRoot })
+    vi.mocked(platform.prepareDispatch).mockImplementation(async () => { calls.push('spawn-boundary'); return {} })
+    await engine.processIssue(issue, [])
+    expect(calls).toEqual(['preflight', 'worktree', 'preflight', 'spawn-boundary'])
+    await engine.tracker.killAll()
   })
   it('reads offline status without invoking GitHub, modifying the registry, or creating runtime directories', async () => {
     const { root, platform } = fixture()

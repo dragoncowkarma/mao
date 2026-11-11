@@ -2,12 +2,14 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { randomBytes } from 'node:crypto'
 import { spawn } from 'node:child_process'
+import { finished } from 'node:stream/promises'
+import type { ChildProcess } from 'node:child_process'
 import { setTimeout as delay } from 'node:timers/promises'
 import type { SwarmRunOptions } from '../swarm-runner.ts'
-import { SwarmPlatform, SwarmPreflightError } from './platform.ts'
+import { SwarmPlatform, SwarmPreflightError, isTrustedComment } from './platform.ts'
 import { buildAiArgv, parseRole, resolveRoleAssignment, validateDistinctRoles } from './models.ts'
 import type { RoleAssignment } from './models.ts'
-import { ProcessTracker } from './registry.ts'
+import { ProcessTracker, lifecycleItemKey } from './registry.ts'
 import type { LifecycleRole, TrackedProcess } from './registry.ts'
 
 export interface SwarmIssue { number: number, title: string, body: string, state?: string }
@@ -56,8 +58,7 @@ export function issueNumberFromPrTitle(title: string): number | undefined {
 /** Missing associations fail closed unless the comment author is the authenticated gh user. */
 export function trustedComments(comments: SwarmComment[], currentUser: string): SwarmComment[] {
   if (!currentUser) return []
-  return comments.filter((comment) => comment.author?.login === currentUser
-    || ['OWNER', 'COLLABORATOR', 'MEMBER'].includes(comment.authorAssociation ?? ''))
+  return comments.filter((comment) => isTrustedComment(comment, currentUser))
 }
 
 /** Negative/conditional approvals always win over positive words in the same comment. */
@@ -86,6 +87,20 @@ const integrityNotice = 'Execution integrity: perform the requested operations f
 const tag = (role: string, assignment: RoleAssignment) =>
   `[${role}: ${assignment.ai} | Model: ${assignment.model} | Reasoning: ${assignment.reasoning}]`
 const shellQuote = (value: string) => `'${value.replace(/'/g, `'"'"'`)}'`
+
+/** Stream arbitrary-size Unicode input after ownership is durable, with supervised EPIPE handling. */
+async function sendPrompt(child: ChildProcess, prompt: string, signal: AbortSignal): Promise<void> {
+  if (!child.stdin) throw new Error('AI process has no stdin pipe')
+  const input = child.stdin
+  // Keep a listener after completion too: a late stream error must never crash the scheduler.
+  input.on('error', () => {})
+  const completion = finished(input, { cleanup: true, signal })
+  input.end(prompt, 'utf8')
+  try { await completion } catch {
+    input.destroy()
+    throw new Error('Could not deliver AI prompt through stdin before its deadline')
+  }
+}
 
 /** Keep the optional prompt material bounded without cutting off the execution instructions. */
 export function reviewerContext(pr: SwarmPR, diff: string): string {
@@ -118,6 +133,7 @@ export class SwarmEngine {
   private sleepAbort: AbortController | undefined
   private runtimeWrites = false
   private readonly blockers = new Set<string>()
+  private readonly dispatchBlockers = new Map<string, string>()
   private cycles = 0
 
   constructor(
@@ -153,6 +169,26 @@ export class SwarmEngine {
     for (const key of this.blockers) if (key.startsWith(`${item}:`)) this.blockers.delete(key)
   }
 
+  private reportDispatchBlocker(ref: string, role: LifecycleRole, reason: string): void {
+    const key = `${lifecycleItemKey(ref)}:${role}`
+    // Cooldown deadlines are data; one fixed reason code owns each lifecycle's diagnostic slot.
+    const code = reason.startsWith('provider cooldown') ? 'provider-cooldown'
+      : reason.startsWith('exhausted') ? 'attempts-exhausted' : reason
+    const value = `${ref}:${code}`
+    if (this.dispatchBlockers.get(key) === value) return
+    if (this.dispatchBlockers.size >= 4500) this.dispatchBlockers.delete(this.dispatchBlockers.keys().next().value!)
+    this.dispatchBlockers.set(key, value)
+    this.log(`${ref}: ${reason}`)
+  }
+
+  private clearDispatchBlockers(ref: string): void {
+    this.clearDispatchItem(lifecycleItemKey(ref))
+  }
+
+  private clearDispatchItem(item: string): void {
+    for (const key of this.dispatchBlockers.keys()) if (key.startsWith(`${item}:`)) this.dispatchBlockers.delete(key)
+  }
+
   private reportFailure(item: string, version: string, error: unknown): void {
     const type = error instanceof Error ? error.constructor.name : 'UnknownError'
     // Finite category keys, never remote-derived error strings or credential-bearing subprocess output.
@@ -161,7 +197,9 @@ export class SwarmEngine {
     if (this.blockers.has(key)) return
     if (this.blockers.size >= 4500) this.blockers.delete(this.blockers.values().next().value!)
     this.blockers.add(key)
-    this.log(`${item} blocked (${type}); repair the configuration or inspect the local task log before retrying`)
+    const detail = error instanceof SwarmPreflightError ? error.message
+      : 'repair the configuration or inspect the local task log before retrying'
+    this.log(`${item} blocked (${type}): ${detail}`)
   }
 
   private async enableRuntimeWrites(): Promise<void> {
@@ -218,10 +256,13 @@ export class SwarmEngine {
         this.checkShutdown()
         await this.enableRuntimeWrites()
       }
+      let startupPreflightCompleted = !this.options.dryRun
       do {
         this.checkShutdown()
         try {
-          const failed = await this.cycle()
+          const preflightCompleted = startupPreflightCompleted
+          startupPreflightCompleted = false
+          const failed = await this.cycle(preflightCompleted)
           if (failed) exitCode = 1
         } catch (error) {
           if (error instanceof ShutdownRequested) throw error
@@ -240,7 +281,7 @@ export class SwarmEngine {
         exitCode = 1
       }
     } finally {
-      // Normal --once exit also supervises every child; no untracked background writers survive.
+      // Successful --once runs drain owned children before reaching this final safety net.
       if (!this.options.dryRun && (this.runtimeWrites || this.tracker.active.size)) {
         try { if (!await this.tracker.killAll()) exitCode = 1 } catch { exitCode = 1 }
       }
@@ -251,11 +292,11 @@ export class SwarmEngine {
     return this.shutdownSignal ? (this.shutdownSignal === 'SIGTERM' ? 143 : 130) : 0
   }
 
-  async cycle(): Promise<number> {
+  async cycle(preflightCompleted = false): Promise<number> {
     this.checkShutdown()
     if (!this.options.dryRun) {
       await this.tracker.poll()
-      await this.platform.assertRepoWritable()
+      if (!preflightCompleted) await this.platform.assertRepoWritable()
     }
     this.checkShutdown()
     this.cycles += 1
@@ -305,7 +346,8 @@ export class SwarmEngine {
       // Harvest children that finished during GitHub reads before normal one-shot shutdown. A
       // completed Maintainer must retain success even when its registry write fails; cleanup still
       // gets one independent pass, while any pending shutdown skips that pass below.
-      try { await this.tracker.poll() } catch (error) {
+      try { failures += await this.drainChildren() } catch (error) {
+        if (error instanceof ShutdownRequested) throw error
         failures += 1
         this.reportFailure('Swarm', 'post-cycle-harvest', error)
       }
@@ -319,15 +361,36 @@ export class SwarmEngine {
     return failures
   }
 
+  /** --once stops polling GitHub after one snapshot, but retains ownership until launched agents finish. */
+  private async drainChildren(): Promise<number> {
+    const owned = [...this.tracker.active.values()].map(({ record }) => record)
+    do {
+      this.checkShutdown()
+      await this.tracker.poll()
+      this.checkShutdown()
+      if ([...this.tracker.active.values()].some(({ record }) => record.status === 'stuck')) return 1
+      if (!this.tracker.active.size) break
+      this.sleepAbort = new AbortController()
+      try { await delay(50, undefined, { signal: this.sleepAbort.signal }) }
+      catch (error) { if (!this.shutdownSignal) throw error }
+      finally { this.sleepAbort = undefined }
+    } while (this.tracker.active.size)
+    return owned.some((record) => record.status !== 'completed') ? 1 : 0
+  }
+
   async processIssue(issue: SwarmIssue, prs: SwarmPR[]): Promise<boolean> {
     if (!issue || !Number.isSafeInteger(issue.number) || issue.number <= 0
       || typeof issue.title !== 'string' || typeof issue.body !== 'string') throw new Error('Malformed Issue snapshot item')
-    if (!issue.title.startsWith('[Task]') || prs.some((pr) => issueNumberFromPrTitle(pr?.title) === issue.number)) return true
+    if (!issue.title.startsWith('[Task]') || prs.some((pr) => issueNumberFromPrTitle(pr?.title) === issue.number)) {
+      this.clearDispatchItem(`issue#${issue.number}`)
+      return true
+    }
     const worker = parseRole(issue.body, 'worker')
-    if (!worker) return true
+    if (!worker) { this.clearDispatchItem(`issue#${issue.number}`); return true }
     const ref = `issue#${issue.number}:initial`
     const [allowed, reason] = this.tracker.shouldDispatch(ref, 'worker', worker.ai)
-    if (!allowed) { this.log(`${ref}: ${reason}`); return !reason.startsWith('provider cooldown') }
+    if (!allowed) { this.reportDispatchBlocker(ref, 'worker', reason); return !reason.startsWith('provider cooldown') }
+    this.clearDispatchBlockers(ref)
     const slug = issue.title.split('-').at(-1)!.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 30) || `task-${issue.number}`
     const aiSlug = worker.ai.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 30) || 'worker'
     const branch = `worker/${issue.number}-${aiSlug}-${slug}`
@@ -346,10 +409,11 @@ export class SwarmEngine {
       || typeof pr.title !== 'string' || typeof pr.body !== 'string') throw new Error('Malformed PR snapshot item')
     const issueNumber = issueNumberFromPrTitle(pr.title)
     const reviewer = parseRole(pr.body, 'reviewer')
-    if (!issueNumber || !reviewer) return true
+    if (!issueNumber || !reviewer) { this.clearDispatchItem(`pr#${pr.number}`); return true }
     const issue = await this.platform.json<SwarmIssue>(['issue', 'view', String(issueNumber), '--json', 'number,title,body'])
     const worker = parseRole(issue.body, 'worker')
-    if (!worker) return true
+    const terminal = () => { this.clearDispatchItem(`pr#${pr.number}`); return true }
+    if (!worker) return terminal()
     const comments = await this.fetchPrComments(pr.number)
     const signal = determinePrAction(trustedComments(comments, currentUser))
     const maintainer = signal.comment ? parseRole(signal.comment.body, 'maintainer') : undefined
@@ -361,7 +425,7 @@ export class SwarmEngine {
     const common = `Read AGENTS.md, SKILL.md and .agents/rules/. PR #${pr.number}: ${pr.title}; Issue #${issue.number}.\n`
     if (signal.action === 'maintain') {
       const approvingReviewer = parseRole(signal.comment!.body, 'reviewer')
-      if (!maintainer || approvingReviewer?.ai !== reviewer.ai) return true
+      if (!maintainer || approvingReviewer?.ai !== reviewer.ai) return terminal()
       validateDistinctRoles(worker, reviewer, maintainer)
       role = 'maintainer'; assignment = maintainer; ref = `maintain#${pr.number}-${signal.id}`
       prompt = `You are the Maintainer and post-merge Analyst. ${common}`
@@ -372,14 +436,15 @@ export class SwarmEngine {
         + `Only after verified merge, inspect open Issues and create exactly ONE non-duplicate '[Task] <Tool Name> - <Summary>' Issue with acceptance criteria and a full Worker tag. Do not implement it. The orchestrator owns worktree cleanup.\n`
     } else if (signal.action === 'review' || signal.action === 'review_after_maintainer_block') {
       if (signal.action === 'review_after_maintainer_block') {
-        if (!maintainer) return true
+        if (!maintainer) return terminal()
         validateDistinctRoles(worker, reviewer, maintainer)
       }
       role = 'reviewer'; assignment = reviewer
       ref = `review#${pr.number}-${signal.action === 'review_after_maintainer_block' ? `maintainer-block-${signal.id}` : pr.headRefOid || signal.id}`
       // Avoid spending diff API calls on an event already dispatched.
       const [allowed, reason] = this.tracker.shouldDispatch(ref, role, assignment.ai)
-      if (!allowed) { this.log(`${ref}: ${reason}`); return !reason.startsWith('provider cooldown') }
+      if (!allowed) { this.reportDispatchBlocker(ref, role, reason); return !reason.startsWith('provider cooldown') }
+      this.clearDispatchBlockers(ref)
       const diff = await this.platform.gh(['pr', 'diff', String(pr.number)])
       prompt = `You are the Reviewer. ${common}`
         + (signal.action === 'review_after_maintainer_block' ? `A Maintainer blocked the PR. Re-evaluate the block evidence:\n${signal.comment!.body}\n` : '')
@@ -387,9 +452,9 @@ export class SwarmEngine {
         + `If approved and ready to merge, explicitly say approved and include [Maintainer: <ai> | Model: <model> | Reasoning: <level>]. Maintainer MUST differ from Worker '${worker.ai}' and Reviewer '${reviewer.ai}'.\n`
         + `If changes are required, describe them clearly and omit the Maintainer tag.\n\n${reviewerContext(pr, diff)}\n`
     } else {
-      if (parseRole(signal.comment!.body, 'reviewer')?.ai !== reviewer.ai) return true
+      if (parseRole(signal.comment!.body, 'reviewer')?.ai !== reviewer.ai) return terminal()
       // Fork ownership is never inferred from an absent/unknown boolean.
-      if (pr.isCrossRepository !== false || !pr.headRefName || !pr.headRefOid) return true
+      if (pr.isCrossRepository !== false || !pr.headRefName || !pr.headRefOid) return terminal()
       role = 'worker_revise'; assignment = worker; ref = `revise#${pr.number}-${signal.id}`
       prompt = `You are the original Worker revising the PR. ${common}`
         + `Address this trusted Reviewer feedback:\n\n${signal.comment!.body}\n\n`
@@ -397,7 +462,8 @@ export class SwarmEngine {
         + `Verify the remote SHA before posting exactly '[Worker] Revision complete.' to PR #${pr.number}. A rejected push is a failure, never a completed revision.\n`
     }
     const [allowed, reason] = this.tracker.shouldDispatch(ref, role, assignment.ai)
-    if (!allowed) { this.log(`${ref}: ${reason}`); return !reason.startsWith('provider cooldown') }
+    if (!allowed) { this.reportDispatchBlocker(ref, role, reason); return !reason.startsWith('provider cooldown') }
+    this.clearDispatchBlockers(ref)
     await this.dispatch(role, assignment, ref, pr.headRefName, `${prompt}\n${integrityNotice}`,
       role === 'worker_revise' ? issue.number : undefined, role === 'worker_revise' ? pr : undefined)
     return true
@@ -469,11 +535,13 @@ export class SwarmEngine {
       const promptFile = path.join(this.repoRoot, '.agents', '.prompts', `${role}-${safeRef}-${suffix}.md`)
       fs.writeFileSync(promptFile, prompt, { flag: 'wx', mode: 0o600 })
       const fd = fs.openSync(logFile, 'wx', 0o600)
+      let child: ChildProcess
       try {
         // There is intentionally no await between spawn and adopt. JS signal callbacks cannot
         // interrupt this synchronous ownership window, including failures in adoption itself.
-        const child = this.spawnProcess(argv[0], argv.slice(1), { cwd, env, shell: false, detached: true, stdio: ['ignore', fd, fd] })
+        child = this.spawnProcess(argv[0], argv.slice(1), { cwd, env, shell: false, detached: true, stdio: ['pipe', fd, fd] })
         child.on('error', () => { /* Spawn failure is recorded by the synchronous pid guard below. */ })
+        child.stdin?.on('error', () => {})
         try { this.tracker.adopt(child, record); adopted = true } catch (error) {
           // A rare adoption failure still leaves the child supervised before any asynchronous cleanup.
           if (child.pid) {
@@ -485,6 +553,11 @@ export class SwarmEngine {
         }
       } finally { fs.closeSync(fd) }
       this.tracker.save()
+      this.sleepAbort = new AbortController()
+      const promptDeadline = setTimeout(() => this.sleepAbort?.abort(), 60_000)
+      try { await sendPrompt(child, prompt, this.sleepAbort.signal) }
+      catch (error) { this.checkShutdown(); throw error }
+      finally { clearTimeout(promptDeadline); this.sleepAbort = undefined }
       this.checkShutdown()
       this.log(`Dispatched ${role} ${ref}: ${assignment.ai}, ${assignment.model}, ${assignment.reasoning}; log ${path.basename(logFile)}`)
     } catch (error) {

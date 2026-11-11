@@ -227,3 +227,49 @@ describe('migration and reset anchors', () => {
     expect(new ProcessTracker(file).cooldowns.get('codex')).toBe('2099-01-02T00:00:00Z')
   })
 })
+
+
+describe('successful completion takes precedence over quota text', () => {
+  it.each([0, 1])('classifies real harvested exit %s without treating quoted errors as success failures', async (exitCode) => {
+    const { tracker, file, directory } = fixture()
+    const log = path.join(directory, 'quoted-limit.log')
+    fs.writeFileSync(log, 'Review covers rate limit exceeded and too many requests; monthly spend limit')
+    tracker.adopt({ pid: 888001, exitCode, signalCode: null } as ChildProcess,
+      record({ status: 'running', log_file: log }))
+    vi.spyOn(process, 'kill').mockImplementation(() => { throw Object.assign(new Error('gone'), { code: 'ESRCH' }) })
+    await tracker.poll()
+    expect(tracker.history[0].status).toBe(exitCode === 0 ? 'completed' : 'deferred')
+    expect(tracker.cooldowns.has('codex')).toBe(exitCode !== 0)
+    const reopened = new ProcessTracker(file)
+    expect(reopened.shouldDispatch('review#42-head-a', 'reviewer', 'codex')[0]).toBe(false)
+    expect(reopened.cooldowns.has('codex')).toBe(exitCode !== 0)
+  })
+
+  it('repairs previously deferred exit-zero records and their false cooldown after restart', () => {
+    const { file, directory } = fixture()
+    const log = path.join(directory, 'success.log')
+    fs.writeFileSync(log, 'rate limit exceeded')
+    const falseDeferred = record({ status: 'deferred', exit_code: 0, defer_scope: 'provider',
+      retry_after: '2099-01-01T00:00:00Z', log_file: log })
+    fs.writeFileSync(file, JSON.stringify({ lifecycle_state_version: 2, history: [falseDeferred],
+      lifecycle_states: [{ record: falseDeferred, failure_count: 0 }],
+      provider_cooldowns: { codex: '2099-01-01T00:00:00Z', claude: '2099-01-02T00:00:00Z' } }))
+    const reopened = new ProcessTracker(file)
+    expect(reopened.history[0].status).toBe('completed')
+    expect(reopened.history[0].retry_after).toBeUndefined()
+    expect(reopened.cooldowns.has('codex')).toBe(false)
+    expect(reopened.cooldowns.has('claude')).toBe(true)
+    expect(reopened.shouldDispatch('review#42-head-a', 'reviewer')[0]).toBe(false)
+    expect(reopened.shouldDispatch('review#43-other', 'reviewer', 'codex')[0]).toBe(true)
+  })
+})
+
+
+it('preserves a different same-provider cooldown when repairing a falsely deferred success', () => {
+  const { file } = fixture()
+  const falseDeferred = record({ status: 'deferred', exit_code: 0, defer_scope: 'provider',
+    retry_after: '2099-01-01T00:00:00Z' })
+  fs.writeFileSync(file, JSON.stringify({ history: [falseDeferred],
+    provider_cooldowns: { codex: '2099-01-02T00:00:00Z' } }))
+  expect(new ProcessTracker(file).cooldowns.get('codex')).toBe('2099-01-02T00:00:00Z')
+})

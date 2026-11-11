@@ -142,21 +142,31 @@ export function resolveRoleAssignment(assignment: RoleAssignment, role: Lifecycl
   return resolved
 }
 
-/** Shell-free, command-inclusive argv. Only Worker executions receive write-capable flags. */
+/**
+ * Shell-free command-inclusive argv. The engine sends the prompt through stdin so large diffs
+ * cannot exceed argv limits or expose task text in process listings. Only Worker executions
+ * receive write-capable flags.
+ */
 export function buildAiArgv(
-  assignment: RoleAssignment, prompt: string, allowToolUse: boolean, cwd?: string,
+  assignment: RoleAssignment, _prompt: string, allowToolUse: boolean, cwd?: string,
 ): string[] {
   const { ai, model, reasoning, customModel: custom } = validateModelAvailability(assignment)
   if (ai === 'antigravity') {
     return ['agy', ...(allowToolUse ? [] : ['--sandbox']), '--dangerously-skip-permissions',
-      '--model', resolveAgyModel(model, reasoning, custom), '--print-timeout', '45m', '-p', prompt]
+      '--model', resolveAgyModel(model, reasoning, custom), '--print-timeout', '45m',
+      '--input-format', 'text', '--print', '']
   }
   const resolvedModel = ownValue(ai === 'codex' ? CODEX_ALIASES : CLAUDE_ALIASES, model.toLowerCase()) ?? model
   if (ai === 'codex') {
-    return ['codex', 'exec', ...buildModelEffortArgs('codex', resolvedModel, reasoning),
+    const effort = resolveReasoning(reasoning,
+      resolvedModel === 'gpt-5.6-sol' || resolvedModel === 'gpt-5.6-terra'
+        ? REASONING_LADDER : REASONING_LADDER.slice(0, 5))
+    return ['codex', 'exec', ...buildModelEffortArgs('codex', resolvedModel, effort),
       ...(cwd ? ['-C', cwd] : []), '-s', allowToolUse ? 'workspace-write' : 'read-only',
-      prompt]
+      ...(allowToolUse ? ['--dangerously-bypass-approvals-and-sandbox'] : []),
+      '-']
   }
-  return ['claude', '-p', ...buildModelEffortArgs('claude', resolvedModel, reasoning),
-    ...(allowToolUse ? ['--dangerously-skip-permissions'] : ['--allowed-tools', 'Bash(gh *),Bash(git *),Read']), prompt]
+  const effort = resolveReasoning(reasoning, REASONING_LADDER.slice(0, 5))
+  return ['claude', '-p', ...buildModelEffortArgs('claude', resolvedModel, effort),
+    ...(allowToolUse ? ['--dangerously-skip-permissions'] : ['--allowed-tools', 'Bash(gh *),Bash(git *),Read'])]
 }

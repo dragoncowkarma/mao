@@ -32,9 +32,15 @@ try {
     if(a[0]==='api' && a.includes('--include')) {
       console.log('HTTP/2.0 200 OK\\nx-oauth-scopes: repo\\n\\n'+JSON.stringify({full_name:'acme/fixture',permissions:{push:true},has_issues:true}));
     } else if(a[0]==='api' && a[1]==='user') console.log(JSON.stringify({login:'operator'}));
-    else if(a[0]==='issue' && a[1]==='list') console.log('[]');
+    else if(a[0]==='issue' && a[1]==='list') console.log(process.env.SWARM_SMOKE_TASK ? JSON.stringify([{number:1,title:'[Task] Fixture - large prompt',body:'[Worker: codex | Model: gpt-5.6-terra | Reasoning: high]'+ '한글'.repeat(60000)}]) : '[]');
     else if(a[0]==='pr' && a[1]==='list') console.log('[]');
     else process.exit(8);`)
+  executable('codex', `let input=''; process.stdin.setEncoding('utf8');
+    process.stdin.on('data',chunk=>input+=chunk);
+    process.stdin.on('end',()=>setTimeout(()=>{
+      require('node:fs').writeFileSync(process.env.SWARM_SMOKE_RESULT,JSON.stringify({input,args:process.argv.slice(2)}));
+      console.log('Test quotation: rate limit exceeded');
+    },300));`)
   run(git, ['init', '-b', 'main'])
   run(git, ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--allow-empty', '-m', 'fixture'])
   run(git, ['remote', 'add', 'origin', 'https://github.com/acme/fixture.git'])
@@ -51,6 +57,20 @@ try {
     run(node, [bundle, 'swarm', '--repo-root', repo, '--once'])
     assert.ok(fs.existsSync(path.join(repo, '.agents', '.process_registry.json')))
     run(node, [bundle, 'swarm', '--repo-root', repo, '--reset', '--once'])
+    const resultFile = path.join(root, 'worker-result.json')
+    run(node, [bundle, 'swarm', '--repo-root', repo, '--once'], {
+      env: { ...env, SWARM_SMOKE_TASK: '1', SWARM_SMOKE_RESULT: resultFile },
+    })
+    const result = JSON.parse(fs.readFileSync(resultFile, 'utf8'))
+    assert.ok(Buffer.byteLength(result.input) > 128 * 1024)
+    assert.ok(result.args.includes('--dangerously-bypass-approvals-and-sandbox'))
+    assert.ok(result.args.every((arg) => !arg.includes('한글')))
+    const registry = JSON.parse(fs.readFileSync(path.join(repo, '.agents', '.process_registry.json'), 'utf8'))
+    const worker = registry.lifecycle_states.find((state) => state.record.role === 'worker')
+    assert.equal(worker.record.status, 'completed')
+    assert.equal(worker.record.exit_code, 0)
+    assert.equal(worker.failure_count, 0)
+    assert.deepEqual(registry.provider_cooldowns, {})
     const child = spawn(node, [bundle, 'swarm', '--repo-root', repo, '--interval', '1'], { cwd: repo, env })
     let output = ''
     child.stdout.on('data', (data) => { output += data })

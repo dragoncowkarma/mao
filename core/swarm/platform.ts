@@ -55,7 +55,7 @@ export function createCommandRunner(execute: typeof execFile = execFile, deadlin
 export const runCommand: CommandRunner = createCommandRunner()
 
 export interface RepoTarget { host: string; owner: string; repo: string; ssh?: string; https?: string }
-export interface PlatformOptions { dryRun?: boolean; run?: CommandRunner; env?: NodeJS.ProcessEnv }
+export interface PlatformOptions { run?: CommandRunner; env?: NodeJS.ProcessEnv }
 export interface WorktreeEntry { worktree: string; branch?: string; [key: string]: string | undefined }
 const identity = (target: RepoTarget) => `${target.host}/${target.owner}/${target.repo}`.toLowerCase()
 const invalidRemote = () => new SwarmPreflightConfigError('Origin is not a supported GitHub repository URL', 'origin-is-not-a-supported-github')
@@ -105,6 +105,7 @@ export class SwarmPlatform {
   target?: RepoTarget
   private readonly run: CommandRunner
   private readonly suppliedEnv?: NodeJS.ProcessEnv
+  private lastCapabilityVerdict?: string
   private get env(): NodeJS.ProcessEnv { return this.suppliedEnv ?? process.env }
   constructor(root: string, readonly options: PlatformOptions = {}) {
     this.root = canonical(root)
@@ -116,16 +117,6 @@ export class SwarmPlatform {
     if (check && result.code !== 0) throw new SwarmPreflightConfigError('Git operation failed; local state was preserved', 'git-operation-failed-local-state-was')
     return result
   }
-  async initialize(): Promise<void> {
-    if (!this.options.dryRun && process.platform === 'win32') {
-      throw new SwarmPreflightConfigError('Swarm requires isolated POSIX process groups', 'swarm-requires-isolated-posix-process-groups')
-    }
-    if (!this.options.dryRun && this.env.GIT_CONFIG_PARAMETERS) {
-      throw new SwarmPreflightConfigError('Unset GIT_CONFIG_PARAMETERS; use explicit git -c outside Swarm', 'unset-git-config-parameters-use-explicit')
-    }
-    await this.bindOrigin(!this.options.dryRun)
-    if (!this.options.dryRun) await this.assertWritable()
-  }
   async bindOrigin(verifyTransport = true): Promise<RepoTarget> {
     if (verifyTransport && this.env.GIT_CONFIG_PARAMETERS) {
       throw new SwarmPreflightConfigError('Unset GIT_CONFIG_PARAMETERS before binding origin', 'unset-git-config-parameters-before-binding')
@@ -134,7 +125,6 @@ export class SwarmPlatform {
     this.repo = `${this.target.owner}/${this.target.repo}`
     return this.target
   }
-  async assertRepoWritable(): Promise<RepoWorkflowCapability> { return this.assertWritable() }
   boundEnvironment(): NodeJS.ProcessEnv {
     if (!this.target) throw new SwarmPreflightConfigError('Origin repository context has not been bound', 'origin-repository-context-has-not-been')
     return { ...this.env, GH_HOST: this.target.host, GH_REPO: `${this.target.host}/${this.repo}` }
@@ -230,7 +220,7 @@ export class SwarmPlatform {
     }
     return { ...first, ssh: ssh[0], https: https[0] }
   }
-  async assertWritable(): Promise<RepoWorkflowCapability> {
+  async assertRepoWritable(): Promise<RepoWorkflowCapability> {
     if (!this.target) throw new SwarmPreflightConfigError('Origin repository context has not been bound', 'origin-repository-context-has-not-been')
     const result = await this.run('gh', ['api', '--include', '--method', 'GET', 'repos/{owner}/{repo}'],
       this.root, this.boundEnvironment())
@@ -269,9 +259,14 @@ export class SwarmPlatform {
       capability = evaluateRepoCapability({ owner, repo,
         repository: response.body as RepoCapabilitySnapshot, oauthScopes: response.headers['x-oauth-scopes'] })
     }
+    // Keep probing on every boundary. Only the operator diagnostic is deduplicated: a changed
+    // verdict (including a known blocker or proven classic scopes) re-arms the caveat if it returns.
+    const verdict = JSON.stringify(capability)
+    const changed = verdict !== this.lastCapabilityVerdict
+    this.lastCapabilityVerdict = verdict
     if (!capability.ok) throw new SwarmPreflightConfigError(describeRepoCapability(capability), 'repo-capability')
     const warning = describeUnverifiedGrants(capability)
-    if (warning) console.warn(warning)
+    if (warning && changed) console.warn(warning)
     return capability
   }
   async prepareDispatch(cwd: string, expectedBranch?: string): Promise<NodeJS.ProcessEnv> {
@@ -418,7 +413,7 @@ export class SwarmPlatform {
     if (entries.some((item) => item.branch === `refs/heads/${branch}`)) return
     if (await this.branchSha(branch)) await this.git(['branch', '-D', '--', branch])
   }
-  async syncMain(dryRun = this.options.dryRun): Promise<void> {
+  async syncMain(dryRun = false): Promise<void> {
     if (dryRun) return
     await this.prepareDispatch(this.root)
     await this.git(['fetch', 'origin', 'main'])
@@ -431,7 +426,9 @@ export class SwarmPlatform {
 }
 
 /** Unknown/missing associations fail closed; API authors are never inferred from display text. */
-export function isTrustedComment(comment: { author?: { login?: string }; authorAssociation?: string }, user: string): boolean {
-  return Boolean(comment.author?.login && (comment.author.login === user ||
+export function isTrustedComment(
+  comment: { author?: { login?: string } | null; authorAssociation?: string }, user: string,
+): boolean {
+  return Boolean(user && comment.author?.login && (comment.author.login === user ||
     ['OWNER', 'COLLABORATOR', 'MEMBER'].includes(comment.authorAssociation ?? '')))
 }

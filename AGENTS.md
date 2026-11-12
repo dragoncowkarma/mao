@@ -12,6 +12,7 @@ Tier 1: loaded in every session; holds only what every task needs. Target 12 KB 
 | `core/repo-registry.ts`, `github:setRepos`, `mao swarm`, Swarm roles, review | [repo-preflight-and-swarm.md](.agents/skills/mao-development/references/repo-preflight-and-swarm.md) |
 | `electron/ipc.ts`, `src/`, vitest config | [ipc-and-renderer-testing.md](.agents/skills/mao-development/references/ipc-and-renderer-testing.md) |
 | `git` branch, commit, push; PR, release | [shipping-and-git.md](.agents/skills/mao-development/references/shipping-and-git.md) |
+| New feature scope, new issue, roadmap | [docs/strategy/README.md](docs/strategy/README.md) (proposals, not rules) |
 
 ## Project
 

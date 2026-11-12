@@ -52,7 +52,7 @@ function resolveDataDir(): string {
  * Every command boots a fresh app instance against the on-disk store — the CLI is stateless between
  * invocations. `resume` defaults to false so that inspecting or reconfiguring state (e.g. `mao config
  * show`) never has the side effect of resuming real GitHub/AI-provider calls left over from a
- * previous `mao run`; only `run` itself opts in.
+ * previous `mao run`. `run` passes false too: it resumes by itself, after attaching its stdout listener.
  */
 function loadApp(resume = false): MaoApp {
   const dataDir = resolveDataDir()

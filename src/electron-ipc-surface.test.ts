@@ -715,9 +715,7 @@ describe('the IPC surface', () => {
   it('keeps the bridge pinned to the renderer declaration tsc can check it against', () => {
     // Without this, every compile-time half of the lockstep can be switched off by deleting one
     // annotation, with no test anywhere going red — `contextBridge.exposeInMainWorld` takes `any`, so
-    // the unannotated object type-checks against nothing at all. `satisfies` rather than a type
-    // annotation is load-bearing too: an annotation widens each function to the declared type and
-    // stops checking what `ipcRenderer.invoke` actually returns against it.
+    // the unannotated object type-checks against nothing at all.
     //
     // Asserted on the argument node itself, not by matching the text anywhere in the file: the regex
     // this replaced could be satisfied by a decoy `} satisfies Window['electronAPI'])` elsewhere while

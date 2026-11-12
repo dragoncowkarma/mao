@@ -38,10 +38,13 @@
 
 ### Lockstep files (check if you touched any)
 
-- [ ] **New IPC channel** → updated all 3: `electron/ipc.ts`, `electron/preload.ts`, `src/electron.d.ts`
-- [ ] **New store field** → updated both `MaoStoreSchema` and `MAO_STORE_DEFAULTS` in `core/store.ts`
-- [ ] **New pipeline stage** → updated `STAGE_ORDER`, `buildPromptForStage`, `applyGithubAction` in `core/workflow-engine.ts` + `STAGE_LABELS` in `KanbanBoard.tsx` and `WorkflowQueue.tsx` + tests
+- [ ] **New IPC channel** → updated all 3: `electron/ipc.ts`, `electron/preload.ts`, `src/electron.d.ts` + the fake bridge in `src/test/electron-api-stub.ts`
+- [ ] **New store field** → updated both `MaoStoreSchema` and `MAO_STORE_DEFAULTS` in `core/store.ts`; a shape `config.json` can violate also needs a `STORED_SHAPE_RULES` entry + table test
+- [ ] **New pipeline stage** → updated `AGENT_STAGES` in `core/ai/types.ts`, `STAGE_ROLE` in `core/agent-selection.ts`, `buildPromptForStage` + `applyGithubAction` in `core/workflow-engine.ts`, `STAGE_LABELS` in `src/components/KanbanBoard.tsx` and `src/components/WorkflowQueue.tsx`, `ALL_STAGES` + `STAGE_LABELS` in `src/components/GlobalSettings.tsx`, and `core/workflow-engine.test.ts`
+- [ ] **Repository registration** → stayed a thin delegation to `updateRepos`; the add-vs-update rule lives only in `core/repo-registry.ts`
+- [ ] **Repository capability policy** → audited `core/repo-capabilities.ts` and `.agents/workflows/swarm_orchestrator.py` together, with regressions in both suites
 - [ ] **Build output rename** → audited `electron/main.ts`, `vite.config.ts`, `package.json`
+- [ ] **Closed a documented gap or moved a rule** → moved or deleted the matching entry in `AGENTS.md` or `.agents/skills/mao-development/` in the same commit
 
 ### UI changes (if applicable)
 

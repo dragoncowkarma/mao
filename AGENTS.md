@@ -12,15 +12,11 @@ Tier 1: loaded in every session; holds only what every task needs. Target 12 KB 
 | `core/repo-registry.ts`, `github:setRepos`, `mao swarm`, Swarm roles, review | [repo-preflight-and-swarm.md](.agents/skills/mao-development/references/repo-preflight-and-swarm.md) |
 | `electron/ipc.ts`, `src/`, vitest config | [ipc-and-renderer-testing.md](.agents/skills/mao-development/references/ipc-and-renderer-testing.md) |
 | `git` branch, commit, push; PR, release | [shipping-and-git.md](.agents/skills/mao-development/references/shipping-and-git.md) |
+| New feature scope, new issue, roadmap | [docs/strategy/README.md](docs/strategy/README.md) (proposals, not rules) |
 
 ## Project
 
 AI agents drive GitHub issue → PR → review → merge, with a maker-checker safeguard that needs two or more providers. One Electron-free core powers an Electron GUI (`electron/` + `src/`) and a headless CLI (`cli/`, bin `mao`).
-
-Product direction, the proposed roadmap and the 2026-11 project review live in
-[`docs/strategy/`](docs/strategy/README.md). They are proposals, not rules — this file wins
-wherever they disagree. Read `docs/strategy/roadmap.md` before scoping a new feature or filing
-an issue.
 
 ## Architecture map
 

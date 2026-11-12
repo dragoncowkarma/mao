@@ -23,6 +23,11 @@ core powers two frontends:
 
 TypeScript throughout, `strict: true`. License: Apache-2.0.
 
+Product direction, the proposed roadmap and the 2026-11 project review live in
+[`docs/strategy/`](docs/strategy/README.md). They are proposals, not rules — this file wins
+wherever they disagree. Read `docs/strategy/roadmap.md` before scoping a new feature or filing
+an issue.
+
 ## Architecture map
 
 | Path | Role |

@@ -48,7 +48,7 @@ README의 "no agent reviews or merges its own work"는 5번 때문에 현재 사
 | 열린 PR | 7건(그중 draft 5건) | PR 목록 |
 | 저장 계층 크기 | `core/store.ts` 1,830줄, `core/store-file.ts` 420줄, `core/persistence-guard.ts` 90줄, `core/store.test.ts` 2,542줄. 엔진의 `assertQueueWritable()` 호출 31곳 | `git show origin/main:<path>` |
 | MAO 파이프라인이 만든 PR | `workflow/*` 브랜치의 #8, #16, #17(2026-08-03~06) 이후 없음 | PR 목록의 브랜치 이름 |
-| 해결됐는데 열려 있는 이슈 | #1(모델·effort 지정: PR #43 등으로 구현됨), #89(원자적 쓰기: PR #101의 `writeStoreFileAtomic`) | 코드 대조 |
+| 해결됐는데 열려 있는 이슈 | #1(모델·effort 지정: PR #43 등으로 구현됨), #89(원자적 쓰기: PR #101의 `writeStoreFileAtomic`). 2026-11-13에 둘 다 닫음 | 코드 대조 |
 
 store 방어 작업은 비배열 `githubRepos` 하나(#60)에서 시작해 프로세스 간 잠금과 조건부 쓰기까지 넓어졌습니다. 그 결과물은 견고하지만, 같은 기간에 2절의 1~6번은 그대로였습니다. 그 파일이 지키는 토큰은 9번 경로로 에이전트가 읽을 수 있습니다.
 

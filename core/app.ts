@@ -38,10 +38,12 @@ export interface MaoAppOptions {
   dataDir: string
   /**
    * Whether to immediately resume processing any leftover 'pending'/'running' tasks from a previous
-   * session. Required (no default) on purpose: a long-lived process (the Electron main process, or
-   * `mao run`) should pass true so it picks back up where it left off, but a one-shot CLI command
-   * (e.g. `mao config show`) MUST pass false — otherwise loading the app to answer an unrelated
-   * question would silently make real GitHub/AI-provider calls and mutate the persisted queue.
+   * session. Required (no default) on purpose. The Electron main process passes true so it picks back
+   * up where it left off. `mao run` passes false even though it is long-lived: it calls
+   * `workflowEngine.resumeProcessing()` itself, after attaching its `'change'` stdout listener, so it
+   * cannot miss a transition that happens synchronously on resume. A one-shot CLI command (e.g. `mao
+   * config show`) MUST pass false — otherwise loading the app to answer an unrelated question would
+   * silently make real GitHub/AI-provider calls and mutate the persisted queue.
    */
   resume: boolean
 }

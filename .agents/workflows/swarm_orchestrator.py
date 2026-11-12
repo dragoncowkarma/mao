@@ -3292,6 +3292,21 @@ def write_prompt_file(prompt: str, role: str, task_ref: str) -> Path:
 # rather than a checked exit code or a re-fetched, confirmed GitHub state
 # (e.g. a stale worktree producing a non-fast-forward push that was never
 # actually accepted by origin).
+# The documents the dispatch prompts name. `mao swarm --repo-root` can target any checkout, so only
+# AGENTS.md is stated unconditionally and the target repository's own guide routes its own references.
+# The Swarm reference ships only with MAO's repository, so it is named conditionally: an agent working in
+# another repository must not treat its absence as a blocker. core/agent-docs.test.ts fails when a
+# document path written in this file stops existing in this repository.
+PROJECT_RULES_INSTRUCTION = (
+    "Read AGENTS.md for all project rules, and follow its routing to any further "
+    "rule or reference files this task touches.\n"
+)
+SWARM_REFERENCE_DOC = ".agents/skills/mao-development/references/repo-preflight-and-swarm.md"
+SWARM_REVIEW_RULES_INSTRUCTION = (
+    f"If this checkout has {SWARM_REFERENCE_DOC}, read it too: its 'Review checklist' section "
+    "governs this review and its 'Role assignment' section governs your Maintainer choice.\n"
+)
+
 EXECUTION_INTEGRITY_NOTICE = (
     "CRITICAL: You are a single, non-interactive batch process in a fully "
     "autonomous swarm. This invocation has no follow-up turn — nothing will "
@@ -3311,7 +3326,7 @@ EXECUTION_INTEGRITY_NOTICE = (
     "Execute your task completely and exit."
 )
 
-# Maps AGENTS.md model names + reasoning level to actual agy CLI model IDs.
+# Maps the model names used in Issue/PR role tags + reasoning level to actual agy CLI model IDs.
 # agy embeds the effort level in the model name itself, e.g.:
 #   "Gemini 3.6 Flash (High)", "Gemini 3.6 Flash (Medium)", "Gemini 3.6 Flash (Low)"
 # There is NO separate --effort flag for agy.
@@ -3328,7 +3343,7 @@ _AGY_EFFORT_LABEL: dict[str, str] = {
 def _resolve_agy_model(model: str, reasoning: str) -> str:
     """Build the full agy model string like 'Gemini 3.6 Flash (High)'."""
     effort = _AGY_EFFORT_LABEL.get(reasoning.lower().strip(), "High")
-    # All AGENTS.md antigravity models map to Gemini 3.6 Flash
+    # All antigravity role-tag models map to Gemini 3.6 Flash
     return f"Gemini 3.6 Flash ({effort})"
 
 _CLAUDE_MODEL_MAP: dict[str, str] = {
@@ -3353,7 +3368,7 @@ _CLAUDE_EFFORT_MAP: dict[str, str] = {
     "엑스트라": "xhigh", "최대": "max", "ultracode": "max",
 }
 
-# Map the human-friendly model names used in AGENTS.md to Codex CLI model IDs.
+# Map the human-friendly model names used in Issue/PR role tags to Codex CLI model IDs.
 # The ChatGPT-authenticated Codex CLI exposes the reasoning variants, but not
 # the bare `gpt-5.6` ID.  Keep the generic aliases on the configured default
 # variant so a valid Issue/PR tag cannot be turned into a deterministic 400.
@@ -3466,7 +3481,7 @@ def build_ai_argv(
 
 
 def _map_reasoning_to_effort(reasoning: str) -> str:
-    """Map AGENTS.md reasoning levels to agy --effort values (low/medium/high)."""
+    """Map role-tag reasoning levels to agy --effort values (low/medium/high)."""
     mapping = {
         "high": "high", "높음": "high", "울트라": "high",
         "매우 높음": "high",
@@ -3700,7 +3715,7 @@ def dispatch_worker(
 
         prompt = (
             f"You are the Worker for Issue #{issue.number}: {issue.title}.\n"
-            f"Read AGENTS.md and .agents/rules/ for all project rules.\n"
+            f"{PROJECT_RULES_INSTRUCTION}"
             f"Implement the task described in the Issue body:\n\n{issue.body}\n\n"
             f"Work inside this directory. When done:\n"
             f"1. Commit your changes with conventional commit messages referencing "
@@ -3840,7 +3855,8 @@ def dispatch_reviewer(
 
     prompt = (
         f"You are the Reviewer for PR #{pr.number}: {pr.title}.\n"
-        f"Read AGENTS.md and .agents/rules/review_checklist.md for review rules.\n"
+        f"{PROJECT_RULES_INSTRUCTION}"
+        f"{SWARM_REVIEW_RULES_INSTRUCTION}"
         f"{trigger_context}"
         f"Review the PR diff, check code quality, and leave review comments.\n\n"
         f"When your review is complete, you MUST post exactly ONE final summary comment "
@@ -3849,12 +3865,11 @@ def dispatch_reviewer(
         f"Reasoning: {reviewer.reasoning}]\n\n"
         f"If the PR is approved and ready to merge, your final comment MUST also include:\n"
         f"  [Maintainer: <ai_name> | Model: <model> | Reasoning: <level>]\n"
-        f"Choose the Maintainer using .agents/rules/role_assignment.md. It MUST differ "
+        f"Choose the Maintainer by those role-assignment rules when they exist. It MUST differ "
         f"from Worker '{worker.ai}' and Reviewer '{reviewer.ai}'.\n\n"
         f"If changes are needed, your final comment MUST include your [Reviewer: ...] tag "
         f"AND clearly describe all required changes. Do NOT include "
         f"[Maintainer: ...] in this case.\n\n"
-        f"Follow the review checklist in .agents/rules/review_checklist.md.\n\n"
         f"{EXECUTION_INTEGRITY_NOTICE}"
     )
 
@@ -3980,7 +3995,7 @@ def dispatch_maintainer(
     prompt = (
         f"You are AI3, the Maintainer and post-merge Analyst for PR #{pr.number} "
         f"(Issue #{issue.number}).\n"
-        f"Read AGENTS.md and .agents/rules/ for all project rules.\n"
+        f"{PROJECT_RULES_INSTRUCTION}"
         f"1. Verify that the independent review is complete and CI passes.\n"
         f"2. Merge PR #{pr.number}. A successful merge closes the PR.\n"
         f"3. Close Issue #{issue.number} only after the merge succeeds.\n"
@@ -4179,7 +4194,7 @@ def dispatch_worker_revision(
         prompt = (
             f"You are the Worker for PR #{pr.number} "
             f"(Issue #{issue.number}: {issue.title}).\n"
-            f"Read AGENTS.md and .agents/rules/ for all project rules.\n"
+            f"{PROJECT_RULES_INSTRUCTION}"
             f"You previously created this PR, but additional modifications were requested. "
             f"Here is the feedback/comments:\n\n{feedback_text}\n\n"
             f"Work inside this directory. This worktree may be stale — first fetch and "

@@ -213,6 +213,50 @@ class WorktreeSafetyTest(unittest.TestCase):
         self.assertIn("git push --set-upstream origin worker/99-codex-dry-run", prompt)
         self.assertIn("never use a remote-less `git push`", prompt)
 
+    def test_every_dispatch_prompt_routes_through_agents_md(self):
+        # `mao swarm --repo-root` can target any checkout, so every role is sent to AGENTS.md and only
+        # the Reviewer is sent further, conditionally, to the reference MAO's own repository ships.
+        # core/agent-docs.test.ts proves that reference exists here; this proves the prompts use it.
+        worker = self.swarm.RoleAssignment("codex", "5.6", "high")
+        reviewer = self.swarm.RoleAssignment("claude", "sonnet 5", "high")
+        maintainer = self.swarm.RoleAssignment("antigravity", "gemini", "high")
+        issue = self.swarm.TaskIssue(
+            number=99, title="[Task] dry run", body="No writes", worker=worker
+        )
+        pr = self.swarm.TaskPR(
+            number=101,
+            title="[PR] dry run",
+            body="No writes",
+            head_branch="worker/99-codex-dry-run",
+            reviewer=reviewer,
+        )
+        reference = self.swarm.SWARM_REFERENCE_DOC
+        dispatches = {
+            "worker": lambda: self.swarm.dispatch_worker(issue, dry_run=True),
+            "reviewer": lambda: self.swarm.dispatch_reviewer(pr, worker, dry_run=True),
+            "maintainer": lambda: self.swarm.dispatch_maintainer(
+                pr, issue, maintainer, dry_run=True
+            ),
+            "revision": lambda: self.swarm.dispatch_worker_revision(
+                pr, issue, "Please revise", dry_run=True
+            ),
+        }
+        for role, dispatch in dispatches.items():
+            with (
+                self.subTest(role=role),
+                patch.object(self.swarm, "build_ai_argv", return_value=([], False)) as argv,
+            ):
+                dispatch()
+                prompt = argv.call_args.kwargs["prompt_text"]
+                self.assertIn(self.swarm.PROJECT_RULES_INSTRUCTION, prompt)
+                self.assertNotIn(".agents/rules", prompt)
+                if role == "reviewer":
+                    self.assertIn(f"If this checkout has {reference}", prompt)
+                    self.assertIn("'Review checklist'", prompt)
+                    self.assertIn("'Role assignment'", prompt)
+                else:
+                    self.assertNotIn(reference, prompt)
+
     def test_worker_revision_shell_quotes_arbitrary_valid_head_branch(self):
         sentinel = "touch-pwned"
         issue = self.swarm.TaskIssue(

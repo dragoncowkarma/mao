@@ -1,8 +1,7 @@
 # codex.md
 
-**Always read and follow [AGENTS.md](AGENTS.md) and [SKILL.md](SKILL.md) before
-starting any task.**
+**Always read and follow [AGENTS.md](AGENTS.md) before starting any task.** Read
+[the playbook](.agents/skills/mao-development/SKILL.md) on demand for commands, recipes and references.
 
-Recent Codex CLI versions read `AGENTS.md` natively; this file exists for older
-versions that look for `codex.md`. Do not add content here — update `AGENTS.md`
-/ `SKILL.md` instead so every AI tool stays in sync.
+Recent Codex CLI versions read `AGENTS.md` natively; this file exists for older versions that look for
+`codex.md`. Do not add content here, so every AI tool stays in sync.

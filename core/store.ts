@@ -590,9 +590,8 @@ const STORED_SHAPE_RULES: { [K in keyof MaoStoreSchema]?: StoredShapeRule<K> } =
     // the other tempting correction, would hide the repositories that still work.
     //
     // `Array.from` rather than the stored array itself: `FileStore`'s backend answers `get` with its own
-    // snapshot object, so handing it out would let a caller that pushes into what it read mutate the
-    // store's in-memory list — and `persist()` writes that list wholesale on the next `set` of any key.
-    // That is the bug the cloned schema default exists to prevent, one level down.
+    // snapshot object, so a caller pushing into what it read would change what later `get()` calls
+    // answer in this process. The cloned schema default prevents the same bug one level down.
     readEntries: (raw) => Array.from(raw) as RepoRef[],
   },
   aiProviders: {

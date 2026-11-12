@@ -38,29 +38,31 @@
 
 | id | 항목 | 유형 | 규모 | 선행 | 이슈 |
 | --- | --- | --- | --- | --- | --- |
-| A1 | auto-trigger 신뢰 게이트: 신뢰할 수 있는 작성자나 승인 라벨이 있는 이슈만 큐에 넣기, 지시 태그도 같은 기준, 새 저장소는 auto-trigger 꺼짐 | 보안 | M | | ISSUE_A1 |
-| A2 | 자격증명 격리: remote URL에서 토큰 제거, provider CLI 환경 변수 제한, 작업 폴더를 데이터 디렉터리 밖으로, 설정 파일 권한 | 보안 | M | | ISSUE_A2 |
-| A3 | 에이전트 출력의 비밀을 GitHub에 쓰기 전에 차단 | 보안 | S~M | | ISSUE_A3 |
-| A4 | 지원되는 Electron으로 올리기, CSP, 탐색 차단, IPC 입력 검증, 렌더러로 비밀 전달 중단 | 보안 | M | | ISSUE_A4 |
-| A5 | SECURITY.md, 위협 모델, 공개 저장소 사용 경고, 최소 권한 토큰 안내 | 문서 | S | | ISSUE_A5 |
-| B1 | 컨텍스트 팩: 이슈 본문, 저장소 규약, 검증 명령을 모든 단계 프롬프트에 | 핵심 루프 | M | | ISSUE_B1 |
-| B2 | diff를 읽는 리뷰와 구조화된 판정 | 핵심 루프 | M | B1 | ISSUE_B2 |
-| B3 | 머지 게이트: 현재 head에 대한 승인 판정, SHA 고정, 검사 없음 정책, 보호 경로, 기본은 머지 전 사람 승인 | 핵심 루프 | M | B2 | ISSUE_B3 |
-| B4 | 코드 변경이 없는 pr 단계를 notes-only PR 대신 실패로 처리 | 버그 | S | | ISSUE_B4 |
-| B5 | maker-checker를 벤더 계열과 작업 이력 전체 기준으로 | 버그 | M | | ISSUE_B5 |
-| B6 | 모델 카탈로그와 CLI별 effort 전달 현행화 | 버그 | S | | ISSUE_B6 |
-| B7 | provider 실패 분류, 한도 안내문과 빈 출력의 게시 차단 | 버그 | M | | ISSUE_B7 |
-| C1 | 작업별 git worktree, 에이전트 프로세스 트리 정리 | 버그 | M | | ISSUE_C1 |
-| C2 | 크래시·재시작 뒤 GitHub 쓰기 중복 방지, 같은 이슈의 중복 enqueue 방지, `mao run` 정상 종료 | 버그 | M | | ISSUE_C2 |
-| C3 | 작업 중지, 취소, 삭제 | 기능 | M | C1 | ISSUE_C3 |
-| C4 | CLI 변경 명령이 큐 전체를 실행하지 않게 하기, 데이터 디렉터리당 실행 주체 하나 | 버그 | M | | ISSUE_C4 |
-| D1 | hermetic e2e 하네스: 가짜 GitHub, `file://` 원격, 가짜 provider CLI | 테스트 | L | | ISSUE_D1 |
-| D2 | CLI 버전 주입, CI에서 번들과 패키징 smoke | 릴리스 | S | | ISSUE_D2 |
-| D3 | 패키징된 앱의 업데이트 배너를 릴리스 기준으로 | 버그 | S | | ISSUE_D3 |
-| D4 | 릴리스 워크플로 최소 권한, 액션 SHA 고정, Dependabot, CodeQL | 공급망 | S~M | | ISSUE_D4 |
-| E1 | `mao init`, `mao doctor`, 안전한 토큰 입력, 일관된 출력과 종료 코드 | DX | M | | ISSUE_E1 |
-| E2 | GUI 온보딩 체크리스트, 토큰·provider 연결 테스트 | UX | M | E1 | ISSUE_E2 |
-| E3 | 사람이 읽는 문서: README 재작성, quickstart, concepts, providers, troubleshooting, CONTRIBUTING, CHANGELOG | 문서 | M | | ISSUE_E3 |
+| A1 | auto-trigger 신뢰 게이트: 신뢰할 수 있는 작성자나 승인 라벨이 있는 이슈만 큐에 넣기, 지시 태그도 같은 기준, 새 저장소는 auto-trigger 꺼짐 | 보안 | M | | #115 |
+| A2 | 자격증명 격리: remote URL에서 토큰 제거, provider CLI 환경 변수 제한, 작업 폴더를 데이터 디렉터리 밖으로, 설정 파일 권한 | 보안 | M | | #116 |
+| A3 | 에이전트 출력의 비밀을 GitHub에 쓰기 전에 차단 | 보안 | S~M | | #117 |
+| A4 | 지원되는 Electron으로 올리기, CSP, 탐색 차단, IPC 입력 검증, 렌더러로 비밀 전달 중단 | 보안 | M | | #118 |
+| A5 | SECURITY.md, 위협 모델, 공개 저장소 사용 경고, 최소 권한 토큰 안내 | 문서 | S | | #119 |
+| B1 | 컨텍스트 팩: 이슈 본문, 저장소 규약, 검증 명령을 모든 단계 프롬프트에 | 핵심 루프 | M | | #120 |
+| B2 | diff를 읽는 리뷰와 구조화된 판정 | 핵심 루프 | M | B1 | #121 |
+| B3 | 머지 게이트: 현재 head에 대한 승인 판정, SHA 고정, 검사 없음 정책, 보호 경로, 기본은 머지 전 사람 승인 | 핵심 루프 | M | B2 | #122 |
+| B4 | 코드 변경이 없는 pr 단계를 notes-only PR 대신 실패로 처리 | 버그 | S | | #123 |
+| B5 | maker-checker를 벤더 계열과 작업 이력 전체 기준으로 | 버그 | M | | #124 |
+| B6 | 모델 카탈로그와 CLI별 effort 전달 현행화 | 버그 | S | | #125 |
+| B7 | provider 실패 분류, 한도 안내문과 빈 출력의 게시 차단 | 버그 | M | | #126 |
+| C1 | 작업별 git worktree, 에이전트 프로세스 트리 정리 | 버그 | M | | #127 |
+| C2 | 크래시·재시작 뒤 GitHub 쓰기 중복 방지, 같은 이슈의 중복 enqueue 방지, `mao run` 정상 종료 | 버그 | M | | #128 |
+| C3 | 작업 중지, 취소, 삭제 | 기능 | M | C1 | #129 |
+| C4 | CLI 변경 명령이 큐 전체를 실행하지 않게 하기, 데이터 디렉터리당 실행 주체 하나 | 버그 | M | | #130 |
+| D1 | hermetic e2e 하네스: 가짜 GitHub, `file://` 원격, 가짜 provider CLI | 테스트 | L | | #131 |
+| D2 | CLI 버전 주입, CI에서 번들과 패키징 smoke | 릴리스 | S | | #132 |
+| D3 | 패키징된 앱의 업데이트 배너를 릴리스 기준으로 | 버그 | S | | #133 |
+| D4 | 릴리스 워크플로 최소 권한, 액션 SHA 고정, Dependabot, CodeQL | 공급망 | S~M | | #134 |
+| E1 | `mao init`, `mao doctor`, 안전한 토큰 입력, 일관된 출력과 종료 코드 | DX | M | | #135 |
+| E2 | GUI 온보딩 체크리스트, 토큰·provider 연결 테스트 | UX | M | E1 | #136 |
+| E3 | 사람이 읽는 문서: README 재작성, quickstart, concepts, providers, troubleshooting, CONTRIBUTING, CHANGELOG | 문서 | M | | #137 |
+
+추적 이슈는 #138입니다.
 
 **권하는 순서.**
 
@@ -85,16 +87,16 @@ A1, A2, A3, B3이 들어오기 전에는 공개 저장소나 신뢰할 수 없�
 
 | id | 항목 | 규모 | 선행 | 이슈 |
 | --- | --- | --- | --- | --- |
-| N1 | WorkflowEngine과 Swarm을 하나의 파이프라인으로 수렴: 계획(선택) → 구현 → 판정이 있는 리뷰 → 횟수 제한이 있는 수정 루프 → 검증 → 머지 게이트 | L | PR #107, B2, B3 | ISSUE_N1 |
-| N2 | 검증 단계: 감지한 테스트·린트 명령을 깨끗한 체크아웃에서 실행해 머지 게이트 입력으로 | M | C1 | ISSUE_N2 |
-| N3 | 구조화 CLI 어댑터, 실시간 transcript, 사용량·비용 원장 | L | B6 | ISSUE_N3 |
-| N4 | 저장 모델 분리: 비밀, 설정(스키마 버전), SQLite 큐. 그 전까지 store 하드닝 동결 | L | A4 | ISSUE_N4 |
-| N5 | 스케줄러: 저장소별 lane, 동시성 상한, 대기와 backoff | M | C1 | ISSUE_N5 |
-| N6 | GitHub App 정체성, auto-merge·merge queue 위임, ETag 폴링, GitHub Enterprise 지원 | L | B3 | ISSUE_N6 |
-| N7 | 미션 컨트롤: 저장소 간 Inbox, 실행 타임라인, 머지 전 승인 패널, 알림, 접근성 기초 | L | B2, B3, N3 | ISSUE_N7 |
-| N8 | 평가 하네스와 도그푸딩 지표 | L | D1 | ISSUE_N8 |
-| N9 | 에이전트를 OS 샌드박스나 컨테이너에서 실행, 격리 없이는 권한 우회 모드 거부 | L | C1 | ISSUE_N9 |
-| N10 | npm 배포, Docker 이미지, 날짜 기반 릴리스 | M | PR #107 | ISSUE_N10 |
+| N1 | WorkflowEngine과 Swarm을 하나의 파이프라인으로 수렴: 계획(선택) → 구현 → 판정이 있는 리뷰 → 횟수 제한이 있는 수정 루프 → 검증 → 머지 게이트 | L | PR #107, B2, B3 | 착수할 때 등록 |
+| N2 | 검증 단계: 감지한 테스트·린트 명령을 깨끗한 체크아웃에서 실행해 머지 게이트 입력으로 | M | C1 | 착수할 때 등록 |
+| N3 | 구조화 CLI 어댑터, 실시간 transcript, 사용량·비용 원장 | L | B6 | 착수할 때 등록 |
+| N4 | 저장 모델 분리: 비밀, 설정(스키마 버전), SQLite 큐. 그 전까지 store 하드닝 동결 | L | A4 | 착수할 때 등록 |
+| N5 | 스케줄러: 저장소별 lane, 동시성 상한, 대기와 backoff | M | C1 | 착수할 때 등록 |
+| N6 | GitHub App 정체성, auto-merge·merge queue 위임, ETag 폴링, GitHub Enterprise 지원 | L | B3 | 착수할 때 등록 |
+| N7 | 미션 컨트롤: 저장소 간 Inbox, 실행 타임라인, 머지 전 승인 패널, 알림, 접근성 기초 | L | B2, B3, N3 | 착수할 때 등록 |
+| N8 | 평가 하네스와 도그푸딩 지표 | L | D1 | 착수할 때 등록 |
+| N9 | 에이전트를 OS 샌드박스나 컨테이너에서 실행, 격리 없이는 권한 우회 모드 거부 | L | C1 | 착수할 때 등록 |
+| N10 | npm 배포, Docker 이미지, 날짜 기반 릴리스 | M | PR #107 | 착수할 때 등록 |
 
 NEXT 항목은 묶음(epic)입니다. 착수할 때 한 쪽짜리 설계 기록을 먼저 쓰고 작은 이슈로 나눕니다.
 

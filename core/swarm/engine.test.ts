@@ -6,7 +6,10 @@ import { Writable } from 'node:stream'
 import { spawn as nativeSpawn } from 'node:child_process'
 import type { ChildProcess, spawn } from 'node:child_process'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { determinePrAction, issueNumberFromPrTitle, reviewerContext, SwarmEngine, trustedComments, ONCE_DRAIN_TIMEOUT_MS } from './engine.ts'
+import {
+  determinePrAction, issueNumberFromPrTitle, reviewerContext, SwarmEngine, trustedComments,
+  ONCE_DRAIN_TIMEOUT_MS, PROJECT_RULES_INSTRUCTION, SWARM_REFERENCE_DOC,
+} from './engine.ts'
 import type { EnginePlatform, SwarmComment, SwarmIssue, SwarmPR } from './engine.ts'
 import { SwarmPreflightConfigError } from './platform.ts'
 import { processGroupExists, terminateProcessGroups } from './registry.ts'
@@ -123,6 +126,34 @@ describe('native scheduler', () => {
     const engine = new SwarmEngine(base.root, { once: true }, base.platform, spawnProcess as unknown as typeof spawn)
     return { ...base, engine, child, spawnProcess, prompt: () => prompt }
   }
+  it.each(['worker', 'reviewer', 'maintainer', 'worker_revise'] as const)(
+    'routes the actual %s dispatch through AGENTS.md and conditionally names the review reference',
+    async (role) => {
+      const { engine, platform, spawnProcess, prompt } = dispatchFixture()
+      vi.mocked(platform.json).mockImplementation(async (args) => {
+        if (args[0] === 'issue') return issue as never
+        const comments = role === 'maintainer' ? [comment(`${REVIEWER}\nApproved\n${MAINTAINER}`)]
+          : role === 'worker_revise' ? [comment(`${REVIEWER}\nChanges requested`)] : []
+        return restPages(...comments) as never
+      })
+      try {
+        if (role === 'worker') await engine.processIssue(issue, [])
+        else await engine.processPr(pr, 'operator')
+        expect(spawnProcess).toHaveBeenCalledTimes(1)
+        const [command, args] = spawnProcess.mock.calls[0] as unknown as [string, string[]]
+        const actual = command === 'agy' ? args.at(-1)! : prompt()
+        expect(actual).toContain(PROJECT_RULES_INSTRUCTION)
+        expect(actual).toContain('follow its routing to any further rule or reference files this task touches')
+        expect(actual).not.toContain('.agents/rules')
+        expect(actual).not.toContain('SKILL.md')
+        if (role === 'reviewer') {
+          expect(actual).toContain(`If this checkout has ${SWARM_REFERENCE_DOC}`)
+          expect(actual).toContain("'Review checklist'")
+          expect(actual).toContain("'Role assignment'")
+        } else expect(actual).not.toContain(SWARM_REFERENCE_DOC)
+      } finally { await engine.tracker.killAll() }
+    },
+  )
   it('registers the isolated child with writer permission only for a Worker', async () => {
     const { engine, spawnProcess } = dispatchFixture()
     await engine.processIssue(issue, [])

@@ -150,10 +150,8 @@ export default function App() {
    * - "does a report exist" misses an all-invalid list hand-repaired into a partly usable one — still
    *   reported either side, while rows appear for the first time.
    * - `nothingUsable` misses the reverse, `'some-entries'` repaired to healthy — `false` either side,
-   *   so the warning vanishes and the rescued repository never arrives. **That one is not cosmetic.**
-   *   `persistRepos` sends the renderer's whole list, so the next settings toggle on a surviving row
-   *   writes a list that omits the repaired entry and deletes it again — and the report this PR added
-   *   is precisely what sent the operator to `config.json` to make that repair.
+   *   so the warning vanishes and the rescued repository shows no row until the next list edit
+   *   re-reads. (`applyRepoListEdit` keeps that edit from deleting it, so the cost is a stale mirror.)
    *
    * Any change in the report is a change in what the store holds for this field (the text carries the
    * counts), so it is the key that catches every one of those. Whether a whole-list *reset* may be

@@ -147,6 +147,12 @@ node --experimental-strip-types --env-file=.env.test scripts/test-workflow.ts
 
 This drives one task through the full pipeline and prints its final state as JSON.
 
+## Direction and roadmap
+
+The 2026-11 project review, the proposed long-term roadmap, a benchmark of similar tools and a
+user-needs analysis live in [`docs/strategy/`](docs/strategy/README.md) (written in Korean). They are
+proposals until the maintainer adopts them.
+
 ## Known limitations
 
 - **CLI agents are full coding agents, not pure text completions.** `claude`/`codex` sometimes respond with meta-commentary ("I can't find a PR to review...") instead of the requested text, especially at the `review`/`merge` stages, which don't run inside the actual repo checkout. The `pr` stage (which does run in a real checkout with `allowToolUse`) behaves best.

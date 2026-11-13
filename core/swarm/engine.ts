@@ -85,6 +85,14 @@ export function determinePrAction(comments: SwarmComment[]): PrSignal {
   return result
 }
 
+/** Swarm targets arbitrary checkouts, so each repository's own guide routes additional rules. */
+export const PROJECT_RULES_INSTRUCTION = 'Read AGENTS.md for all project rules, and follow its routing '
+  + 'to any further rule or reference files this task touches.\n'
+export const SWARM_REFERENCE_DOC = '.agents/skills/mao-development/references/repo-preflight-and-swarm.md'
+/** The MAO review reference is optional in other repositories; its absence must not block work. */
+export const SWARM_REVIEW_RULES_INSTRUCTION = `If this checkout has ${SWARM_REFERENCE_DOC}, read it too: `
+  + "its 'Review checklist' section governs this review and its 'Role assignment' section governs your Maintainer choice.\n"
+
 const integrityNotice = 'Execution integrity: perform the requested operations for real, verify their results, '
   + 'and report failures honestly. Never invent a commit, push, review, CI, merge, or issue result.'
 const tag = (role: string, assignment: RoleAssignment) =>
@@ -404,7 +412,7 @@ export class SwarmEngine {
     const aiSlug = worker.ai.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 30) || 'worker'
     const branch = `worker/${issue.number}-${aiSlug}-${slug}`
     const prompt = `You are the Worker for Issue #${issue.number}: ${issue.title}.\n`
-      + `Read AGENTS.md, SKILL.md and .agents/rules/. Implement the Issue body:\n\n${issue.body}\n\n`
+      + PROJECT_RULES_INSTRUCTION + `Implement the Issue body:\n\n${issue.body}\n\n`
       + `Work in this directory. Commit changes with conventional commits referencing #${issue.number}.\n`
       + `Push using git push --set-upstream origin ${shellQuote(branch)}. Verify the remote push.\n`
       + `Create a PR titled '[PR] ${issue.number} - <summary>' containing a full [Reviewer: <ai> | Model: <model> | Reasoning: <level>] tag.\n`
@@ -431,7 +439,7 @@ export class SwarmEngine {
     let assignment: RoleAssignment
     let ref: string
     let prompt: string
-    const common = `Read AGENTS.md, SKILL.md and .agents/rules/. PR #${pr.number}: ${pr.title}; Issue #${issue.number}.\n`
+    const common = PROJECT_RULES_INSTRUCTION + `PR #${pr.number}: ${pr.title}; Issue #${issue.number}.\n`
     if (signal.action === 'maintain') {
       const approvingReviewer = parseRole(signal.comment!.body, 'reviewer')
       if (!maintainer || approvingReviewer?.ai !== reviewer.ai) return terminal()
@@ -456,6 +464,7 @@ export class SwarmEngine {
       this.clearDispatchBlockers(ref)
       const diff = await this.platform.gh(['pr', 'diff', String(pr.number)])
       prompt = `You are the Reviewer. ${common}`
+        + SWARM_REVIEW_RULES_INSTRUCTION
         + (signal.action === 'review_after_maintainer_block' ? `A Maintainer blocked the PR. Re-evaluate the block evidence:\n${signal.comment!.body}\n` : '')
         + `Review the changed code and verification evidence. Post exactly ONE final summary comment with ${tag('Reviewer', reviewer)}.\n`
         + `If approved and ready to merge, explicitly say approved and include [Maintainer: <ai> | Model: <model> | Reasoning: <level>]. Maintainer MUST differ from Worker '${worker.ai}' and Reviewer '${reviewer.ai}'.\n`

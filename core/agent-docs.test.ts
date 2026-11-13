@@ -41,7 +41,7 @@ const REFERENCES = [
   'ipc-and-renderer-testing.md',
   'shipping-and-git.md',
 ]
-const SWARM_ORCHESTRATOR = '.agents/workflows/swarm_orchestrator.py'
+const SWARM_ORCHESTRATOR = 'core/swarm/engine.ts'
 const SWARM_REFERENCE = `${REFERENCE_DIR}/repo-preflight-and-swarm.md`
 /** Files the orchestrator creates at runtime. They are gitignored, so they exist only after a real run. */
 const SWARM_RUNTIME_PATHS = new Set(['.agents/logs/', '.agents/.prompts/', '.agents/.process_registry.json'])

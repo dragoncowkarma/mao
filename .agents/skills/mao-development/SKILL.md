@@ -22,7 +22,6 @@ sit on a volume named `NO NAME`.
 
 ```bash
 npm ci              # locked graph, same as CI; CI uses Node 22, the CLI bundle targets node18
-python3 --version   # 3.11 in CI; required by the Swarm asset and npm run test
 ```
 
 Use `npm install` only when intentionally changing dependencies and the lockfile.
@@ -33,11 +32,11 @@ Use `npm install` only when intentionally changing dependencies and the lockfile
 | --- | --- |
 | `npm run dev` | Electron + Vite, hot reload. Real host (`resume: true`, auto-trigger, `userData`, not `MAO_DATA_DIR`): it can write to GitHub, so run only with explicit authorization |
 | `npm run lint` | `tsc --noEmit`, the only type and style gate |
-| `npm run test` | Vitest `core`, then `renderer`, then the Python Swarm tests |
+| `npm run test` | Vitest `core` (including native Swarm), then `renderer`; no Python runtime |
 | `npm run test:origin` | Standalone matrix for `scripts/check-origin.mjs` |
 | `npm run build` | `vite build` + `electron-builder --dir`, unpacked into `release/` |
 | `npm run dist` | Full distributable (dmg/zip on mac) |
-| `npm run build:cli` | Bundle `cli/index.ts` to `dist-cli/index.cjs` and copy the Swarm asset beside it |
+| `npm run build:cli` | Bundle CLI and native Swarm into the single `dist-cli/index.cjs` artifact |
 | `npm run cli -- <args>` | Build the bundle, then run it (`npm run cli -- config show`) |
 | `npm run preview` | Vite preview of the built renderer |
 
@@ -51,12 +50,12 @@ Always, in CI's order: `npm run lint && npm run test && npm run test:origin && n
 
 | Touched | Also run | Why |
 | --- | --- | --- |
-| `cli/` or `core/` | `npm run build:cli && node dist-cli/index.cjs --help` | CI never builds the bundle |
+| `cli/` or `core/` | `npm run build:cli && node dist-cli/index.cjs --help && npm run test:swarm-bundle` | Verify the standalone bundle locally as well as in CI |
 | `core/workflow-engine.ts` | `npx vitest run core/workflow-engine.test.ts` | Focused loop |
 | `src/` | `npx vitest run --project renderer` | Nothing else sees renderer behaviour |
 | IPC surface | `npx vitest run --project renderer src/electron-ipc-surface.test.ts` | Pins channel strings, not what a handler does |
 | `scripts/` | Run it, except `scripts/test-workflow.ts` (real writes: needs authorization); for `scripts/build-cli.mjs`, `npm run build:cli` | Outside `tsconfig.json`'s `include` |
-| `.agents/workflows/swarm_orchestrator.py` | `npm run test`, then `npm run build:cli && node dist-cli/index.cjs swarm --status` | The bundle runs its own copy of the asset |
+| `core/swarm/` or `core/swarm-runner.ts` | `npm run build:cli && npm run test:swarm-bundle` | Native modes run from the standalone bundle with fake GitHub/AI commands |
 | Agent documents | `npx vitest run --project core core/agent-docs.test.ts` | Budgets, links, rule numbers |
 
 These commands test the filesystem, not a commit. For exact-SHA evidence use the isolated worktree in

@@ -68,6 +68,21 @@ Tier 3 reference — read when changing the workflow engine, agent routing, `cor
 - A resolved effort is dropped when the model is `noEffort` in `PROVIDER_OPTIONS`
   (`core/ai/provider-options.ts`); a CLI would otherwise get a literal `--effort` it does not take.
 
+### Shared CLI arguments and native Swarm tags
+
+`buildModelEffortArgs()` in `core/ai/provider-options.ts` encodes resolved arguments without rewriting
+ordinary saved provider models or efforts, including custom wrappers named after built-in CLIs. Codex
+uses `-c model_reasoning_effort=<value>`; an existing explicit model/effort flag is not duplicated.
+Retain `noEffort` metadata for current Haiku and stored legacy ids so a catalog refresh cannot add an
+unsupported flag to an old configuration.
+
+Only native Swarm prose tags use alias normalization, the reasoning ladder and model clamping in
+`core/swarm/models.ts`. Its last-unquoted-tag parser, role cost overrides, custom-model policy and
+CLI prompt transports are documented in [repo-preflight-and-swarm.md](repo-preflight-and-swarm.md).
+Swarm runs inside the CLI bundle, using active gh credentials and its own process registry; it neither
+loads the app queue nor starts through `createMaoApp()`. Its `--once` child drain has a shared 45-minute
+cap, and a latched app queue does not stop this separate engine.
+
 ## RunOverride: one-shot, stricter
 
 - `retry(taskId, runOverride?)` / `advance(taskId, runOverride?)` take `{ providerId?, model?, effort? }` from

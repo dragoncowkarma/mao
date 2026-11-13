@@ -151,8 +151,9 @@ cd "<dir>" && npm ci
 npm run lint && npm run test && npm run test:origin && npx vite build
 ```
 
-CI (`.github/workflows/ci.yml`) runs on pushes to `main` and all PRs, Node 22 and Python 3.11, in order:
-`npm ci`, `npm run lint`, `npm run test`, `npm run test:origin`, `npx vite build`. Locally, with
+CI (`.github/workflows/ci.yml`) runs on pushes to `main` and all PRs, Node 22, in order:
+`npm ci`, `npm run lint`, `npm run test`, `npm run test:origin`, `npx vite build`,
+`npm run build:cli`, `npm run test:swarm-bundle`. Locally, with
 dependencies installed, run the last line of the block above.
 
 `main` has no branch protection or rulesets (2026-11-03). Re-check:
@@ -161,8 +162,8 @@ dependencies installed, run the last line of the block above.
 it as required. The app's own merge-stage gate (`getChecksStatus`) is separate:
 [workflow-and-routing.md](workflow-and-routing.md).
 
-CI never builds the CLI, so bundle breakage is invisible there: after touching `cli/` or `core/`, run
-`npm run build:cli`, then `node dist-cli/index.cjs --help`. Other per-area runs: the verification matrix
+CI builds and smoke-tests the CLI bundle. After touching `cli/` or `core/`, run
+`npm run build:cli`, `node dist-cli/index.cjs --help` and `npm run test:swarm-bundle` locally too. Other per-area runs: the verification matrix
 in [SKILL.md](../SKILL.md).
 
 ## When shipping a change

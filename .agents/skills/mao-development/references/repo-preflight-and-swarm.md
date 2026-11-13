@@ -3,12 +3,13 @@
 Tier 3 reference — read when changing `core/repo-capabilities.ts`, `core/repo-registry.ts` or repository polling, running or changing `mao swarm`, assigning Swarm roles, or reviewing a PR. Rule summary: [AGENTS.md](../../../../AGENTS.md). Playbook: [SKILL.md](../SKILL.md).
 
 - `mao swarm --repo-root <path>` can target any repository, so this MAO-specific file may be absent
-  there; prompts name it conditionally (`SWARM_REVIEW_RULES_INSTRUCTION`). Absence is no blocker.
+  there; prompts name it conditionally (the shared instructions in `core/swarm/engine.ts`). Absence is no blocker.
 - Engine routing and the per-stage gate: [workflow-and-routing.md](workflow-and-routing.md). Store
   concurrency and `githubRepos` recovery: [store-and-recovery.md](store-and-recovery.md).
-- Swarm proof: `.agents/workflows/swarm_orchestrator_test.py`. It does not pin Role assignment's
-  `validate_distinct_roles` rejection, Reviewer-AI equality, `Model:`/`Reasoning:` maps, or the
-  `maintain`, `review_after_maintainer_block` and `[Worker] Revision complete.` signals.
+- Swarm is native TypeScript in `core/swarm/`, reached through `core/swarm-runner.ts`; the CLI stays
+  thin. Tests in `core/swarm/` cover role separation, lifecycle signals, model/effort resolution,
+  capability/origin boundaries, registry recovery and process groups. `npm run test:swarm-bundle`
+  checks the standalone bundle with fake commands, without Python or real GitHub/AI writes.
 
 ## When changing repository registration
 
@@ -88,19 +89,18 @@ Verdict rules (`evaluateRepoCapability`; rationale: JSDoc in `core/repo-capabili
 
 ## When changing capability policy
 
-Tables are intentionally duplicated. Audit together; add regressions to both suites
-(`core/repo-capabilities.test.ts` and the Swarm one).
+Policy has one definition: `core/repo-capabilities.ts`. Both `GithubService` and
+`SwarmPlatform.assertRepoWritable()` call `evaluateRepoCapability()`, `describeRepoCapability()` and
+`describeUnverifiedGrants()` directly. Change its tests and the Swarm platform adapter tests together
+when changing inputs or failure classification; never reintroduce a second verdict table.
 
-| Must stay aligned | `core/repo-capabilities.ts` | `.agents/workflows/swarm_orchestrator.py` |
-| --- | --- | --- |
-| Gap ids, reasons | `RepoCapabilityGap`, `GAP_REASONS` | `_CAPABILITY_GAP_REASONS` |
-| Remedy kinds, text, rank | `GAP_REMEDY`, `REMEDY_TEXT`, `REMEDY_RANK` | `_CAPABILITY_GAP_REMEDIES`, `_CAPABILITY_REMEDY_TEXT`, `_CAPABILITY_REMEDY_RANK` |
-| Public/private scopes, three-state push | `evaluateRepoCapability` | `_evaluate_repo_workflow_capability` |
-| Unverified grants | `PIPELINE_GRANTS`, `UNVERIFIED_LABELS` | `_PIPELINE_GRANTS`, `_UNVERIFIED_GRANT_LABELS` |
-
-Deliberately different, because Swarm checks the active `gh` credential: credential acquisition
-(`token-missing` vs `gh-not-authenticated`), failure
-classification (`classifyLookupFailure` vs `_classify_gh_api_failure`), wording naming that credential.
+The credential boundaries deliberately differ: `GithubService` uses the store token, while Swarm runs
+`gh api --include --method GET repos/{owner}/{repo}` with the active gh credential. Parse the entire
+HTTP envelope and response object, including `x-oauth-scopes`; no `--jq` projection may discard fields
+and turn an omitted/false permission into a grant. Authentication and command-failure diagnostics must
+name the active credential, with no raw headers, body, stdout, stderr or credential-bearing URLs.
+Repeated identical unverified-grant caveats print once per observed verdict; every required capability
+probe still runs, and a changed verdict re-arms the warning.
 
 ## Operator runbook: tracked repositories
 
@@ -121,7 +121,8 @@ classification (`classifyLookupFailure` vs `_classify_gh_api_failure`), wording 
 
 ## Operator runbook: `mao swarm` modes
 
-Needs Python 3 (`MAO_SWARM_PYTHON`), `git`, authenticated `gh` and the CLIs the tags name. Target: the
+Needs Node.js, `git`, authenticated `gh` and the CLIs the tags name. Swarm runs inside the single
+`dist-cli/index.cjs` bundle; no Python, copied script or `MAO_SWARM_PYTHON` override is used. Target: the
 checkout containing the current directory, or `--repo-root <path inside it>`. `npm run cli` runs from this
 package's root, so without `--repo-root` it targets MAO itself.
 It can create issues and comments, push, review, merge and close issues: a real run needs explicit
@@ -129,25 +130,28 @@ task authorization.
 
 | Invocation | GitHub | Local writes | Exit |
 | --- | --- | --- | --- |
-| `mao swarm --status` | none, no target resolution | none | 0 |
+| `mao swarm --status` | none, no origin or API lookup | none | 0 |
 | `mao swarm --dry-run --once` | reads only; binds origin; skips write probe, `core.sshCommand`/`GIT_SSH*` check | none | 0, or 1 on failure |
-| `mao swarm --once` | real dispatch and writes | runtime paths, task branches, fast-forward of a clean local `main` (`sync_main_branch`) | 0, with dispatched agents left running detached; 1 if an item failed, or if a signal's cleanup left a tree; 130 on signal |
-| `mao swarm [--interval <seconds>]` | same, polling (default 30 s) | runtime paths, task branches, fast-forward of a clean local `main` (`sync_main_branch`) | 0 on signal; 1 if a tree survives |
+| `mao swarm --once` | real dispatch and writes | runtime paths, task branches, fast-forward of a clean local `main` (`syncMain`) | 0 after owned agents complete; 1 on failure, 45-minute wait expiry or residual trees; SIGINT 130, SIGTERM 143 |
+| `mao swarm [--interval <seconds>]` | same, polling (default 30 s) | runtime paths, task branches, fast-forward of a clean local `main` (`syncMain`) | SIGINT 130, SIGTERM 143; 1 on observed failures or surviving trees |
 
 - `--dry-run` without `--once` polls forever.
+- A normal `--once` drains its owned children and records their actual terminal statuses. One monotonic
+  45-minute deadline covers the entire wait, not each child separately; expiry calls bounded group
+  termination and returns 1. It never treats a still-running child as successful completion.
 - `--reset` is a flag on a run, never a standalone clear: after deleting the registry it goes on to the
   preflight and real dispatch (`--once`: one cycle; else polling), so it needs the same authorization.
 - Its own mutation is the registry alone, even if the next preflight fails: the one write before the
-  network gate, so it works during access repair. With `--dry-run` it only logs; `--status` ignores it.
+  network gate, so it works during access repair. With `--dry-run` it does not clear; `--status` ignores it.
 - It forgets `running`/`stuck` ownership and cooldowns: stop residual trees first. It forgets every
-  item's events too: completed ones read as `new event` and can dispatch again. Proof: `main()`,
-  `should_dispatch`.
+  item's events too: completed ones read as `new event` and can dispatch again. Proof: `SwarmEngine.run()`,
+  `ProcessTracker.shouldDispatch()`.
 - A startup preflight failure exits 1 and creates no runtime file.
 - Runtime paths: `.worktrees/<issue>`, `.agents/.process_registry.json`, `.agents/logs/`,
   `.agents/.prompts/`. Added to `.git/info/exclude` only; it never edits or commits `.gitignore`.
 - Real runs also change Git state outside runtime paths: fetch, fast-forward of a clean local `main`
-  (`sync_main_branch`), task branches (`create_worktree`), and for merged PRs `git worktree remove` plus
-  `git branch -D` (`cleanup_worktree`).
+  (`syncMain`), task branches (`createWorktree`), and for merged PRs `git worktree remove` plus
+  `git branch -D` (`cleanupWorktree`).
 
 | `dispatch blocked`/`deferred` reason | Action |
 | --- | --- |
@@ -162,14 +166,14 @@ task authorization.
   `gh api --method GET repos/{owner}/{repo}`, at startup and before each later cycle, so revoked access
   stops new work.
 - Credential: the active `gh` one agents inherit. The store's `githubToken` is ignored, which is why
-  this stays in Python: `GithubService` would check the wrong credential.
+  the native platform adapter calls shared policy directly: `GithubService` would check the wrong credential.
 - Rate limits, timeouts, 5xx, unclassified 403s: `SwarmPreflightTransientError`, never "missing
   permission". Startup exits 1 for every failure, with an actionable message; later cycles log and retry.
 - A pass is not proof: grants stay unverified, and `git push` may use SSH or another helper this probe
   cannot establish.
-- `GH_REPO` and `GH_HOST` are overridden for its calls and every agent (`_bound_gh_environment`), so a
+- `GH_REPO` and `GH_HOST` are overridden for its calls and every agent (`SwarmPlatform.boundEnvironment()`), so a
   caller cannot preflight one repo or host and dispatch against another.
-- Never log a remote URL or raw `gh` output: either can hold a credential (`_run_gh`).
+- Never log a remote URL or raw `gh` output: either can hold a credential (`SwarmPlatform.gh()`).
 
 | Origin | Rule |
 | --- | --- |
@@ -181,12 +185,12 @@ task authorization.
 
 ## Swarm dispatch boundary
 
-- `_prepare_ai_process_spawn` revalidates right before each dispatch, uncached: Workers in their task
+- `SwarmPlatform.prepareDispatch()` revalidates right before each dispatch, uncached: Workers in their task
   worktree, Reviewers and Maintainers in the repository checkout.
 - Effective repository-local or worktree-local `remote.pushDefault`, `branch.<name>.pushRemote` and
   `branch.<name>.remote` must name `origin`; shadowed and global values cause no false rejection.
 - Every child gets highest-precedence command-scope values pinning all three to `origin`
-  (`_bound_dispatch_environment`), so inherited selectors cannot redirect a bare push.
+  (`prepareDispatch()`), so inherited selectors cannot redirect a bare push.
 - `GIT_CONFIG_PARAMETERS` is rejected at real-run startup (`git -c`/hook diagnostic) and at spawn: Git
   applies it after those values.
 - A detached repository root stays valid for Reviewer and Maintainer: origin, transport and
@@ -196,12 +200,12 @@ task authorization.
 ## Swarm revision dispatch
 
 - Accepts a same-repository, non-empty head ref. Fork PRs are refused: `origin` cannot update them.
-- `fetch_pr_head` fetches `refs/pull/<number>/head`; the commit must equal `headRefOid`, else retry
+- `fetchPrHead` fetches `refs/pull/<number>/head`; the commit must equal `headRefOid`, else retry
   next cycle.
 - A missing local branch is created from that commit, **never** `origin/main`.
 - A tracked-clean local ancestor fast-forwards to it, keeping non-conflicting untracked files.
 - Tracked changes, conflicting untracked or ignored files, or divergence stay put with a blocker.
-- Git and process calls pass the ref as argv with no shell; prompt examples use `shlex.quote`:
+- Git and process calls pass the ref as argv with no shell; prompt examples use the shell-quote helper in `core/swarm/engine.ts`:
   command-example hygiene, not a trust boundary.
 
 ## Swarm prompt-content trust boundary
@@ -210,22 +214,29 @@ task authorization.
   moderated.
 - Eligible `[Task]` Issue titles and bodies have no author gate before instructing tool-enabled
   Workers. PR titles and bodies have none either.
-- Comments count only from the active `gh` user or `OWNER`/`COLLABORATOR`/`MEMBER`; revision feedback
-  then passes through as instructions.
+- Comments require an author login and either the active `gh` user or an explicit
+  `OWNER`/`COLLABORATOR`/`MEMBER` association (`isTrustedComment` in `core/swarm/platform.ts`). Missing
+  login or association fails closed, except the authenticated user needs no association. Fetch all
+  paginated REST issue comments: `gh pr view --json comments` omits the association field. Trusted
+  revision feedback then passes through as instructions.
 
 ## Swarm item isolation and retry budget
 
 - A per-item failure (worktree, prompt or log write) skips neither later items nor merged-task
   cleanup. A failed authenticated-user lookup fails its PR batch closed.
 - Every selected non-preflight setup or launch failure before registration consumes the crash budget
-  (`MAX_DISPATCH_ATTEMPTS`, 3).
+  (3 attempts per event).
 - Typed per-item preflight blockers (`SwarmPreflightError`) stay retryable and spend no budget. Dedup
-  key: lifecycle, exception class, finite `reason_code`, never the message; first at error, repeats at
-  debug, no traceback.
+  key: lifecycle, exception class, finite `causeCode`, never the message; first occurrence is reported; uninterrupted repeats are suppressed without a traceback.
 - A successful dispatch or definitive no-dispatch result clears the item's keys. Incomplete observation
   and provider-cooldown deferrals retain them: neither is a clean pass.
-- `PROVIDER_LIMIT_PATTERNS` pause that AI on every item, budget-exempt. `EVENT_DEFER_PATTERNS` spend
-  budget after the pause, so they cannot retry forever.
+- `classifyProviderFailure()` (`core/swarm/cooldown.ts`) pauses a provider across items for rate/usage
+  limits, budget-exempt; event-local timeout/tool withdrawals spend budget after the pause. Spend
+  limits fall back to 24 hours, other unparsed limits to one hour. Explicit reset durations and Codex
+  local "try again at" times take precedence, with a 60-second buffer and midnight/DST handling.
+- Exit 0 is authoritative success: quoted limit text in a successful log never defers the run. Restart
+  healing re-parses failed/deferred log tails against their historical run timestamps, not startup
+  time. Status shows local and UTC reset times together.
 
 ## Swarm registry persistence
 
@@ -235,20 +246,22 @@ task authorization.
   one attempt spent; leader gone but group alive means `stuck`.
 - `history` is diagnostic, capped at 500. Dispatch authority is `lifecycle_states`: one current event
   per role per Issue or PR, so roles never erase one another while repeated heads stay bounded.
-- List every dispatchable role in `LIFECYCLE_ROLES`: `should_dispatch` blocks while any is running or
+- List every dispatchable role in `LIFECYCLE_ROLES`: `shouldDispatch` blocks while any is running or
   stuck on the item; an omitted role lets a second agent rewrite a live worktree.
-- Prune closed terminal items only when the open list is shorter than `OPEN_ITEMS_LIMIT` (1,000), which
+- Prune closed terminal items only when the open list is shorter than the 1,000-item query limit, which
   proves it complete. `running`/`stuck` always survive.
-- Cooldowns have their own bounded map. Legacy registries collapse into this schema on load.
+- Cooldowns have their own bounded map. Legacy registries collapse into this schema on load; a valid
+  current-version lifecycle table is authoritative even when empty, so pruned events do not resurrect
+  from diagnostic history. Aggregate the maximum active deadline for each provider.
 
 ## Swarm process groups and shutdown
 
 - Each agent gets its own POSIX process group; other platforms fail before the write preflight or any
   runtime file.
-- `terminate_process_groups` signals all eligible groups in one batch, with one shared deadline and
-  forced-exit grace, on shutdown and when an agent's group leader exits (`poll_all`).
-- Polling and `--once` share `_shutdown_signal_controller`. A signal between spawn and in-memory
-  adoption defers until the child is supervised, even if spawn or adoption raises. Environment
+- `terminateProcessGroups` signals all eligible groups in one batch, with one shared deadline and
+  forced-exit grace, on shutdown and when an agent's group leader exits (`ProcessTracker.poll()`).
+- Polling and `--once` share the engine's signal handlers. Spawn and in-memory adoption are synchronous,
+  so JavaScript signal callbacks run only after the child is supervised, even if adoption raises. Environment
   preflight runs before that window, registry persistence after it. Both modes then stop; `--once`
   skips merged-task cleanup.
 - A child found unwinding before registration persisted is saved `running` before bounded termination,
@@ -262,6 +275,10 @@ task authorization.
 - One worktree per task at `.worktrees/<issue>`. A branch checked out elsewhere is a hard blocker.
 - A damaged checkout gets `git worktree repair`. A non-empty damaged or mismatched directory is kept
   for a human, never recursively deleted.
+- Merged-task cleanup locates the branch in `git worktree list --porcelain`, including a registered
+  alternate path. It refuses the repository root, symlinks, wrong branch ownership and tracked,
+  untracked or ignored local files. Only after safe removal and a fresh ownership check may its local
+  task branch be deleted.
 
 ## Role assignment
 
@@ -271,12 +288,12 @@ Swarm tag grammar, identical for `Worker`, `Reviewer` and `Maintainer`:
 [Worker: <ai> | Model: <model> | Reasoning: <level>]
 ```
 
-- All fields required, or no match (`WORKER_PATTERN` and siblings). Case-insensitive; first match wins;
-  `parse_role` lower-cases `<ai>`.
-- No code-fence exclusion: a concrete tag quoted anywhere parses; a literal `<ai>` never does.
-- Two systems, neither parser reading the other's: this form vs the workflow engine's
-  `[Worker: <providerId>]` plus separate `[Model:]`, `[Effort:]`
-  ([workflow-and-routing.md](workflow-and-routing.md)).
+- All fields are required. `parseRole()` in `core/swarm/models.ts` matches case-insensitively and
+  lower-cases the AI name. Last matching occurrence wins. It reuses `stripQuotedText()` so fenced code, inline
+  code, HTML comments and blockquotes are examples, not active directives.
+- The workflow engine uses its separate `[Worker: <providerId>]` form with task-wide `[Model:]` and
+  `[Effort:]`; never substitute a Swarm CLI tool name for a registered provider id. See
+  [workflow-and-routing.md](workflow-and-routing.md).
 
 | Tag | Named by | Lives in |
 | --- | --- | --- |
@@ -284,39 +301,44 @@ Swarm tag grammar, identical for `Worker`, `Reviewer` and `Maintainer`:
 | Reviewer | Worker | Body of its PR, titled `[PR] <issue> - <summary>` |
 | Maintainer | Reviewer | Its approval comment, beside its own Reviewer tag |
 
-- Worker, Reviewer and Maintainer must be **pairwise different** AIs within one issue->PR lifecycle
-  (`validate_distinct_roles`). The same AI with another model still violates it; nothing is dispatched.
-- A Worker and Reviewer thus leave one valid Maintainer. `DEFAULT_ROTATION` is a convention no code
-  reads: a missing tag is never filled in.
-- The approval's and feedback's Reviewer AI must equal the PR body's, or dispatch is blocked.
+- Worker, Reviewer and Maintainer must be **pairwise different** AIs (`validateDistinctRoles`). Using
+  another model of the same AI does not satisfy maker-checker. Missing tags are not auto-filled.
+- The approval's and feedback's Reviewer AI must equal the PR body's assignment, or dispatch blocks.
 
-| `<ai>` | CLI (`build_ai_argv`) | `Model:` | `Reasoning:` |
-| --- | --- | --- | --- |
-| `claude` | `claude -p` | `sonnet 5`, `opus 5`, `fable 5`, `haiku 4.5`, full IDs (`_CLAUDE_MODEL_MAP`); others verbatim | `--effort` from `_CLAUDE_EFFORT_MAP` |
-| `codex` | `codex exec` | `5.6`, `5.6 sol`, `5.6 terra`, `5.6 luna`, `5.5`, `5.4`, `5.4 mini` (`_CODEX_MODEL_MAP`); others verbatim. All but sol, luna run `gpt-5.6-terra` | Ignored: no flag |
-| `antigravity` | `agy` (not a valid `<ai>`) | Ignored: `Gemini 3.6 Flash (<effort>)` (`_resolve_agy_model`) | Suffix from `_AGY_EFFORT_LABEL` |
-
-| `Reasoning:` | Claude | Antigravity |
+| AI | Models and compatibility | Effort encoding |
 | --- | --- | --- |
-| `high`, `높음`, `울트라`, `매우 높음`, `thinking` | `high` | `High` |
-| `medium`, `중간` | `medium` | `Medium` |
-| `low`, `낮음`, `light` | `low` | `Low` |
-| `엑스트라` | `xhigh` | `High` |
-| `최대`, `ultracode` | `max` | `High` |
-| Anything else, including literal `xhigh`, `max` | `medium` | `High` |
+| `claude` | `claude-opus-5`, `claude-sonnet-5`, `claude-fable-5`, `claude-haiku-4-5`; old prose aliases normalize | `--effort`; Haiku and retained legacy no-effort ids omit it |
+| `codex` | `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`; retired/short aliases normalize | `-c model_reasoning_effort=<effort>` explicitly overrides local config |
+| `antigravity` | `gemini-4-argon`, `gemini-3.8-flash`; older Gemini aliases normalize; foreign Claude/GPT families redirect to Gemini | `-low`, `-medium`, `-high` suffix, never `--effort` |
 
-- `_map_reasoning_to_effort` has no caller; it is not the authority.
-- Any other `<ai>` raises at dispatch and spends the budget.
-- Worker and revision run tool-enabled; Reviewer and Maintainer restricted (flags: `build_ai_argv`).
+- The shared reasoning ladder is `low -> medium -> high -> xhigh -> max -> ultra`; English/Korean
+  labels and punctuation normalize through `resolveReasoning()`. Unknown labels become `medium`.
+  Excessive levels clamp: Claude and Codex Luna at `max`, Codex Sol/Terra at `ultra`, agy at `high`.
+- `validateModelAvailability()` accepts registered aliases or explicit `custom:`/`unlisted:` models,
+  reserved Codex review ids, and `SWARM_ALLOWED_CUSTOM_MODELS` comma-separated allowlist entries.
+  Unknown models warn and use defaults. Custom agy models must still be Gemini to preserve family
+  separation. Unknown AIs are rejected before launch.
+- Initial Worker retains its requested effort; Reviewer and `worker_revise` use `medium`, Maintainer
+  `low`. A Reviewer receives the PR description and at most 50,000 diff characters, with a truncation
+  notice; it can inspect omitted changes.
+- Worker and revision are tool-enabled; Reviewer and Maintainer keep restricted flags (`buildAiArgv`).
+- Claude/Codex receive prompt bytes through stdin after durable ownership registration. Delivery has
+  a 60-second deadline, handles EPIPE, and aborts on shutdown; no task text appears in their argv.
+  agy retains the verified `--print <prompt>` argv contract with ignored stdin: prompt size is subject
+  to OS argument limits and text is visible in local process listings. Do not assume stdin support.
 
-The newest recognized trusted comment sets the next action (`determine_pr_action`):
+The newest recognized trusted comment sets the next action (`determinePrAction`):
 
 - Reviewer tag alone: `revise`; the Worker gets it as feedback.
-- Reviewer and Maintainer tags: `maintain`.
+- Reviewer and Maintainer tags: `maintain` only without negative or conditional approval text.
+  "not approved", "changes requested", "needs further changes" and "conditionally approved"
+  remain `revise`; negative feedback wins over positive words in the same comment.
 - Maintainer tag and `[Maintainer Blocked]`: `review_after_maintainer_block`.
 - `[Worker] Revision complete.`: `review`. A lone Maintainer tag changes nothing.
 
-Maintainer merge, block and follow-up-Issue duties: its prompt in `dispatch_maintainer`.
+Maintainer merge, block and follow-up-Issue duties live in `core/swarm/engine.ts`. Before merging a
+Draft PR, it checks `isDraft`, runs `gh pr ready`, then rechecks merge state and CI. A verified merge
+precedes Issue closure and the single non-duplicate follow-up task; the orchestrator owns cleanup.
 
 ## Review checklist
 
@@ -348,5 +370,5 @@ comment on the PR, carrying its own Reviewer tag:
 - Changes needed: describe all required changes; **no** Maintainer tag.
 - After a Maintainer block: re-evaluate its evidence, then request changes or approve anew.
 - Keep tags out of earlier comments: a trusted comment with a Reviewer tag is itself a `revise` signal.
-- Use `gh pr comment`: Swarm reads `gh pr view --json comments`, not review bodies. Re-fetch to confirm
-  it landed (`EXECUTION_INTEGRITY_NOTICE`).
+- Use `gh pr comment`: Swarm reads paginated REST issue comments, not review bodies. Re-fetch to
+  confirm it landed; never invent a review, push, merge or follow-up result.

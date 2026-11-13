@@ -449,4 +449,4 @@ $ mao config set-theme dark
   `readable: false`). Other fields: a `FileStore` booted on it reads defaults, one booted clean its
   snapshot; conf's `get()` throws `UnreadableStoreError`. The write refusal, not the latch, stops
   the data loss.
-- `mao swarm` reads none of this: separate Python engine, separate credential.
+- `mao swarm` reads none of this: separate native Swarm engine, separate credential.

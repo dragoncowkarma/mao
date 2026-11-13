@@ -35,7 +35,8 @@ AI agents drive GitHub issue → PR → review → merge, with a maker-checker s
 | `core/persistence-guard.ts` | Durable persistence-broken marker |
 | `core/provider-import.ts` | CLI-only provider import |
 | `core/git-workspace.ts` | Local git via `execFile` |
-| `core/swarm-runner.ts` | Shell-free Swarm launcher |
+| `core/swarm-runner.ts` | Checkout validation + native Swarm entry |
+| `core/swarm/` | Native lifecycle, platform preflight/worktrees, registry, models and cooldowns |
 | `core/self-update.ts` | GUI self-update guard |
 | `core/paths.ts` | CLI data dir |
 | `core/ai/` | `AiProvider`, API and CLI adapters, `provider-options.ts` |
@@ -46,7 +47,6 @@ AI agents drive GitHub issue → PR → review → merge, with a maker-checker s
 | `src/` | React 18 renderer; `src/App.tsx` owns cross-view state |
 | `src/electron-api.ts` | Only bridge accessor |
 | `cli/index.ts` | Commander CLI |
-| `.agents/workflows/swarm_orchestrator.py` | Swarm lifecycle |
 | `scripts/test-workflow.ts` | E2E harness (throwaway repo) |
 | `scripts/check-origin.mjs` | Origin guard |
 
@@ -55,7 +55,7 @@ AI agents drive GitHub issue → PR → review → merge, with a maker-checker s
 Code comments cite these numbers: never renumber (`core/agent-docs.test.ts`).
 
 1. **`core/` stays Electron-free.** `core/` and `cli/` never import `electron`, `electron-store` or `electron/`; persistence goes through `MaoStore`. No test yet (#82): `git grep --untracked -E "from '[./]*electron" -- core cli` must be empty.
-2. **Business logic lives in `core/`, never in the shells.** `electron/ipc.ts` and `cli/index.ts` stay thin, or GUI↔CLI parity breaks. Sole exception: `.agents/workflows/swarm_orchestrator.py` owns the CLI-only Swarm lifecycle; `cli/index.ts` only calls `core/swarm-runner.ts`. Partial proof: `core/shell-queue-gate.test.ts`.
+2. **Business logic lives in `core/`, never in the shells.** `electron/ipc.ts` and `cli/index.ts` stay thin, or GUI↔CLI parity breaks. The CLI-only Swarm lifecycle also lives in `core/swarm/`; `cli/index.ts` only calls `core/swarm-runner.ts`. Partial proof: `core/shell-queue-gate.test.ts`.
 3. **`createMaoApp()` (`core/app.ts`) is the only boot path.** Mutate through `WorkflowEngine` so persistence is automatic. Partial proof: `core/app.test.ts`.
 4. **The `resume` flag is deliberately required (no default).** One-shot commands pass `false`; `electron/ipc.ts` passes `true`; `mao run` passes `false`, then calls `resumeProcessing()` after attaching its listener. Proof: `npm run lint` (flag required); shell values and order: review.
 5. **Never start the auto-trigger poller inside `createMaoApp()`.** Its `setInterval` keeps the process alive; only `electron/ipc.ts` and `mao run` start it. No test: `git grep "auto-trigger.ts'" -- core/app.ts` must print nothing.
@@ -71,7 +71,7 @@ Code comments cite these numbers: never renumber (`core/agent-docs.test.ts`).
 | Store field | `MaoStoreSchema` + `MAO_STORE_DEFAULTS`; array: `STORED_SHAPE_RULES` + table test | Lint (pair); rule: review |
 | `MaoStore` backend | `createGuardedStore()`, strict `getFresh`, `withFileWriteLock` | `core/store.test.ts` |
 | Repo registration | Rule only in `core/repo-registry.ts`; shells call `updateRepos` and surface unverified grants | `core/repo-registry.test.ts` (shells: review) |
-| Capability policy | `core/repo-capabilities.ts` + tables in `.agents/workflows/swarm_orchestrator.py` | Both suites |
+| Capability policy | `core/repo-capabilities.ts`, consumed by `core/github-service.ts` and `core/swarm/platform.ts`; preserve each credential boundary | Core capability + Swarm platform tests |
 | Pipeline stage | `AGENT_STAGES` (`core/ai/types.ts`); `STAGE_ROLE` (`core/agent-selection.ts`); `buildPromptForStage`, `applyGithubAction`; `STAGE_LABELS` in `KanbanBoard.tsx`, `WorkflowQueue.tsx`; `ALL_STAGES` + `STAGE_LABELS` in `GlobalSettings.tsx` | Partial: `core/workflow-engine.test.ts` |
 | Build outputs | `electron/main.ts`, `vite.config.ts`, `package.json` | Hand audit; `npm run build` checks only `main` |
 

@@ -139,7 +139,7 @@ So a green run does not replace an authorized `npm run dev` smoke test:
 - It cannot see a stray plugin on `core`: keep that out by reading the config. Root-level
   `test.environment` and plugins never reach an inline project.
 - Outside vitest: `scripts/check-origin.test.mjs` (`npm run test:origin`) and
-  `.agents/workflows/swarm_orchestrator_test.py` (through `npm run test`, so Python 3 is required).
+  native Swarm tests in `core/swarm/` (through the Node Vitest project).
 
 ## When writing renderer code
 

@@ -59,7 +59,8 @@ repository's ignored `.worktrees/` and `.agents/` paths.
 The first real run records those runtime patterns only in the target checkout's local
 `.git/info/exclude`; it does not edit the repository's shared `.gitignore`. `--status`
 and `--dry-run` leave both the checkout and its Git metadata unchanged. `--once` polls once
-and waits for its dispatched agents to complete; SIGINT/SIGTERM still terminate owned groups.
+and waits up to 45 minutes for its dispatched agents to complete. At the limit it stops owned
+groups and exits non-zero; SIGINT/SIGTERM also terminate owned groups.
 
 ### Settings
 

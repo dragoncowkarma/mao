@@ -6,9 +6,10 @@ import { Writable } from 'node:stream'
 import { spawn as nativeSpawn } from 'node:child_process'
 import type { ChildProcess, spawn } from 'node:child_process'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { determinePrAction, issueNumberFromPrTitle, reviewerContext, SwarmEngine, trustedComments } from './engine.ts'
+import { determinePrAction, issueNumberFromPrTitle, reviewerContext, SwarmEngine, trustedComments, ONCE_DRAIN_TIMEOUT_MS } from './engine.ts'
 import type { EnginePlatform, SwarmComment, SwarmIssue, SwarmPR } from './engine.ts'
 import { SwarmPreflightConfigError } from './platform.ts'
+import { processGroupExists, terminateProcessGroups } from './registry.ts'
 
 const WORKER = '[Worker: claude | Model: claude-sonnet-5 | Reasoning: high]'
 const REVIEWER = '[Reviewer: codex | Model: gpt-5.6-sol | Reasoning: high]'
@@ -165,8 +166,12 @@ describe('native scheduler', () => {
     const args = spawnProcess.mock.calls[0] as unknown as [string, string[]]
     expect(args[0]).toBe('agy')
     expect(args[1]).toContain('--sandbox')
-    expect(prompt()).toContain('gh pr ready 42')
-    expect(prompt()).toContain('passing CI')
+    expect(args[1].at(-1)).toContain('gh pr ready 42')
+    expect(args[1].at(-1)).toContain('passing CI')
+    expect(prompt()).toBe('')
+    expect(spawnProcess.mock.calls[0]).toEqual(expect.arrayContaining([
+      expect.objectContaining({ stdio: ['ignore', expect.any(Number), expect.any(Number)] }),
+    ]))
     await engine.tracker.killAll()
   })
   it('rejects approval from a different Reviewer even when actual Worker/Reviewer/Maintainer roles are distinct', async () => {
@@ -280,6 +285,63 @@ describe('native scheduler', () => {
     expect(engine.tracker.history.at(-1)?.status).toBe('completed')
     expect([...engine.tracker.states.values()][0].failure_count).toBe(0)
   })
+  it('bounds the total once wait and returns nonzero after terminating owned groups', async () => {
+    const { engine, platform, child } = dispatchFixture()
+    vi.mocked(platform.json).mockImplementation(async (args) => {
+      if (args[0] === 'issue' && args[1] === 'list') return [issue] as never
+      return [] as never
+    })
+    vi.spyOn(engine as unknown as { enableRuntimeWrites(): Promise<void> }, 'enableRuntimeWrites').mockResolvedValue()
+    let clock = 0
+    vi.spyOn(engine.tracker, 'poll').mockImplementation(async () => {
+      if (engine.tracker.active.size) {
+        if (clock === ONCE_DRAIN_TIMEOUT_MS) throw new Error('poll continued beyond the child wait limit')
+        clock = ONCE_DRAIN_TIMEOUT_MS
+      }
+    })
+    const kill = vi.spyOn(engine.tracker, 'killAll').mockImplementation(async () => {
+      Object.assign(child, { exitCode: 1 })
+      engine.tracker.active.clear()
+      return true
+    })
+    vi.spyOn(performance, 'now').mockImplementation(() => clock)
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+    await expect(engine.run()).resolves.toBe(1)
+    expect(kill).toHaveBeenCalled()
+    expect(engine.tracker.active.size).toBe(0)
+    expect(log.mock.calls.flat().join(' ')).toContain('wait exceeded 45 minutes')
+  })
+
+  it('terminates a real non-finishing child at the once wait limit', async () => {
+    const { root, platform } = dispatchFixture()
+    let child: ChildProcess | undefined
+    const spawnProcess = ((_command: string, _args: string[], options: object) => {
+      child = nativeSpawn(process.execPath, ['-e',
+        'process.stdin.resume();process.stdin.on("end",()=>setInterval(()=>{},1000))'], options)
+      return child
+    }) as typeof nativeSpawn
+    const engine = new SwarmEngine(root, { once: true }, platform, spawnProcess)
+    vi.spyOn(engine as unknown as { enableRuntimeWrites(): Promise<void> }, 'enableRuntimeWrites').mockResolvedValue()
+    vi.mocked(platform.json).mockImplementation(async (args) => args[0] === 'issue' && args[1] === 'list'
+      ? [issue] as never : [] as never)
+    let clock = 0
+    vi.spyOn(performance, 'now').mockImplementation(() => clock)
+    const poll = engine.tracker.poll.bind(engine.tracker)
+    vi.spyOn(engine.tracker, 'poll').mockImplementation(async () => {
+      await poll()
+      if (engine.tracker.active.size) clock = ONCE_DRAIN_TIMEOUT_MS
+    })
+    try {
+      expect(await engine.run()).toBe(1)
+      expect(child?.pid).toBeDefined()
+      expect(processGroupExists(child!.pid!)).toBe(false)
+      expect(engine.tracker.active.size).toBe(0)
+      expect(engine.tracker.history.at(-1)?.status).toBe('failed')
+    } finally {
+      if (child?.pid) await terminateProcessGroups([child.pid], 0)
+    }
+  })
+
   it('handles prompt-pipe errors under supervision without leaving a live child or unhandled error', async () => {
     const { engine, child } = dispatchFixture()
     Object.assign(child, { stdin: new Writable({ write(_chunk, _encoding, done) {

@@ -556,7 +556,8 @@ task worktrees under `<repo>/.worktrees`, persists process history under
 review, merge, and close issues. `--dry-run` and `--status` do not modify the target
 checkout, its Git metadata, or GitHub; `--dry-run` performs GitHub reads only.
 `--once` performs one GitHub polling cycle, then waits for the agents it dispatched to finish
-under process supervision and records their real exit statuses. It performs real Git/GitHub
+under process supervision and records their real exit statuses. The entire child wait is capped
+at 45 minutes; exceeding it stops owned process groups and exits 1. It performs real Git/GitHub
 operations; SIGINT/SIGTERM still stop owned process groups. `--reset` clears only
 the persisted dispatch history, not Git branches or worktrees, and that explicit local clear runs
 even if the following GitHub preflight fails. On the first real run it
@@ -979,3 +980,8 @@ hygiene, then style (match surrounding code — there is no autoformatter).
 This checklist is **local verification**. Posting an actual GitHub review
 (comment, approval) or merging requires explicit authorization from the user —
 a "review this" request alone does not grant it (see AGENTS.md safety rails).
+
+
+Swarm prompt transport: Claude and Codex use bounded stdin delivery. Antigravity uses its established
+`--print <prompt>` argv contract; its prompt is subject to OS argument-size limits and visible in
+local process listings. No stdin compatibility is assumed for `agy`.

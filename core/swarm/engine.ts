@@ -12,6 +12,9 @@ import type { RoleAssignment } from './models.ts'
 import { ProcessTracker, lifecycleItemKey } from './registry.ts'
 import type { LifecycleRole, TrackedProcess } from './registry.ts'
 
+/** Cap one-shot child waiting at the longest supported provider window (agy's 45 minutes). */
+export const ONCE_DRAIN_TIMEOUT_MS = 45 * 60_000
+
 export interface SwarmIssue { number: number, title: string, body: string, state?: string }
 export interface SwarmPR extends SwarmIssue {
   headRefName: string
@@ -364,12 +367,18 @@ export class SwarmEngine {
   /** --once stops polling GitHub after one snapshot, but retains ownership until launched agents finish. */
   private async drainChildren(): Promise<number> {
     const owned = [...this.tracker.active.values()].map(({ record }) => record)
+    const deadline = performance.now() + ONCE_DRAIN_TIMEOUT_MS
     do {
       this.checkShutdown()
       await this.tracker.poll()
       this.checkShutdown()
       if ([...this.tracker.active.values()].some(({ record }) => record.status === 'stuck')) return 1
       if (!this.tracker.active.size) break
+      if (performance.now() >= deadline) {
+        this.log('Swarm --once child wait exceeded 45 minutes; stopping owned process groups')
+        await this.tracker.killAll()
+        return 1
+      }
       this.sleepAbort = new AbortController()
       try { await delay(50, undefined, { signal: this.sleepAbort.signal }) }
       catch (error) { if (!this.shutdownSignal) throw error }
@@ -535,11 +544,12 @@ export class SwarmEngine {
       const promptFile = path.join(this.repoRoot, '.agents', '.prompts', `${role}-${safeRef}-${suffix}.md`)
       fs.writeFileSync(promptFile, prompt, { flag: 'wx', mode: 0o600 })
       const fd = fs.openSync(logFile, 'wx', 0o600)
+      const useStdin = assignment.ai !== 'antigravity'
       let child: ChildProcess
       try {
         // There is intentionally no await between spawn and adopt. JS signal callbacks cannot
         // interrupt this synchronous ownership window, including failures in adoption itself.
-        child = this.spawnProcess(argv[0], argv.slice(1), { cwd, env, shell: false, detached: true, stdio: ['pipe', fd, fd] })
+        child = this.spawnProcess(argv[0], argv.slice(1), { cwd, env, shell: false, detached: true, stdio: [useStdin ? 'pipe' : 'ignore', fd, fd] })
         child.on('error', () => { /* Spawn failure is recorded by the synchronous pid guard below. */ })
         child.stdin?.on('error', () => {})
         try { this.tracker.adopt(child, record); adopted = true } catch (error) {
@@ -553,11 +563,13 @@ export class SwarmEngine {
         }
       } finally { fs.closeSync(fd) }
       this.tracker.save()
-      this.sleepAbort = new AbortController()
-      const promptDeadline = setTimeout(() => this.sleepAbort?.abort(), 60_000)
-      try { await sendPrompt(child, prompt, this.sleepAbort.signal) }
-      catch (error) { this.checkShutdown(); throw error }
-      finally { clearTimeout(promptDeadline); this.sleepAbort = undefined }
+      if (useStdin) {
+        this.sleepAbort = new AbortController()
+        const promptDeadline = setTimeout(() => this.sleepAbort?.abort(), 60_000)
+        try { await sendPrompt(child, prompt, this.sleepAbort.signal) }
+        catch (error) { this.checkShutdown(); throw error }
+        finally { clearTimeout(promptDeadline); this.sleepAbort = undefined }
+      }
       this.checkShutdown()
       this.log(`Dispatched ${role} ${ref}: ${assignment.ai}, ${assignment.model}, ${assignment.reasoning}; log ${path.basename(logFile)}`)
     } catch (error) {

@@ -1014,7 +1014,8 @@ There is no codegen — these couplings are maintained by hand and only `npm run
   fallback performs at most two atomic writes. Dispatched agents
   require isolated POSIX process groups; unsupported platforms fail before the write preflight or
   runtime-file creation. A normal `--once` waits for its dispatched children to finish and harvests
-  their actual exit status; it does not terminate them at the end of its single polling cycle.
+  their actual exit status, with a shared 45-minute wait limit. At the limit it stops owned groups
+  and exits non-zero; it does not terminate them at the end of its single polling cycle.
   Shutdown and abnormal leader exit signal all eligible process groups in a batch, then
   terminate residual descendants within one shared supervision deadline and one shared
   forced-exit grace. Polling and `--once` share the same signal controller. A shutdown signal

@@ -143,18 +143,18 @@ export function resolveRoleAssignment(assignment: RoleAssignment, role: Lifecycl
 }
 
 /**
- * Shell-free command-inclusive argv. The engine sends the prompt through stdin so large diffs
- * cannot exceed argv limits or expose task text in process listings. Only Worker executions
- * receive write-capable flags.
+ * Shell-free command-inclusive argv. Claude/Codex read prompts from stdin. Keep agy on its
+ * established --print argument contract until its stdin protocol is verified; it therefore retains
+ * argv size and process-list visibility limits. Only Worker executions receive write-capable flags.
  */
 export function buildAiArgv(
-  assignment: RoleAssignment, _prompt: string, allowToolUse: boolean, cwd?: string,
+  assignment: RoleAssignment, prompt: string, allowToolUse: boolean, cwd?: string,
 ): string[] {
   const { ai, model, reasoning, customModel: custom } = validateModelAvailability(assignment)
   if (ai === 'antigravity') {
     return ['agy', ...(allowToolUse ? [] : ['--sandbox']), '--dangerously-skip-permissions',
       '--model', resolveAgyModel(model, reasoning, custom), '--print-timeout', '45m',
-      '--input-format', 'text', '--print', '']
+      '--print', prompt]
   }
   const resolvedModel = ownValue(ai === 'codex' ? CODEX_ALIASES : CLAUDE_ALIASES, model.toLowerCase()) ?? model
   if (ai === 'codex') {

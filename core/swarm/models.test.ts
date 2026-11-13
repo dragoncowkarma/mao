@@ -118,14 +118,20 @@ describe('command construction', () => {
       .toContain('model_reasoning_effort=ultra')
   })
 
-  it.each(['codex', 'claude', 'antigravity'] as const)('keeps a large private %s prompt out of argv', (ai) => {
+  it.each(['codex', 'claude'] as const)('keeps a large private %s prompt out of argv', (ai) => {
     const prompt = 'Private issue, PR and diff: 한글\n'.repeat(10_000)
     const argv = buildAiArgv(DEFAULT_AI_CONFIG[ai], prompt, false)
     expect(argv.join(' ')).not.toContain('Private issue')
     expect(Buffer.byteLength(argv.join(' '))).toBeLessThan(1000)
-    if (ai === 'antigravity') expect(argv.slice(-4)).toEqual(['--input-format', 'text', '--print', ''])
     if (ai === 'codex') expect(argv.at(-1)).toBe('-')
     if (ai === 'claude') expect(argv).toContain('-p')
+  })
+
+  it.each([false, true])('keeps the established agy print-argument contract (writer=%s)', (writer) => {
+    const prompt = 'Actual agy prompt: 한글\nwith multiple lines'
+    const argv = buildAiArgv(DEFAULT_AI_CONFIG.antigravity, prompt, writer)
+    expect(argv.slice(-2)).toEqual(['--print', prompt])
+    expect(argv).not.toContain('--input-format')
   })
 
   it('keeps read-only permission flags separate from Worker flags', () => {

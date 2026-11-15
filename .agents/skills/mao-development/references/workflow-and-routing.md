@@ -43,7 +43,7 @@ Tier 3 reference — read when changing the workflow engine, agent routing, `cor
 
 - An unregistered or stage-ineligible id throws: a stored pin at stage time (retryable), a one-shot on the
   command itself. Proof: `core/workflow-engine.test.ts`, describes `provider override`,
-  `role assignment (swarm_orchestrator-style Worker/Reviewer/Maintainer pins)`, `allowedStages`,
+  `role assignment (Swarm-style Worker/Reviewer/Maintainer pins)`, `allowedStages`,
   `one-shot run override (card Tool/Model/Effort dropdowns)`; `core/agent-selection.test.ts` (effort, preview).
 
 ## ProviderOverride: durable pins and issue tags
@@ -80,7 +80,7 @@ Only native Swarm prose tags use alias normalization, the reasoning ladder and m
 `core/swarm/models.ts`. Its last-unquoted-tag parser, role cost overrides, custom-model policy and
 CLI prompt transports are documented in [repo-preflight-and-swarm.md](repo-preflight-and-swarm.md).
 Swarm runs inside the CLI bundle, using active gh credentials and its own process registry; it neither
-loads the app queue nor starts through `createMaoApp()`. Its `--once` child drain has a shared 45-minute
+loads the app queue nor starts through `createMaoApp()`. Its `--once` child drain has a shared 50-minute
 cap, and a latched app queue does not stop this separate engine.
 
 ## RunOverride: one-shot, stricter

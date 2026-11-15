@@ -316,6 +316,29 @@ describe('native scheduler', () => {
     expect(engine.tracker.history.at(-1)?.status).toBe('completed')
     expect([...engine.tracker.states.values()][0].failure_count).toBe(0)
   })
+  it('leaves time for agy to finish after its 45-minute provider timeout', async () => {
+    const { engine, platform, child, spawnProcess } = dispatchFixture()
+    vi.mocked(platform.json).mockImplementation(async (args) => args[0] === 'issue' && args[1] === 'list'
+      ? [{ ...issue, body: '[Worker: antigravity | Model: gemini-3.8-flash | Reasoning: high]' }] as never : [] as never)
+    vi.spyOn(engine as unknown as { enableRuntimeWrites(): Promise<void> }, 'enableRuntimeWrites').mockResolvedValue()
+    let clock = 0
+    vi.spyOn(performance, 'now').mockImplementation(() => clock)
+    const poll = engine.tracker.poll.bind(engine.tracker)
+    vi.spyOn(engine.tracker, 'poll').mockImplementation(async () => {
+      if (engine.tracker.active.size) {
+        if (clock >= 45 * 60_000) Object.assign(child, { exitCode: 0 })
+        clock = 45 * 60_000
+      }
+      await poll()
+    })
+    const kill = vi.spyOn(engine.tracker, 'killAll')
+    expect(await engine.run()).toBe(0)
+    expect(spawnProcess).toHaveBeenCalledWith('agy', expect.arrayContaining(['--print-timeout', '45m']), expect.anything())
+    expect(kill).not.toHaveBeenCalled()
+    expect(engine.tracker.history.at(-1)?.status).toBe('completed')
+    expect([...engine.tracker.states.values()][0].failure_count).toBe(0)
+  })
+
   it('bounds the total once wait and returns nonzero after terminating owned groups', async () => {
     const { engine, platform, child } = dispatchFixture()
     vi.mocked(platform.json).mockImplementation(async (args) => {
@@ -340,7 +363,7 @@ describe('native scheduler', () => {
     await expect(engine.run()).resolves.toBe(1)
     expect(kill).toHaveBeenCalled()
     expect(engine.tracker.active.size).toBe(0)
-    expect(log.mock.calls.flat().join(' ')).toContain('wait exceeded 45 minutes')
+    expect(log.mock.calls.flat().join(' ')).toContain('wait exceeded 50 minutes')
   })
 
   it('terminates a real non-finishing child at the once wait limit', async () => {

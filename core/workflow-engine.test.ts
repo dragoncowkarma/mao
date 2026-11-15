@@ -631,7 +631,7 @@ describe('WorkflowEngine', () => {
     })
   })
 
-  describe('role assignment (swarm_orchestrator-style Worker/Reviewer/Maintainer pins)', () => {
+  describe('role assignment (Swarm-style Worker/Reviewer/Maintainer pins)', () => {
     it('lets a Worker pin handle issue+pr with the same agent, and falls back to providerId for unpinned roles', async () => {
       const github = makeFakeGithub()
       const engine = new WorkflowEngine(github)

@@ -132,13 +132,14 @@ task authorization.
 | --- | --- | --- | --- |
 | `mao swarm --status` | none, no origin or API lookup | none | 0 |
 | `mao swarm --dry-run --once` | reads only; binds origin; skips write probe, `core.sshCommand`/`GIT_SSH*` check | none | 0, or 1 on failure |
-| `mao swarm --once` | real dispatch and writes | runtime paths, task branches, fast-forward of a clean local `main` (`syncMain`) | 0 after owned agents complete; 1 on failure, 45-minute wait expiry or residual trees; SIGINT 130, SIGTERM 143 |
+| `mao swarm --once` | real dispatch and writes | runtime paths, task branches, fast-forward of a clean local `main` (`syncMain`) | 0 after owned agents complete; 1 on failure, 50-minute wait expiry or residual trees; SIGINT 130, SIGTERM 143 |
 | `mao swarm [--interval <seconds>]` | same, polling (default 30 s) | runtime paths, task branches, fast-forward of a clean local `main` (`syncMain`) | SIGINT 130, SIGTERM 143; 1 on observed failures or surviving trees |
 
 - `--dry-run` without `--once` polls forever.
 - A normal `--once` drains its owned children and records their actual terminal statuses. One monotonic
-  45-minute deadline covers the entire wait, not each child separately; expiry calls bounded group
-  termination and returns 1. It never treats a still-running child as successful completion.
+  50-minute deadline covers the entire wait, not each child separately; expiry calls bounded group
+  termination and returns 1. This includes five minutes beyond agy's own 45-minute timeout, so its
+  normal shutdown can complete before the supervisor intervenes. It never treats a still-running child as successful completion.
 - `--reset` is a flag on a run, never a standalone clear: after deleting the registry it goes on to the
   preflight and real dispatch (`--once`: one cycle; else polling), so it needs the same authorization.
 - Its own mutation is the registry alone, even if the next preflight fails: the one write before the

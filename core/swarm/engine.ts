@@ -12,8 +12,8 @@ import type { RoleAssignment } from './models.ts'
 import { ProcessTracker, lifecycleItemKey } from './registry.ts'
 import type { LifecycleRole, TrackedProcess } from './registry.ts'
 
-/** Cap one-shot child waiting at the longest supported provider window (agy's 45 minutes). */
-export const ONCE_DRAIN_TIMEOUT_MS = 45 * 60_000
+/** Leave five minutes beyond agy's 45-minute provider timeout before forcing one-shot cleanup. */
+export const ONCE_DRAIN_TIMEOUT_MS = 50 * 60_000
 
 export interface SwarmIssue { number: number, title: string, body: string, state?: string }
 export interface SwarmPR extends SwarmIssue {
@@ -383,7 +383,7 @@ export class SwarmEngine {
       if ([...this.tracker.active.values()].some(({ record }) => record.status === 'stuck')) return 1
       if (!this.tracker.active.size) break
       if (performance.now() >= deadline) {
-        this.log('Swarm --once child wait exceeded 45 minutes; stopping owned process groups')
+        this.log('Swarm --once child wait exceeded 50 minutes; stopping owned process groups')
         await this.tracker.killAll()
         return 1
       }

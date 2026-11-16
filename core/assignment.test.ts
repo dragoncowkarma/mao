@@ -170,7 +170,7 @@ describe('parseProviderOverride', () => {
     expect(parseProviderOverride('[Model] [Model:] [Model: my model]')).toBeUndefined()
   })
 
-  it('does not confuse a swarm_orchestrator-style piped sub-field with a real tag', () => {
+  it('does not confuse a Swarm-style piped sub-field with a real tag', () => {
     expect(parseProviderOverride('[Worker: agent-cli | Model: claude-opus-5]')).toBeUndefined()
   })
 })

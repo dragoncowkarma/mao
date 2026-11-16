@@ -118,9 +118,6 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
       - run: npm ci
       - run: npm run lint
       - run: npm run test
@@ -195,8 +192,8 @@ jobs:
           npm run build:cli
           node dist-cli/index.cjs --help >/dev/null
           mkdir -p release-cli
-          tar -czf "release-cli/MAO-${VERSION}-cli.tar.gz" -C dist-cli index.cjs swarm_orchestrator.py
-          (cd dist-cli && zip -q "../release-cli/MAO-${VERSION}-cli.zip" index.cjs swarm_orchestrator.py)
+          tar -czf "release-cli/MAO-${VERSION}-cli.tar.gz" -C dist-cli index.cjs
+          (cd dist-cli && zip -q "../release-cli/MAO-${VERSION}-cli.zip" index.cjs)
       - name: Upload CLI release assets
         uses: actions/upload-artifact@v4
         with:

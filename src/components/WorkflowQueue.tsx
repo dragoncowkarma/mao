@@ -54,9 +54,9 @@ function AgentBadge({
   return (
     <span className="tag tag-neutral inline-flex items-center gap-1">
       {name}
-      {kind && <span className="opacity-60">· {kind}</span>}
-      {model && <span className="opacity-60">· {model}</span>}
-      {effort && <span className="opacity-60">· {effort} effort</span>}
+      {kind && <span className="agent-badge-meta">· {kind}</span>}
+      {model && <span className="agent-badge-meta">· {model}</span>}
+      {effort && <span className="agent-badge-meta">· {effort} effort</span>}
     </span>
   )
 }

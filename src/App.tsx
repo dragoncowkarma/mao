@@ -28,6 +28,21 @@ function selectedRepoIndex(repos: RepoRef[], selected: RepoRef): number {
   return exact === -1 ? repos.findIndex((repo) => sameRepoRef(repo, selected)) : exact
 }
 
+function normalizeThemePreference(value: unknown): ThemePreference {
+  return value === 'light' || value === 'dark' || value === 'system' ? value : 'system'
+}
+
+/**
+ * Electron re-wraps anything thrown inside `ipcMain.handle` as
+ * `Error invoking remote method '<channel>': <ErrorName>: <message>`. Strip the plumbing while
+ * leaving normal error messages verbatim.
+ */
+function appearanceErrorMessage(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err)
+  const match = raw.match(/^Error invoking remote method '[^']*':\s*(?:\w*Error:\s*)?(.*)$/s)
+  return match && match[1] ? match[1] : raw
+}
+
 export default function App() {
   const [repos, setRepos] = useState<RepoRef[]>([])
   const [selectedRepo, setSelectedRepo] = useState<RepoRef | null>(null)
@@ -35,7 +50,18 @@ export default function App() {
   const [projectTab, setProjectTab] = useState<ProjectTab>('board')
   const [theme, setThemeState] = useState<ThemePreference>('system')
   const [design, setDesignState] = useState<DesignId>(DEFAULT_DESIGN_ID)
-  const [appearanceError, setAppearanceError] = useState('')
+  const [themeError, setThemeError] = useState('')
+  const [designError, setDesignError] = useState('')
+  const appearanceError = [designError, themeError].filter(Boolean).join(' ')
+  /**
+   * Per-axis request generations and last-confirmed values so an initial mount read or an older
+   * failed write cannot overwrite a newer user selection, and a double failure falls back to the
+   * last persisted state rather than an unpersisted optimistic pick.
+   */
+  const themeRequestGen = useRef(0)
+  const designRequestGen = useRef(0)
+  const lastConfirmedTheme = useRef<ThemePreference>('system')
+  const lastConfirmedDesign = useRef<DesignId>(DEFAULT_DESIGN_ID)
   const [update, setUpdate] = useState<AppUpdateCheck | null>(null)
   const [dismissedUpdateSha, setDismissedUpdateSha] = useState<string | null>(null)
   /** Surfaces a failed settings edit or removal, which are otherwise silent (no preflight, no form). */
@@ -114,13 +140,20 @@ export default function App() {
     selectRepo(index === null ? null : candidates[index] ?? null)
   }
 
+  function clearAppearanceErrors() {
+    setDesignError('')
+    setThemeError('')
+  }
+
   function selectView(next: View) {
     navigationGeneration.current += 1
+    clearAppearanceErrors()
     setView(next)
   }
 
   function selectProjectTab(next: ProjectTab) {
     navigationGeneration.current += 1
+    clearAppearanceErrors()
     setProjectTab(next)
   }
 
@@ -264,14 +297,36 @@ export default function App() {
   }, [])
 
   useEffect(() => {
-    electronApi()
-      .ui.getTheme()
-      .then(setThemeState)
-      .catch(() => {})
-    electronApi()
-      .ui.getDesign()
-      .then((saved) => setDesignState(normalizeDesignId(saved)))
-      .catch(() => setDesignState(DEFAULT_DESIGN_ID))
+    let cancelled = false
+    Promise.resolve()
+      .then(() => electronApi().ui.getTheme())
+      .then((saved) => {
+        if (cancelled || themeRequestGen.current !== 0) return
+        const normalized = normalizeThemePreference(saved)
+        lastConfirmedTheme.current = normalized
+        setThemeState(normalized)
+      })
+      .catch(() => {
+        if (cancelled || themeRequestGen.current !== 0) return
+        lastConfirmedTheme.current = 'system'
+        setThemeState('system')
+      })
+    Promise.resolve()
+      .then(() => electronApi().ui.getDesign())
+      .then((saved) => {
+        if (cancelled || designRequestGen.current !== 0) return
+        const normalized = normalizeDesignId(saved)
+        lastConfirmedDesign.current = normalized
+        setDesignState(normalized)
+      })
+      .catch(() => {
+        if (cancelled || designRequestGen.current !== 0) return
+        lastConfirmedDesign.current = DEFAULT_DESIGN_ID
+        setDesignState(DEFAULT_DESIGN_ID)
+      })
+    return () => {
+      cancelled = true
+    }
   }, [])
 
   useEffect(() => {
@@ -302,33 +357,42 @@ export default function App() {
   }, [theme])
 
   async function setTheme(next: ThemePreference) {
-    setAppearanceError('')
-    const previous = theme
+    setThemeError('')
+    const request = (themeRequestGen.current += 1)
     setThemeState(next)
     try {
       await electronApi().ui.setTheme(next)
+      lastConfirmedTheme.current = next
     } catch (err) {
-      const actual = await electronApi()
-        .ui.getTheme()
-        .catch(() => previous)
+      const actual = await Promise.resolve()
+        .then(() => electronApi().ui.getTheme())
+        .then(normalizeThemePreference)
+        .catch(() => lastConfirmedTheme.current)
+      if (themeRequestGen.current !== request) return
+      lastConfirmedTheme.current = actual
       setThemeState(actual)
-      setAppearanceError(err instanceof Error ? err.message : String(err))
+      setThemeError(appearanceErrorMessage(err))
     }
   }
 
   async function setDesign(next: DesignId) {
-    setAppearanceError('')
-    const previous = design
+    setDesignError('')
+    const request = (designRequestGen.current += 1)
     setDesignState(next)
     try {
       await electronApi().ui.setDesign(next)
+      lastConfirmedDesign.current = next
     } catch (err) {
-      const actual = await electronApi()
-        .ui.getDesign()
+      const actual = await Promise.resolve()
+        .then(() => electronApi().ui.getDesign())
         .then(normalizeDesignId)
-        .catch(() => previous)
+        .catch(() => lastConfirmedDesign.current)
+      if (designRequestGen.current !== request) return
+      lastConfirmedDesign.current = actual
       setDesignState(actual)
-      setAppearanceError(err instanceof Error ? err.message : String(err))
+      setDesignError(appearanceErrorMessage(err))
+    } finally {
+      void refreshStoreProblems()
     }
   }
 
@@ -731,6 +795,7 @@ export default function App() {
   }
 
   function selectProject(index: number) {
+    clearAppearanceErrors()
     selectIndex(index, repos)
     setView('project')
     setProjectTab('board')
@@ -766,6 +831,19 @@ export default function App() {
           />
         )}
 
+        {appearanceError && view !== 'global-settings' && (
+          <div className="mb-3 flex items-center gap-2" role="alert">
+            <p className="text-xs text-danger">{appearanceError}</p>
+            <button
+              type="button"
+              className="btn btn-secondary text-xs"
+              onClick={clearAppearanceErrors}
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
+
         {view === 'global-settings' ? (
           <GlobalSettings
             theme={theme}
@@ -773,6 +851,7 @@ export default function App() {
             design={design}
             onDesignChange={setDesign}
             appearanceError={appearanceError}
+            onDismissAppearanceError={clearAppearanceErrors}
           />
         ) : !selected ? (
           <div>

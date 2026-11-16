@@ -341,7 +341,36 @@ describe('GlobalSettings design system selector', () => {
     )
 
     expect(screen.getByRole('alert')).toHaveTextContent('Cannot write config.json: EACCES')
+    expect(screen.queryByRole('button', { name: 'Dismiss' })).toBeNull()
     expect(screen.getByPlaceholderText('ghp_...')).toHaveValue('ghp_unsaved_token')
     expect(screen.getByDisplayValue('Claude Code')).toBeInTheDocument()
+  })
+
+  it('invokes onDismissAppearanceError when the Dismiss button is clicked and marks preset disclosure as button', async () => {
+    const stub = createElectronApiStub()
+    stub.listProviders.mockResolvedValue([{ id: 'claude', name: 'Claude', kind: 'cli', command: 'claude' }])
+    const onDismiss = vi.fn()
+    const user = userEvent.setup()
+
+    render(
+      <GlobalSettings
+        theme="system"
+        onThemeChange={() => {}}
+        design="classic"
+        appearanceError="Cannot write config.json: EACCES"
+        onDismissAppearanceError={onDismiss}
+      />,
+    )
+
+    const disclosure = await screen.findByRole('button', { name: /Model \/ Effort presets/ })
+    expect(disclosure).toHaveAttribute('type', 'button')
+    expect(disclosure).toHaveClass('btn-disclosure')
+
+    const dismiss = screen.getByRole('button', { name: 'Dismiss' })
+    expect(dismiss).toHaveAttribute('type', 'button')
+    expect(screen.getByRole('alert')).toContainElement(dismiss)
+
+    await user.click(dismiss)
+    expect(onDismiss).toHaveBeenCalledTimes(1)
   })
 })

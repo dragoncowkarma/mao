@@ -1,6 +1,6 @@
 # MAO UI 디자인 시스템 명세 및 후보군 비교 분석 (Issue #108)
 
-본 문서는 MAO 데스크톱 애플리케이션(`electron/` + `src/`)과 헤드리스 CLI(`cli/`)가 공유하는 **선택 가능한 디자인 시스템(Selectable Design System)**의 사전 조사, 동일 화면·동일 샘플 데이터 기반 후보군 비교 분석, 최종 구현 대상 선정 근거, 그리고 의미 기반(Semantic) CSS 토큰 계약을 정의합니다.
+본 문서는 MAO 데스크톱 애플리케이션(`electron/` + `src/`)과 헤드리스 CLI(`cli/`)가 공유하는 **선택 가능한 디자인 시스템(Selectable Design System)**의 사전 조사, 동일 화면·동일 샘플 데이터 기반 후보군 비교 분석 및 실제 캡처 스크린샷, 최종 구현 대상 선정 근거, 그리고 시맨틱 CSS 토큰 계약을 정의합니다.
 
 ---
 
@@ -11,165 +11,181 @@
 
 | 분류 | 기존 토큰 | Light 값 | Dark 값 | 조사에서 확인된 한계점 |
 | --- | --- | --- | --- | --- |
-| 배경/표면 | `--color-bg`, `--color-surface` | `#f3f2f2`, `#eae9e9` | `#1a1817`, `#262322` | 3단계 계층(`--color-bg-subtle`)이 정의되지 않아 일부 컴포넌트에서 미정의 변수를 참조함 |
-| 텍스트/구분선 | `--color-text`, `--color-divider` | `#201e1d`, `rgb(32 30 29 / 0.4)` | `#f3f2f2`, `rgb(243 242 242 / 0.16)` | 1px 보조 보더용 `--color-border`가 없고, `.text-muted`가 반투명(`rgb(var(--color-text-rgb) / 0.5)`)에 의존해 어두운 표면 위에서 WCAG AA 대비가 흔들릴 수 있음 |
-| 브랜드/강조 | `--color-accent`, `--color-accent-2` | `#ec3013`, `#e15b47` | `#ff6a4a`, `#ff8f78` | 브랜드 주조색과 주요 액션 버튼(`.btn-primary`), 선택 상태(`.sidebar-item.active`), 오류(error)·실행 중(running) 상태가 동일한 붉은 계열에 묶여 있음 |
-| 배지/태그 | `--color-accent-100` ~ `800`, `--color-neutral-100` / `800` | `#fff2ef` / `#7c1405` | `#3a1c14` / `#ffd3c4` | 오류(`tag-accent`), 일시정지(`tag-warn`), 완료(`tag-neutral`), 진행(`tag-outline`)의 의미 분리가 약함 |
-| 타이포그래피 | `--font-heading`, `--font-body` | `'Archivo', system-ui, sans-serif` | 동일 | 프롬프트 및 SHA/로그 표시를 위한 고정폭 폰트 토큰(`--font-mono`)이 분리되어 있지 않음 |
-| 형태/모서리 | `--radius-md` | `0px` | `0px` | 직각 모서리 원칙(`0px`)이 유지되고 있으나 일부 인라인 클래스(`rounded`)가 혼재함 |
+| 배경/표면 | `--color-bg`, `--color-surface` | `#f3f2f2`, `#eae9e9` | `#1a1817`, `#262322` | 3단계 표면 계층(`--color-bg-subtle`)이 정의되지 않아 중첩 영역(코드/프롬프트 블록, 프리셋 행)의 시각적 구분이 약함 |
+| 텍스트/구분선 | `--color-text`, `--color-divider` | `#201e1d`, `rgb(32 30 29 / 0.4)` | `#f3f2f2`, `rgb(243 242 242 / 0.16)` | 비-Classic 디자인용 1px 보조 보더 토큰(`--color-border`)과 불투명 보조 텍스트 토큰(`--color-text-muted`)이 분리되어 있지 않음 |
+| 브랜드/강조 | `--color-accent`, `--color-accent-2` | `#ec3013`, `#e15b47` | `#ff6a4a`, `#ff8f78` | 브랜드 액센트, 주요 액션(`.btn-primary`), 사이드바 선택 행(`.sidebar-item.active`), 오류/실행 중 상태가 동일 계열에 결합됨 |
+| 배지/태그 | `--color-accent-100`/`700`/`800`, `--color-neutral-100`/`800` | `#fff2ef` / `#ae1800` / `#7c1405`, `#f8f4f4` / `#444141` | `#3a1c14` / `#ffab94` / `#ffd3c4`, `#2c2928` / `#d8d4d4` | `Crimson Signal`처럼 붉은색을 주조로 쓸 때 브랜드 색과 오류(`.tag-danger`), 일시정지(`.tag-warn`), 완료(`.tag-success`)가 혼동될 수 있음 |
+| 타이포그래피 | `--font-heading`, `--font-body` | `'Archivo', system-ui, sans-serif` | 동일 | 프롬프트(`<pre>`) 및 코드 블록용 고정폭 토큰(`--font-mono`)이 별도로 분리되어 있지 않음 |
+| 형태/모서리 | `--radius-md` | `0px` | `0px` | 전 컴포넌트에서 직각 모서리(`0px`, `rounded-*` 미사용)를 유지하고 있으나 키보드 탐색용 통일 `:focus-visible` 아웃라인이 필요함 |
 
-### 1.2 주요 화면별 컴포넌트 조사 및 개선 지점
+> **오프라인 폰트 로딩 정책**: `src/index.css`는 `classic`, `crimson`, `editorial`에서 `'Archivo'`를 우선 참조(로컬 설치 시 사용)하고, `system-ui, -apple-system, sans-serif`(Classic은 `system-ui, sans-serif`)를 오프라인 폴백으로 사용합니다. `index.html`에는 외부 폰트 CDN `<link>` 요청을 일절 포함하지 않습니다.
+
+### 1.2 주요 화면별 컴포넌트 조사 및 Classic 보존 범위
 
 1. **`Sidebar` (`src/components/Sidebar.tsx`)**
-   - 프로젝트 목록, 저장소 추가 폼, 스토어 복구 경고 카드(`githubRepos`, `workflowTasks`, `persistenceBroken`), 전역 설정 진입 버튼을 포함합니다.
-   - **개선 지점**: 활성 프로젝트 행(`.sidebar-item.active`)에 전용 선택/액션 토큰(`--color-action-bg`, `--color-action-text`, `--color-action-border`)을 적용하여 `Crimson Signal`에서는 라이트·다크 모드 모두 붉은색(버건디) 사이드바 바탕 위에 노란색(웜 앰버) 선택 행이 선명히 부각되도록 개선합니다. 또한 스토어 복구/경고 배너가 브랜드 색상과 혼동되지 않도록 의미 기반 경고/오류 스타일과 비색상 기호(`⚠`, `✕`)를 함께 제공합니다.
+   - 프로젝트 목록, 저장소 추가 폼(`+ Add`), 스토어 복구/경고 카드(`githubRepos`, `workflowTasks`, `persistenceBroken`), 하단 `Global settings` 진입 버튼을 포함합니다.
+   - **비-Classic 개선**: 활성 행(`.sidebar-item.active`)에 전용 선택/액션 토큰(`--color-action-bg`, `--color-action-text`, `--color-action-border`, 좌측 `inset 3px 0 0 var(--color-action-indicator)` 스트라이프)을 적용해 `Crimson Signal`에서 라이트·다크 모두 버건디 바탕 위에 앰버 골드 선택 행과 크림슨 스트라이프가 뚜렷이 분리됩니다.
 2. **`KanbanBoard` (`src/components/KanbanBoard.tsx`)**
-   - `Open Issues`, `In Progress / PRs`, `Done / Merged` 3개 컬럼과 카드별 워크플로 배지(`workflowBadgeClass`), 실행 중 펄스(`.card-active`), 에이전트 할당 정보, 프롬프트 펼침 영역을 렌더링합니다.
-   - **개선 지점**: 붉은색 베이스 디자인(`Crimson Signal`)을 적용할 때 브랜드 붉은색/노란색과 작업 실패(`failed`)·일시정지(`paused`)·진행 중(`running`)·완료(`done`) 배지가 색채와 형태(아이콘 기호 + 보더 스타일) 양쪽에서 즉시 구별되도록 개선합니다.
+   - **`Issues`와 `Pull Requests` 2개 컬럼**, 상단 **`Refresh` 버튼**(`.btn-secondary`), 동기화 상태(`synced ...`), 인라인 오류 메시지(`.text-danger`), 연결 이슈/PR 태그, 워크플로 상태 배지(`PR running`, `Issue failed`, `Review paused`, `workflow done`), `.card-active` 펄스 링, 접이식 `Prompt` 영역, `AgentRunControls`(`Run` / `Retry` `.btn-primary`)를 렌더링합니다.
 3. **`WorkflowQueue` (`src/components/WorkflowQueue.tsx`)**
-   - 큐에 등록된 작업 카드, 단계별 상태 태그(`statusTagClass`), 에이전트 배지(`AgentBadge`), 실행 이력(`history`) 및 프롬프트 전문(`<pre>`)을 표시합니다.
-   - **개선 지점**: 프롬프트와 실행 로그 영역에 `--font-mono` 및 `--color-bg-subtle`을 적용해 장시간 모니터링 시 가독성을 높입니다.
-4. **`TaskDetailModal` (`src/components/TaskDetailModal.tsx`)**
-   - 이슈/PR 본문, 라벨, 코멘트 목록, 워크플로 큐 등록 컨트롤을 모달로 표시합니다.
-   - **개선 지점**: 모달 백드롭(`.modal-backdrop`)과 카드 경계선을 디자인 프리셋의 표면 토큰과 연동합니다.
-5. **`GlobalSettings` / `ProjectSettings` / `UpdateBanner`**
-   - `GlobalSettings.tsx`에서 정의되지 않은 `--color-border`, `--color-bg-subtle` 참조를 정식 시맨틱 토큰으로 연결하고, **Light / Dark / System 모드 선택**과 직교(orthogonal)하는 **Design System 프리셋 선택기(스와치 미리보기 포함)**를 제공합니다.
-   - 모든 대화형 컨트롤(`.btn`, `.input`, `.tab`, `.sidebar-item`, `.design-option`)에 `:focus-visible` 기반 `--color-focus` 포커스 링을 통일하고, `--radius-md: 0px` 직각 기하학 원칙과 오프라인 안전 시스템 폰트 스택을 유지합니다.
+   - 작업 제목 입력 + `Auto-advance` + `Start`(`.btn-primary`), `Clear completed`, 작업 카드, 실행 중 내부 박스(`.card-subtle`), 단계별 이력 및 `Show prompt/output` 펼침 영역(`<pre className="code-block">`), `Run next stage` / `Retry` 컨트롤을 표시합니다.
+4. **`TaskDetailModal` / `ProjectSettings` / `UpdateBanner`**
+   - 모달 백드롭(`--color-backdrop`), 카드 경계, 업데이트 배너(`.update-banner`)가 활성 디자인 프리셋의 표면·구분선 토큰을 따릅니다.
+5. **`GlobalSettings` (`src/components/GlobalSettings.tsx`)**
+   - `Appearance` 섹션의 **Design system** 프리셋 그리드(`Classic`, `Crimson Signal`, `Developer Console`)와 **Theme** 탭(`Light`, `Dark`, `System`), `role="alert"` 인라인 오류 알림(`Dismiss`), `GitHub token` 입력, `AI Providers` 편집기(`Model / Effort presets` 카운트 배지 `.badge-count`), 최종 제출 버튼 **`Save changes`**를 제공합니다.
+
+#### `Classic` (`data-design="classic"` / 미지정 기본값) 시각 보존 범위 및 2가지 명시적 추가 사항
+`Classic`은 기존 사용자의 화면 기대치와 시각적 회귀를 막기 위해 기존 프로젝트·보드·큐·설정 화면의 스타일을 **100% 그대로 보존**합니다.
+- **보존 항목**: 테두리 없는 `.card`, 기존 반투명 `.text-muted`(`0.55`)·`.field label`(`0.7`)·`.sidebar-heading`(`0.5`)·`.card-meta`(`0.5`)·`.agent-badge-meta`(`0.6`), 박스 스타일 없는 `.card-subtle`/`.code-block`, 비색상 기호(`✕`/`⚠`/`✓`) 없는 기존 상태 배지(`.tag-danger`: `--color-accent-100`/`--color-accent-800`, `.tag-warn`: `--color-accent-2` 외곽선, `.tag-success`: `--color-neutral-100`/`--color-neutral-800`), 기존 `.sidebar-item.active`(`--color-accent` 배경 / `--color-bg` 텍스트).
+- **Classic에 포함된 2가지 명시적 추가 사항**:
+  1. **`:focus-visible` 키보드 포커스 아웃라인**: `.btn`, `.btn-disclosure`, `.input`, `.tab`, `.sidebar-item`, `.link-button`, `.design-option`, `.card[role='button']`, `button.tag`, `input[type='checkbox']`, `input[type='radio']`, `summary`, `a`에 `2px solid var(--color-focus); outline-offset: 2px;`를 적용합니다(마우스 클릭이나 정지 상태에서는 전혀 나타나지 않으며 키보드 탐색 시에만 표시됨).
+  2. **`GlobalSettings` 내 Appearance Design system 프리셋 그리드**: `Classic` / `Crimson Signal` / `Developer Console` 선택 카드(`.design-grid`, `.design-option`, `.design-swatch-bar`, 활성 카드의 `.tag-success` `✓ Active` 배지)와 `.preset-row`·`.badge-count`의 직각(`--radius-md: 0px`) 스타일을 추가했습니다.
 
 ---
 
 ## 2. 후보군 비교 분석 (동일 화면·동일 샘플 데이터 기준)
 
-### 2.1 외부 오픈소스 디자인 시스템 레퍼런스 검토
-새 디자인 토큰 계층을 설계하기 위해 두 가지 오픈소스 디자인 시스템을 검토했습니다.
-
-- **Radix Themes (Token Scale & Semantic Aliasing)**
-  - 배경(`bg` / `surface` / `subtle`), 텍스트(`text` / `text-muted`), 경계선(`border` / `divider`), 브랜드 강조(`accent` / `highlight`), 주요 액션·선택(`action-bg` / `action-text` / `action-border`), 상태(`danger` / `warning` / `success`)를 역할별로 분리하는 2계층 시맨틱 토큰 구조를 참고했습니다.
-- **Carbon Design System (UI Shell, High-Density Console & Non-Color Status Indicators)**
-  - 좌측 고정 사이드바(`UI Shell`)와 우측 작업 영역의 경계 대비, 고밀도 개발자 콘솔 환경에서의 1px 구조선, 그리고 상태 배지에 색상뿐 아니라 형태·기호(`✕`, `⚠`, `●`, `✓`)를 결합하는 규칙을 참고했습니다.
-- **외부 런타임 라이브러리 미도입 근거**
-  - 외부 UI 컴포넌트 패키지를 추가하면 번들 크기 증가, 런타임 스타일 주입 오버헤드, 기존 직각 모서리(`--radius-md: 0px`) 규칙과의 충돌, 그리고 Testing Library 기반 렌더러 테스트(`src/**/*.test.tsx`)의 DOM 구조 변경이 발생합니다. 따라서 `package.json` 의존성 추가 없이 순수 CSS 커스텀 프로퍼티(`src/index.css`)와 `@layer components` 확장만으로 다중 디자인 시스템을 구현했습니다.
+### 2.1 외부 디자인 레퍼런스 참고 및 순수 CSS 구현 근거
+- **Radix Themes (계층적 시맨틱 토큰 구조)**: 3단계 표면(`bg` / `surface` / `bg-subtle`), 불투명 보조 텍스트(`text-muted`), 브랜드(`accent` / `highlight`), 액션/선택(`action-bg` / `action-text` / `action-border` / `action-indicator`), 상태(`danger` / `warn` / `success`)를 역할별로 분리하는 구조를 참고했습니다.
+- **Carbon Design System (UI Shell & 비색상 상태 식별자)**: 고정 좌측 사이드바(`UI Shell`)의 구조적 경계 대비, 고밀도 콘솔의 1px 구조선, 색상과 기호(`✕`, `⚠`, `✓`)·보더를 결합하는 상태 배지 규칙을 참고했습니다.
+- **외부 런타임 UI 라이브러리 미도입 근거**: 외부 패키지 추가 없이 `src/index.css`의 `@layer base` 토큰 매트릭스와 `@layer components` 확장만으로 구현해 번들 크기 증가, 런타임 CSS-in-JS 오버헤드, `--radius-md: 0px` 직각 원칙 충돌을 방지했습니다.
 
 ### 2.2 비교 기준 샘플 데이터 및 대상 화면
-모든 후보군은 아래의 **동일한 4개 핵심 화면**과 **동일한 샘플 데이터**를 기준으로 평가했습니다.
+모든 후보군과 캡처 스크린샷은 아래의 **동일한 화면**과 **동일한 샘플 데이터**를 기준으로 검증했습니다.
 
-- **대상 화면 (4종)**: `Sidebar`(프로젝트 탐색 및 상태 경고), `KanbanBoard`(3컬럼 이슈/PR 보드), `WorkflowQueue`(단계별 실행 큐 및 프롬프트 로그), `GlobalSettings`(테마·디자인·AI 프로바이더 설정)
+- **대상 화면**: `Sidebar`, `KanbanBoard`(2컬럼 `Issues` / `Pull Requests`), `WorkflowQueue`(단계별 큐 및 `Show prompt/output` 코드 블록), `GlobalSettings`(Appearance 선택기 + `Save changes`)
 - **공통 샘플 데이터**:
-  - 저장소: `acme/widgets` (활성 선택), `acme/cli-tools` (비활성)
-  - 작업 A (실행 중): `Issue #42 · Implement token refresh` — 상태 `PR running`, 담당 `Claude · claude-sonnet-4-6 · high effort`, `.card-active` 및 `.live-dot` 활성
-  - 작업 B (일시정지): `PR #43 · Fix race condition in poller` — 상태 `Review paused`, 담당 `Codex · gpt-5.4 · medium effort`
-  - 작업 C (오류): `Issue #44 · Migrate config schema` — 상태 `Issue failed`, 오류 메시지 노출
-  - 작업 D (완료): `PR #41 · Add capability preflight` — 상태 `workflow done`
+  - 저장소: `acme/widgets` (`autoTrigger: true`, 활성 선택), `acme/cli-tools` (`autoTrigger: false`)
+  - AI 프로바이더: `Claude Code` (`cli`, `claude`, `claude-sonnet-5`, `high`), `Codex CLI` (`cli`, `codex`, `gpt-5.6-sol`, `medium`)
+  - 작업 A (실행 중): `Issue #42 · Implement token guard` (`urgent: true`, `linked PR #43`) — 워크플로 `PR running`, 현재 `Claude Code · claude · claude-sonnet-5 · high effort`, 이전 단계 `Issue` (`Codex CLI`) 이력 보유
+  - 작업 B (일시정지): `PR #43 · Refactor store lock` (`linkedIssueNumbers: [42]`) — 워크플로 `Review paused`, `Issue`·`PR` 이력 보유, `.card-active` 활성(`stage === 'review'`)
+  - 작업 C (오류): `Issue #44 · Fix parser edge case` — 워크플로 `Issue failed`, 오류 메시지 `"Rate limit exceeded on POST /repos/acme/widgets/issues"`
+  - 작업 D (완료): `PR #41 · Add dark mode toggle` (`linkedIssueNumbers: [40]` -> `Issue #40 · closed`) — 워크플로 `workflow done`
 
-### 2.3 5개 디자인 후보군 종합 비교표
+### 2.3 5개 디자인 후보군 종합 비교표 (`src/index.css` 실측 대비율)
 
 | 평가 항목 | 1. Classic (`classic`) | 2. Crimson Signal (`crimson`) | 3. Minimal Workspace (`minimal`) | 4. Developer Console (`console`) | 5. Editorial / Industrial (`editorial`) |
 | --- | --- | --- | --- | --- | --- |
-| **핵심 컨셉** | 기존 MAO 기본 웜 스톤 & 버밀리온 | **붉은색(버건디/크림슨) 베이스 + 노란색(앰버/골드) 액션·포인트** | 무채색 종이·잉크 질감의 미니멀 워크스페이스 | 차콜·슬레이트 기반 고밀도 기술 콘솔 | 굵은 그리드 루프와 대형 타이포그래피 중심 브루탈리즘 |
-| **Light 스와치** (`bg` / `surface` / `text` / `accent` / `highlight`) | `#f3f2f2` / `#eae9e9` / `#201e1d` / `#ec3013` / `#e15b47` | `#f6eeee` / `#ede0e0` / `#261214` / `#9e1b24` / `#f5b82e` | `#fafafa` / `#f1f1f1` / `#171717` / `#262626` / `#525252` | `#eef1f5` / `#e2e7ee` / `#111822` / `#0b6bcb` / `#0891b2` | `#f4f1ea` / `#e9e4d8` / `#141413` / `#141413` / `#b84a1b` |
+| **핵심 컨셉** | 기존 MAO 웜 스톤 & 버밀리온 | **붉은색(버건디/크림슨) 베이스 + 노란색(앰버 골드) 액션·포인트** | 무채색 종이·잉크 질감의 미니멀 워크스페이스 | 슬레이트·차콜 기반 고밀도 기술 콘솔 | 3px 굵은 구조선과 고대비 브루탈리즘 그리드 |
+| **Light 스와치** (`bg` / `surface` / `text` / `accent` / `highlight`) | `#f3f2f2` / `#eae9e9` / `#201e1d` / `#ec3013` / `#e15b47` | `#f6eeee` / `#ede0e0` / `#261214` / `#9e1b24` / `#f5b82e` | `#fafafa` / `#f1f1f1` / `#171717` / `#262626` / `#525252` | `#eef1f5` / `#e2e7ee` / `#111822` / `#064b91` / `#065f73` | `#f4f1ea` / `#e9e4d8` / `#141413` / `#141413` / `#b84a1b` |
 | **Dark 스와치** (`bg` / `surface` / `text` / `accent` / `highlight`) | `#1a1817` / `#262322` / `#f3f2f2` / `#ff6a4a` / `#ff8f78` | `#180c0e` / `#251317` / `#f7ecec` / `#f5b82e` / `#c92a3a` | `#121212` / `#1c1c1c` / `#f5f5f5` / `#e5e5e5` / `#a3a3a3` | `#0f1318` / `#171d24` / `#e6edf3` / `#38bdf8` / `#f59e0b` | `#141413` / `#1f1e1c` / `#f4f1ea` / `#f4f1ea` / `#e06d3b` |
-| **타이포그래피 & 정보 밀도** | Archivo 헤딩(800) + 15px 본문, 표준 밀도 | 디스플레이 헤딩 + 따뜻한 본문, 표준 밀도, 앰버 포커스 링 | 산세리프 단일 계층, 넓은 여백, 낮은 밀도 | 고정폭 메타데이터 강조, 14px 컴팩트 본문, 높은 정보 밀도 | 초대형 섹션 타이틀, 두꺼운 2~3px 구획선, 낮은 카드 밀도 |
-| **WCAG 대비율 (본문 텍스트 vs `bg` / `surface`)** | Light `14.8:1` (`13.6:1`) / Dark `14.8:1` (`12.8:1`) — AAA 통과 | Light `14.2:1` (`12.3:1`) / Dark `15.1:1` (`13.0:1`) — AAA 통과 | Light `16.9:1` (`15.6:1`) / Dark `16.1:1` (`14.3:1`) — AAA 통과 | Light `15.4:1` (`13.9:1`) / Dark `14.6:1` (`12.8:1`) — AAA 통과 | Light `15.2:1` (`13.7:1`) / Dark `15.2:1` (`13.5:1`) — AAA 통과 |
-| **장점** | 기존 사용자에게 친숙하며 회귀 위험이 없음 | 라이트·다크 모두 버건디/크림슨 베이스 위에 웜 앰버/골드 액션·선택 포인트가 선명히 대비됨 | 시각적 노이즈가 가장 적음 | 다중 에이전트 큐·프롬프트·SHA 비교에 가장 높은 가독성 제공 | 첫인상이 강렬하고 에디토리얼 개성이 뚜렷함 |
-| **단점** | 장시간 로그 분석 시 붉은 포인트가 강할 수 있음 | 채도 조절이 정교하지 않으면 오류 배지와 혼동될 수 있음 (전용 상태 토큰 및 기호로 해결) | 무채색 강조만으로는 칸반 보드의 `running`/`paused` 상태를 즉시 찾기 어려움 | 따뜻한 톤을 선호하는 사용자에게는 차갑게 느껴질 수 있음 (`Classic`/`Crimson`으로 보완) | 두꺼운 보더와 큰 제목이 칸반 3컬럼 및 모달 내부 공간 효율을 떨어뜨림 |
-| **컴포넌트 재사용성 / 구현 비용** | 100% 재사용 / 추가 비용 없음 | 100% 재사용 / 시맨틱 토큰 분리로 구현 가능 | 100% 재사용 / 낮음 | 100% 재사용 / 폰트·밀도·보더 토큰화로 구현 가능 | 레이아웃 여백 재조정이 필요해 비용이 상대적으로 높음 |
+| **타이포그래피 & 밀도** | Archivo 헤딩(800) + `15px` 본문, `260px` 사이드바 | Archivo 헤딩(800) + `15px` 본문, `260px` 사이드바 | 시스템 산세리프 + `15px` 본문, `1px` 보더 | 고정폭(`monospace`) 헤딩 + `13px` 본문(`line-height: 1.4`), `228px` 사이드바, 고밀도 간격 | Archivo 헤딩 + `15px` 본문, `3px` 구조 구분선 |
+| **본문 대비율 (`--color-text` vs `bg` / `surface`)** | Light `14.86:1` / `13.70:1`<br>Dark `15.83:1` / `13.96:1` (AAA) | Light `15.59:1` / `13.86:1`<br>Dark `16.55:1` / `15.34:1` (AAA) | Light `17.18:1` / `15.87:1`<br>Dark `17.18:1` / `15.63:1` (AAA) | Light `15.74:1` / `14.35:1`<br>Dark `15.77:1` / `14.36:1` (AAA) | Light `16.34:1` / `14.53:1`<br>Dark `16.34:1` / `14.77:1` (AAA) |
+| **액션 버튼 대비율 (`--color-action-text` vs `action-bg`)** | Light `3.76:1` (기존값 보존)<br>Dark `6.25:1` | Light **`9.99:1`** (AAA)<br>Dark **`10.73:1`** (AAA) | Light `14.50:1`<br>Dark `14.87:1` | Light **`8.28:1`** (AAA)<br>Dark **`8.86:1`** (AAA) | Light `16.34:1`<br>Dark `16.34:1` |
+| **장점** | 기존 사용자에게 친숙하고 회귀 없음 | 라이트·다크 모두 버건디/옥스블러드 바탕 위에 노란색(`#f5b82e`) 액션·선택 행과 크림슨 스트라이프가 선명히 대비됨 | 시각적 노이즈가 가장 적음 | 컴팩트한 카드/간격과 고정폭 헤딩으로 한 화면에 더 많은 큐 작업·프롬프트 수용 | 3px 굵은 구획선으로 레이아웃 골격이 명확함 |
+| **단점** | Light 기본 버튼 대비(`3.76:1`)가 낮고 장시간 큐 분석 시 웜 톤 위주 | 전용 상태 토큰·기호 없이 붉은색을 쓰면 오류 배지와 혼동 위험(전용 토큰 및 기호로 해결) | 무채색 강조만으로는 보드의 진행 중/일시정지 시선 유도가 약함 | 차가운 슬레이트 톤이 호불호가 있을 수 있음(`Classic`/`Crimson`과 선택적 제공) | 3px 외곽선과 두꺼운 그림자가 밀집 큐 화면에서 무거울 수 있음 |
 | **최종 구분** | **선택 가능 프리셋 (`classic`, 기본값)** | **선택 가능 프리셋 (`crimson`)** | **탐색 전용 후보 (`minimal`)** | **선택 가능 프리셋 (`console`)** | **탐색 전용 후보 (`editorial`)** |
 
-### 2.4 동일 샘플 데이터 기준 4개 핵심 화면별 표현 및 접근성 검증
+---
 
-| 대상 화면 (샘플 데이터) | 1. Classic (`classic`) | 2. Crimson Signal (`crimson`) | 3. Minimal Workspace (`minimal` — 탐색 전용) | 4. Developer Console (`console`) | 5. Editorial / Industrial (`editorial` — 탐색 전용) |
-| --- | --- | --- | --- | --- | --- |
-| **`Sidebar`** (`acme/widgets` 선택, `acme/cli-tools` 비활성, 스토어 경고 카드) | 웜 스톤 패널(`#eae9e9` / `#262322`) + 2px 구분선, 선택 행 `acme/widgets`는 버밀리온 배경으로 강조 | 로즈-옥사이드(Light `#ede0e0`) / 딥 버건디(Dark `#251317`) 패널 + 크림슨 구분선, 선택 행 `acme/widgets`는 **라이트·다크 모두 웜 앰버 골드(`#f5b82e`) 배경 + 다크 버건디 텍스트(`#261214` / `#180c0e`)**로 강조 | 연회색 패널 + 흑백 반전 선택 행; 스토어 경고와 일반 카드의 경계 구분이 약함 | 슬레이트 패널(`#e2e7ee` / `#171d24`) + 1px 정밀 보더, 선택 행은 코발트/시안(`#0b6bcb` / `#38bdf8`)으로 표시 | 크림색/흑색 패널 + 3px 외곽선, 좁은 260px 폭 안에서 텍스트 여백이 부족함 |
-| **`KanbanBoard`** (`Issue #42 PR running`, `PR #43 Review paused`, `Issue #44 Issue failed`, `PR #41 workflow done`) | `.card-active`가 버밀리온 펄스 링으로 표시되고 상태 배지 4종이 분리됨 | 크림슨/버건디 카드 표면 위에서 실행 중 `Issue #42`가 **앰버 골드(`#f5b82e`) 펄스 링**으로 부각되고, `Issue failed`(`✕` + 루비/로즈 보더), `Review paused`(`⚠` + 브론즈/앰버 보더), `workflow done`(`✓` + 에메랄드 보더)이 명확히 구별됨 | 무채색 테두리 위주라 3개 컬럼에 카드가 많을 때 `Issue #42` 실행 중 카드를 한눈에 찾기 어려움 | 컴팩트한 카드 패딩과 고정폭 메타 라인(`Claude · claude-sonnet-4-6`) 덕분에 한 화면에 더 많은 이슈/PR 카드가 노출됨 | 굵은 카드 제목이 2~3줄로 줄바꿈되어 컬럼당 표시 가능한 카드 수가 감소함 |
-| **`WorkflowQueue`** (큐 목록 + `<pre>` 프롬프트 펼침 + Retry/Run 액션 버튼) | 표준 카드 간격, 버밀리온 `Run`/`Retry` 버튼 | **웜 앰버 골드(`#f5b82e`) `Run`/`Retry` 주요 액션 버튼**과 크림슨 테두리가 조화를 이루며, 프롬프트 영역은 `--color-bg-subtle`(`#e5d4d5` / `#1e0f12`)로 깊이감 부여 | 깔끔하나 `Retry` 버튼과 보조 버튼의 중요도 차이가 작음 | `--font-mono` 고정폭 메타·프롬프트 블록과 슬레이트 배경(`#d6dde7` / `#12171d`)이 결합되어 긴 프롬프트·이력 검토에 최적 | 두꺼운 구분선이 이력 행마다 반복되어 스크롤 길이가 길어짐 |
-| **`GlobalSettings`** (`Theme`: Light/Dark/System, `Design`: 프리셋 카드 + 5색 스와치, AI 프로바이더 편집) | 기본 선택 카드로 표시되며 웜 스톤/버밀리온 스와치 제공 | `Red · Yellow` 배지와 함께 크림슨 베이스 + 앰버 골드 포인트 스와치를 표시, `Save settings` 버튼이 골드 포인트로 강조됨 | 후보 비교 문서에만 수록 (런타임 선택기 미노출) | `High density` 배지와 슬레이트·시안·앰버 스와치를 표시, 프로바이더 입력 폼이 1px 보더로 정돈됨 | 후보 비교 문서에만 수록 (런타임 선택기 미노출) |
+## 3. 실제 렌더링 비교 스크린샷 갤러리 (`docs/screenshots/issue-108/`)
+
+모든 스크린샷은 프로덕션 Vite 번들(`dist/`)을 로컬 루프백 HTTP 서버로 제공하고, 위 공통 샘플 데이터를 반환하는 결정적 `window.electronAPI` 스텁을 주입한 뒤 헤드리스 Chromium(`1280×860`, `deviceScaleFactor: 2`; 긴 큐·설정 화면은 전체 스크롤 높이 캡처)으로 실제 React 앱(`src/App.tsx`)을 구동해 캡처했습니다.
+
+### 3.1 Board (2컬럼: `Issues` / `Pull Requests`) 5개 방향 비교
+
+| Classic — Light (기본값) | Classic — Dark |
+| --- | --- |
+| ![Classic Light Board](screenshots/issue-108/board-classic-light.png) | ![Classic Dark Board](screenshots/issue-108/board-classic-dark.png) |
+
+| Crimson Signal — Light | Crimson Signal — Dark |
+| --- | --- |
+| ![Crimson Signal Light Board](screenshots/issue-108/board-crimson-light.png) | ![Crimson Signal Dark Board](screenshots/issue-108/board-crimson-dark.png) |
+
+| Developer Console — Light | Developer Console — Dark |
+| --- | --- |
+| ![Developer Console Light Board](screenshots/issue-108/board-console-light.png) | ![Developer Console Dark Board](screenshots/issue-108/board-console-dark.png) |
+
+| Minimal Workspace — Light (탐색 전용 후보) | Editorial / Industrial — Light (탐색 전용 후보) |
+| --- | --- |
+| ![Minimal Workspace Light Board](screenshots/issue-108/board-minimal-light.png) | ![Editorial Industrial Light Board](screenshots/issue-108/board-editorial-light.png) |
+
+> **탐색 전용 후보 프리뷰 방법**: `minimal`과 `editorial`은 `core/design-system.ts`의 `EXPLORED_DESIGN_CANDIDATES`로 분리되어 런타임 선택기(`DESIGN_IDS`)에는 노출되지 않지만, `src/index.css`에 1:1 시맨틱 토큰 블록과 대비율 검증 테스트(`core/design-system.test.ts`)가 유지되므로 `<html data-design="minimal">` 또는 `<html data-design="editorial">` 속성으로 직접 검증·프리뷰할 수 있습니다.
+
+### 3.2 Workflow Queue (시맨틱 상태, 코드 블록, 고밀도 비교)
+
+| Crimson Signal — Dark (`Show prompt/output` 확장, `.card-subtle`·`.code-block`·`.card-active`·`✕`/`⚠`/`✓`) | Developer Console — Dark (동일 `1280×860` 뷰포트 고밀도 배치) |
+| --- | --- |
+| ![Crimson Signal Dark Queue](screenshots/issue-108/queue-crimson-dark.png) | ![Developer Console Dark Queue](screenshots/issue-108/queue-console-dark.png) |
+
+- **`queue-crimson-dark.png`**: 실행 중 카드(`#42`)의 `.card-subtle` 내부 블록과 확장된 `PROMPT`/`OUTPUT` `.code-block`, 리뷰 일시정지 카드(`#43`)의 `.card-active` 링 및 `⚠ Review · paused`, 실패 카드(`#44`)의 `✕ Issue · error` 및 오류 텍스트(`#ff7a88`), 완료 카드(`#41`)의 `✓ Done` 배지, 그리고 노란색(`#f5b82e`) 주요 액션 버튼(`Start`, `Run next stage`, `Retry`) 및 사이드바 선택 행 + `#c92a3a` 크림슨 보더/스트라이프가 한 화면에서 명확히 구별됩니다.
+- **`queue-console-dark.png`**: 동일한 `1280×860` 뷰포트 한 화면 안에서 4개 작업 카드(`#42`, `#43`, `#44`, `#41`)가 모두 동시에 가시 영역에 진입해(카드 `#41`의 `Review` 이력 행까지 노출되고 최하단 `Merge` 행만 `860px` 경계에 걸림) `Classic`/`Crimson` 대비 실질적으로 향상된 수직 정보 밀도를 확인할 수 있습니다.
+
+### 3.3 Global Settings (Appearance 선택기 및 `:focus-visible` 키보드 탐색)
+
+| Classic — Light (`Design system` 3열 프리셋 카드, 래핑 없는 배지, `Save changes`) | Crimson Signal — Dark (활성 선택 카드, 다크 스와치, `Save changes`) |
+| --- | --- |
+| ![Classic Light Settings](screenshots/issue-108/settings-design-selector-light.png) | ![Crimson Dark Settings](screenshots/issue-108/settings-design-selector-dark.png) |
+
+| Crimson Signal — Light (`Tab` 키보드 이동 시 `:focus-visible` `2px solid #6e4700` 아웃라인 렌더링) |
+| --- |
+| ![Keyboard focus-visible outline](screenshots/issue-108/keyboard-focus-visible.png) |
 
 ---
 
-## 3. 구현 대상 선정 근거 및 구분
+## 4. 구현 대상 선정 근거 및 시맨틱 토큰 계약
 
-코드(`core/design-system.ts`)와 설정 UI에서 **실제 선택 가능한 디자인 프리셋(`DESIGN_PRESETS`)**과 **탐색 전용 후보(`EXPLORED_DESIGN_CANDIDATES`)**를 명확히 분리합니다.
+### 4.1 선택 가능한 프리셋 (`DESIGN_IDS = ['classic', 'crimson', 'console']`)
+1. **`Classic` (`classic` — 기본값)**: 기존 MAO의 웜 스톤·버밀리온 시각 언어를 100% 보존합니다. `config.json`에 `design`이 없거나 잘못된 값이 들어와도 `normalizeDesignId()`가 `'classic'`으로 안전하게 폴백합니다.
+2. **`Crimson Signal` (`crimson` — 레드·옐로 디자인)**:
+   - **Light 모드**: 로즈-옥사이드 캔버스(`#f6eeee` / `#ede0e0` / `#e5d4d5`)와 딥 크림슨 브랜드/테두리(`#9e1b24`, `#8c5c61`)를 베이스로 두고, 주요 액션(`.btn-primary`)·활성 사이드바(`.sidebar-item.active`)·하이라이트에 웜 앰버 골드(`#f5b82e`, 전경 `#261214` 대비 **`9.99:1` AAA**)와 크림슨 인디케이터(`#9e1b24`, **`4.47:1`**)를 배치하며, 키보드 포커스 링은 고대비 딥 앰버(`#6e4700` — `bg` `7.17:1`, `surface` `6.37:1`, `bg-subtle` `5.74:1`)를 사용합니다.
+   - **Dark 모드**: 딥 옥스블러드/버건디 바탕(`#180c0e` / `#251317` / `#1e0f12`)과 크림슨 구조선(`.sidebar` 우측 보더 및 `--color-highlight` `#c92a3a` — `bg` `3.53:1`, `surface` `3.27:1`) 위에 웜 앰버 골드(`#f5b82e`, 전경 `#180c0e` 대비 **`10.73:1` AAA**) 액션/선택 행과 `#c92a3a` 인디케이터(`3.04:1`), `#ffd24c` 포커스 링(`13.28:1`)을 조합합니다.
+3. **`Developer Console` (`console` — 추가 선정 고밀도 디자인)**:
+   - **Light 모드**: 쿨 슬레이트 바탕(`#eef1f5` / `#e2e7ee` / `#d6dde7`), 코발트 액센트/포커스/액션(`#064b91` — `bg` `7.65:1`, `surface` `6.97:1`, `bg-subtle` `6.34:1`; 전경 `#f8fafc` 대비 **`8.28:1` AAA**), 틸 하이라이트(`#065f73` — `bg` `6.41:1`), 스카이 인디케이터(`#38bdf8` — `4.05:1`), 1px 보더(`#6b7b8f` — `3.82:1` / `3.48:1`).
+   - **Dark 모드**: 차콜-슬레이트 바탕(`#0f1318` / `#171d24` / `#12171d`), 스카이 액센트/포커스/액션(`#38bdf8` — `bg` `8.70:1`, `surface` `7.92:1`; 전경 `#09111a` 대비 **`8.86:1` AAA**), 앰버 하이라이트(`#f59e0b` — `bg` `8.68:1`), 코발트 인디케이터(`#064b91` — `4.05:1`), 보더(`#5a6b82` — `3.43:1` / `3.12:1`).
+   - **고밀도 레이아웃 조정**: 본문 `13px`(`line-height: 1.4`), 제목 `h2: 24px` / `h3: 19px` / `h4: 16px`, 사이드바 `228px`, 컴팩트 스페이싱(`--space-1/2/3/4/6/8`: `3px`/`6px`/`8px`/`12px`/`16px`/`22px`), `.card` 패딩 `8px 10px`(`gap: 5px`), `.btn` `12px`, `.input:not(.input-sm)` 최소 높이 `30px`, `.tag` `10px`.
 
-### 3.1 실제 선택 가능한 디자인 프리셋 (`DESIGN_IDS = ['classic', 'crimson', 'console']`)
-1. **`Classic` (`classic` — 기본값)**
-   - 기존 사용자의 시각적 경험과 테스트 기대치를 100% 보존하기 위해 기본값(`DEFAULT_DESIGN_ID = 'classic'`)으로 유지합니다. 저장소에 `design` 필드가 없거나 알 수 없는 값이 들어온 경우에도 항상 `classic`으로 안전하게 폴백합니다.
-2. **`Crimson Signal` (`crimson` — 레드·옐로 디자인)**
-   - 이슈 #108의 핵심 요구사항인 **붉은색 계열을 주조색(베이스 표면·구조 경계선·브랜드 액센트)으로, 노란색을 주요 액션·선택 상태·핵심 강조 포인트로 사용하는 디자인**입니다.
-   - 고채도 순수 적색(`#ff0000`)이나 순수 황색(`#ffff00`)을 넓은 면적에 그대로 쓰면 눈의 피로와 텍스트 대비 저하가 발생하므로, **Light 모드**에서는 따뜻한 로즈-옥사이드 배경(`#f6eeee` / `#ede0e0`)과 딥 크림슨 브랜드 액센트(`#9e1b24`)를 주조로 삼고, **Dark 모드**에서는 딥 버건디-옥사이드 배경(`#180c0e` / `#251317`)과 크림슨 구조선(`#c92a3a`)을 주조로 삼습니다. 그리고 **Light·Dark 양쪽 모두에서 주요 액션 버튼(`.btn-primary`), 활성 내비게이션(`.sidebar-item.active`), 포커스 링(`--color-focus`), 실행 중 카드 하이라이트에 웜 앰버 골드(`#f5b82e` / `#ffd24c`)**를 일관되게 사용하여 레드 베이스 + 옐로 포인트의 정체성과 `8.9:1` 이상의 높은 텍스트 대비율을 동시에 달성했습니다.
-3. **`Developer Console` (`console` — 추가 선정 디자인)**
-   - 후보군 비교 결과, MAO의 주 사용 시나리오인 **다중 저장소 칸반 트리아지, 워크플로 큐 모니터링, AI 에이전트 프롬프트/로그 검증**에서 가장 높은 실용성과 대비 효용을 보여준 후보입니다.
-   - 따뜻한 스톤 톤(`Classic`) 및 강렬한 레드·옐로(`Crimson Signal`)와 시각적 축이 확실히 구분되는 쿨 슬레이트·차콜 기반 고밀도 기술 워크스페이스를 제공하여, 사용자의 작업 성향과 조명 환경에 따른 실질적인 선택권을 보장합니다.
+### 4.2 시맨틱 CSS 토큰 매트릭스 (`src/index.css`)
 
-### 3.2 탐색 전용 후보 (`EXPLORED_DESIGN_CANDIDATES = ['minimal', 'editorial']`)
-- **`Minimal Workspace` (`minimal`)**: 무채색 중심의 절제된 인상은 우수하나, 여러 단계(`issue`, `pr`, `review`, `merge`)와 상태(`running`, `paused`, `error`, `done`)가 동시에 움직이는 칸반 보드에서 시선 유도력이 부족하여 런타임 프리셋에서는 제외하고 탐색 후보로 기록합니다.
-- **`Editorial / Industrial` (`editorial`)**: `Classic`이 이미 강한 직각 모서리(`0px`)와 굵은 헤딩의 장점을 포함하고 있어, 과도한 보더 두께로 정보 밀도를 낮추는 별도 프리셋을 추가하는 대신 `Classic`과 `Developer Console`의 명확한 대비를 유지하는 편이 유지보수성과 사용성 면에서 유리합니다.
+| 시맨틱 토큰 | `classic` (Light / Dark) | `crimson` (Light / Dark) | `console` (Light / Dark) |
+| --- | --- | --- | --- |
+| `--color-bg` | `#f3f2f2` / `#1a1817` | `#f6eeee` / `#180c0e` | `#eef1f5` / `#0f1318` |
+| `--color-surface` | `#eae9e9` / `#262322` | `#ede0e0` / `#251317` | `#e2e7ee` / `#171d24` |
+| `--color-bg-subtle` | `#e2e0df` / `#1f1c1b` | `#e5d4d5` / `#1e0f12` | `#d6dde7` / `#12171d` |
+| `--color-text` | `#201e1d` / `#f3f2f2` | `#261214` / `#f7ecec` | `#111822` / `#e6edf3` |
+| `--color-text-muted` | `#5c5755` / `#b8b2b0` | `#664246` / `#c9aeb0` | `#475569` / `#94a3b8` |
+| `--color-border` | `#cfcaca` / `#3d3836` | `#8c5c61` / `#98545f` | `#6b7b8f` / `#5a6b82` |
+| `--color-divider` | `rgb(32 30 29 / 0.4)` / `rgb(243 242 242 / 0.16)` | `rgb(38 18 20 / 0.36)` / `rgb(247 236 236 / 0.2)` | `rgb(17 24 34 / 0.28)` / `rgb(230 237 243 / 0.16)` |
+| `--border-structural-width` | `2px` / `2px` | `2px` / `2px` | `1px` / `1px` |
+| `--color-accent` | `#ec3013` / `#ff6a4a` | `#9e1b24` / `#f5b82e` | `#064b91` / `#38bdf8` |
+| `--color-highlight` | `#e15b47` / `#ff8f78` | `#f5b82e` / `#c92a3a` | `#065f73` / `#f59e0b` |
+| `--color-action-bg` | `#ec3013` / `#ff6a4a` | `#f5b82e` / `#f5b82e` | `#064b91` / `#38bdf8` |
+| `--color-action-hover` | `#dd2b0f` / `#ff8465` | `#e5a519` / `#e5a519` | `#043970` / `#7dd3fc` |
+| `--color-action-text` | `#f3f2f2` / `#1a1817` | `#261214` / `#180c0e` | `#f8fafc` / `#09111a` |
+| `--color-action-border` | `transparent` / `transparent` | `#9e1b24` / `#ffd24c` | `transparent` / `transparent` |
+| `--color-active-border` | `#ec3013` / `#ff6a4a` | `#9e1b24` / `#c92a3a` | `#064b91` / `#f59e0b` |
+| `--color-action-indicator` | `#f3f2f2` / `#1a1817` | `#9e1b24` / `#c92a3a` | `#38bdf8` / `#064b91` |
+| `--color-focus` | `#ec3013` / `#ff8465` | `#6e4700` / `#ffd24c` | `#064b91` / `#38bdf8` |
+| `--color-accent-100` / `800` | `#fff2ef`·`#7c1405` / `#3a1c14`·`#ffd3c4` | `#fbe4e6`·`#5c0b12` / `#421218`·`#ffd6da` | `#dff0ff`·`#022042` / `#0c2d48`·`#e0f2fe` |
+| `--color-danger-bg` / `text` / `border` | `#fff2ef`·`#ae1800`·`#ec3013` / `#3a1c14`·`#ffab94`·`#ff6a4a` | `#fde8e8`·`#8c0b15`·`#b91c1c` / `#451219`·`#ff7a88`·`#fb7185` | `#fee2e2`·`#991b1b`·`#dc2626` / `#3b1219`·`#fca5a5`·`#ef4444` |
+| `--color-warn-bg` / `text` / `border` | `transparent`·`#e15b47`·`#e15b47` / `transparent`·`#ff8f78`·`#ff8f78` | `#fff3c4`·`#6e3a00`·`#b45309` / `#3b2607`·`#fde68a`·`#fbbf24` | `#fef3c7`·`#92400e`·`#d97706` / `#382408`·`#fcd34d`·`#f59e0b` |
+| `--color-success-bg` / `text` / `border` | `#f8f4f4`·`#444141`·`transparent` / `#2c2928`·`#d8d4d4`·`transparent` | `#dcfce7`·`#14532d`·`#15803d` / `#0d2e1b`·`#86efac`·`#34d399` | `#dcfce7`·`#166534`·`#16a34a` / `#0c2d1c`·`#86efac`·`#22c55e` |
+| `--color-badge-active-bg` / `text` / `border` | `#dcfce7`·`#14532d`·`#16a34a` / `#0f2e1c`·`#86efac`·`#22c55e` | 동일 (`--color-success-*`) | 동일 (`--color-success-*`) |
+| `--font-heading` | `'Archivo', system-ui, sans-serif` | `'Archivo', system-ui, -apple-system, sans-serif` | `'SFMono-Regular', 'JetBrains Mono', 'Menlo', 'Consolas', monospace` |
+| `--font-body` | `'Archivo', system-ui, sans-serif` | `'Archivo', system-ui, -apple-system, sans-serif` | `system-ui, -apple-system, 'Segoe UI', sans-serif` |
+| `--font-mono` | `'SFMono-Regular', 'JetBrains Mono', 'Menlo', 'Consolas', monospace` | 동일 | 동일 |
 
----
+> **참고 (`classic` 오류 대비)**: Classic Light에서 `.btn-primary`의 `#f3f2f2` on `#ec3013` 대비율은 `3.76:1`로 기존 시각 호환을 위해 원형 유지되었으며, `.text-danger`(`#ae1800`)는 `bg` 위 `6.41:1` / `danger-bg` 위 `6.55:1`, `.tag-danger`(`#7c1405` on `#fff2ef`)는 `9.80:1`을 만족합니다. 반면 `crimson` Light의 `#8c0b15` on `#fde8e8`(`8.23:1`), `crimson` Dark의 `#ff7a88` on `#451219`(`6.20:1`, 본문 `#f7ecec`과의 RGB 거리 및 명도 차로 백색 텍스트와도 명확히 구분됨), `warn`(`8.32:1` / `11.50:1`), `success`(`8.30:1` / `10.50:1`)는 모두 WCAG AA 이상을 충족합니다.
 
-## 4. 의미 기반 토큰 체계 및 상태 식별 규칙
-
-### 4.1 디자인 선택(`data-design`)과 테마 모드(`data-theme`)의 직교 구조
-- `<html>` 루트 엘리먼트는 두 개의 독립 속성을 가집니다:
-  - `data-theme="light" | "dark"`: 명암 모드 (`ThemePreference`: `'light' | 'dark' | 'system'`에서 해석됨)
-  - `data-design="classic" | "crimson" | "console"`: 디자인 시스템 프리셋 (`DesignId`)
-- 모든 디자인 프리셋은 Light 모드와 Dark 모드 토큰 세트를 1:1로 완비하므로, 총 `3 (디자인) × 2 (명암) = 6`가지 조합이 누락 없이 동작합니다.
-
-### 4.2 시맨틱 CSS 토큰 계약 (`src/index.css`)
-
-| 시맨틱 토큰 | 역할 | `classic` (Light / Dark) | `crimson` (Light / Dark) | `console` (Light / Dark) |
-| --- | --- | --- | --- | --- |
-| `--color-bg` | 앱 전체 기본 캔버스 배경 | `#f3f2f2` / `#1a1817` | `#f6eeee` / `#180c0e` | `#eef1f5` / `#0f1318` |
-| `--color-surface` | 카드, 사이드바, 입력창 표면 | `#eae9e9` / `#262322` | `#ede0e0` / `#251317` | `#e2e7ee` / `#171d24` |
-| `--color-bg-subtle` | 중첩 카드, 비활성 행, 코드/프롬프트 블록 배경 | `#e2e0df` / `#1f1c1b` | `#e5d4d5` / `#1e0f12` | `#d6dde7` / `#12171d` |
-| `--color-text` | 기본 본문 및 제목 전경색 (AAA `>= 12:1`) | `#201e1d` / `#f3f2f2` | `#261214` / `#f7ecec` | `#111822` / `#e6edf3` |
-| `--color-text-muted` | 보조 설명, 메타데이터, 캡션 전경색 (AA `>= 4.8:1`) | `#5c5755` / `#b8b2b0` | `#664246` / `#c9aeb0` | `#475569` / `#94a3b8` |
-| `--color-border` | 카드·입력창·중첩 컨테이너 1px 경계선 | `#cfcaca` / `#3d3836` | `#cfb3b5` / `#4a232a` | `#c1cbd7` / `#2a3441` |
-| `--color-divider` | 사이드바/탭/수평선 구조 구분선 | `rgb(32 30 29 / 0.4)` / `rgb(243 242 242 / 0.16)` | `rgb(38 18 20 / 0.36)` / `rgb(247 236 236 / 0.2)` | `rgb(17 24 34 / 0.28)` / `rgb(230 237 243 / 0.16)` |
-| `--border-structural-width` | 사이드바/탭/수평선 구조 보더 두께 | `2px` / `2px` | `2px` / `2px` | `1px` / `1px` |
-| `--color-accent` | 인라인 링크, 활성 탭 텍스트, 키커, 라이브 인디케이터 | `#ec3013` / `#ff6a4a` | `#9e1b24` / `#f5b82e` | `#0b6bcb` / `#38bdf8` |
-| `--color-highlight` | 보조 강조 포인트 및 액티브 카드 펄스 외곽 링 | `#e15b47` / `#ff8f78` | `#f5b82e` / `#c92a3a` | `#0891b2` / `#f59e0b` |
-| `--color-action-bg` | 주요 액션 버튼(`.btn-primary`) 및 선택 행(`.sidebar-item.active`) 배경 | `#ec3013` / `#ff6a4a` | `#f5b82e` / `#f5b82e` | `#0b6bcb` / `#38bdf8` |
-| `--color-action-hover` | 주요 액션 버튼 호버 배경 | `#dd2b0f` / `#ff8465` | `#e5a519` / `#e5a519` | `#0958a8` / `#7dd3fc` |
-| `--color-action-text` | `--color-action-bg` 위의 전경 텍스트 (AA/AAA 통과) | `#f3f2f2` / `#1a1817` | `#261214` / `#180c0e` | `#f8fafc` / `#09111a` |
-| `--color-action-border` | 주요 액션 버튼 및 선택 행 경계선 | `transparent` / `transparent` | `#9e1b24` / `#ffd24c` | `transparent` / `transparent` |
-| `--color-focus` | `:focus-visible` 키보드 포커스 아웃라인 | `#ec3013` / `#ff8465` | `#b87d00` / `#ffd24c` | `#0b6bcb` / `#38bdf8` |
-| `--color-danger-bg` / `--color-danger-text` / `--color-danger-border` | 실패(`error`) 태그(`.tag-danger`) 및 오류 알림 | `#fce8e6`·`#9e1600`·`#d93025` / `#3b1414`·`#fca5a5`·`#ef4444` | `#fde8e8`·`#8c0b15`·`#b91c1c` / `#451219`·`#fecdd3`·`#fb7185` | `#fee2e2`·`#991b1b`·`#dc2626` / `#3b1219`·`#fca5a5`·`#ef4444` |
-| `--color-warn-bg` / `--color-warn-text` / `--color-warn-border` | 일시정지(`paused`) 태그(`.tag-warn`) 및 주의 알림 | `#fef3c7`·`#854d0e`·`#d97706` / `#38260b`·`#fcd34d`·`#f59e0b` | `#fff3cd`·`#784200`·`#b45309` / `#3b2607`·`#fde68a`·`#fbbf24` | `#fef3c7`·`#92400e`·`#d97706` / `#382408`·`#fcd34d`·`#f59e0b` |
-| `--color-success-bg` / `--color-success-text` / `--color-success-border` | 완료(`done`) 상태 배지(`.tag-success`) | `#dcfce7`·`#14532d`·`#16a34a` / `#0f2e1c`·`#86efac`·`#22c55e` | `#dcfce7`·`#14532d`·`#15803d` / `#0d2e1b`·`#86efac`·`#34d399` | `#dcfce7`·`#166534`·`#16a34a` / `#0c2d1c`·`#86efac`·`#22c55e` |
-| `--font-heading` | 섹션 타이틀, 카드 제목, 버튼 타이포그래피 | `'Archivo', system-ui, -apple-system, sans-serif` | `'Archivo', system-ui, -apple-system, sans-serif` | `'SFMono-Regular', 'JetBrains Mono', 'Menlo', 'Consolas', monospace` |
-| `--font-body` | 기본 본문 및 입력 컨트롤 타이포그래피 | `'Archivo', system-ui, -apple-system, sans-serif` | `'Archivo', system-ui, -apple-system, sans-serif` | `system-ui, -apple-system, 'Segoe UI', sans-serif` |
-| `--font-mono` | 프롬프트(`<pre>`), 코드 블록, 키커, 텔레메트리 | `'SFMono-Regular', 'JetBrains Mono', 'Menlo', 'Consolas', monospace` | 동일 | 동일 |
-
-### 4.3 브랜드 색상(레드·옐로)과 의미 상태(오류·경고·진행·완료)의 시각적 분리 규칙
-특히 `Crimson Signal`(`crimson`)에서 브랜드 색상인 붉은색·노란색이 시스템 상태와 혼동되지 않도록 다음 3가지 원칙을 동시에 적용합니다.
-
-1. **전용 상태 토큰 분리**:
-   - 작업 실패(`status === 'error'`)는 브랜드 `.tag-accent` 대신 전용 `.tag-danger`(`--color-danger-*`)를 사용하여 배경 채도·보더 두께·전경 명도를 일반 브랜드 태그와 분리합니다.
-   - 작업 완료(`status === 'done'`)는 `.tag-success`(`--color-success-*`)를 사용하여 대기(`pending`, `.tag-neutral`)와 명확히 구분합니다.
-   - 일시정지(`status === 'paused'`)는 `.tag-warn`(`--color-warn-*`)을 사용합니다.
-   - 실행 중(`status === 'running'`)은 `.tag-outline` + `.live-dot` 애니메이션 + `.card-active` 외곽선 펄스를 조합합니다.
-2. **비색상(Non-color) 상태 식별자 병행**:
-   - 색각 이상 사용자나 단색 환경에서도 상태를 오인하지 않도록 모든 상태 배지는 명시적 텍스트(`Issue failed`, `PR running`, `Review paused`, `workflow done`)와 함께 시각적 상태 기호(`✕` 실패, `⚠` 일시정지/주의, `●` 실행 중 펄스 점, `✓` 완료) 및 보더 스타일 차이(실선/배경 채움/외곽선)를 함께 유지합니다.
-3. **일관된 포커스 및 상호작용 피드백**:
-   - 모든 버튼(`.btn`), 입력 컨트롤(`.input`), 탭(`.tab`), 사이드바 항목(`.sidebar-item`), 디자인 선택 카드(`.design-option`)는 `:focus-visible` 시 `2px solid var(--color-focus)`와 `outline-offset: 2px`를 표시하여 키보드 탐색 시 현재 위치를 놓치지 않게 합니다.
+### 4.3 브랜드 색상(레드·옐로)과 의미 상태의 분리 규칙
+1. **전용 상태 토큰 분리 (`:not([data-design='classic'])`)**: 작업 실패(`.tag-danger`), 일시정지(`.tag-warn`), 완료(`.tag-success`), 실행 중(`.tag-outline` + `.live-dot` + `.card-active`)을 각각 독립된 배경·테두리·전경 토큰으로 분리했습니다.
+2. **비색상(Non-color) 상태 식별자 병행**: 비-Classic 프리셋에서는 모든 상태 배지에 텍스트 라벨과 함께 상태 기호(`✕` 실패, `⚠` 일시정지, `●` 실행 중 펄스 점, `✓` 완료)를 결합합니다. (`GlobalSettings`의 활성 프리셋 카드 `.design-option .tag-success`는 모든 프리셋에서 `✓ Active`와 `--color-badge-active-*`를 사용합니다.)
+3. **일관된 키보드 포커스 피드백**: 모든 대화형 요소가 `:focus-visible` 시 `2px solid var(--color-focus)`와 `outline-offset: 2px`를 표시합니다.
 
 ---
 
 ## 5. 아키텍처 연동 및 검증 요약
 
 ### 5.1 Core · Store · IPC · CLI · Renderer 동기화
-- **단일 순수 계약 (`core/design-system.ts`)**: Node 내장 모듈이나 런타임 `core/` 의존성이 없는 순수 모듈로, `DESIGN_IDS` (`'classic'`, `'crimson'`, `'console'`), `DEFAULT_DESIGN_ID` (`'classic'`), `DESIGN_PRESETS`, `EXPLORED_DESIGN_CANDIDATES` (`'minimal'`, `'editorial'`), `isDesignId()`, `normalizeDesignId()`, `getDesignPreset()`를 정의합니다.
-- **영속화 및 폴백 (`core/store.ts`)**: `MaoStoreSchema.design` 필드를 추가하고 기본값을 `'classic'`으로 설정했습니다. 손상되거나 알 수 없는 문자열이 `config.json`에 저장되어 있어도 `normalizeDesignId()`를 통해 워크플로 큐를 멈추지 않고 안전하게 `'classic'`으로 폴백합니다.
-- **IPC 및 Preload 락스텝 (`electron/ipc.ts`, `electron/preload.ts`, `src/electron.d.ts`, `src/test/electron-api-stub.ts`)**: `ui:getDesign` 및 `ui:setDesign` 핸들러를 추가하고, `src/electron-ipc-surface.test.ts` AST 검증을 통과하도록 브리지 표면과 이름을 일치시켰습니다.
+- **단일 순수 계약 (`core/design-system.ts`)**: Node 내장 모듈과 런타임 `core/` 의존성이 없는 순수 모듈로, `DESIGN_IDS`, `DEFAULT_DESIGN_ID`, `DESIGN_PRESETS`, `EXPLORED_DESIGN_CANDIDATES`, `isDesignId()`, `normalizeDesignId()`, `getDesignPreset()`를 제공합니다.
+- **영속화 및 폴백 (`core/store.ts`)**: `MaoStoreSchema.design` 필드를 추가하고 기본값을 `'classic'`으로 설정했습니다. 손상되거나 알 수 없는 값은 `normalizeDesignId()`가 `'classic'`으로 폴백합니다.
+- **IPC 및 Preload 락스텝 (`electron/ipc.ts`, `electron/preload.ts`, `src/electron.d.ts`, `src/test/electron-api-stub.ts`)**: `ui:getDesign`과 `ui:setDesign`을 4개 락스텝 파일과 일치시켰습니다.
 - **GUI↔CLI 패리티 (`cli/index.ts`, `src/App.tsx`, `src/components/GlobalSettings.tsx`)**:
   - CLI에서 `mao config set-design <classic|crimson|console>` 및 `mao config show`의 `"design"` 필드로 디자인 프리셋을 조회·변경할 수 있습니다.
-  - 렌더러(`src/App.tsx`)는 마운트 시 `electronApi().ui.getDesign()`을 읽어 `<html data-design="...">`에 반영하며, 저장 실패 시 이전 디자인 상태로 롤백하고 `role="alert"`로 오류를 표시합니다. 이때 `GlobalSettings`에 입력 중이던 미저장 GitHub 토큰이나 AI 프로바이더 편집 상태는 그대로 보존됩니다.
+  - 렌더러(`src/App.tsx`)는 마운트 시 `ui:getDesign()`과 `ui:getTheme()`를 읽어 `<html data-design="...">` 및 `<html data-theme="...">`에 반영하며, 저장 실패 시 마지막 확인 상태로 롤백하고 `role="alert"`(`Dismiss` 버튼 포함)로 오류를 표시합니다.
 
-### 5.2 검증 게이트 결과 요약
-- `npm run lint` (`tsc --noEmit`): 타입 및 IPC 브리지 `satisfies Window['electronAPI']` 검증 통과
-- `npm run test`:
-  - `vitest --project core`: `core/design-system.test.ts` (WCAG AAA 대비율 및 프리셋/후보군 검증) 및 `core/store.test.ts` (`design` 영속성·폴백 검증) 포함 전체 통과
-  - `vitest --project renderer`: `src/App.test.tsx`, `src/components/GlobalSettings.test.tsx`, `src/electron-ipc-surface.test.ts` 포함 전체 통과
-  - `python3 -m unittest discover -s .agents/workflows -p "*_test.py"`: Swarm 오케스트레이터 안전성 회귀 테스트 통과
-- `npm run test:origin`: 원격 저장소 URL 검증 매트릭스 통과
-- `npx vite build` & `npm run build:cli`: 렌더러 프로덕션 번들 및 CLI 번들(`dist-cli/index.cjs`) 빌드 성공, 임시 `MAO_DATA_DIR` 격리 환경에서 `config show` / `config set-design` 정상 및 오류 종료 코드(1) 동작 확인
+### 5.2 검증 게이트 요약
+- `npm run lint` (`tsc --noEmit`): 타입 및 IPC 브리지 계약 검증 통과
+- `core/design-system.test.ts`: 10개 CSS 토큰 블록(`classic`/`crimson`/`console`/`minimal`/`editorial` × Light/Dark)의 스와치 일치성, WCAG 대비율, 고밀도 `console` 규칙, `:focus-visible` 커버리지, Classic 시각 격리 가드 검증 통과
+- `core/agent-docs.test.ts`: 에이전트 문서 크기 제한·참조 무결성·아키텍처 규칙 번호 불변 검증 통과
+- `npm run test` (`core` + `renderer` 프로젝트), `npm run test:origin`, `npx vite build`, `npm run build:cli` 검증 완료

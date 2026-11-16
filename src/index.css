@@ -9,7 +9,8 @@
  * `data-design` on <html> selects the visual language (`classic` | `crimson` | `console`, defaulting
  * to `classic`), while `data-theme="dark"` selects dark polarity. Every block below defines the full
  * 1:1 semantic token surface so switching either axis at runtime never leaks a stale fallback from
- * another preset or polarity.
+ * another preset or polarity. Token blocks for the two explored-only candidates (`minimal` and
+ * `editorial`) are also maintained here for direct contrast verification against `core/design-system.ts`.
  */
 :root,
 :root[data-design='classic'] {
@@ -38,26 +39,31 @@
   --color-action-hover: var(--color-accent-600);
   --color-action-text: var(--color-bg);
   --color-action-border: transparent;
+  --color-active-border: var(--color-accent);
+  --color-action-indicator: var(--color-bg);
 
   --color-focus: #ec3013;
 
-  --color-danger-bg: #fce8e6;
-  --color-danger-text: #9e1600;
-  --color-danger-border: #d93025;
+  --color-danger-bg: var(--color-accent-100);
+  --color-danger-text: var(--color-accent-700);
+  --color-danger-border: var(--color-accent);
 
-  --color-warn-bg: #fef3c7;
-  --color-warn-text: #854d0e;
-  --color-warn-border: #d97706;
+  --color-warn-bg: transparent;
+  --color-warn-text: var(--color-accent-2);
+  --color-warn-border: var(--color-accent-2);
 
-  --color-success-bg: #dcfce7;
-  --color-success-text: #14532d;
-  --color-success-border: #16a34a;
+  --color-success-bg: var(--color-neutral-100);
+  --color-success-text: var(--color-neutral-800);
+  --color-success-border: transparent;
+  --color-badge-active-bg: #dcfce7;
+  --color-badge-active-text: #14532d;
+  --color-badge-active-border: #16a34a;
 
   --color-neutral-100: #f8f4f4;
   --color-neutral-800: #444141;
 
-  --font-heading: 'Archivo', system-ui, -apple-system, sans-serif;
-  --font-body: 'Archivo', system-ui, -apple-system, sans-serif;
+  --font-heading: 'Archivo', system-ui, sans-serif;
+  --font-body: 'Archivo', system-ui, sans-serif;
   --font-mono: 'SFMono-Regular', 'JetBrains Mono', 'Menlo', 'Consolas', monospace;
 
   --space-1: 4px;
@@ -101,26 +107,31 @@
   --color-action-hover: var(--color-accent-600);
   --color-action-text: var(--color-bg);
   --color-action-border: transparent;
+  --color-active-border: var(--color-accent);
+  --color-action-indicator: var(--color-bg);
 
   --color-focus: #ff8465;
 
-  --color-danger-bg: #3b1414;
-  --color-danger-text: #fca5a5;
-  --color-danger-border: #ef4444;
+  --color-danger-bg: var(--color-accent-100);
+  --color-danger-text: var(--color-accent-700);
+  --color-danger-border: var(--color-accent);
 
-  --color-warn-bg: #38260b;
-  --color-warn-text: #fcd34d;
-  --color-warn-border: #f59e0b;
+  --color-warn-bg: transparent;
+  --color-warn-text: var(--color-accent-2);
+  --color-warn-border: var(--color-accent-2);
 
-  --color-success-bg: #0f2e1c;
-  --color-success-text: #86efac;
-  --color-success-border: #22c55e;
+  --color-success-bg: var(--color-neutral-100);
+  --color-success-text: var(--color-neutral-800);
+  --color-success-border: transparent;
+  --color-badge-active-bg: #0f2e1c;
+  --color-badge-active-text: #86efac;
+  --color-badge-active-border: #22c55e;
 
   --color-neutral-100: #2c2928;
   --color-neutral-800: #d8d4d4;
 
-  --font-heading: 'Archivo', system-ui, -apple-system, sans-serif;
-  --font-body: 'Archivo', system-ui, -apple-system, sans-serif;
+  --font-heading: 'Archivo', system-ui, sans-serif;
+  --font-body: 'Archivo', system-ui, sans-serif;
   --font-mono: 'SFMono-Regular', 'JetBrains Mono', 'Menlo', 'Consolas', monospace;
 
   --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.4);
@@ -128,8 +139,8 @@
 
 /*
  * Crimson Signal Light — low-glare burgundy/oxide surfaces with deep crimson structure and warm
- * amber-gold primary actions/selections. Semantic danger/warn/success tokens are kept distinct from
- * the brand crimson & yellow palette so status badges never collide with brand chrome.
+ * amber-gold primary actions/selections. Brand crimson and yellow highlights are separated from
+ * semantic error, warning, and success tokens so status badges never collide with brand chrome.
  */
 :root[data-design='crimson'] {
   --color-bg: #f6eeee;
@@ -141,36 +152,41 @@
   --color-text-rgb: 38 18 20;
   --color-text-muted: #664246;
 
-  --color-border: #cfb3b5;
+  --color-border: #8c5c61;
   --color-divider: rgb(var(--color-text-rgb) / 0.36);
   --border-structural-width: 2px;
 
   --color-accent: #9e1b24;
   --color-accent-2: #c98a00;
-  --color-accent-100: #fff4d1;
+  --color-accent-100: #fbe4e6;
   --color-accent-600: #82141c;
   --color-accent-700: #6b0f16;
-  --color-accent-800: #4a0a0f;
+  --color-accent-800: #5c0b12;
   --color-highlight: #f5b82e;
 
   --color-action-bg: #f5b82e;
   --color-action-hover: #e5a519;
   --color-action-text: #261214;
   --color-action-border: #9e1b24;
+  --color-active-border: #9e1b24;
+  --color-action-indicator: #9e1b24;
 
-  --color-focus: #b87d00;
+  --color-focus: #6e4700;
 
   --color-danger-bg: #fde8e8;
   --color-danger-text: #8c0b15;
   --color-danger-border: #b91c1c;
 
-  --color-warn-bg: #fff3cd;
-  --color-warn-text: #784200;
+  --color-warn-bg: #fff3c4;
+  --color-warn-text: #6e3a00;
   --color-warn-border: #b45309;
 
   --color-success-bg: #dcfce7;
   --color-success-text: #14532d;
   --color-success-border: #15803d;
+  --color-badge-active-bg: var(--color-success-bg);
+  --color-badge-active-text: var(--color-success-text);
+  --color-badge-active-border: var(--color-success-border);
 
   --color-neutral-100: #f5e6e7;
   --color-neutral-800: #422528;
@@ -196,27 +212,29 @@
   --color-text-rgb: 247 236 236;
   --color-text-muted: #c9aeb0;
 
-  --color-border: #4a232a;
+  --color-border: #98545f;
   --color-divider: rgb(247 236 236 / 0.2);
   --border-structural-width: 2px;
 
   --color-accent: #f5b82e;
   --color-accent-2: #ffd24c;
-  --color-accent-100: #3d270a;
+  --color-accent-100: #421218;
   --color-accent-600: #ffd24c;
   --color-accent-700: #ffe07d;
-  --color-accent-800: #fff0b8;
+  --color-accent-800: #ffd6da;
   --color-highlight: #c92a3a;
 
   --color-action-bg: #f5b82e;
   --color-action-hover: #e5a519;
   --color-action-text: #180c0e;
   --color-action-border: #ffd24c;
+  --color-active-border: var(--color-highlight);
+  --color-action-indicator: #c92a3a;
 
   --color-focus: #ffd24c;
 
   --color-danger-bg: #451219;
-  --color-danger-text: #fecdd3;
+  --color-danger-text: #ff7a88;
   --color-danger-border: #fb7185;
 
   --color-warn-bg: #3b2607;
@@ -226,6 +244,9 @@
   --color-success-bg: #0d2e1b;
   --color-success-text: #86efac;
   --color-success-border: #34d399;
+  --color-badge-active-bg: var(--color-success-bg);
+  --color-badge-active-text: var(--color-success-text);
+  --color-badge-active-border: var(--color-success-border);
 
   --color-neutral-100: #331a20;
   --color-neutral-800: #ebd8da;
@@ -238,8 +259,8 @@
 }
 
 /*
- * Developer Console Light — cool technical slate surfaces, crisp 1px framing, monospace headings,
- * and cobalt/cyan telemetry accents for dense multi-agent queue monitoring.
+ * Developer Console Light — cool technical slate surfaces, crisp 1px framing, high-density spacing,
+ * monospace headings, and cobalt/cyan telemetry accents for dense multi-agent queue monitoring.
  */
 :root[data-design='console'] {
   --color-bg: #eef1f5;
@@ -251,24 +272,26 @@
   --color-text-rgb: 17 24 34;
   --color-text-muted: #475569;
 
-  --color-border: #c1cbd7;
+  --color-border: #6b7b8f;
   --color-divider: rgb(var(--color-text-rgb) / 0.28);
   --border-structural-width: 1px;
 
-  --color-accent: #0b6bcb;
-  --color-accent-2: #0891b2;
+  --color-accent: #064b91;
+  --color-accent-2: #065f73;
   --color-accent-100: #dff0ff;
-  --color-accent-600: #0958a8;
-  --color-accent-700: #074787;
-  --color-accent-800: #053363;
-  --color-highlight: #0891b2;
+  --color-accent-600: #043970;
+  --color-accent-700: #032d59;
+  --color-accent-800: #022042;
+  --color-highlight: #065f73;
 
   --color-action-bg: var(--color-accent);
   --color-action-hover: var(--color-accent-600);
   --color-action-text: #f8fafc;
   --color-action-border: transparent;
+  --color-active-border: #064b91;
+  --color-action-indicator: #38bdf8;
 
-  --color-focus: #0b6bcb;
+  --color-focus: #064b91;
 
   --color-danger-bg: #fee2e2;
   --color-danger-text: #991b1b;
@@ -281,6 +304,9 @@
   --color-success-bg: #dcfce7;
   --color-success-text: #166534;
   --color-success-border: #16a34a;
+  --color-badge-active-bg: var(--color-success-bg);
+  --color-badge-active-text: var(--color-success-text);
+  --color-badge-active-border: var(--color-success-border);
 
   --color-neutral-100: #f4f6f9;
   --color-neutral-800: #334155;
@@ -288,6 +314,13 @@
   --font-heading: 'SFMono-Regular', 'JetBrains Mono', 'Menlo', 'Consolas', monospace;
   --font-body: system-ui, -apple-system, 'Segoe UI', sans-serif;
   --font-mono: 'SFMono-Regular', 'JetBrains Mono', 'Menlo', 'Consolas', monospace;
+
+  --space-1: 3px;
+  --space-2: 6px;
+  --space-3: 8px;
+  --space-4: 12px;
+  --space-6: 16px;
+  --space-8: 22px;
 
   --shadow-sm: 0 1px 2px rgb(17 24 34 / 0.12);
 }
@@ -306,7 +339,7 @@
   --color-text-rgb: 230 237 243;
   --color-text-muted: #94a3b8;
 
-  --color-border: #2a3441;
+  --color-border: #5a6b82;
   --color-divider: rgb(230 237 243 / 0.16);
   --border-structural-width: 1px;
 
@@ -322,6 +355,8 @@
   --color-action-hover: var(--color-accent-600);
   --color-action-text: #09111a;
   --color-action-border: transparent;
+  --color-active-border: var(--color-highlight);
+  --color-action-indicator: #064b91;
 
   --color-focus: #38bdf8;
 
@@ -336,6 +371,9 @@
   --color-success-bg: #0c2d1c;
   --color-success-text: #86efac;
   --color-success-border: #22c55e;
+  --color-badge-active-bg: var(--color-success-bg);
+  --color-badge-active-text: var(--color-success-text);
+  --color-badge-active-border: var(--color-success-border);
 
   --color-neutral-100: #202934;
   --color-neutral-800: #cbd5e1;
@@ -345,6 +383,244 @@
   --font-mono: 'SFMono-Regular', 'JetBrains Mono', 'Menlo', 'Consolas', monospace;
 
   --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.5);
+}
+
+/*
+ * Explored Candidate: Minimal Workspace (Light) — documented in core/design-system.ts and
+ * docs/ui-design-system.md; not exposed as a selectable preset.
+ */
+:root[data-design='minimal'] {
+  --color-bg: #fafafa;
+  --color-surface: #f1f1f1;
+  --color-bg-subtle: #e5e5e5;
+  --color-backdrop: rgb(23 23 23 / 0.55);
+
+  --color-text: #171717;
+  --color-text-rgb: 23 23 23;
+  --color-text-muted: #595959;
+
+  --color-border: #737373;
+  --color-divider: rgb(var(--color-text-rgb) / 0.22);
+  --border-structural-width: 1px;
+
+  --color-accent: #262626;
+  --color-accent-2: #525252;
+  --color-accent-100: #ececec;
+  --color-accent-600: #171717;
+  --color-accent-700: #111111;
+  --color-accent-800: #0a0a0a;
+  --color-highlight: #525252;
+
+  --color-action-bg: var(--color-accent);
+  --color-action-hover: var(--color-accent-600);
+  --color-action-text: var(--color-bg);
+  --color-action-border: transparent;
+  --color-active-border: #262626;
+  --color-action-indicator: #d4d4d4;
+
+  --color-focus: #525252;
+
+  --color-danger-bg: #fee2e2;
+  --color-danger-text: #991b1b;
+  --color-danger-border: #dc2626;
+
+  --color-warn-bg: #fef3c7;
+  --color-warn-text: #854d0e;
+  --color-warn-border: #d97706;
+
+  --color-success-bg: #dcfce7;
+  --color-success-text: #14532d;
+  --color-success-border: #16a34a;
+  --color-badge-active-bg: var(--color-success-bg);
+  --color-badge-active-text: var(--color-success-text);
+  --color-badge-active-border: var(--color-success-border);
+
+  --color-neutral-100: #f5f5f5;
+  --color-neutral-800: #404040;
+
+  --font-heading: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-body: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'SFMono-Regular', 'JetBrains Mono', 'Menlo', 'Consolas', monospace;
+
+  --shadow-sm: 0 1px 2px rgb(23 23 23 / 0.08);
+}
+
+/*
+ * Explored Candidate: Minimal Workspace (Dark).
+ */
+:root[data-design='minimal'][data-theme='dark'] {
+  --color-bg: #121212;
+  --color-surface: #1c1c1c;
+  --color-bg-subtle: #171717;
+  --color-backdrop: rgb(0 0 0 / 0.72);
+
+  --color-text: #f5f5f5;
+  --color-text-rgb: 245 245 245;
+  --color-text-muted: #a3a3a3;
+
+  --color-border: #6b7280;
+  --color-divider: rgb(245 245 245 / 0.16);
+  --border-structural-width: 1px;
+
+  --color-accent: #e5e5e5;
+  --color-accent-2: #a3a3a3;
+  --color-accent-100: #262626;
+  --color-accent-600: #f5f5f5;
+  --color-accent-700: #fafafa;
+  --color-accent-800: #ffffff;
+  --color-highlight: #a3a3a3;
+
+  --color-action-bg: var(--color-accent);
+  --color-action-hover: var(--color-accent-600);
+  --color-action-text: var(--color-bg);
+  --color-action-border: transparent;
+  --color-active-border: #a3a3a3;
+  --color-action-indicator: #525252;
+
+  --color-focus: #a3a3a3;
+
+  --color-danger-bg: #3b1414;
+  --color-danger-text: #fca5a5;
+  --color-danger-border: #ef4444;
+
+  --color-warn-bg: #38260b;
+  --color-warn-text: #fcd34d;
+  --color-warn-border: #f59e0b;
+
+  --color-success-bg: #0f2e1c;
+  --color-success-text: #86efac;
+  --color-success-border: #22c55e;
+  --color-badge-active-bg: var(--color-success-bg);
+  --color-badge-active-text: var(--color-success-text);
+  --color-badge-active-border: var(--color-success-border);
+
+  --color-neutral-100: #262626;
+  --color-neutral-800: #d4d4d4;
+
+  --font-heading: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-body: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'SFMono-Regular', 'JetBrains Mono', 'Menlo', 'Consolas', monospace;
+
+  --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.45);
+}
+
+/*
+ * Explored Candidate: Editorial / Industrial (Light) — documented in core/design-system.ts and
+ * docs/ui-design-system.md; not exposed as a selectable preset.
+ */
+:root[data-design='editorial'] {
+  --color-bg: #f4f1ea;
+  --color-surface: #e9e4d8;
+  --color-bg-subtle: #dfd8c8;
+  --color-backdrop: rgb(20 20 19 / 0.6);
+
+  --color-text: #141413;
+  --color-text-rgb: 20 20 19;
+  --color-text-muted: #524f47;
+
+  --color-border: #57534e;
+  --color-divider: rgb(20 20 19 / 0.85);
+  --border-structural-width: 3px;
+
+  --color-accent: #141413;
+  --color-accent-2: #b84a1b;
+  --color-accent-100: #f3e2d8;
+  --color-accent-600: #2b2b28;
+  --color-accent-700: #1f1f1d;
+  --color-accent-800: #141413;
+  --color-highlight: #b84a1b;
+
+  --color-action-bg: var(--color-accent);
+  --color-action-hover: var(--color-accent-600);
+  --color-action-text: var(--color-bg);
+  --color-action-border: transparent;
+  --color-active-border: var(--color-highlight);
+  --color-action-indicator: #e06d3b;
+
+  --color-focus: #b84a1b;
+
+  --color-danger-bg: #fce8e6;
+  --color-danger-text: #9e1600;
+  --color-danger-border: #b84a1b;
+
+  --color-warn-bg: #fef3c7;
+  --color-warn-text: #854d0e;
+  --color-warn-border: #d97706;
+
+  --color-success-bg: #dcfce7;
+  --color-success-text: #14532d;
+  --color-success-border: #16a34a;
+  --color-badge-active-bg: var(--color-success-bg);
+  --color-badge-active-text: var(--color-success-text);
+  --color-badge-active-border: var(--color-success-border);
+
+  --color-neutral-100: #efeae0;
+  --color-neutral-800: #2e2d2a;
+
+  --font-heading: 'Archivo', system-ui, -apple-system, sans-serif;
+  --font-body: 'Archivo', system-ui, -apple-system, sans-serif;
+  --font-mono: 'SFMono-Regular', 'JetBrains Mono', 'Menlo', 'Consolas', monospace;
+
+  --shadow-sm: 0 2px 0 rgb(20 20 19 / 0.9);
+}
+
+/*
+ * Explored Candidate: Editorial / Industrial (Dark).
+ */
+:root[data-design='editorial'][data-theme='dark'] {
+  --color-bg: #141413;
+  --color-surface: #1f1e1c;
+  --color-bg-subtle: #191816;
+  --color-backdrop: rgb(10 10 9 / 0.78);
+
+  --color-text: #f4f1ea;
+  --color-text-rgb: 244 241 234;
+  --color-text-muted: #ada89e;
+
+  --color-border: #78716c;
+  --color-divider: rgb(244 241 234 / 0.72);
+  --border-structural-width: 3px;
+
+  --color-accent: #f4f1ea;
+  --color-accent-2: #e06d3b;
+  --color-accent-100: #2e1d15;
+  --color-accent-600: #e9e4d8;
+  --color-accent-700: #dfd8c8;
+  --color-accent-800: #f4f1ea;
+  --color-highlight: #e06d3b;
+
+  --color-action-bg: var(--color-accent);
+  --color-action-hover: var(--color-accent-600);
+  --color-action-text: var(--color-bg);
+  --color-action-border: transparent;
+  --color-active-border: var(--color-highlight);
+  --color-action-indicator: #b84a1b;
+
+  --color-focus: #e06d3b;
+
+  --color-danger-bg: #3b1414;
+  --color-danger-text: #fca5a5;
+  --color-danger-border: #ef4444;
+
+  --color-warn-bg: #38260b;
+  --color-warn-text: #fcd34d;
+  --color-warn-border: #f59e0b;
+
+  --color-success-bg: #0f2e1c;
+  --color-success-text: #86efac;
+  --color-success-border: #22c55e;
+  --color-badge-active-bg: var(--color-success-bg);
+  --color-badge-active-text: var(--color-success-text);
+  --color-badge-active-border: var(--color-success-border);
+
+  --color-neutral-100: #2a2926;
+  --color-neutral-800: #dfd8c8;
+
+  --font-heading: 'Archivo', system-ui, -apple-system, sans-serif;
+  --font-body: 'Archivo', system-ui, -apple-system, sans-serif;
+  --font-mono: 'SFMono-Regular', 'JetBrains Mono', 'Menlo', 'Consolas', monospace;
+
+  --shadow-sm: 0 2px 0 rgb(244 241 234 / 0.25);
 }
 
 html,
@@ -359,6 +635,11 @@ body {
   font-family: var(--font-body);
   font-size: 15px;
   line-height: 1.55;
+}
+
+:root[data-design='console'] body {
+  font-size: 13px;
+  line-height: 1.4;
 }
 
 h1,
@@ -378,12 +659,24 @@ h2 {
   font-size: 32px;
 }
 
+:root[data-design='console'] h2 {
+  font-size: 24px;
+}
+
 h3 {
   font-size: 25px;
 }
 
+:root[data-design='console'] h3 {
+  font-size: 19px;
+}
+
 h4 {
   font-size: 20px;
+}
+
+:root[data-design='console'] h4 {
+  font-size: 16px;
 }
 
 a {
@@ -394,7 +687,7 @@ a {
 
 @layer components {
 .text-muted {
-  color: var(--color-text-muted);
+  color: rgb(var(--color-text-rgb) / 0.55);
 }
 
 .text-danger {
@@ -450,6 +743,7 @@ a {
 }
 
 .btn:focus-visible,
+.btn-disclosure:focus-visible,
 .input:focus-visible,
 .tab:focus-visible,
 .sidebar-item:focus-visible,
@@ -457,6 +751,9 @@ a {
 .design-option:focus-visible,
 .card[role='button']:focus-visible,
 button.tag:focus-visible,
+input[type='checkbox']:focus-visible,
+input[type='radio']:focus-visible,
+summary:focus-visible,
 a:focus-visible {
   outline: 2px solid var(--color-focus);
   outline-offset: 2px;
@@ -508,7 +805,7 @@ a:focus-visible {
 }
 
 .input::placeholder {
-  color: var(--color-text-muted);
+  color: rgb(var(--color-text-rgb) / 0.45);
 }
 
 /*
@@ -530,24 +827,9 @@ a:focus-visible {
   padding: var(--space-3);
   border-radius: var(--radius-md);
   background: var(--color-surface);
-  border: 1px solid var(--color-border);
-}
-
-.card-subtle {
-  background: var(--color-bg-subtle);
-  border: 1px solid var(--color-border);
-}
-
-.code-block {
-  font-family: var(--font-mono);
-  background: var(--color-bg-subtle);
-  border: 1px solid var(--color-border);
-  padding: var(--space-2);
-  border-radius: var(--radius-md);
 }
 
 .card-kicker {
-  font-family: var(--font-mono);
   font-size: 10px;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -566,8 +848,7 @@ a:focus-visible {
   align-items: center;
   gap: 6px;
   font-size: 11px;
-  font-variant-numeric: tabular-nums;
-  color: var(--color-text-muted);
+  color: rgb(var(--color-text-rgb) / 0.5);
 }
 
 .elev-sm {
@@ -586,13 +867,11 @@ a:focus-visible {
 .tag-accent {
   background: var(--color-accent-100);
   color: var(--color-accent-800);
-  border: 1px solid var(--color-accent);
 }
 
 .tag-neutral {
   background: var(--color-neutral-100);
   color: var(--color-neutral-800);
-  border: 1px solid var(--color-border);
 }
 
 .tag-outline {
@@ -601,45 +880,25 @@ a:focus-visible {
 }
 
 .tag-danger {
-  background: var(--color-danger-bg);
-  color: var(--color-danger-text);
-  border: 1px solid var(--color-danger-border);
-}
-
-.tag-danger::before {
-  content: '✕ ';
-  font-weight: 800;
-  margin-right: 3px;
+  background: var(--color-accent-100);
+  color: var(--color-accent-800);
 }
 
 .tag-warn {
-  background: var(--color-warn-bg);
-  color: var(--color-warn-text);
-  border: 1px solid var(--color-warn-border);
-}
-
-.tag-warn::before {
-  content: '⚠ ';
-  font-weight: 800;
-  margin-right: 3px;
+  background: transparent;
+  border: 1px solid var(--color-accent-2);
+  color: var(--color-accent-2);
 }
 
 .tag-success {
-  background: var(--color-success-bg);
-  color: var(--color-success-text);
-  border: 1px solid var(--color-success-border);
-}
-
-.tag-success::before {
-  content: '✓ ';
-  font-weight: 800;
-  margin-right: 3px;
+  background: var(--color-neutral-100);
+  color: var(--color-neutral-800);
 }
 
 .tag-stage {
   background: transparent;
-  border: 1px solid var(--color-border);
-  color: var(--color-text-muted);
+  border: 1px solid rgb(var(--color-text-rgb) / 0.3);
+  color: rgb(var(--color-text-rgb) / 0.7);
 }
 
 /*
@@ -655,7 +914,7 @@ a:focus-visible {
 
 @keyframes card-active-pulse {
   0%, 100% { box-shadow: 0 0 0 2px var(--color-accent), var(--shadow-sm); }
-  50% { box-shadow: 0 0 0 4px var(--color-accent-2), var(--shadow-sm); }
+  50% { box-shadow: 0 0 0 4px var(--color-active-border), var(--shadow-sm); }
 }
 
 .summary-indicator {
@@ -671,7 +930,7 @@ a:focus-visible {
   display: block;
   margin-bottom: var(--space-1);
   font-size: 13px;
-  color: var(--color-text-muted);
+  color: rgb(var(--color-text-rgb) / 0.7);
 }
 
 .sidebar {
@@ -688,11 +947,19 @@ a:focus-visible {
   padding: var(--space-3);
 }
 
+.sidebar-footer {
+  border-top: var(--border-structural-width) solid var(--color-divider);
+}
+
+.agent-badge-meta {
+  opacity: 0.6;
+}
+
 .sidebar-heading {
   font-size: 11px;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: var(--color-text-muted);
+  color: rgb(var(--color-text-rgb) / 0.5);
   padding: 0 var(--space-2);
   margin-bottom: var(--space-1);
 }
@@ -709,7 +976,7 @@ a:focus-visible {
   font-family: var(--font-body);
   color: var(--color-text);
   background: transparent;
-  border: 1px solid transparent;
+  border: 0;
   border-radius: var(--radius-md);
   cursor: pointer;
 }
@@ -719,10 +986,8 @@ a:focus-visible {
 }
 
 .sidebar-item.active {
-  background: var(--color-action-bg);
-  color: var(--color-action-text);
-  border-color: var(--color-action-border);
-  font-weight: 700;
+  background: var(--color-accent);
+  color: var(--color-bg);
 }
 
 .live-dot {
@@ -751,7 +1016,7 @@ a:focus-visible {
   font-family: var(--font-heading);
   font-weight: 800;
   font-size: 14px;
-  color: var(--color-text-muted);
+  color: rgb(var(--color-text-rgb) / 0.55);
   background: transparent;
   border: 0;
   border-bottom: var(--border-structural-width) solid transparent;
@@ -840,6 +1105,23 @@ a:focus-visible {
   box-shadow: var(--shadow-sm);
 }
 
+.design-option .tag {
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.design-option .tag-success {
+  background: var(--color-badge-active-bg);
+  color: var(--color-badge-active-text);
+  border: 1px solid var(--color-badge-active-border);
+}
+
+.design-option .tag-success::before {
+  content: '✓ ';
+  font-weight: 800;
+  margin-right: 3px;
+}
+
 .design-swatch-bar {
   display: flex;
   width: 100%;
@@ -870,7 +1152,7 @@ a:focus-visible {
 .update-banner-meta {
   margin-top: 2px;
   font-size: 12px;
-  color: var(--color-text-muted);
+  color: rgb(var(--color-text-rgb) / 0.65);
 }
 
 .modal-backdrop {
@@ -888,5 +1170,188 @@ a:focus-visible {
 .modal {
   width: 100%;
   max-width: 640px;
+}
+
+/*
+ * Non-Classic visual enhancements (Crimson Signal, Developer Console, and explored candidates).
+ * Scoped with :not([data-design='classic']) so the default Classic design stays visually identical
+ * to baseline while non-classic presets add crisp semantic card borders, monospace metadata,
+ * highlight indicators, and non-color status glyphs.
+ */
+:root[data-design]:not([data-design='classic']) .text-muted {
+  color: var(--color-text-muted);
+}
+
+:root[data-design]:not([data-design='classic']) .field label {
+  color: var(--color-text-muted);
+}
+
+:root[data-design]:not([data-design='classic']) .sidebar-heading {
+  color: var(--color-text-muted);
+}
+
+:root[data-design]:not([data-design='classic']) .input::placeholder {
+  color: var(--color-text-muted);
+}
+
+:root[data-design]:not([data-design='classic']) .update-banner-meta {
+  color: var(--color-text-muted);
+}
+
+:root[data-design]:not([data-design='classic']) .card {
+  border: 1px solid var(--color-border);
+}
+
+:root[data-design]:not([data-design='classic']) .card-subtle {
+  background: var(--color-bg-subtle);
+  border: 1px solid var(--color-border);
+}
+
+:root[data-design]:not([data-design='classic']) .code-block {
+  font-family: var(--font-mono);
+  background: var(--color-bg-subtle);
+  border: 1px solid var(--color-border);
+  padding: var(--space-2);
+  border-radius: var(--radius-md);
+}
+
+:root[data-design]:not([data-design='classic']) .card-kicker {
+  font-family: var(--font-mono);
+}
+
+:root[data-design]:not([data-design='classic']) .card-meta {
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text-muted);
+}
+
+:root[data-design]:not([data-design='classic']) .tag-accent {
+  border: 1px solid var(--color-accent);
+}
+
+:root[data-design]:not([data-design='classic']) .tag-neutral {
+  border: 1px solid var(--color-border);
+}
+
+:root[data-design]:not([data-design='classic']) .tag-danger {
+  background: var(--color-danger-bg);
+  color: var(--color-danger-text);
+  border: 1px solid var(--color-danger-border);
+}
+
+:root[data-design]:not([data-design='classic']) .tag-danger::before {
+  content: '✕ ';
+  font-weight: 800;
+  margin-right: 3px;
+}
+
+:root[data-design]:not([data-design='classic']) .tag-warn {
+  background: var(--color-warn-bg);
+  color: var(--color-warn-text);
+  border: 1px solid var(--color-warn-border);
+}
+
+:root[data-design]:not([data-design='classic']) .tag-warn::before {
+  content: '⚠ ';
+  font-weight: 800;
+  margin-right: 3px;
+}
+
+:root[data-design]:not([data-design='classic']) .tag-success {
+  background: var(--color-success-bg);
+  color: var(--color-success-text);
+  border: 1px solid var(--color-success-border);
+}
+
+:root[data-design]:not([data-design='classic']) .tag-success::before {
+  content: '✓ ';
+  font-weight: 800;
+  margin-right: 3px;
+}
+
+:root[data-design]:not([data-design='classic']) .tag-stage {
+  border: 1px solid var(--color-border);
+  color: var(--color-text-muted);
+}
+
+:root[data-design]:not([data-design='classic']) .agent-badge-meta {
+  opacity: 1;
+  color: var(--color-text-muted);
+}
+
+:root[data-design]:not([data-design='classic']) .sidebar-item {
+  border: 1px solid transparent;
+}
+
+:root[data-design]:not([data-design='classic']) .sidebar-item.active {
+  background: var(--color-action-bg);
+  color: var(--color-action-text);
+  border-color: var(--color-action-border);
+  box-shadow: inset 3px 0 0 var(--color-action-indicator);
+  font-weight: 700;
+}
+
+:root[data-design='crimson'][data-theme='dark'] .sidebar {
+  border-right-color: var(--color-highlight);
+}
+
+:root[data-design]:not([data-design='classic']) .tab {
+  color: var(--color-text-muted);
+}
+
+:root[data-design]:not([data-design='classic']) .tab:hover {
+  color: var(--color-text);
+}
+
+:root[data-design]:not([data-design='classic']) .tab.active {
+  color: var(--color-accent);
+  border-bottom-color: var(--color-active-border);
+}
+
+:root[data-design]:not([data-design='classic']) .design-option-active {
+  border: 2px solid var(--color-active-border);
+}
+
+:root[data-design]:not([data-design='classic']) .preset-row-active {
+  border-color: var(--color-active-border);
+}
+
+/*
+ * Developer Console high-density layout adjustments for queue and kanban monitoring.
+ */
+:root[data-design='console'] .sidebar {
+  width: 228px;
+}
+
+:root[data-design='console'] .sidebar-item {
+  padding: 5px 8px;
+  font-size: 12.5px;
+}
+
+:root[data-design='console'] .card {
+  padding: 8px 10px;
+  gap: 5px;
+}
+
+:root[data-design='console'] .card-title {
+  font-size: 14px;
+}
+
+:root[data-design='console'] .btn {
+  font-size: 12px;
+}
+
+:root[data-design='console'] .btn:not(.btn-ghost) {
+  padding: 5px 10px;
+}
+
+:root[data-design='console'] .input:not(.input-sm) {
+  min-height: 30px;
+  padding: 4px 8px;
+  font-size: 12.5px;
+}
+
+:root[data-design='console'] .tag {
+  font-size: 10px;
+  padding: 2px 7px;
 }
 }

@@ -493,4 +493,12 @@ describe('Sidebar queue recovery', () => {
     expect(screen.queryByText('Workflow automation is halted')).toBeNull()
     expect(screen.queryByRole('button', { name: 'Recover readable tasks' })).toBeNull()
   })
+
+  it('uses sidebar-footer rather than hardcoded border-t-2 on the Global settings footer', () => {
+    renderSidebar()
+
+    const footer = screen.getByRole('button', { name: 'Global settings' }).parentElement
+    expect(footer).toHaveClass('sidebar-section', 'sidebar-footer')
+    expect(footer).not.toHaveClass('border-t-2')
+  })
 })

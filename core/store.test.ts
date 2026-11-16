@@ -7,6 +7,7 @@ import {
   MAO_STORE_DEFAULTS,
   createStoredReadGuard,
   describeStoredProblems,
+  describeUnusableDesign,
   describeUnusableRepoList,
   describeUnusableProviderList,
   describeUnusableTaskQueue,
@@ -2557,19 +2558,70 @@ describe('FileStore and createGuardedStore design preset setting', () => {
     expect(warn).not.toHaveBeenCalled()
   })
 
-  it('falls back to classic on unknown or non-string design values without adding a storeProblems entry', () => {
-    for (const invalid of ['unknown-design', 'minimal', 'editorial', '', 42, null, {}, ['crimson']]) {
+  it('falls back to classic on unknown or non-string design values AND reports the unusable value in storeProblems and warnings', () => {
+    for (const invalid of [
+      'unknown-design',
+      'minimal',
+      'editorial',
+      'ghp_SECRET_DESIGN',
+      '',
+      42,
+      true,
+      false,
+      null,
+      {},
+      ['crimson'],
+      { secret: 'ghp_SECRET_KEY' },
+      ['ghp_SECRET_ITEM'],
+    ]) {
       const warn = captureWarnings()
-      const { store } = storeHolding({ design: invalid })
+      const { store, filePath } = storeHolding({ design: invalid })
 
       expect(store.get('design'), String(invalid)).toBe('classic')
-      expect(store.inspect('design').value, String(invalid)).toBe('classic')
-      expect(store.inspect('design').problem, String(invalid)).toBeUndefined()
+      expect(warn).toHaveBeenCalledTimes(1)
+      const warnedMessage = warn.mock.calls[0]![0] as string
+      expect(warnedMessage, String(invalid)).toContain('"design"')
+      expect(warnedMessage, String(invalid)).toContain(filePath)
+      expect(warnedMessage, String(invalid)).toContain('classic')
+      if (typeof invalid === 'string' && invalid.length > 0) {
+        expect(warnedMessage, invalid).not.toContain(invalid)
+      }
+      expect(warnedMessage, String(invalid)).not.toContain('ghp_SECRET')
+
+      const problems = store.problems()
+      expect(problems, String(invalid)).toHaveLength(1)
+      expect(problems[0], String(invalid)).toMatchObject({
+        field: 'design',
+        defect: 'value',
+        nothingUsable: true,
+        source: filePath,
+      })
+
+      const observed = store.inspect('design')
+      expect(observed, String(invalid)).toMatchObject({
+        value: 'classic',
+        defect: 'value',
+        readable: true,
+        problem: problems[0]!.message,
+      })
+      // Once-per-field warning deduplication holds across get() + inspect().
+      expect(warn).toHaveBeenCalledTimes(1)
+
+      store.set('design', 'crimson')
       expect(store.problems(), String(invalid)).toEqual([])
-      expect(warn).not.toHaveBeenCalled()
+      expect(store.get('design'), String(invalid)).toBe('crimson')
+      expect(store.inspect('design'), String(invalid)).toMatchObject({
+        value: 'crimson',
+        defect: undefined,
+        problem: undefined,
+        readable: true,
+      })
 
       warn.mockRestore()
     }
+
+    expect(describeUnusableDesign('ghp_SECRET_DESIGN', '/tmp/config.json')).not.toContain('ghp_SECRET_DESIGN')
+    expect(describeUnusableDesign('classic', '/tmp/config.json')).toBeNull()
   })
 
   it('persists each valid design preset and preserves all other settings across processes (issue #73)', () => {
@@ -2636,5 +2688,47 @@ describe('FileStore and createGuardedStore design preset setting', () => {
     expect(storeWriteRequiresRestart(refused)).toBe(true)
     expect(String((refused as Error).message)).not.toContain('ghp_SENTINEL')
     expect(fs.readFileSync(filePath, 'utf-8')).toBe(corrupt)
+  })
+
+  it('defaults absent design key from electron-store-style backend to classic while reporting invalid raw values', () => {
+    const { backend: emptyBackend } = fakeBackend()
+    expect(emptyBackend.get('design')).toBeUndefined()
+    const cleanWarnings: string[] = []
+    const cleanStore = createGuardedStore(emptyBackend, '/data/config.json', (message) =>
+      cleanWarnings.push(message),
+    )
+
+    expect(cleanStore.get('design')).toBe('classic')
+    expect(cleanStore.inspect('design')).toMatchObject({
+      value: 'classic',
+      defect: undefined,
+      problem: undefined,
+      readable: true,
+    })
+    expect(cleanStore.problems()).toEqual([])
+    expect(cleanWarnings).toEqual([])
+
+    for (const invalid of [null, true, 'invalid'] as const) {
+      const { backend } = fakeBackend({ design: invalid })
+      const warnings: string[] = []
+      const store = createGuardedStore(backend, '/data/config.json', (message) => warnings.push(message))
+
+      expect(store.get('design'), String(invalid)).toBe('classic')
+      const problems = store.problems()
+      expect(problems, String(invalid)).toHaveLength(1)
+      expect(problems[0], String(invalid)).toMatchObject({
+        field: 'design',
+        defect: 'value',
+        nothingUsable: true,
+        source: '/data/config.json',
+      })
+      expect(store.inspect('design'), String(invalid)).toMatchObject({
+        value: 'classic',
+        defect: 'value',
+        readable: true,
+        problem: problems[0]!.message,
+      })
+      expect(warnings).toHaveLength(1)
+    }
   })
 })

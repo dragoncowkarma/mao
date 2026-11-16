@@ -113,14 +113,14 @@ export const DESIGN_PRESETS: readonly DesignPresetMeta[] = [
     badge: 'High density',
     summary: 'Cool slate & charcoal workspace with crisp 1px borders and technical telemetry.',
     description:
-      'Optimized for dense multi-agent queue monitoring and prompt log inspection. Pairs low-fatigue slate-charcoal surfaces with cyan/cobalt interactive accents, tabular monospace metadata, and compact 1px structural framing.',
+      'Optimized for dense multi-agent queue monitoring and prompt log inspection. Pairs low-fatigue slate-charcoal surfaces with cyan/cobalt interactive accents, high-density spacing and compact typography, tabular monospace metadata, and crisp 1px structural framing.',
     swatches: {
       light: {
         bg: '#eef1f5',
         surface: '#e2e7ee',
         text: '#111822',
-        accent: '#0b6bcb',
-        highlight: '#0891b2',
+        accent: '#064b91',
+        highlight: '#065f73',
       },
       dark: {
         bg: '#0f1318',

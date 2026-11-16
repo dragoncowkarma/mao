@@ -612,6 +612,7 @@ export default function Sidebar({
             <button
               key={`${r.owner}/${r.repo}`}
               onClick={() => onSelect(i)}
+              data-selected={selectedIndex === i ? 'true' : undefined}
               className={`sidebar-item ${view === 'project' && selectedIndex === i ? 'active' : ''}`}
             >
               <span className="truncate">
@@ -630,7 +631,7 @@ export default function Sidebar({
         )}
       </div>
 
-      <div className="sidebar-section border-t-2 border-divider">
+      <div className="sidebar-section sidebar-footer">
         <button
           onClick={() => onViewChange('global-settings')}
           className={`sidebar-item ${view === 'global-settings' ? 'active' : ''}`}

@@ -14,6 +14,7 @@ interface GlobalSettingsProps {
   design?: DesignId
   onDesignChange?: (design: DesignId) => void | Promise<void>
   appearanceError?: string
+  onDismissAppearanceError?: () => void
 }
 
 const THEME_OPTIONS: { value: ThemePreference; label: string }[] = [
@@ -342,7 +343,8 @@ function ProviderCard({ provider: p, onUpdate, onRemove }: ProviderCardProps) {
       <div>
         <div className="flex items-center justify-between gap-2 mb-2">
           <button
-            className="flex items-center gap-1 text-xs text-muted hover:text-[var(--color-text)] transition-colors"
+            type="button"
+            className="btn-disclosure flex items-center gap-1 text-xs text-muted hover:text-[var(--color-text)] transition-colors"
             onClick={() => setPresetsExpanded((v) => !v)}
           >
             <span style={{ display: 'inline-block', transform: presetsExpanded ? 'rotate(90deg)' : 'none', transition: 'transform 0.15s' }}>▶</span>
@@ -386,6 +388,7 @@ export default function GlobalSettings({
   design = DEFAULT_DESIGN_ID,
   onDesignChange,
   appearanceError,
+  onDismissAppearanceError,
 }: GlobalSettingsProps) {
   const [githubToken, setGithubToken] = useState('')
   const [providers, setProviders] = useState<AiProviderConfig[]>([])
@@ -534,7 +537,7 @@ export default function GlobalSettings({
               onClick={() => onDesignChange?.(preset.id)}
             >
               <div className="w-full flex items-center justify-between gap-2">
-                <div className="flex items-center gap-2">
+                <div className="flex flex-wrap items-center gap-1.5 min-w-0">
                   <span className="font-bold text-sm">{preset.name}</span>
                   {preset.badge && <span className="tag tag-neutral">{preset.badge}</span>}
                 </div>
@@ -575,9 +578,18 @@ export default function GlobalSettings({
           "System" follows your OS light/dark setting and updates automatically if it changes.
         </p>
         {appearanceError && (
-          <p className="mt-2 text-xs text-danger" role="alert">
-            {appearanceError}
-          </p>
+          <div className="mt-2 flex items-center gap-2" role="alert">
+            <span className="text-xs text-danger">{appearanceError}</span>
+            {onDismissAppearanceError && (
+              <button
+                type="button"
+                className="btn btn-secondary text-xs"
+                onClick={onDismissAppearanceError}
+              >
+                Dismiss
+              </button>
+            )}
+          </div>
         )}
       </div>
 

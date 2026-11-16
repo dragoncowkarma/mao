@@ -92,12 +92,9 @@ export function sameRepoRef(a: RepoRef, b: RepoRef): boolean {
  * those same strings, so the guarantee holds by construction rather than by an argument about how
  * GitHub happens to resolve names.
  *
- * Deliberately *not* a lower-casing normalisation of the whole list. Rewriting stored entries would
- * change strings that other state already copied verbatim — `QueuedTask.repo` is snapshotted at
- * enqueue time, and the board and queue views filter tasks by an exact `t.repo.owner === repo.owner`
- * comparison — so canonicalising the sidebar's spelling would hide every task queued before the
- * change. It would also misspell repositories back at the operator (`microsoft/typescript`), and the
- * casing shown in the sidebar is the one they registered.
+ * Deliberately *not* a lower-casing normalisation of the whole list: `QueuedTask.repo` copies the stored
+ * spelling at enqueue, and lower-casing would misspell repositories back at the operator
+ * (`microsoft/typescript`); the casing in the sidebar is the one they registered.
  *
  * The last occurrence of a repository wins its *position*, matching `mao repos add`'s documented "adds
  * or replaces its entry" and letting the GUI's add path find the entry it just registered at the end

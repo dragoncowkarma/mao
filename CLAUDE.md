@@ -1,13 +1,7 @@
 # CLAUDE.md
 
-Always read and follow the two files below before starting any task:
-
 @AGENTS.md
-@SKILL.md
 
-- `AGENTS.md` — architecture rules, invariants, conventions, agent roles
-  (the single source of truth).
-- `SKILL.md` — commands, verification workflow, step-by-step recipes.
-
-Do not duplicate their content here; update those files instead so every AI tool
-(Claude Code, Codex, Antigravity, …) stays in sync.
+Read `.agents/skills/mao-development/SKILL.md` on demand for commands, recipes and per-subsystem
+references. It is deliberately not inlined: it would load on every task. Add rules to those files, never
+here, so every AI tool stays in sync.

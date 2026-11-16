@@ -2,8 +2,8 @@ import { AI_EFFORTS, type AiEffort } from './ai/types.ts'
 import type { ProviderOverride, WorkflowRoleAssignment } from './workflow-engine.ts'
 
 /**
- * Matches swarm_orchestrator.py-style role metadata tags: `[Worker: <id>]`, `[Reviewer: <id>]`,
- * `[Maintainer: <id>]`. Unlike swarm_orchestrator's `[Worker: <ai> | Model: <model> | Reasoning:
+ * Matches workflow role metadata tags: `[Worker: <id>]`, `[Reviewer: <id>]`,
+ * `[Maintainer: <id>]`. Unlike native Swarm's `[Worker: <ai> | Model: <model> | Reasoning:
  * <reasoning>]` tags, mao's carry only a provider id: model/effort default to that provider's own
  * registered config (see AiProviderConfig) and are overridden — for the whole task, not per role —
  * by the separate `[Model: …]`/`[Effort: …]` tags below, mirroring the task-level `model`/`effort`
@@ -80,7 +80,7 @@ function stripFencedCodeBlocks(text: string): string {
  * `[Worker: id]` format (in a code fence, inline code, or an issue-template HTML-comment hint) would
  * have that example text parsed as a real directive.
  */
-function stripQuotedText(text: string): string {
+export function stripQuotedText(text: string): string {
   return stripFencedCodeBlocks(text)
     .replace(/`[^`\n]*`/g, ' ')
     .replace(/<!--[\s\S]*?-->/g, ' ')

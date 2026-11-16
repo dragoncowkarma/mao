@@ -112,7 +112,7 @@ export function startAutoTrigger(
         if (task.type !== 'issue' || task.state !== 'open') continue
         if (task.labels.includes(WORKFLOW_ACTIVE_LABEL)) continue
 
-        // Directive tags in the issue body: swarm_orchestrator-style [Worker: id] / [Reviewer: id] /
+        // Directive tags in the issue body: workflow role tags [Worker: id] / [Reviewer: id] /
         // [Maintainer: id] pin specific registered providers to specific stages, while [Model: id] /
         // [Effort: level] pin the model and reasoning effort for the whole task (the auto-trigger
         // equivalent of `mao workflow enqueue --model/--effort`). An issue carrying none of them

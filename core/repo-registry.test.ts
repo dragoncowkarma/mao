@@ -170,8 +170,7 @@ describe('canonicalRepoList', () => {
     // The duplicate this fix prevents could already have been written by an earlier build; the next
     // list write folds it away rather than requiring the operator to notice and remove it. Asserted on
     // the exact strings, not with the (now case-insensitive) sameRepoRef, because *which* spelling
-    // survives is the point: tasks queued before the heal carry the one it was first registered under,
-    // and the board and queue filter them with an exact `t.repo.owner === repo.owner`.
+    // survives is the point: the sidebar shows it, and tasks queued before the heal may carry it.
     expect(canonicalRepoList([widgets, widgetsShouted], [widgets, widgetsShouted])).toEqual([widgets])
     // Order of the stored duplicate decides it — not which spelling happens to sort first.
     expect(canonicalRepoList([widgetsShouted, widgets], [widgetsShouted, widgets])).toEqual([widgetsShouted])

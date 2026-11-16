@@ -12,7 +12,7 @@ import type { AgentStage, AiEffort, AiProviderConfig } from './ai/types.ts'
  * core/workflow-engine.ts re-exports the types below so existing importers keep working.
  */
 
-/** Which lifecycle "role" (à la swarm_orchestrator.py's Worker/Reviewer/Maintainer tags) owns each stage. */
+/** Which workflow role (Worker/Reviewer/Maintainer) owns each stage. */
 export type WorkflowRole = 'worker' | 'reviewer' | 'maintainer'
 
 export const STAGE_ROLE: Record<AgentStage, WorkflowRole> = {

@@ -28,7 +28,7 @@
  * Scope note: this vouches for `origin` at the moment it runs. Branch-scoped
  * config (`includeIf "onbranch:…"`) can change `origin.pushurl` the moment a
  * branch is created or switched — re-run the guard after the final branch
- * switch, immediately before pushing (see SKILL.md).
+ * switch, immediately before pushing (see .agents/skills/mao-development/references/shipping-and-git.md).
  */
 import { execFileSync } from 'node:child_process'
 

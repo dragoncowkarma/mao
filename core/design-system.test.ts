@@ -281,7 +281,10 @@ describe('CSS token parity and contrast verification against src/index.css', () 
       const border = resolveCssToken(decl, '--color-border')
       const focus = resolveCssToken(decl, '--color-focus')
       const actionBg = resolveCssToken(decl, '--color-action-bg')
+      const actionHover = resolveCssToken(decl, '--color-action-hover')
       const actionText = resolveCssToken(decl, '--color-action-text')
+      const accent100 = resolveCssToken(decl, '--color-accent-100')
+      const accent800 = resolveCssToken(decl, '--color-accent-800')
       const dangerBg = resolveCssToken(decl, '--color-danger-bg')
       const dangerText = resolveCssToken(decl, '--color-danger-text')
       const warnBg = resolveCssToken(decl, '--color-warn-bg')
@@ -304,7 +307,10 @@ describe('CSS token parity and contrast verification against src/index.css', () 
         border,
         focus,
         actionBg,
+        actionHover,
         actionText,
+        accent100,
+        accent800,
         dangerBg,
         dangerText,
         warnText,
@@ -396,6 +402,14 @@ describe('CSS token parity and contrast verification against src/index.css', () 
       }
 
       expect(contrastRatio(dangerText, dangerBg), `${label} danger`).toBeGreaterThanOrEqual(4.5)
+      expect(contrastRatio(accent800, accent100), `${label} accent-800 vs accent-100`).toBeGreaterThanOrEqual(4.5)
+      expect(contrastRatio(text, accent100), `${label} update-banner text vs accent-100`).toBeGreaterThanOrEqual(4.5)
+
+      if (entry.id !== 'classic' || entry.mode === 'dark') {
+        expect(contrastRatio(actionText, actionHover), `${label} action-text vs action-hover`).toBeGreaterThanOrEqual(
+          4.5,
+        )
+      }
 
       if (entry.id === 'crimson' && entry.mode === 'dark') {
         // Ensure danger text is visibly distinct from near-white body text (#f7ecec)
@@ -504,6 +518,13 @@ describe('CSS token parity and contrast verification against src/index.css', () 
 
     const pulseRule = componentRules.find((rule) => rule.selector === '@keyframes card-active-pulse')
     expect(pulseRule?.body).toContain('var(--color-active-border)')
+    const classicDarkTokens = blockFor(
+      ":root[data-theme='dark'], :root[data-design='classic'][data-theme='dark']",
+    ).declarations
+    expect(classicTokens['--color-active-border']).toBe('var(--color-accent-2)')
+    expect(resolveCssToken(classicTokens, '--color-active-border')).toBe('#e15b47')
+    expect(classicDarkTokens['--color-active-border']).toBe('var(--color-accent-2)')
+    expect(resolveCssToken(classicDarkTokens, '--color-active-border')).toBe('#ff8f78')
 
     const statusGlyphRules = componentRules.filter(
       (rule) =>
@@ -525,6 +546,18 @@ describe('CSS token parity and contrast verification against src/index.css', () 
       (rule) => rule.selector === ":root[data-design]:not([data-design='classic']) .card",
     )
     expect(nonClassicCardRule?.declarations.border).toBe('1px solid var(--color-border)')
+
+    for (const control of ['.btn-secondary', '.input']) {
+      const expectedSelector = `:root[data-design]:not([data-design='classic']) ${control}`
+      const controlRule = componentRules.find((rule) =>
+        rule.selector
+          .split(',')
+          .map((s) => s.trim())
+          .includes(expectedSelector),
+      )
+      expect(controlRule, `Missing non-Classic border rule for ${control}`).toBeDefined()
+      expect(controlRule!.declarations['border-color']).toBe('var(--color-border)')
+    }
 
     const cardSubtleRules = componentRules.filter((rule) => rule.selector.includes('.card-subtle'))
     expect(cardSubtleRules.length).toBeGreaterThan(0)

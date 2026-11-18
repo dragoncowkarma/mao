@@ -30,6 +30,8 @@ afterEach(() => {
   cleanup()
   document.documentElement.removeAttribute('data-design')
   document.documentElement.removeAttribute('data-theme')
+  window.localStorage.removeItem('mao:design')
+  window.localStorage.removeItem('mao:theme')
   // Then drop the bridge, so anything that outlived cleanup fails with the accessor's message instead
   // of quietly recording calls against a stub the next test is asserting on.
   setElectronApi(null)

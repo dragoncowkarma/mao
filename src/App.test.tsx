@@ -3,6 +3,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 import App from './App'
+import { primeDocumentAppearance } from './appearance-cache'
 import { createElectronApiStub } from './test/electron-api-stub'
 import type { RepoRef } from '../core/workflow-engine'
 import type { DesignId, StoredValueProblem, ThemePreference } from '../core/store'
@@ -1529,40 +1530,152 @@ describe('Selectable design system and color mode', () => {
     await waitFor(() => expect(document.documentElement.getAttribute('data-design')).toBe('console'))
     cleanup()
 
+    window.localStorage.setItem('mao:design', 'crimson')
+    window.localStorage.setItem('mao:theme', 'dark')
+    const unknownDesign = deferred<DesignId>()
+    const unknownTheme = deferred<ThemePreference>()
     const userUnknown = userEvent.setup()
     const stubUnknown = createElectronApiStub([ONE])
-    stubUnknown.getDesign.mockResolvedValue('unknown-theme' as never)
-    stubUnknown.getTheme.mockResolvedValue('sepia' as never)
+    stubUnknown.getDesign.mockImplementation(() => unknownDesign.promise)
+    stubUnknown.getTheme.mockImplementation(() => unknownTheme.promise)
     render(
       <StrictMode>
         <App />
       </StrictMode>,
     )
+    expect(document.documentElement.getAttribute('data-design')).toBe('crimson')
+    expect(document.documentElement.getAttribute('data-theme')).toBe('dark')
     await projectHeading(ONE)
-    await waitFor(() => expect(document.documentElement.getAttribute('data-design')).toBe('classic'))
+    await act(async () => {
+      unknownDesign.resolve('unknown-theme' as never)
+      unknownTheme.resolve('sepia' as never)
+      await Promise.all([unknownDesign.promise, unknownTheme.promise])
+    })
+    expect(document.documentElement.getAttribute('data-design')).toBe('classic')
     expect(document.documentElement.getAttribute('data-theme')).toBeNull()
+    expect(window.localStorage.getItem('mao:design')).toBe('classic')
+    expect(window.localStorage.getItem('mao:theme')).toBe('system')
     await userUnknown.click(globalSettingsNav())
     expect(screen.getByRole('button', { name: 'System' })).toHaveClass('active')
     cleanup()
 
+    window.localStorage.setItem('mao:design', 'crimson')
+    window.localStorage.setItem('mao:theme', 'dark')
+    const rejectedDesign = deferred<DesignId>()
+    const rejectedTheme = deferred<ThemePreference>()
     const userRejected = userEvent.setup()
     const stubRejected = createElectronApiStub([ONE])
-    stubRejected.getDesign.mockRejectedValue(new Error('Failed to read design'))
-    stubRejected.getTheme.mockRejectedValue(new Error('Failed to read theme'))
+    stubRejected.getDesign.mockImplementation(() => rejectedDesign.promise)
+    stubRejected.getTheme.mockImplementation(() => rejectedTheme.promise)
     render(
       <StrictMode>
         <App />
       </StrictMode>,
     )
+    expect(document.documentElement.getAttribute('data-design')).toBe('crimson')
+    expect(document.documentElement.getAttribute('data-theme')).toBe('dark')
     await projectHeading(ONE)
-    await waitFor(() => expect(stubRejected.getDesign).toHaveBeenCalled())
-    await waitFor(() => expect(stubRejected.getTheme).toHaveBeenCalled())
+    await act(async () => {
+      rejectedDesign.reject(new Error('Failed to read design'))
+      rejectedTheme.reject(new Error('Failed to read theme'))
+      await Promise.allSettled([rejectedDesign.promise, rejectedTheme.promise])
+    })
+    await waitFor(() => {
+      expect(screen.getByRole('alert')).toHaveTextContent('Failed to read design Failed to read theme')
+    })
     expect(document.documentElement.getAttribute('data-design')).toBe('classic')
     expect(document.documentElement.getAttribute('data-theme')).toBeNull()
+    expect(window.localStorage.getItem('mao:design')).toBe('classic')
+    expect(window.localStorage.getItem('mao:theme')).toBe('system')
+    await userRejected.click(screen.getByRole('button', { name: 'Dismiss' }))
+    await waitFor(() => expect(screen.queryByRole('alert')).toBeNull())
     await userRejected.click(globalSettingsNav())
     expect(screen.getByRole('button', { name: /Classic/ })).toHaveAttribute('aria-pressed', 'true')
     expect(screen.getByRole('button', { name: 'System' })).toHaveClass('active')
     expect(screen.queryByRole('alert')).toBeNull()
+
+    // Subsequent double failure must roll back to reset default ('classic'), not the stale 'crimson' cache.
+    stubRejected.setDesign.mockRejectedValueOnce(new Error('Cannot write design: EIO'))
+    stubRejected.getDesign.mockRejectedValueOnce(new Error('Cannot read design: EIO'))
+    await userRejected.click(screen.getByRole('button', { name: /Developer Console/ }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Cannot write design: EIO')
+    expect(document.documentElement.getAttribute('data-design')).toBe('classic')
+    expect(window.localStorage.getItem('mao:design')).toBe('classic')
+    expect(screen.getByRole('button', { name: /Classic/ })).toHaveAttribute('aria-pressed', 'true')
+  })
+
+  it('primes document appearance from cached design and theme before mount', () => {
+    const originalMatchMedia = window.matchMedia
+    let osDark = false
+    window.matchMedia = (query: string): MediaQueryList => ({
+      get matches() {
+        return osDark
+      },
+      media: query,
+      onchange: null,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      addListener: () => {},
+      removeListener: () => {},
+      dispatchEvent: () => false,
+    })
+
+    try {
+      window.localStorage.setItem('mao:design', 'crimson')
+      window.localStorage.setItem('mao:theme', 'dark')
+      primeDocumentAppearance()
+      expect(document.documentElement.getAttribute('data-design')).toBe('crimson')
+      expect(document.documentElement.getAttribute('data-theme')).toBe('dark')
+
+      window.localStorage.setItem('mao:design', 'console')
+      window.localStorage.setItem('mao:theme', 'system')
+      osDark = true
+      primeDocumentAppearance()
+      expect(document.documentElement.getAttribute('data-design')).toBe('console')
+      expect(document.documentElement.getAttribute('data-theme')).toBe('dark')
+
+      window.localStorage.setItem('mao:theme', 'light')
+      primeDocumentAppearance()
+      expect(document.documentElement.getAttribute('data-design')).toBe('console')
+      expect(document.documentElement.getAttribute('data-theme')).toBeNull()
+    } finally {
+      window.matchMedia = originalMatchMedia
+    }
+  })
+
+  it('applies cached design and theme synchronously on initial commit before IPC reads settle, then reconciles with store', async () => {
+    window.localStorage.setItem('mao:design', 'crimson')
+    window.localStorage.setItem('mao:theme', 'dark')
+
+    const initialDesign = deferred<DesignId>()
+    const initialTheme = deferred<ThemePreference>()
+    const stub = createElectronApiStub([ONE])
+    stub.getDesign.mockImplementation(() => initialDesign.promise)
+    stub.getTheme.mockImplementation(() => initialTheme.promise)
+
+    render(
+      <StrictMode>
+        <App />
+      </StrictMode>,
+    )
+
+    expect(document.documentElement.getAttribute('data-design')).toBe('crimson')
+    expect(document.documentElement.getAttribute('data-theme')).toBe('dark')
+
+    await projectHeading(ONE)
+    expect(document.documentElement.getAttribute('data-design')).toBe('crimson')
+    expect(document.documentElement.getAttribute('data-theme')).toBe('dark')
+
+    await act(async () => {
+      initialDesign.resolve('console')
+      initialTheme.resolve('light')
+      await Promise.all([initialDesign.promise, initialTheme.promise])
+    })
+
+    expect(document.documentElement.getAttribute('data-design')).toBe('console')
+    expect(document.documentElement.getAttribute('data-theme')).toBeNull()
+    expect(window.localStorage.getItem('mao:design')).toBe('console')
+    expect(window.localStorage.getItem('mao:theme')).toBe('light')
   })
 
   it('ignores late initial mount reads after the operator already chose a design or theme', async () => {
@@ -1788,6 +1901,7 @@ describe('Selectable design system and color mode', () => {
     expect(stub.api.workflow.enqueueFromIssue).not.toHaveBeenCalled()
     expect(stub.api.workflow.retry).not.toHaveBeenCalled()
     expect(stub.api.workflow.advance).not.toHaveBeenCalled()
+    expect(stub.api.workflow.setAutoAdvance).not.toHaveBeenCalled()
     expect(stub.api.workflow.clearCompleted).not.toHaveBeenCalled()
 
     await user.click(sidebarProject(TWO))
@@ -1818,6 +1932,7 @@ describe('Selectable design system and color mode', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('Cannot write config.json: EACCES')
     expect(screen.getByRole('alert').textContent).not.toContain('Error invoking remote method')
     expect(document.documentElement.getAttribute('data-design')).toBe('console')
+    expect(window.localStorage.getItem('mao:design')).toBe('console')
     expect(consoleBtn).toHaveAttribute('aria-pressed', 'true')
     expect(crimsonBtn).toHaveAttribute('aria-pressed', 'false')
     expect(classicBtn).toHaveAttribute('aria-pressed', 'false')
@@ -1830,6 +1945,7 @@ describe('Selectable design system and color mode', () => {
     // proving fallback restores lastConfirmedDesign rather than blindly substituting 'classic'.
     await user.click(consoleBtn)
     expect(document.documentElement.getAttribute('data-design')).toBe('console')
+    expect(window.localStorage.getItem('mao:design')).toBe('console')
     expect(consoleBtn).toHaveAttribute('aria-pressed', 'true')
 
     stub.setDesign.mockRejectedValueOnce(new Error('Cannot write config.json: EIO'))
@@ -1838,6 +1954,7 @@ describe('Selectable design system and color mode', () => {
 
     expect(await screen.findByRole('alert')).toHaveTextContent('Cannot write config.json: EIO')
     expect(document.documentElement.getAttribute('data-design')).toBe('console')
+    expect(window.localStorage.getItem('mao:design')).toBe('console')
     expect(consoleBtn).toHaveAttribute('aria-pressed', 'true')
     expect(crimsonBtn).toHaveAttribute('aria-pressed', 'false')
 
@@ -1888,8 +2005,57 @@ describe('Selectable design system and color mode', () => {
     await waitFor(() => expect(stub.storeProblems.mock.calls.length).toBeGreaterThan(storeProblemsBeforeReject))
 
     expect(document.documentElement.getAttribute('data-design')).toBe('console')
+    expect(window.localStorage.getItem('mao:design')).toBe('console')
     expect(screen.getByRole('button', { name: /Developer Console/ })).toHaveAttribute('aria-pressed', 'true')
     expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('ignores out-of-order setDesign and setTheme settlements after newer selections already succeeded', async () => {
+    const { stub, user } = await renderApp([ONE])
+    await user.click(globalSettingsNav())
+    await waitFor(() => expect(stub.getDesign).toHaveBeenCalled())
+    await waitFor(() => expect(stub.getTheme).toHaveBeenCalled())
+
+    const pendingDesign1 = deferred<void>()
+    stub.setDesign.mockImplementationOnce(() => pendingDesign1.promise)
+    await user.click(screen.getByRole('button', { name: /Crimson Signal/ }))
+    await user.click(screen.getByRole('button', { name: /Developer Console/ }))
+    await waitFor(() => expect(window.localStorage.getItem('mao:design')).toBe('console'))
+
+    const pendingTheme1 = deferred<void>()
+    stub.setTheme.mockImplementationOnce(() => pendingTheme1.promise)
+    await user.click(screen.getByRole('button', { name: 'Dark' }))
+    await user.click(screen.getByRole('button', { name: 'Light' }))
+    await waitFor(() => expect(window.localStorage.getItem('mao:theme')).toBe('light'))
+
+    // Older request 1 resolves AFTER request 2 already settled: must not clobber localStorage or lastConfirmed*.
+    await act(async () => {
+      pendingDesign1.resolve()
+      pendingTheme1.resolve()
+      await Promise.all([pendingDesign1.promise, pendingTheme1.promise])
+    })
+
+    expect(document.documentElement.getAttribute('data-design')).toBe('console')
+    expect(window.localStorage.getItem('mao:design')).toBe('console')
+    expect(document.documentElement.getAttribute('data-theme')).toBeNull()
+    expect(window.localStorage.getItem('mao:theme')).toBe('light')
+
+    // Subsequent double failure must roll back to 'console' / 'light', NOT the stale 'crimson' / 'dark' settlement.
+    stub.setDesign.mockRejectedValueOnce(new Error('Cannot write design: EIO'))
+    stub.getDesign.mockRejectedValueOnce(new Error('Cannot read design: EIO'))
+    await user.click(screen.getByRole('button', { name: /Classic/ }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Cannot write design: EIO')
+    expect(document.documentElement.getAttribute('data-design')).toBe('console')
+    expect(window.localStorage.getItem('mao:design')).toBe('console')
+    expect(screen.getByRole('button', { name: /Developer Console/ })).toHaveAttribute('aria-pressed', 'true')
+
+    stub.setTheme.mockRejectedValueOnce(new Error('Cannot write theme: EIO'))
+    stub.getTheme.mockRejectedValueOnce(new Error('Cannot read theme: EIO'))
+    await user.click(screen.getByRole('button', { name: 'Dark' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Cannot write theme: EIO')
+    expect(document.documentElement.getAttribute('data-theme')).toBeNull()
+    expect(window.localStorage.getItem('mao:theme')).toBe('light')
+    expect(screen.getByRole('button', { name: 'Light' })).toHaveClass('active')
   })
 
   it('surfaces in-flight setDesign and setTheme failures after leaving Global settings and clears via Dismiss or navigation', async () => {

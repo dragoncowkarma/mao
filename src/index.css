@@ -39,7 +39,7 @@
   --color-action-hover: var(--color-accent-600);
   --color-action-text: var(--color-bg);
   --color-action-border: transparent;
-  --color-active-border: var(--color-accent);
+  --color-active-border: var(--color-accent-2);
   --color-action-indicator: var(--color-bg);
 
   --color-focus: #ec3013;
@@ -107,7 +107,7 @@
   --color-action-hover: var(--color-accent-600);
   --color-action-text: var(--color-bg);
   --color-action-border: transparent;
-  --color-active-border: var(--color-accent);
+  --color-active-border: var(--color-accent-2);
   --color-action-indicator: var(--color-bg);
 
   --color-focus: #ff8465;
@@ -1192,6 +1192,11 @@ a:focus-visible {
 
 :root[data-design]:not([data-design='classic']) .input::placeholder {
   color: var(--color-text-muted);
+}
+
+:root[data-design]:not([data-design='classic']) .btn-secondary,
+:root[data-design]:not([data-design='classic']) .input {
+  border-color: var(--color-border);
 }
 
 :root[data-design]:not([data-design='classic']) .update-banner-meta {

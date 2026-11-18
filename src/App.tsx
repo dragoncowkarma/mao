@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import Sidebar, { type RepoListResetOutcome } from './components/Sidebar'
 import KanbanBoard from './components/KanbanBoard'
 import WorkflowQueue from './components/WorkflowQueue'
@@ -6,6 +6,14 @@ import ProjectSettings from './components/ProjectSettings'
 import GlobalSettings from './components/GlobalSettings'
 import UpdateBanner from './components/UpdateBanner'
 import { electronApi } from './electron-api'
+import {
+  applyEffectiveTheme,
+  normalizeThemePreference,
+  readCachedDesign,
+  readCachedTheme,
+  writeCachedDesign,
+  writeCachedTheme,
+} from './appearance-cache'
 import type { QueueRecoveryState, RepoRef } from '../core/workflow-engine'
 import type { RepoWorkflowCapability } from '../core/repo-capabilities'
 import { sameRepoRef } from '../core/repo-registry'
@@ -28,10 +36,6 @@ function selectedRepoIndex(repos: RepoRef[], selected: RepoRef): number {
   return exact === -1 ? repos.findIndex((repo) => sameRepoRef(repo, selected)) : exact
 }
 
-function normalizeThemePreference(value: unknown): ThemePreference {
-  return value === 'light' || value === 'dark' || value === 'system' ? value : 'system'
-}
-
 /**
  * Electron re-wraps anything thrown inside `ipcMain.handle` as
  * `Error invoking remote method '<channel>': <ErrorName>: <message>`. Strip the plumbing while
@@ -48,20 +52,22 @@ export default function App() {
   const [selectedRepo, setSelectedRepo] = useState<RepoRef | null>(null)
   const [view, setView] = useState<View>('project')
   const [projectTab, setProjectTab] = useState<ProjectTab>('board')
-  const [theme, setThemeState] = useState<ThemePreference>('system')
-  const [design, setDesignState] = useState<DesignId>(DEFAULT_DESIGN_ID)
+  const [theme, setThemeState] = useState<ThemePreference>(readCachedTheme)
+  const [design, setDesignState] = useState<DesignId>(readCachedDesign)
   const [themeError, setThemeError] = useState('')
   const [designError, setDesignError] = useState('')
   const appearanceError = [designError, themeError].filter(Boolean).join(' ')
   /**
-   * Per-axis request generations and last-confirmed values so an initial mount read or an older
-   * failed write cannot overwrite a newer user selection, and a double failure falls back to the
-   * last persisted state rather than an unpersisted optimistic pick.
+   * Per-axis request/settlement generations and last-confirmed values so an initial mount read or an
+   * out-of-order settlement cannot overwrite a newer user selection, and a double failure falls back
+   * to the last persisted state rather than an unpersisted optimistic pick.
    */
   const themeRequestGen = useRef(0)
   const designRequestGen = useRef(0)
-  const lastConfirmedTheme = useRef<ThemePreference>('system')
-  const lastConfirmedDesign = useRef<DesignId>(DEFAULT_DESIGN_ID)
+  const lastSettledThemeGen = useRef(0)
+  const lastSettledDesignGen = useRef(0)
+  const lastConfirmedTheme = useRef<ThemePreference>(theme)
+  const lastConfirmedDesign = useRef<DesignId>(design)
   const [update, setUpdate] = useState<AppUpdateCheck | null>(null)
   const [dismissedUpdateSha, setDismissedUpdateSha] = useState<string | null>(null)
   /** Surfaces a failed settings edit or removal, which are otherwise silent (no preflight, no form). */
@@ -304,12 +310,15 @@ export default function App() {
         if (cancelled || themeRequestGen.current !== 0) return
         const normalized = normalizeThemePreference(saved)
         lastConfirmedTheme.current = normalized
+        writeCachedTheme(normalized)
         setThemeState(normalized)
       })
-      .catch(() => {
+      .catch((err) => {
         if (cancelled || themeRequestGen.current !== 0) return
         lastConfirmedTheme.current = 'system'
+        writeCachedTheme('system')
         setThemeState('system')
+        setThemeError(appearanceErrorMessage(err))
       })
     Promise.resolve()
       .then(() => electronApi().ui.getDesign())
@@ -317,19 +326,22 @@ export default function App() {
         if (cancelled || designRequestGen.current !== 0) return
         const normalized = normalizeDesignId(saved)
         lastConfirmedDesign.current = normalized
+        writeCachedDesign(normalized)
         setDesignState(normalized)
       })
-      .catch(() => {
+      .catch((err) => {
         if (cancelled || designRequestGen.current !== 0) return
         lastConfirmedDesign.current = DEFAULT_DESIGN_ID
+        writeCachedDesign(DEFAULT_DESIGN_ID)
         setDesignState(DEFAULT_DESIGN_ID)
+        setDesignError(appearanceErrorMessage(err))
       })
     return () => {
       cancelled = true
     }
   }, [])
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     document.documentElement.setAttribute('data-design', design)
   }, [design])
 
@@ -337,23 +349,15 @@ export default function App() {
   // token overrides off of. 'system' has no fixed effective value, so it tracks the OS-level media
   // query live instead of resolving once — the app should flip immediately if the OS theme changes
   // while it's open, without requiring a restart or a settings round-trip.
-  useEffect(() => {
+  useLayoutEffect(() => {
     const media = window.matchMedia('(prefers-color-scheme: dark)')
+    const syncEffectiveTheme = () => applyEffectiveTheme(theme, media.matches)
 
-    function applyEffectiveTheme() {
-      const effective = theme === 'system' ? (media.matches ? 'dark' : 'light') : theme
-      if (effective === 'dark') {
-        document.documentElement.setAttribute('data-theme', 'dark')
-      } else {
-        document.documentElement.removeAttribute('data-theme')
-      }
-    }
-
-    applyEffectiveTheme()
+    syncEffectiveTheme()
 
     if (theme !== 'system') return
-    media.addEventListener('change', applyEffectiveTheme)
-    return () => media.removeEventListener('change', applyEffectiveTheme)
+    media.addEventListener('change', syncEffectiveTheme)
+    return () => media.removeEventListener('change', syncEffectiveTheme)
   }, [theme])
 
   async function setTheme(next: ThemePreference) {
@@ -362,14 +366,22 @@ export default function App() {
     setThemeState(next)
     try {
       await electronApi().ui.setTheme(next)
-      lastConfirmedTheme.current = next
+      if (request > lastSettledThemeGen.current) {
+        lastSettledThemeGen.current = request
+        lastConfirmedTheme.current = next
+      }
+      if (themeRequestGen.current === request) {
+        writeCachedTheme(next)
+      }
     } catch (err) {
       const actual = await Promise.resolve()
         .then(() => electronApi().ui.getTheme())
         .then(normalizeThemePreference)
         .catch(() => lastConfirmedTheme.current)
       if (themeRequestGen.current !== request) return
+      lastSettledThemeGen.current = request
       lastConfirmedTheme.current = actual
+      writeCachedTheme(actual)
       setThemeState(actual)
       setThemeError(appearanceErrorMessage(err))
     }
@@ -381,14 +393,22 @@ export default function App() {
     setDesignState(next)
     try {
       await electronApi().ui.setDesign(next)
-      lastConfirmedDesign.current = next
+      if (request > lastSettledDesignGen.current) {
+        lastSettledDesignGen.current = request
+        lastConfirmedDesign.current = next
+      }
+      if (designRequestGen.current === request) {
+        writeCachedDesign(next)
+      }
     } catch (err) {
       const actual = await Promise.resolve()
         .then(() => electronApi().ui.getDesign())
         .then(normalizeDesignId)
         .catch(() => lastConfirmedDesign.current)
       if (designRequestGen.current !== request) return
+      lastSettledDesignGen.current = request
       lastConfirmedDesign.current = actual
+      writeCachedDesign(actual)
       setDesignState(actual)
       setDesignError(appearanceErrorMessage(err))
     } finally {

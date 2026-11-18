@@ -117,8 +117,10 @@ config
       throw new Error(`Invalid design "${design}" — expected one of: ${DESIGN_IDS.join(', ')}`)
     }
     const { store } = loadApp()
+    const priorProblem = store.problems().find((problem) => problem.field === 'design')
     store.set('design', design as DesignId)
     log(`Design preset set to ${design}`)
+    if (priorProblem !== undefined) log(describeHealedStoredValue(priorProblem))
   })
 
 config

@@ -153,7 +153,7 @@
 | `--color-action-hover` | `#dd2b0f` / `#ff8465` | `#e5a519` / `#e5a519` | `#043970` / `#7dd3fc` |
 | `--color-action-text` | `#f3f2f2` / `#1a1817` | `#261214` / `#180c0e` | `#f8fafc` / `#09111a` |
 | `--color-action-border` | `transparent` / `transparent` | `#9e1b24` / `#ffd24c` | `transparent` / `transparent` |
-| `--color-active-border` | `#ec3013` / `#ff6a4a` | `#9e1b24` / `#c92a3a` | `#064b91` / `#f59e0b` |
+| `--color-active-border` | `#e15b47` / `#ff8f78` | `#9e1b24` / `#c92a3a` | `#064b91` / `#f59e0b` |
 | `--color-action-indicator` | `#f3f2f2` / `#1a1817` | `#9e1b24` / `#c92a3a` | `#38bdf8` / `#064b91` |
 | `--color-focus` | `#ec3013` / `#ff8465` | `#6e4700` / `#ffd24c` | `#064b91` / `#38bdf8` |
 | `--color-accent-100` / `800` | `#fff2ef`·`#7c1405` / `#3a1c14`·`#ffd3c4` | `#fbe4e6`·`#5c0b12` / `#421218`·`#ffd6da` | `#dff0ff`·`#022042` / `#0c2d48`·`#e0f2fe` |

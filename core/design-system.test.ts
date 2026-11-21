@@ -405,7 +405,14 @@ describe('CSS token parity and contrast verification against src/index.css', () 
       expect(contrastRatio(accent800, accent100), `${label} accent-800 vs accent-100`).toBeGreaterThanOrEqual(4.5)
       expect(contrastRatio(text, accent100), `${label} update-banner text vs accent-100`).toBeGreaterThanOrEqual(4.5)
 
-      if (entry.id !== 'classic' || entry.mode === 'dark') {
+      if (entry.id === 'classic' && entry.mode === 'light') {
+        // Classic Light preserves main's #f3f2f2 on #ec3013 (3.76:1) and #dd2b0f hover (4.25:1) verbatim.
+        expect(contrastRatio(actionText, actionBg), `${label} action-text vs action-bg`).toBeGreaterThanOrEqual(3.75)
+        expect(contrastRatio(actionText, actionHover), `${label} action-text vs action-hover`).toBeGreaterThanOrEqual(
+          4.24,
+        )
+        expect(contrastRatio(actionText, actionHover)).toBeGreaterThan(contrastRatio(actionText, actionBg))
+      } else {
         expect(contrastRatio(actionText, actionHover), `${label} action-text vs action-hover`).toBeGreaterThanOrEqual(
           4.5,
         )

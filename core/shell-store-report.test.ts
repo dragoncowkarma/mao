@@ -65,3 +65,42 @@ describe('cli repository-list writes report what they healed', () => {
     }
   })
 })
+
+describe('cli set-design reports healed invalid stored design values', () => {
+  const source = withoutComments(fs.readFileSync(path.join(REPO_ROOT, 'cli', 'index.ts'), 'utf-8'))
+  const start = source.indexOf(".command('set-design <design>')")
+  const end = source.indexOf(".command('show')", start)
+  const setDesignAction = source.slice(start, end)
+
+  it('reads prior design problems before writing and conditionally logs describeHealedStoredValue after', () => {
+    expect(start).toBeGreaterThan(-1)
+    expect(end).toBeGreaterThan(start)
+
+    const problemsIndex = setDesignAction.indexOf('store.problems()')
+    const designFieldIndex = setDesignAction.indexOf("'design'", problemsIndex)
+    const setIndex = setDesignAction.indexOf("store.set('design',")
+
+    expect(problemsIndex).toBeGreaterThan(-1)
+    expect(designFieldIndex).toBeGreaterThan(problemsIndex)
+    expect(setIndex).toBeGreaterThan(designFieldIndex)
+    expect(setDesignAction.slice(setIndex)).toMatch(
+      /if\s*\([^)]+\)\s*(?:\{[^}]*)?log\(\s*describeHealedStoredValue\(/,
+    )
+  })
+})
+
+describe('renderer entry bootstrap ordering', () => {
+  const mainSource = withoutComments(fs.readFileSync(path.join(REPO_ROOT, 'src', 'main.tsx'), 'utf-8'))
+
+  it('binds the preload bridge and primes document appearance strictly before createRoot', () => {
+    const bridgeIndex = mainSource.indexOf('setElectronApi(window.electronAPI)')
+    const primeIndex = mainSource.indexOf('primeDocumentAppearance()')
+    const createRootIndex = mainSource.indexOf('createRoot(')
+
+    expect(bridgeIndex).toBeGreaterThan(-1)
+    expect(primeIndex).toBeGreaterThan(-1)
+    expect(createRootIndex).toBeGreaterThan(-1)
+    expect(bridgeIndex).toBeLessThan(createRootIndex)
+    expect(primeIndex).toBeLessThan(createRootIndex)
+  })
+})

@@ -165,7 +165,7 @@
 | `--font-body` | `'Archivo', system-ui, sans-serif` | `'Archivo', system-ui, -apple-system, sans-serif` | `system-ui, -apple-system, 'Segoe UI', sans-serif` |
 | `--font-mono` | `'SFMono-Regular', 'JetBrains Mono', 'Menlo', 'Consolas', monospace` | 동일 | 동일 |
 
-> **참고 (`classic` 오류 대비)**: Classic Light에서 `.btn-primary`의 `#f3f2f2` on `#ec3013` 대비율은 `3.76:1`로 기존 시각 호환을 위해 원형 유지되었으며, `.text-danger`(`#ae1800`)는 `bg` 위 `6.41:1` / `danger-bg` 위 `6.55:1`, `.tag-danger`(`#7c1405` on `#fff2ef`)는 `9.80:1`을 만족합니다. 반면 `crimson` Light의 `#8c0b15` on `#fde8e8`(`8.23:1`), `crimson` Dark의 `#ff7a88` on `#451219`(`6.20:1`, 본문 `#f7ecec`과의 RGB 거리 및 명도 차로 백색 텍스트와도 명확히 구분됨), `warn`(`8.32:1` / `11.50:1`), `success`(`8.30:1` / `10.50:1`)는 모두 WCAG AA 이상을 충족합니다.
+> **참고 (`classic` 버튼·오류 대비)**: Classic Light에서 `.btn-primary`(`#f3f2f2` on `#ec3013`, `3.76:1`)와 `.btn-primary:hover`(`#f3f2f2` on `#dd2b0f`, `4.25:1`)는 `main`과의 100% Classic 시각 호환을 위해 원형 그대로 유지되었으며, `.text-danger`(`#ae1800`)는 `bg` 위 `6.41:1` / `danger-bg` 위 `6.55:1`, `.tag-danger`(`#7c1405` on `#fff2ef`)는 `9.80:1`을 만족합니다. 반면 `crimson` Light의 `#8c0b15` on `#fde8e8`(`8.23:1`), `crimson` Dark의 `#ff7a88` on `#451219`(`6.20:1`, 본문 `#f7ecec`과의 RGB 거리 및 명도 차로 백색 텍스트와도 명확히 구분됨), `warn`(`8.32:1` / `11.50:1`), `success`(`8.30:1` / `10.50:1`)는 모두 WCAG AA 이상을 충족합니다.
 
 ### 4.3 브랜드 색상(레드·옐로)과 의미 상태의 분리 규칙
 1. **전용 상태 토큰 분리 (`:not([data-design='classic'])`)**: 작업 실패(`.tag-danger`), 일시정지(`.tag-warn`), 완료(`.tag-success`), 실행 중(`.tag-outline` + `.live-dot` + `.card-active`)을 각각 독립된 배경·테두리·전경 토큰으로 분리했습니다.
@@ -183,6 +183,10 @@
 - **GUI↔CLI 패리티 (`cli/index.ts`, `src/App.tsx`, `src/components/GlobalSettings.tsx`)**:
   - CLI에서 `mao config set-design <classic|crimson|console>` 및 `mao config show`의 `"design"` 필드로 디자인 프리셋을 조회·변경할 수 있습니다.
   - 렌더러(`src/App.tsx`)는 마운트 시 `ui:getDesign()`과 `ui:getTheme()`를 읽어 `<html data-design="...">` 및 `<html data-theme="...">`에 반영하며, 저장 실패 시 마지막 확인 상태로 롤백하고 `role="alert"`(`Dismiss` 버튼 포함)로 오류를 표시합니다.
+  - **첫 프레임 캐시 동기화 (`src/appearance-cache.ts`, `localStorage` 키 `mao:design`·`mao:theme`)**:
+    - `src/main.tsx`는 `ReactDOM.createRoot(...).render(...)` 호출 직전에 `primeDocumentAppearance()`를 실행하고, `src/App.tsx`는 캐시(`readCachedDesign`·`readCachedTheme`)로 초기 상태를 초기화한 뒤 `useLayoutEffect`로 `<html data-design>` 및 `<html data-theme>`을 동기화해 시작 시 Classic/Light로 깜빡이는 현상을 방지합니다.
+    - GUI가 닫혀 있는 동안 CLI(`mao config set-design` / `mao config set-theme`)로 `design` 또는 `theme`을 변경하면, 다음 GUI 실행 시 직전 GUI 캐시 프리셋을 먼저 그린 뒤 `ui:getDesign` / `ui:getTheme`가 응답하는 즉시 `config.json` 값으로 재조정(reconcile)합니다.
+    - 시작 시 초기 `ui:getDesign` / `ui:getTheme` 읽기가 실패하면 렌더러는 `'classic'` / `'system'`으로 폴백하고, `localStorage` 캐시(`mao:design`·`mao:theme`)도 동일 기본값으로 재설정해 `lastConfirmed*` 참조 및 렌더링된 DOM 폴백과 일관성을 유지하며, 닫기 가능한(`Dismiss`) `role="alert"` 오류 배너를 표시합니다.
 
 ### 5.2 검증 게이트 요약
 - `npm run lint` (`tsc --noEmit`): 타입 및 IPC 브리지 계약 검증 통과

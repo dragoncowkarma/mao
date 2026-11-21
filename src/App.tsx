@@ -315,6 +315,7 @@ export default function App() {
       })
       .catch((err) => {
         if (cancelled || themeRequestGen.current !== 0) return
+        // Reset localStorage alongside the fallback state so cache, lastConfirmedTheme, and DOM stay aligned.
         lastConfirmedTheme.current = 'system'
         writeCachedTheme('system')
         setThemeState('system')
@@ -331,6 +332,7 @@ export default function App() {
       })
       .catch((err) => {
         if (cancelled || designRequestGen.current !== 0) return
+        // Reset localStorage alongside the fallback state so cache, lastConfirmedDesign, and DOM stay aligned.
         lastConfirmedDesign.current = DEFAULT_DESIGN_ID
         writeCachedDesign(DEFAULT_DESIGN_ID)
         setDesignState(DEFAULT_DESIGN_ID)

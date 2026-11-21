@@ -2255,4 +2255,87 @@ describe('Selectable design system and color mode', () => {
     await user.click(screen.getByRole('button', { name: 'Dismiss' }))
     await waitFor(() => expect(screen.queryByRole('alert')).toBeNull())
   })
+
+  it('bootstraps via src/main.tsx by priming cached appearance before createRoot and reconciling once IPC resolves', async () => {
+    const rootEl = document.createElement('div')
+    rootEl.id = 'root'
+    document.body.appendChild(rootEl)
+
+    const hadElectronApi = Object.prototype.hasOwnProperty.call(window, 'electronAPI')
+    const previousElectronApi = window.electronAPI
+    let createdRoot: { unmount: () => void } | undefined
+    let createRootSpy: { mockRestore: () => void } | undefined
+    let freshElectronApi: typeof import('./electron-api') | undefined
+    let designAtCreateRoot: string | null = null
+    let themeAtCreateRoot: string | null = null
+
+    try {
+      window.localStorage.setItem('mao:design', 'crimson')
+      window.localStorage.setItem('mao:theme', 'dark')
+
+      const initialDesign = deferred<DesignId>()
+      const initialTheme = deferred<ThemePreference>()
+      const user = userEvent.setup()
+      const stub = createElectronApiStub([ONE])
+      stub.getDesign.mockImplementation(() => initialDesign.promise)
+      stub.getTheme.mockImplementation(() => initialTheme.promise)
+      window.electronAPI = stub.api
+
+      vi.resetModules()
+      const reactDomClient = await import('react-dom/client')
+      freshElectronApi = await import('./electron-api')
+      const realCreateRoot = reactDomClient.default.createRoot
+      createRootSpy = vi.spyOn(reactDomClient.default, 'createRoot').mockImplementation((...args) => {
+        designAtCreateRoot = document.documentElement.getAttribute('data-design')
+        themeAtCreateRoot = document.documentElement.getAttribute('data-theme')
+        const root = realCreateRoot(...args)
+        createdRoot = root
+        return root
+      })
+
+      await act(async () => {
+        await import('./main')
+      })
+
+      expect(createRootSpy).toHaveBeenCalledWith(rootEl)
+      expect(designAtCreateRoot).toBe('crimson')
+      expect(themeAtCreateRoot).toBe('dark')
+      expect(document.documentElement.getAttribute('data-design')).toBe('crimson')
+      expect(document.documentElement.getAttribute('data-theme')).toBe('dark')
+
+      const initialHeading = await projectHeading(ONE)
+      expect(rootEl.contains(initialHeading)).toBe(true)
+
+      await act(async () => {
+        initialDesign.resolve('console')
+        initialTheme.resolve('light')
+        await Promise.all([initialDesign.promise, initialTheme.promise])
+      })
+
+      expect(document.documentElement.getAttribute('data-design')).toBe('console')
+      expect(document.documentElement.getAttribute('data-theme')).toBeNull()
+      expect(window.localStorage.getItem('mao:design')).toBe('console')
+      expect(window.localStorage.getItem('mao:theme')).toBe('light')
+      expect(rootEl.contains(await projectHeading(ONE))).toBe(true)
+
+      await user.click(globalSettingsNav())
+      expect(screen.getByRole('button', { name: /Developer Console/ })).toHaveAttribute('aria-pressed', 'true')
+      expect(screen.getByRole('button', { name: 'Light' })).toHaveClass('active')
+    } finally {
+      if (createdRoot) {
+        await act(async () => {
+          createdRoot!.unmount()
+        })
+      }
+      createRootSpy?.mockRestore()
+      freshElectronApi?.setElectronApi(null)
+      rootEl.remove()
+      if (hadElectronApi) {
+        window.electronAPI = previousElectronApi
+      } else {
+        Reflect.deleteProperty(window, 'electronAPI')
+      }
+      vi.resetModules()
+    }
+  })
 })

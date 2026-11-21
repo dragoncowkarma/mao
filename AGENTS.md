@@ -25,6 +25,7 @@ AI agents drive GitHub issue → PR → review → merge, with a maker-checker s
 | `core/app.ts` | `createMaoApp()`, the single composition root |
 | `core/workflow-engine.ts` | Queue state machine, CI gate, retry |
 | `core/agent-selection.ts` | Pure routing: maker-checker, pins, model/effort |
+| `core/design-system.ts` | Pure design presets, swatches, fallback contract (renderer-importable) |
 | `core/assignment.ts` | Issue-body tags → `ProviderOverride` |
 | `core/auto-trigger.ts` | Per-repo poller; enqueues new open issues |
 | `core/github-service.ts` | Octokit wrapper + read-only write preflight |
@@ -59,7 +60,7 @@ Code comments cite these numbers: never renumber (`core/agent-docs.test.ts`).
 3. **`createMaoApp()` (`core/app.ts`) is the only boot path.** Mutate through `WorkflowEngine` so persistence is automatic. Partial proof: `core/app.test.ts`.
 4. **The `resume` flag is deliberately required (no default).** One-shot commands pass `false`; `electron/ipc.ts` passes `true`; `mao run` passes `false`, then calls `resumeProcessing()` after attaching its listener. Proof: `npm run lint` (flag required); shell values and order: review.
 5. **Never start the auto-trigger poller inside `createMaoApp()`.** Its `setInterval` keeps the process alive; only `electron/ipc.ts` and `mao run` start it. No test: `git grep "auto-trigger.ts'" -- core/app.ts` must print nothing.
-6. **Renderer isolation.** `src/` reaches main only through `electronApi()`. Outside tests, from `core/` it imports types, plus values from `core/agent-selection.ts`, `core/ai/provider-options.ts`, `core/repo-registry.ts` only. No IPC push: the UI polls and re-fetches after each mutation. Partial proof: `src/electron-api.test.ts` (bridge door only).
+6. **Renderer isolation.** `src/` reaches main only through `electronApi()`. Outside tests, from `core/` it imports types, plus values from `core/agent-selection.ts`, `core/ai/provider-options.ts`, `core/design-system.ts`, `core/repo-registry.ts` only. No IPC push: the UI polls and re-fetches after each mutation. Partial proof: `src/electron-api.test.ts` (bridge door only).
 7. **Electron security posture.** `webPreferences` sets only `preload`; never weaken Electron 33 defaults. `setWindowOpenHandler` keeps `{ action: 'deny' }`, routing http/https to `shell.openExternal`. No test: review `electron/main.ts`.
 8. **`core/` tests must stay runnable under plain Node.** `vitest.config.ts` keeps two projects: `core` (node, zero plugins, no `extends`) and `renderer` (jsdom). `npm run test` runs them separately: combined, an empty project exits 0. Partial proof: `core/node-environment.test.ts`.
 
@@ -70,6 +71,7 @@ Code comments cite these numbers: never renumber (`core/agent-docs.test.ts`).
 | IPC channel | `electron/ipc.ts`, `electron/preload.ts`, `src/electron.d.ts`, `src/test/electron-api-stub.ts`; literal `<domain>:<camelCaseAction>` | `src/electron-ipc-surface.test.ts` |
 | Store field | `MaoStoreSchema` + `MAO_STORE_DEFAULTS`; array: `STORED_SHAPE_RULES` + table test | Lint (pair); rule: review |
 | `MaoStore` backend | `createGuardedStore()`, strict `getFresh`, `withFileWriteLock` | `core/store.test.ts` |
+| Design preset | `core/design-system.ts`, `src/index.css` (light + dark blocks), `core/design-system.test.ts` | `core/design-system.test.ts` |
 | Repo registration | Rule only in `core/repo-registry.ts`; shells call `updateRepos` and surface unverified grants | `core/repo-registry.test.ts` (shells: review) |
 | Capability policy | `core/repo-capabilities.ts`, consumed by `core/github-service.ts` and `core/swarm/platform.ts`; preserve each credential boundary | Core capability + Swarm platform tests |
 | Pipeline stage | `AGENT_STAGES` (`core/ai/types.ts`); `STAGE_ROLE` (`core/agent-selection.ts`); `buildPromptForStage`, `applyGithubAction`; `STAGE_LABELS` in `KanbanBoard.tsx`, `WorkflowQueue.tsx`; `ALL_STAGES` + `STAGE_LABELS` in `GlobalSettings.tsx` | Partial: `core/workflow-engine.test.ts` |
@@ -90,7 +92,7 @@ Code comments cite these numbers: never renumber (`core/agent-docs.test.ts`).
 1. **Each external write needs explicit task authorization;** analyze, review and verify requests grant none. Enqueueing, `mao run`, `npm run dev` (real host), `mao swarm` (except `--dry-run`/`--status`), `github:refreshRepo` (bypasses `autoTrigger: false`), the E2E harness, and closing the last item of a `vX.Y.Z` milestone (`release.yml` publishes) count. Test only against throwaway repos.
 2. **Writers are fixed.** `githubRepos`: only `updateRepos`. `workflowTasks`: two conditional writers, both in `core/app.ts`.
 3. **Reads coerce, writes refuse.** An unreadable `config.json` refuses every write; invalid `aiProviders`/`workflowTasks` lists never reach a backend.
-4. **A value derived from a read writes with `setIfUnchanged`.** Only a value stated outright (token, theme) may use `set`.
+4. **A value derived from a read writes with `setIfUnchanged`.** Only a value stated outright (token, theme, design) may use `set`.
 5. **Two separate halts.** Unusable `workflowTasks` at boot latches queue recovery (`mao workflow confirm-queue-recovery`, which deletes invalid entries); never run it beside a live host. A confirmed write failure sets `workflowPersistenceBroken`: queue work stays blocked until an operator reconciles GitHub, clears the marker (`mao config clear-persistence-broken`, or the GUI's own action) and restarts.
 6. **Repo identity is case-insensitive:** match with `sameRepoRef()`, never lower-case stored entries.
 7. **`mao swarm` is a separate engine and credential:** a latched queue does not stop it.

@@ -5,7 +5,7 @@ import type { AiProviderConfig } from '../../core/ai/types'
 import type { GithubTask } from '../../core/github-service'
 import type { RepoWorkflowCapability } from '../../core/repo-capabilities'
 import { applyRepoListEdit } from '../../core/repo-registry'
-import type { StoredValueProblem, ThemePreference } from '../../core/store'
+import type { DesignId, StoredValueProblem, ThemePreference } from '../../core/store'
 import type {
   QueuedTask,
   QueueRecoveryOutcome,
@@ -61,8 +61,16 @@ export function createElectronApiStub(initialRepos: RepoRef[] = [], initialProbl
     return []
   })
   const storeProblems = vi.fn(async (): Promise<StoredValueProblem[]> => problems.map((p) => ({ ...p })))
-  const getTheme = vi.fn(async (): Promise<ThemePreference> => 'system')
-  const setTheme = vi.fn(async (): Promise<void> => {})
+  let currentTheme: ThemePreference = 'system'
+  const getTheme = vi.fn(async (): Promise<ThemePreference> => currentTheme)
+  const setTheme = vi.fn(async (next: ThemePreference): Promise<void> => {
+    currentTheme = next
+  })
+  let currentDesign: DesignId = 'classic'
+  const getDesign = vi.fn(async (): Promise<DesignId> => currentDesign)
+  const setDesign = vi.fn(async (next: DesignId): Promise<void> => {
+    currentDesign = next
+  })
   const checkUpdate = vi.fn(
     async (): Promise<AppUpdateCheck> => ({
       currentSha: 'test-sha',
@@ -145,6 +153,8 @@ export function createElectronApiStub(initialRepos: RepoRef[] = [], initialProbl
     ui: {
       getTheme,
       setTheme,
+      getDesign,
+      setDesign,
     },
   } satisfies ElectronApi
 
@@ -154,6 +164,10 @@ export function createElectronApiStub(initialRepos: RepoRef[] = [], initialProbl
     api,
     getRepos,
     setRepos,
+    getTheme,
+    setTheme,
+    getDesign,
+    setDesign,
     checkUpdate,
     storeProblems,
     fetchTasks,

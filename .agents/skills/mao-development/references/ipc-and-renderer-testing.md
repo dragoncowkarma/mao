@@ -103,7 +103,7 @@ So a green run does not replace an authorized `npm run dev` smoke test:
 - Proof: `src/electron-api.test.ts` fails on the identifier `electronAPI` anywhere in `src/` outside
   `src/electron.d.ts`, `src/electron-api.ts`, `src/main.tsx` and test code, comments included.
 - Outside tests, from `core/` import types, plus values only from `core/agent-selection.ts`,
-  `core/ai/provider-options.ts` and `core/repo-registry.ts`: they are pure, and their own `core/`
+  `core/ai/provider-options.ts`, `core/design-system.ts` and `core/repo-registry.ts`: they are pure, and their own `core/`
   imports are `import type` or another module on this list, so nothing Node-side enters the bundle.
 - Never import a value from another `core/` module. Re-implementing one of these rules in `src/` is
   worse: the board and the registry then disagree on repository identity.
@@ -147,8 +147,7 @@ So a green run does not replace an authorized `npm run dev` smoke test:
   never add tokens to the Tailwind theme, never hardcode hex in TSX.
 - Reusable visuals are semantic classes (`.btn`, `.card`, `.tag`, …) in `@layer components`; Tailwind
   utilities only for one-off layout tweaks.
-- Sharp corners on purpose (`--radius-md: 0px`): no `rounded-*`. The `rounded-full` badge in
-  `src/components/GlobalSettings.tsx` is an existing violation, not a precedent.
+- Sharp corners on purpose (`--radius-md: 0px`): no `rounded-*`.
 - `src/index.css` names 'Archivo', but nothing loads it. Never add external font links (offline app).
 - Plain `useState`/`useEffect`, props-down/callbacks-up. No context, store or data-fetching libraries.
 - Polling effects must `clearInterval` in cleanup and tolerate StrictMode double-invocation.

@@ -302,7 +302,7 @@ place, so a lockless reader can catch it half-done. The desktop app does not kee
 
 | Value | When two processes change it |
 | --- | --- |
-| `githubToken`, `theme`, `buildSha`, `import-providers` | plain `set`: last write wins |
+| `githubToken`, `theme`, `design`, `buildSha`, `import-providers` | plain `set`: last write wins |
 | repositories, `repos add`/`remove` | written if unchanged; re-planned and re-preflighted up to `MAX_REPO_LIST_ATTEMPTS` (3), then `Nothing was written: …` |
 | repositories, desktop app | only the window's edit applies to the list stored now; a settings edit to a repository removed elsewhere is dropped |
 | providers, Global settings | written if still the list loaded or last saved, else `reopen Global settings and apply the edit again` |

@@ -9,6 +9,13 @@ import {
 } from './ai/types.ts'
 import { isRepoRef } from './repo-registry.ts'
 import {
+  DEFAULT_DESIGN_ID,
+  DESIGN_IDS,
+  isDesignId,
+  normalizeDesignId,
+  type DesignId,
+} from './design-system.ts'
+import {
   createStoreWriteLock,
   writeStoreFileAtomic,
   type StoreWriteLock,
@@ -16,6 +23,8 @@ import {
 } from './store-file.ts'
 import { WORKFLOW_ACTIVE_LABEL, WORKFLOW_TASK_STATUSES } from './workflow-engine.ts'
 import type { QueuedTask, RepoRef } from './workflow-engine.ts'
+
+export { DEFAULT_DESIGN_ID, DESIGN_IDS, isDesignId, normalizeDesignId, type DesignId }
 
 /**
  * UI color scheme preference. 'system' follows the OS-level `prefers-color-scheme` media query and
@@ -35,6 +44,7 @@ export interface MaoStoreSchema {
    */
   buildSha: string
   theme: ThemePreference
+  design: DesignId
 }
 
 export const MAO_STORE_DEFAULTS: MaoStoreSchema = {
@@ -44,6 +54,7 @@ export const MAO_STORE_DEFAULTS: MaoStoreSchema = {
   workflowTasks: [],
   buildSha: '',
   theme: 'system',
+  design: DEFAULT_DESIGN_ID,
 }
 
 type UnknownRecord = Record<string, unknown>
@@ -504,6 +515,27 @@ function reportUnusableTaskQueue(value: unknown, source: string, defect: StoredV
 }
 
 /**
+ * The actionable report for a stored `design` that is not one of the shipped selectable presets — or
+ * `null` when it is usable.
+ *
+ * Like the list describers above, this reports only the field's stored type and never interpolates the
+ * stored value (a malformed hand-edit could carry a pasted secret or neighbouring JSON key). Scalar
+ * `design` stays outside `STORED_SHAPE_RULES` because `storedValueDefect()` treats any non-array as a
+ * `'value'` defect; keeping it in `storedValueProblem()` and `describeStoredProblems()` still preserves
+ * the "report >= correct" contract so every fallback `normalizeDesignId()` performs is surfaced to
+ * both CLI and GUI operators until healed via Global settings or `mao config set-design <design>`.
+ */
+export function describeUnusableDesign(raw: unknown, source: string): string | null {
+  if (isDesignId(raw)) return null
+  return (
+    `[store] "design" in ${source} is ${describeStoredType(raw)}, not one of ${DESIGN_IDS.join(', ')} — ` +
+    `ignoring it and using "${DEFAULT_DESIGN_ID}" for this session. No stored value is shown in ` +
+    `this report. The invalid value is still in ${source}; select a design in Global settings or run ` +
+    '`mao config set-design <design>` to replace it.'
+  )
+}
+
+/**
  * Which part of a stored value the schema cannot use.
  *
  * Three states rather than a message-or-nothing, because both the correction and the safe recovery
@@ -561,12 +593,13 @@ interface StoredShapeRule<K extends keyof MaoStoreSchema> {
  *
  * A table rather than a predicate over every schema key, because `describeStoredProblems()` iterates it
  * to decide what to *read*: electron-store re-reads and re-parses the whole config file on every `get`,
- * so walking all six fields to have five of them answer `null` cost six full file reads per call, on the
- * main process, in the `finally` of every repository-list write. It is **three** fields now, not one, so
- * each `problems()` call is three of those reads — which is why the queue latch is derived once at boot
- * (`core/app.ts`) and never re-probed from the `'change'` path: routing it through there would have put
- * three whole-config reads and three `JSON.parse`s on every queue change, and `config.json` carries up
- * to `MAX_FINISHED_TASKS` finished tasks with their full prompts and AI output.
+ * so walking all seven schema fields to have three of them answer `null` would cost seven full file reads
+ * per call, on the main process, in the `finally` of every repository-list write. It is **three** array
+ * fields (plus the scalar `design` check in `describeStoredProblems`), not one, so each `problems()` call
+ * is four of those reads — which is why the queue latch is derived once at boot (`core/app.ts`) and never
+ * re-probed from the `'change'` path: routing it through there would have put four whole-config reads and
+ * four `JSON.parse`s on every queue change, and `config.json` carries up to `MAX_FINISHED_TASKS` finished
+ * tasks with their full prompts and AI output.
  */
 const STORED_SHAPE_RULES: { [K in keyof MaoStoreSchema]?: StoredShapeRule<K> } = {
   githubRepos: {
@@ -640,6 +673,7 @@ function storedValueDefect(
  * point).
  */
 function usableStoredValue<K extends keyof MaoStoreSchema>(key: K, raw: MaoStoreSchema[K]): MaoStoreSchema[K] {
+  if (key === 'design') return normalizeDesignId(raw) as MaoStoreSchema[K]
   const rule = storedShapeRule(key)
   if (rule === undefined) return raw
   if (!Array.isArray(raw)) return structuredClone(MAO_STORE_DEFAULTS[key])
@@ -701,6 +735,13 @@ function describeInvalidStoredWrite<K extends keyof MaoStoreSchema>(
   value: MaoStoreSchema[K],
   source: string,
 ): string | null {
+  if (key === 'design') {
+    if (isDesignId(value)) return null
+    return (
+      `[store] Refusing to write "design" in ${source}: expected one of ${DESIGN_IDS.join(', ')}, ` +
+      `received ${describeStoredType(value)}. Nothing was written.`
+    )
+  }
   const predicate =
     key === 'aiProviders' ? isAiProviderConfig : key === 'workflowTasks' ? isQueuedTask : undefined
   if (predicate === undefined) return null
@@ -790,6 +831,10 @@ function storedValueProblem<K extends keyof MaoStoreSchema>(
   raw: MaoStoreSchema[K],
   source: string,
 ): StoredValueProblem | null {
+  if (field === 'design') {
+    const message = describeUnusableDesign(raw, source)
+    return message === null ? null : { field, source, message, defect: 'value', nothingUsable: true }
+  }
   const rule = storedShapeRule(field)
   if (rule === undefined) return null
   const defect = storedValueDefect(raw, rule.usableEntry)
@@ -830,8 +875,9 @@ export function describeHealedStoredValue(problem: StoredValueProblem): string {
  * the backend directly makes the answer true whenever it is asked. It is also live for Electron, whose
  * electron-store backend re-reads the file on every `get`.
  *
- * Read-only, like the guard: nothing here repairs the file. Only the fields `STORED_SHAPE_RULES` has a
- * rule for are read at all — see there for why reading the rest would not be free.
+ * Read-only, like the guard: nothing here repairs the file. Only the array fields `STORED_SHAPE_RULES`
+ * has a rule for — plus scalar `design`, which is checked separately because `storedValueDefect()` is
+ * array-only — are read at all; see `STORED_SHAPE_RULES` for why reading the rest would not be free.
  */
 export function describeStoredProblems(
   readRaw: <K extends keyof MaoStoreSchema>(key: K) => MaoStoreSchema[K],
@@ -842,6 +888,8 @@ export function describeStoredProblems(
     const problem = storedValueProblem(field, readRaw(field), source)
     if (problem !== null) problems.push(problem)
   }
+  const designProblem = storedValueProblem('design', readRaw('design'), source)
+  if (designProblem !== null) problems.push(designProblem)
   return problems
 }
 

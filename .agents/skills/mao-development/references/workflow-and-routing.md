@@ -214,6 +214,8 @@ State: `$MAO_DATA_DIR/config.json` (default: platform data dir from `core/paths.
 ```bash
 config set-token <token>  # argv: never a real token from an agent terminal
 config import-providers <file>  # JSON array of AiProviderConfig
+config set-theme <light|dark|system>
+config set-design <classic|crimson|console>
 config show  # secrets redacted as '[set]'
 config clear-persistence-broken
 repos add <owner> <repo> [--no-auto-trigger] [--poll-interval-ms <ms>]  # preflights write access

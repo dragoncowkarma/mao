@@ -64,3 +64,38 @@ describe('WorkflowQueue surfaces a refused queue action', () => {
     expect(await screen.findByText(REFUSAL)).toBeInTheDocument()
   })
 })
+
+describe('WorkflowQueue AgentBadge metadata styling', () => {
+  it('uses agent-badge-meta rather than opacity-60 for provider kind, model, and effort metadata', async () => {
+    const stub = createElectronApiStub()
+    stub.listProviders.mockResolvedValue([
+      { id: 'claude', name: 'Claude', kind: 'cli', command: 'claude', providerKindId: 'claude' },
+    ])
+    const activeTask: QueuedTask = {
+      ...finishedTask,
+      id: 'running-1',
+      title: 'Running task',
+      stage: 'pr',
+      status: 'running',
+      active: {
+        agentId: 'claude',
+        agentName: 'Claude',
+        providerKindId: 'claude',
+        model: 'sonnet',
+        effort: 'high',
+        prompt: 'Implement',
+      },
+    }
+    stub.listWorkflowTasks.mockResolvedValue([activeTask])
+
+    render(<WorkflowQueue repo={repo} />)
+
+    const modelMeta = await screen.findByText(/· sonnet/)
+    const effortMeta = screen.getByText(/· high effort/)
+    const kindMeta = screen.getByText(/· claude/)
+    for (const el of [kindMeta, modelMeta, effortMeta]) {
+      expect(el).toHaveClass('agent-badge-meta')
+      expect(el).not.toHaveClass('opacity-60')
+    }
+  })
+})

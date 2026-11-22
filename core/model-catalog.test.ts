@@ -642,24 +642,35 @@ describe('an unsaved list a newer saved one replaced (PR #141 follow-up review)'
     expect(a.read().providers.codex).toBeUndefined()
   }, 20_000)
 
-  it('is kept through a clock that steps back: nothing superseded it, so it returns and is saved', async () => {
+  it('stays in use through a clock that steps back, its stamp moved back to the clock', async () => {
     const dir = blockedDir()
     let now = T0
     const { deps } = cliDeps({ codex: CODEX, agy: AGY })
     const a = createModelCatalogMaintainer({ dataDir: dir, ttlMs: 24 * HOUR, now: () => now, deps })
     await a.refreshNow(['codex'])
-    // Ten minutes back, its own stamp lies too far ahead to count: it is not used, and not forgotten either.
+    // Ten minutes back, its stamp would lie too far ahead to count; it moves to the clock and stays in use.
     now = T0 - 10 * 60_000
-    expect(a.read().providers.codex).toBeUndefined()
-    now = T0 + 60_000
-    expect(a.read().providers.codex?.models[0].id).toBe('gpt-7-nova')
-    expect(a.read().attempts.codex).toEqual({ at: new Date(T0).toISOString(), outcome: 'updated' })
+    const clock = new Date(now).toISOString()
+    expect(a.read().providers.codex).toMatchObject({ updatedAt: clock, models: [{ id: 'gpt-7-nova' }] })
+    expect(a.read().attempts.codex).toEqual({ at: clock, outcome: 'updated' })
+    // A write made meanwhile saves it at the clock's time: no stamp from the future reaches the file.
     unblock(dir)
     expect((await a.refreshNow(['antigravity'])).persisted).toBe(true)
-    expect(readModelCatalog(dir).providers.codex?.models[0].id).toBe('gpt-7-nova')
+    expect(readModelCatalog(dir).providers.codex).toMatchObject({ updatedAt: clock, models: [{ id: 'gpt-7-nova' }] })
   })
 
-  it('is only hidden while the clock is behind it, even by the older list it replaced, and then back', async () => {
+  it('is saved by a write made while the clock is behind, even with no read in between', async () => {
+    const dir = blockedDir()
+    let now = T0
+    const a = createModelCatalogMaintainer({ dataDir: dir, ttlMs: 24 * HOUR, now: () => now, deps: cliDeps({ codex: CODEX, agy: AGY }).deps })
+    await a.refreshNow(['codex'])
+    now = T0 - 10 * 60_000
+    unblock(dir)
+    expect((await a.refreshNow(['antigravity'])).persisted).toBe(true)
+    expect(readModelCatalog(dir).providers.codex).toMatchObject({ updatedAt: new Date(now).toISOString(), models: [{ id: 'gpt-7-nova' }] })
+  })
+
+  it('stays in use over the older saved list it replaced while the clock is behind', async () => {
     // The usual shape of an unsaved list: the file already holds the list this refresh replaces, and another
     // writer holds the lock, so the write times out.
     const dir = tempDir()
@@ -670,32 +681,13 @@ describe('an unsaved list a newer saved one replaced (PR #141 follow-up review)'
     const a = createModelCatalogMaintainer({ dataDir: dir, ttlMs: 24 * HOUR, now: () => now, deps: cliDeps({ codex: CODEX }).deps })
     expect((await a.refreshNow(['codex'])).persisted).toBe(false)
     fs.rmSync(lock)
-    // Ten minutes back, the saved list is the one that can be used; it looks no different from a list another
-    // host might have saved meanwhile, so the unsaved one cannot be judged older and is kept...
     now = T0 - 10 * 60_000
-    expect(a.read().providers.codex?.models[0].id).toBe('gpt-7-old')
-    // ...and is current again once the clock catches up.
+    expect(a.read().providers.codex?.models[0].id).toBe('gpt-7-nova')
     now = T0 + 60_000
     expect(a.read().providers.codex?.models[0].id).toBe('gpt-7-nova')
   }, 20_000)
 
-  it('keeps a list a successful write left out while the clock was behind it, and saves it once it catches up', async () => {
-    const dir = blockedDir()
-    let now = T0
-    const a = createModelCatalogMaintainer({ dataDir: dir, ttlMs: 24 * HOUR, now: () => now, deps: cliDeps({ codex: CODEX, agy: AGY }).deps })
-    await a.refreshNow(['codex'])
-    now = T0 - 10 * 60_000
-    unblock(dir)
-    expect((await a.refreshNow(['antigravity'])).persisted).toBe(true)
-    // Its stamp did not count yet, so that write left it out; it must not have been dropped either.
-    expect(readModelCatalog(dir).providers.codex).toBeUndefined()
-    now = T0 + 60_000
-    expect(a.read().providers.codex?.models[0].id).toBe('gpt-7-nova')
-    expect((await a.refreshNow(['antigravity'])).persisted).toBe(true)
-    expect(readModelCatalog(dir).providers.codex?.models[0].id).toBe('gpt-7-nova')
-  })
-
-  it('lets its own later refresh of that provider replace what the clock still hides, list and attempt', async () => {
+  it('lets its own later refresh of that provider replace what it held, across a clock step', async () => {
     const dir = blockedDir()
     let now = T0
     let codex: string | ModelDiscoveryError = new ModelDiscoveryError('command-timeout')
@@ -716,7 +708,7 @@ describe('an unsaved list a newer saved one replaced (PR #141 follow-up review)'
     unblock(dir)
     codex = JSON.stringify({ models: [{ slug: 'gpt-7-orbit', visibility: 'list', priority: 1, supported_reasoning_levels: [{ effort: 'low' }] }] })
     expect((await a.refreshNow(['codex'])).persisted).toBe(true)
-    // Once the clock catches up, the older hidden list and attempt must not come back over it, nor be saved.
+    // Once the clock catches up, the older list and attempt must not come back over it, nor be saved.
     now = T0 + 60_000
     expect(a.read().providers.codex?.models[0].id).toBe('gpt-7-orbit')
     expect(a.read().attempts.codex).toEqual({ at: new Date(T0 - HOUR).toISOString(), outcome: 'updated' })
@@ -725,7 +717,7 @@ describe('an unsaved list a newer saved one replaced (PR #141 follow-up review)'
     expect(readModelCatalog(dir).attempts.codex?.outcome).toBe('updated')
   })
 
-  it('keeps a hidden attempt with its list when a refresh it could not write recorded no attempt', async () => {
+  it('keeps its own attempt with its list when a refresh it could not write records none', async () => {
     const dir = tempDir()
     const at = (time: number) => new Date(time).toISOString()
     writeCache(dir, {
@@ -738,17 +730,41 @@ describe('an unsaved list a newer saved one replaced (PR #141 follow-up review)'
     let now = T0
     const a = createModelCatalogMaintainer({ dataDir: dir, ttlMs: 24 * HOUR, now: () => now, deps: { run: cliDeps({}).run, env } })
     expect((await a.refreshNow(['claude'])).persisted).toBe(false)
-    // An hour back, the source is gone: the file's list stands (kept-cached-list), and no attempt is recorded...
+    // An hour back, the source is gone: this process's list stands (kept-cached-list), and no attempt is recorded...
     now = T0 - HOUR
     delete env.ANTHROPIC_MODEL
     expect((await a.refreshNow(['claude'])).results)
       .toEqual([{ kind: 'claude', outcome: 'static', reason: 'kept-cached-list', models: 0 }])
     fs.rmSync(lock)
-    // ...so once the clock catches up, the hidden list returns with its own attempt, not the file's.
+    // ...so the list keeps its own attempt (moved back with the clock), never the file's older one.
     now = T0 + 60_000
     expect(a.read().providers.claude?.models).toEqual([{ id: 'claude-fable-5-2' }])
-    expect(a.read().attempts.claude).toEqual({ at: at(T0), outcome: 'updated' })
+    expect(a.read().attempts.claude).toEqual({ at: at(T0 - HOUR), outcome: 'updated' })
   }, 30_000)
+
+  it.each([['saved', true], ['still unsaved', false]])(
+    'keeps an Anthropic API listing over Claude Code settings across a clock step (%s)', async (_case, writable) => {
+      const dir = blockedDir()
+      let now = T0
+      let providers: AiProviderConfig[] = [{ id: 'a', name: 'API', kind: 'api', apiFormat: 'anthropic', apiKey: 'sk-test' }]
+      const fetch = vi.fn(async () => new Response(JSON.stringify({ data: [{ id: 'claude-opus-5-5' }], has_more: false })))
+      const a = createModelCatalogMaintainer({
+        dataDir: dir, ttlMs: 24 * HOUR, now: () => now, listProviders: () => providers,
+        deps: { run: cliDeps({}).run, env: { ANTHROPIC_MODEL: 'claude-fable-5-2' }, fetch: fetch as unknown as typeof globalThis.fetch },
+      })
+      expect((await a.refreshNow(['claude'])).persisted).toBe(false)
+      // An hour back, the key is gone and only Claude Code's settings answer.
+      now = T0 - HOUR
+      providers = []
+      if (writable) unblock(dir)
+      const settings = await a.refreshNow(['claude'])
+      expect(settings.persisted).toBe(writable)
+      expect(settings.results).toEqual([{ kind: 'claude', outcome: 'static', reason: 'kept-api-list', models: 0 }])
+      now = T0 + 60_000
+      expect(a.read().providers.claude).toMatchObject({ source: 'anthropic-models-api', models: [{ id: 'claude-opus-5-5' }] })
+      if (writable) expect(readModelCatalog(dir).providers.claude?.source).toBe('anthropic-models-api')
+    },
+  )
 
   it('forgets a copy of a fresher saved list a refresh could not write, as soon as it is recorded', async () => {
     const dir = tempDir()

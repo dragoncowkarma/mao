@@ -584,3 +584,61 @@ describe('a refresh the cache file refused (PR #141 review)', () => {
     })
   })
 })
+
+describe('an unsaved list a newer saved one replaced (PR #141 follow-up review)', () => {
+  const blockedDir = () => {
+    const blocker = path.join(tempDir(), 'not-a-directory')
+    fs.writeFileSync(blocker, '')
+    return blocker
+  }
+  const unblock = (dir: string) => {
+    fs.rmSync(dir)
+    fs.mkdirSync(dir)
+  }
+  /** What another host's saved Codex refresh leaves in the file: its list and its attempt. */
+  const codexList = (id: string, at: number) => ({
+    providers: { codex: { updatedAt: new Date(at).toISOString(), source: 'codex-debug-models', models: [{ id }] } },
+    attempts: { codex: { at: new Date(at).toISOString(), outcome: 'updated' } },
+  })
+
+  it('is forgotten once read, so neither a cache reset nor a later write brings it back', async () => {
+    const dir = blockedDir()
+    let now = T0
+    const { deps } = cliDeps({ codex: CODEX })
+    const a = createModelCatalogMaintainer({ dataDir: dir, ttlMs: 24 * HOUR, now: () => now, deps })
+    expect((await a.refreshNow(['codex'])).persisted).toBe(false)
+    // Another host saves a newer Codex list, and this process reads it.
+    unblock(dir)
+    writeCache(dir, codexList('gpt-7-orbit', T0 + 30 * 60_000))
+    now = T0 + HOUR
+    expect(a.read().providers.codex?.models[0].id).toBe('gpt-7-orbit')
+    // The cache is reset: the older unsaved list does not come back, nor its attempt...
+    fs.rmSync(modelCatalogPath(dir))
+    expect(a.read().providers.codex).toBeUndefined()
+    expect(a.read().attempts.codex).toBeUndefined()
+    // ...and a write for another provider does not save them again.
+    expect((await a.refreshNow(['claude'])).persisted).toBe(true)
+    expect(readModelCatalog(dir).providers.codex).toBeUndefined()
+    expect(readModelCatalog(dir).attempts.codex).toBeUndefined()
+  })
+
+  it('is forgotten when a refresh that could not be saved saw the newer list, without any read in between', async () => {
+    const dir = blockedDir()
+    let now = T0
+    const { deps } = cliDeps({ codex: CODEX })
+    const a = createModelCatalogMaintainer({ dataDir: dir, ttlMs: 24 * HOUR, now: () => now, deps })
+    await a.refreshNow(['codex'])
+    unblock(dir)
+    writeCache(dir, codexList('gpt-7-orbit', T0 + 30 * 60_000))
+    // A live owner (the test runner's parent) holds the cache lock, so this refresh reads the file but cannot write.
+    const lock = `${modelCatalogPath(dir)}.lock`
+    fs.writeFileSync(lock, JSON.stringify({ pid: process.ppid, host: os.hostname(), nonce: 'other-writer' }))
+    now = T0 + HOUR
+    const blocked = await a.refreshNow(['claude'])
+    expect(blocked.persisted).toBe(false)
+    expect(blocked.catalog.providers.codex?.models[0].id).toBe('gpt-7-orbit')
+    fs.rmSync(lock)
+    fs.rmSync(modelCatalogPath(dir))
+    expect(a.read().providers.codex).toBeUndefined()
+  }, 20_000)
+})

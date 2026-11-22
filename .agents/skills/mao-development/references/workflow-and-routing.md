@@ -116,7 +116,8 @@ listed is offered only at the levels it listed: picker, listing and Swarm all re
   `read()` lays it over the file until the file holds a newer one, so Swarm dispatch, `ai:getModelCatalog`
   and the due check all see it, and the CLI is not asked again every poll. Later refreshes fold over it as
   over a saved list (a failure keeps it; `kept-cached-list`/`kept-api-list` apply), and the next write that
-  succeeds saves it too.
+  succeeds saves it too. Once the process reads a newer list for that provider (another host's), it forgets
+  its own, so a deleted or damaged cache file cannot bring the stale list back.
 - Due: a list missing or older than the TTL (24 h; `MAO_MODEL_CATALOG_TTL_HOURS`, `0` = manual only),
   unless this process tried it within the TTL, or within an hour after a failure. Another host's recent
   failure counts too, except `command-not-found` (a Dock-launched GUI's PATH lacks the CLIs).

@@ -28,8 +28,8 @@ import {
 } from '../core/model-catalog.ts'
 import {
   DISCOVERABLE_PROVIDER_KINDS,
+  parseDiscoverableKind,
   providerOptionsWithCatalog,
-  type DiscoverableProviderKind,
 } from '../core/ai/provider-options.ts'
 import {
   QUEUE_PERSISTENCE_BROKEN,
@@ -242,21 +242,22 @@ providers
       'API key, else Claude Code\'s model settings) for their current model lists and cache them. Read-only ' +
       'and billing-free; a provider that cannot answer keeps its cached or built-in list.',
   )
-  .option('--provider <kind>', `refresh only this provider (${DISCOVERABLE_PROVIDER_KINDS.join(', ')}); repeatable`,
+  .option('--provider <kind>', 'refresh only this provider (agy or antigravity, claude, codex); repeatable',
     (value: string, previous: string[] = []) => [...previous, value])
   .action(async (opts: { provider?: string[] }) => {
-    const requested = opts.provider ?? []
-    const unknown = requested.filter((kind) => !(DISCOVERABLE_PROVIDER_KINDS as readonly string[]).includes(kind))
-    if (unknown.length > 0) {
-      throw new Error(`Unknown provider "${unknown[0]}" — expected one of: ${DISCOVERABLE_PROVIDER_KINDS.join(', ')}`)
-    }
+    // Checked before booting the app: a typo must not run a partial refresh, or none, and exit 0.
+    const requested = (opts.provider ?? []).map((name) => {
+      const kind = parseDiscoverableKind(name)
+      if (!kind) throw new Error(`Unknown provider "${name}" — expected one of: agy (antigravity), claude, codex`)
+      return kind
+    })
     const { store } = loadApp()
     const report = await createModelCatalogMaintainer({
       dataDir: resolveDataDir(),
       // An Anthropic-format API provider's saved key is what lists Claude models; the store's read guard
       // already filters entries it cannot use.
       listProviders: () => store.get('aiProviders'),
-    }).refreshNow(requested as DiscoverableProviderKind[])
+    }).refreshNow(requested)
     for (const line of describeModelCatalogRefresh(report)) log(line)
     // Scriptable: non-zero when any requested provider could not be refreshed or the cache was not saved.
     if (!report.persisted || report.results.some((result) => result.outcome === 'failed')) process.exitCode = 1

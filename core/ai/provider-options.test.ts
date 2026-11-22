@@ -2,8 +2,9 @@ import { describe, expect, it } from 'vitest'
 import { resolveStageAgent } from '../agent-selection.ts'
 import type { AiProviderConfig } from './types.ts'
 import {
-  PROVIDER_OPTIONS, REASONING_LADDER, agyStemEfforts, buildModelEffortArgs, effortOptionsForModel, getProviderOptions,
-  isEligibleAgyStem, modelEfforts, providerOptionsWithCatalog, type ModelCatalogSnapshot,
+  PROVIDER_OPTIONS, REASONING_LADDER, UNIDENTIFIED_EFFORT_CEILING, agyStemEfforts, buildModelEffortArgs, catalogModelRows,
+  effortOptionsForModel, getProviderOptions, isEligibleAgyStem, modelEfforts, parseDiscoverableKind,
+  providerOptionsWithCatalog, type ModelCatalogSnapshot,
 } from './provider-options.ts'
 
 const haikuModels = ['haiku', 'claude-3-5-haiku', 'claude-3.5-haiku',
@@ -111,5 +112,42 @@ describe('merging a refreshed catalog over the built-in tables (#140)', () => {
     expect(levels('gpt-6.2-sol')).toEqual(REASONING_LADDER)
     expect(levels(undefined)).toEqual(REASONING_LADDER)
     expect(effortOptionsForModel(merged.claude, 'haiku')).toEqual([])
+  })
+})
+
+describe('review follow-ups (#140)', () => {
+  const at = '2026-11-22T00:00:00.000Z'
+
+  it('caps a refreshed model the source listed without levels at max, never the provider\'s widest', () => {
+    const catalog: ModelCatalogSnapshot = { providers: {
+      codex: { updatedAt: at, source: 'codex-debug-models', models: [{ id: 'gpt-7-luna' }, { id: 'gpt-6.2-sol' }] },
+    } }
+    expect(modelEfforts('codex', 'gpt-7-luna', catalog)).toEqual(UNIDENTIFIED_EFFORT_CEILING)
+    // A model MAO knows keeps its own ceiling: Sol still reaches ultra.
+    expect(modelEfforts('codex', 'gpt-6.2-sol', catalog)).toEqual(REASONING_LADDER)
+  })
+
+  it.each([
+    ['agy', 'antigravity'], ['AGY', 'antigravity'], ['Antigravity', 'antigravity'], [' codex ', 'codex'],
+    ['Claude', 'claude'], ['gemini', undefined], ['', undefined], ['custom', undefined],
+  ])('reads --provider %j as %j', (name, kind) => {
+    expect(parseDiscoverableKind(name)).toBe(kind)
+  })
+
+  it('lists one row per model with its levels, for the CLI and the GUI alike', () => {
+    const catalog: ModelCatalogSnapshot = { providers: {
+      codex: { updatedAt: at, source: 'codex-debug-models', models: [{ id: 'gpt-7-nova', efforts: ['low', 'high'] }] },
+      antigravity: { updatedAt: at, source: 'agy-models', models: [{ id: 'gemini-5-krypton', efforts: ['low', 'max'] }] },
+    } }
+    const codex = catalogModelRows('codex', catalog)
+    expect(codex[0]).toEqual({ id: 'gpt-7-nova', efforts: ['low', 'high'] })
+    expect(codex).toContainEqual({ id: 'gpt-6-luna', efforts: REASONING_LADDER.slice(0, 5) })
+    expect(codex).toContainEqual({ id: 'gpt-6.2-sol', efforts: REASONING_LADDER })
+    expect(catalogModelRows('claude')).toContainEqual({ id: 'haiku', efforts: [] })
+    expect(catalogModelRows('claude')).toContainEqual({ id: 'claude-haiku-5-5', efforts: REASONING_LADDER.slice(0, 5) })
+    expect(catalogModelRows('antigravity', catalog).slice(0, 2)).toEqual([
+      { id: 'gemini-5-krypton', efforts: ['low', 'max'] },
+      { id: 'gemini-4-neon', efforts: ['low', 'medium', 'high', 'xhigh'] },
+    ])
   })
 })

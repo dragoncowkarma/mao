@@ -5,6 +5,7 @@ import GlobalSettings from './GlobalSettings'
 import { createElectronApiStub } from '../test/electron-api-stub'
 import type { AiProviderConfig } from '../../core/ai/types'
 import type { ModelCatalogView } from '../../core/ai/provider-options'
+import type { ModelCatalogRefreshReport } from '../../core/model-catalog'
 
 /** What `MaoApp.saveProviders` resolves with once the write lands. Cast past the stub's throw-only type. */
 const echoSave = (async (providers: AiProviderConfig[]) => providers) as never
@@ -451,6 +452,88 @@ describe('GlobalSettings model catalog', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('Could not refresh the model lists.')
     expect(document.body.textContent).not.toContain('sk-ant-SECRET')
     expect(screen.getByRole('button', { name: 'Refresh model lists' })).toBeEnabled()
+  })
+
+  it('keeps a saved effort the chosen model no longer offers visible and selected', async () => {
+    const stub = createElectronApiStub()
+    stub.listProviders.mockResolvedValue([{
+      ...codexCli, presets: [{ id: 'p1', model: 'gpt-6-luna', effort: 'ultra' }], selectedPresetId: 'p1',
+    }])
+    const user = userEvent.setup()
+
+    render(<GlobalSettings theme="system" onThemeChange={() => {}} />)
+    await user.click(await screen.findByRole('button', { name: /Model \/ Effort presets/ }))
+
+    const kept = screen.getByRole('option', { name: 'ultra (not supported by this model)' })
+    expect((kept as HTMLOptionElement).selected).toBe(true)
+  })
+
+  // `hidden: true` because the rows sit in a collapsed <details>: present for every operator to expand.
+  it('lists every provider\'s models with their levels, even one no provider uses yet', async () => {
+    const stub = createElectronApiStub()
+    stub.getModelCatalog.mockResolvedValue(refreshed)
+
+    render(<GlobalSettings theme="system" onThemeChange={() => {}} />)
+
+    const codexModels = await screen.findByRole('list', { name: 'Codex models', hidden: true })
+    expect(within(codexModels).getByText('gpt-7-nova')).toBeInTheDocument()
+    expect(within(codexModels).getByText('gpt-7-nova').parentElement).toHaveTextContent('gpt-7-nova low, medium, high')
+    expect(within(codexModels).getByText('gpt-6-luna').parentElement).toHaveTextContent('low, medium, high, xhigh, max')
+    const claudeModels = screen.getByRole('list', { name: 'Claude models', hidden: true })
+    expect(within(claudeModels).getByText('haiku').parentElement).toHaveTextContent('haiku no effort flag')
+    expect(within(screen.getByRole('list', { name: 'Antigravity (agy) models', hidden: true })).getByText('gemini-4-neon')).toBeInTheDocument()
+  })
+
+  it('says when a refresh could not be saved, which no provider line can', async () => {
+    const stub = createElectronApiStub()
+    stub.api.ai.refreshModelCatalog.mockImplementation((async () => ({
+      results: [{ kind: 'codex', outcome: 'updated', models: 1 }], catalog: refreshed, persisted: false,
+    })) as never)
+    const user = userEvent.setup()
+
+    render(<GlobalSettings theme="system" onThemeChange={() => {}} />)
+    await user.click(await screen.findByRole('button', { name: 'Refresh model lists' }))
+
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('Model lists refreshed.'))
+    expect(screen.getByRole('status')).toHaveTextContent('could not be saved, so the rest of MAO keeps the previous lists')
+  })
+
+  it('states the refresh cadence only once the catalog has loaded', async () => {
+    const stub = createElectronApiStub()
+    let answer!: (view: ModelCatalogView) => void
+    stub.getModelCatalog.mockImplementation(() => new Promise((resolve) => { answer = resolve }))
+
+    render(<GlobalSettings theme="system" onThemeChange={() => {}} />)
+    await screen.findByRole('heading', { name: 'Model catalog' })
+    expect(screen.queryByText(/refreshes them every|Automatic refresh is off/)).toBeNull()
+
+    answer({ ...refreshed, ttlMs: null })
+    expect(await screen.findByText(/Automatic refresh is off/)).toBeInTheDocument()
+    expect(screen.queryByText(/on request only/)).toBeNull()
+  })
+
+  it('announces a refresh in progress through the same status region', async () => {
+    const stub = createElectronApiStub()
+    let finish!: (report: ModelCatalogRefreshReport) => void
+    stub.api.ai.refreshModelCatalog.mockImplementation((() => new Promise((resolve) => { finish = resolve })) as never)
+    const user = userEvent.setup()
+
+    render(<GlobalSettings theme="system" onThemeChange={() => {}} />)
+    const status = screen.getByRole('status')
+    await user.click(await screen.findByRole('button', { name: 'Refresh model lists' }))
+
+    expect(status).toHaveTextContent('Refreshing model lists…')
+    expect(screen.getByRole('button', { name: 'Refreshing…' })).toBeDisabled()
+    finish({ results: [], catalog: refreshed, persisted: true })
+    await waitFor(() => expect(status).toHaveTextContent('Model lists refreshed.'))
+    expect(screen.getByRole('status')).toBe(status)
+  })
+
+  it('names the daily cadence for the default period', async () => {
+    const stub = createElectronApiStub()
+    stub.getModelCatalog.mockResolvedValue(refreshed)
+    render(<GlobalSettings theme="system" onThemeChange={() => {}} />)
+    expect(await screen.findByText(/MAO also refreshes them every 24 h\./)).toBeInTheDocument()
   })
 
   it('narrows a preset\'s effort choices to the chosen model\'s levels', async () => {

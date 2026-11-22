@@ -147,8 +147,14 @@ describe('refreshing', () => {
       models: [{ id: 'claude-opus-5-5' }, { id: 'claude-mythos-5-2' }] }
     writeCache(dir, { providers: { claude: api } })
     const { deps } = cliDeps({}, { ANTHROPIC_MODEL: 'claude-sonnet-5-5' })
-    await refreshModelCatalog({ dataDir: dir, kinds: ['claude'], deps, now: () => T0 })
+    const kept = await refreshModelCatalog({ dataDir: dir, kinds: ['claude'], deps, now: () => T0 })
     expect(readModelCatalog(dir).providers.claude).toEqual(api)
+    // Said as what happened — nothing was fetched from the API — and recorded as nothing.
+    expect(kept.results).toEqual([{ kind: 'claude', outcome: 'static', reason: 'kept-api-list', models: 0 }])
+    expect(readModelCatalog(dir).attempts.claude).toBeUndefined()
+    expect(describeModelCatalogRefresh(kept)).toEqual([
+      'Claude: only Claude Code\'s model settings are available here, so the Anthropic API listing stays in use',
+    ])
     // …while the same local answer does fill an empty cache.
     const empty = tempDir()
     await refreshModelCatalog({ dataDir: empty, kinds: ['claude'], deps, now: () => T0 })
@@ -157,11 +163,61 @@ describe('refreshing', () => {
 
   it('leaves a later attempt another process recorded in place', async () => {
     const dir = tempDir()
-    const later = { at: '2026-11-22T01:00:00.000Z', outcome: 'updated' }
+    const later = { at: '2026-11-22T00:02:00.000Z', outcome: 'updated' }
     writeCache(dir, { attempts: { codex: later } })
     const { deps } = cliDeps({ codex: new ModelDiscoveryError('command-failed') })
     await refreshModelCatalog({ dataDir: dir, kinds: ['codex'], deps, now: () => T0 })
     expect(readModelCatalog(dir).attempts.codex).toEqual(later)
+  })
+
+  it('lets no future timestamp freeze a list: beyond the clock-skew window it counts for nothing', async () => {
+    const dir = tempDir()
+    writeCache(dir, {
+      providers: { codex: { updatedAt: '2099-01-01T00:00:00.000Z', source: 'codex-debug-models', models: [{ id: 'gpt-old' }] } },
+      attempts: { codex: { at: '2099-01-01T00:00:00.000Z', outcome: 'failed', reason: 'command-failed' } },
+    })
+    const { deps } = cliDeps({ codex: CODEX })
+    const report = await refreshModelCatalog({ dataDir: dir, kinds: ['codex'], deps, now: () => T0 })
+    const onDisk = readModelCatalog(dir)
+    expect(report.results).toEqual([{ kind: 'codex', outcome: 'updated', models: 1 }])
+    expect(onDisk.providers.codex?.models).toEqual([{ id: 'gpt-7-nova', efforts: ['low', 'ultra'] }])
+    expect(onDisk.attempts.codex).toEqual({ at: '2026-11-22T00:00:00.000Z', outcome: 'updated' })
+  })
+
+  it('keeps a list another process stored after this refresh began', async () => {
+    const dir = tempDir()
+    const fresher = { updatedAt: '2026-11-22T00:01:00.000Z', source: 'codex-debug-models', models: [{ id: 'gpt-7-nova-2' }] }
+    writeCache(dir, { providers: { codex: fresher } })
+    const { deps } = cliDeps({ codex: CODEX })
+    await refreshModelCatalog({ dataDir: dir, kinds: ['codex'], deps, now: () => T0 })
+    expect(readModelCatalog(dir).providers.codex).toEqual(fresher)
+  })
+
+  it('records no "no source here" attempt over a list another host fetched', async () => {
+    const dir = tempDir()
+    const api = { updatedAt: '2026-11-21T23:00:00.000Z', source: 'anthropic-models-api', models: [{ id: 'claude-opus-5-5' }] }
+    const fetched = { at: '2026-11-21T23:00:00.000Z', outcome: 'updated' }
+    writeCache(dir, { providers: { claude: api }, attempts: { claude: fetched } })
+    const { deps } = cliDeps({}, {})
+    const report = await refreshModelCatalog({ dataDir: dir, kinds: ['claude'], deps, now: () => T0 })
+    expect(report.results).toEqual([{ kind: 'claude', outcome: 'static', reason: 'no-source', models: 0 }])
+    expect(readModelCatalog(dir).attempts.claude).toEqual(fetched)
+    expect(describeModelCatalog(readModelCatalog(dir)).join('\n')).not.toContain('built-in list stays in use')
+  })
+
+  it.each([
+    ['a listing', async () => new Response(JSON.stringify({ data: [{ id: 'claude-opus-5-5' }], has_more: false }))],
+    ['a rejection', async () => new Response('{"error":{"message":"invalid x-api-key sk-ant-SENTINEL-140"}}', { status: 401 })],
+    ['a socket failure', async () => { throw new TypeError('connect failed for sk-ant-SENTINEL-140') }],
+  ])('keeps the saved API key out of the cache file and the report after %s', async (_name, answer) => {
+    const dir = tempDir()
+    const providers = [{ id: 'api', name: 'API', kind: 'api' as const, apiFormat: 'anthropic' as const, apiKey: 'sk-ant-SENTINEL-140' }]
+    const report = await refreshModelCatalog({
+      dataDir: dir, kinds: ['claude'], providers, deps: { fetch: answer as unknown as typeof fetch, env: {} }, now: () => T0,
+    })
+    expect(JSON.stringify(report)).not.toContain('SENTINEL')
+    expect(fs.readFileSync(modelCatalogPath(dir), 'utf8')).not.toContain('SENTINEL')
+    expect(describeModelCatalogRefresh(report).join('\n')).not.toContain('SENTINEL')
   })
 
   it('records nothing for a refresh that was interrupted', async () => {
@@ -171,6 +227,19 @@ describe('refreshing', () => {
     expect(report.results.every((result) => result.reason === 'aborted')).toBe(true)
     expect(fs.existsSync(modelCatalogPath(dir))).toBe(false)
   })
+
+  it('takes the store lock for its write, never writing over a file another process is writing', async () => {
+    const dir = tempDir()
+    // A live owner on this host (the test runner's parent) holds the lock, as a concurrent refresh would.
+    const lock = `${modelCatalogPath(dir)}.lock`
+    fs.writeFileSync(lock, JSON.stringify({ pid: process.ppid, host: os.hostname(), nonce: 'other-writer' }))
+    const { deps } = cliDeps({ codex: CODEX })
+    const report = await refreshModelCatalog({ dataDir: dir, kinds: ['codex'], deps, now: () => T0 })
+    expect(report.persisted).toBe(false)
+    expect(report.catalog.providers.codex?.models[0].id).toBe('gpt-7-nova')
+    expect(fs.existsSync(modelCatalogPath(dir))).toBe(false)
+    expect(fs.readFileSync(lock, 'utf8')).toContain('other-writer')
+  }, 20_000)
 
   it('still answers, unsaved, when the cache cannot be written', async () => {
     const blocker = path.join(tempDir(), 'not-a-directory')
@@ -338,6 +407,8 @@ describe('operator-facing text', () => {
     expect(lines).toContain('  last refresh (2026-11-22T00:00:00.000Z) failed: the CLI is not installed or not on PATH')
     expect(lines).toContain('  gemini-4-neon (low, medium, high, xhigh)')
     expect(lines).toContain('  haiku (no effort flag)')
+    expect(lines).toContain('  claude-opus-5-5 (low, medium, high, xhigh, max)')
+    expect(lines).toContain('  gpt-6.2-sol (low, medium, high, xhigh, max, ultra)')
     expect(lines.at(-1)).toBe('Long-running hosts refresh every 24 h (MAO_MODEL_CATALOG_TTL_HOURS).')
   })
 })

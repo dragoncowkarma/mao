@@ -8,14 +8,12 @@ import {
   type ModelDiscoveryDeps,
 } from './ai/model-discovery.ts'
 import {
-  AGY_STATIC_STEMS,
   DISCOVERABLE_PROVIDER_KINDS,
   MODEL_CATALOG_FAILURES,
   MODEL_CATALOG_FAILURE_TEXT,
   REASONING_LADDER,
-  agyStemEfforts,
+  catalogModelRows,
   isEligibleAgyStem,
-  providerOptionsWithCatalog,
   type CatalogModel,
   type DiscoverableProviderKind,
   type ModelCatalogAttempt,
@@ -192,53 +190,74 @@ export interface ModelCatalogRefreshReport {
   persisted: boolean
 }
 
-/**
- * Folds one refresh into the cached state.
- *
- * - A fetched list replaces the provider's entry — except that Claude Code's local settings (a model or
- *   two) never replace an Anthropic API listing (all of them): the host without a key leaves that list
- *   for the host with one to refresh.
- * - `static` (no source here) and failures leave the entry alone. Stale is better than empty, and the
- *   built-in tables cover what the cache does not.
- * - An attempt record newer than this one belongs to another process that finished later; it stands.
- * - An interrupted refresh records nothing.
- */
-function applyOutcomes(current: ModelCatalogView, outcomes: readonly KindOutcome[], at: string): ModelCatalogView {
-  const next: ModelCatalogView = { providers: { ...current.providers }, attempts: { ...current.attempts }, ttlMs: current.ttlMs }
-  const time = Date.parse(at)
-  for (const outcome of outcomes) {
-    if ('failure' in outcome && outcome.failure === 'aborted') continue
-    const previous = next.attempts[outcome.kind]
-    if (previous && Date.parse(previous.at) > time) continue
-    if ('failure' in outcome) {
-      next.attempts[outcome.kind] = { at, outcome: 'failed', reason: outcome.failure }
-    } else if (outcome.result.kind === 'static') {
-      next.attempts[outcome.kind] = { at, outcome: 'static', reason: outcome.result.reason }
-    } else {
-      const existing = next.providers[outcome.kind]
-      const downgrade = existing?.source === 'anthropic-models-api' && outcome.result.source === 'claude-local-settings'
-      if (!downgrade) {
-        next.providers[outcome.kind] = { updatedAt: at, source: outcome.result.source, models: outcome.result.models }
-      }
-      next.attempts[outcome.kind] = { at, outcome: 'updated' }
-    }
-  }
-  return next
+interface AppliedOutcomes {
+  catalog: ModelCatalogView
+  /** What the fold actually did per provider, which is what a report must say. */
+  results: ModelCatalogRefreshResult[]
 }
 
 /**
- * Read, fold and replace under the store's cross-process lock, so two hosts refreshing different providers
- * at once both land. The lock is synchronous and held only for this read-merge-write, never across the
- * discovery awaits. The replace is atomic (`writeStoreFileAtomic`): a reader sees the old file or the new one.
+ * Folds one refresh into the cached state, and says what it did.
+ *
+ * - A fetched list replaces the provider's entry — except that Claude Code's local settings (a model or
+ *   two) never replace an Anthropic API listing (all of them): the host without a key leaves that list
+ *   for the host with one to refresh, and reports `static`/`kept-api-list` rather than a refresh.
+ * - `static` (no source here) and failures leave the entry alone. Stale is better than empty, and the
+ *   built-in tables cover what the cache does not. A `static` attempt is not even recorded over a cached
+ *   list: "this host has no source" says nothing about a list another host fetched.
+ * - A record stamped after this refresh began belongs to another process that finished later; it stands.
+ *   One stamped beyond `CLOCK_SKEW_MS` ahead is a wrong clock or a hand edit and stands for nothing, or a
+ *   single bad timestamp would freeze the provider's list until the wall clock caught up.
+ * - An interrupted refresh records nothing.
  */
-function persistOutcomes(dataDir: string, outcomes: readonly KindOutcome[], at: string, ttlMs: number | null): ModelCatalogView {
+function applyOutcomes(current: ModelCatalogView, outcomes: readonly KindOutcome[], at: string): AppliedOutcomes {
+  const next: ModelCatalogView = { providers: { ...current.providers }, attempts: { ...current.attempts }, ttlMs: current.ttlMs }
+  const time = Date.parse(at)
+  const isLater = (timestamp: string | undefined) => {
+    const stamped = Date.parse(timestamp ?? '')
+    return Number.isFinite(stamped) && stamped > time && stamped <= time + CLOCK_SKEW_MS
+  }
+  const record = (kind: DiscoverableProviderKind, attempt: ModelCatalogAttempt) => {
+    if (!isLater(next.attempts[kind]?.at)) next.attempts[kind] = attempt
+  }
+  const results = outcomes.map((outcome): ModelCatalogRefreshResult => {
+    const { kind } = outcome
+    if ('failure' in outcome) {
+      if (outcome.failure !== 'aborted') record(kind, { at, outcome: 'failed', reason: outcome.failure })
+      return { kind, outcome: 'failed', reason: outcome.failure, models: 0 }
+    }
+    if (outcome.result.kind === 'static') {
+      if (!next.providers[kind]) record(kind, { at, outcome: 'static', reason: outcome.result.reason })
+      return { kind, outcome: 'static', reason: outcome.result.reason, models: 0 }
+    }
+    const existing = next.providers[kind]
+    if (existing?.source === 'anthropic-models-api' && outcome.result.source === 'claude-local-settings') {
+      return { kind, outcome: 'static', reason: 'kept-api-list', models: 0 }
+    }
+    if (!isLater(existing?.updatedAt)) {
+      next.providers[kind] = { updatedAt: at, source: outcome.result.source, models: outcome.result.models }
+    }
+    record(kind, { at, outcome: 'updated' })
+    return { kind, outcome: 'updated', models: outcome.result.models.length }
+  })
+  return { catalog: next, results }
+}
+
+/**
+ * Read, fold and replace under the cache's own cross-process lock (the store's lock mechanism,
+ * `createStoreWriteLock`, on `model-catalog.json` — never `config.json`'s), so two hosts refreshing
+ * different providers at once both land. The lock is synchronous and held only for this read-merge-write,
+ * never across the discovery awaits. The replace is atomic (`writeStoreFileAtomic`): a reader sees the old
+ * file or the new one.
+ */
+function persistOutcomes(dataDir: string, outcomes: readonly KindOutcome[], at: string, ttlMs: number | null): AppliedOutcomes {
   const file = modelCatalogPath(dataDir)
   fs.mkdirSync(dataDir, { recursive: true })
   return createStoreWriteLock(file)(() => {
-    const next = applyOutcomes(readModelCatalog(dataDir, ttlMs), outcomes, at)
-    const document = { version: MODEL_CATALOG_VERSION, providers: next.providers, attempts: next.attempts }
+    const applied = applyOutcomes(readModelCatalog(dataDir, ttlMs), outcomes, at)
+    const document = { version: MODEL_CATALOG_VERSION, providers: applied.catalog.providers, attempts: applied.catalog.attempts }
     writeStoreFileAtomic(file, `${JSON.stringify(document, null, 2)}\n`)
-    return next
+    return applied
   })
 }
 
@@ -277,14 +296,13 @@ export async function refreshModelCatalog(options: RefreshModelCatalogOptions): 
     }
   }))
   const at = new Date((options.now ?? Date.now)()).toISOString()
-  const results = outcomes.map(toResult)
   if (outcomes.every((outcome) => 'failure' in outcome && outcome.failure === 'aborted')) {
-    return { results, catalog: readModelCatalog(options.dataDir, ttlMs), persisted: true }
+    return { results: outcomes.map(toResult), catalog: readModelCatalog(options.dataDir, ttlMs), persisted: true }
   }
   try {
-    return { results, catalog: persistOutcomes(options.dataDir, outcomes, at, ttlMs), persisted: true }
+    return { ...persistOutcomes(options.dataDir, outcomes, at, ttlMs), persisted: true }
   } catch {
-    return { results, catalog: applyOutcomes(readModelCatalog(options.dataDir, ttlMs), outcomes, at), persisted: false }
+    return { ...applyOutcomes(readModelCatalog(options.dataDir, ttlMs), outcomes, at), persisted: false }
   }
 }
 
@@ -441,21 +459,11 @@ const SOURCE_LABELS: Record<ModelCatalogSource, string> = {
   'claude-local-settings': "Claude Code's model settings",
 }
 
-/** Every Antigravity stem the merged catalog offers, with its levels. */
-function agyStems(view: ModelCatalogView): Array<{ stem: string; efforts: readonly string[] }> {
-  const stems = [
-    ...(view.providers.antigravity?.models ?? []).map((model) => model.id),
-    ...AGY_STATIC_STEMS.map((entry) => entry.stem),
-  ]
-  return [...new Set(stems)].flatMap((stem) => {
-    const efforts = agyStemEfforts(stem, view)
-    return efforts && efforts.length > 0 ? [{ stem, efforts }] : []
-  })
-}
-
-/** `mao providers models`: each provider's source and freshness, then the models a picker or Swarm accepts. */
+/**
+ * `mao providers models`: each provider's source and freshness, then the models a picker or Swarm accepts
+ * with their levels — the rows Global settings lists too (`catalogModelRows`).
+ */
 export function describeModelCatalog(view: ModelCatalogView): string[] {
-  const options = providerOptionsWithCatalog(view)
   const lines: string[] = []
   for (const kind of DISCOVERABLE_PROVIDER_KINDS) {
     const catalog = view.providers[kind]
@@ -467,13 +475,8 @@ export function describeModelCatalog(view: ModelCatalogView): string[] {
       const reason = MODEL_CATALOG_FAILURE_TEXT[attempt.reason ?? 'unexpected-error']
       lines.push(attempt.outcome === 'failed' ? `  last refresh (${attempt.at}) failed: ${reason}` : `  ${reason}`)
     }
-    if (kind === 'antigravity') {
-      for (const { stem, efforts } of agyStems(view)) lines.push(`  ${stem} (${efforts.join(', ')})`)
-      continue
-    }
-    for (const model of options[kind].models) {
-      const detail = model.noEffort ? ' (no effort flag)' : model.efforts ? ` (${model.efforts.join(', ')})` : ''
-      lines.push(`  ${model.value}${detail}`)
+    for (const row of catalogModelRows(kind, view)) {
+      lines.push(`  ${row.id} (${row.efforts.length > 0 ? row.efforts.join(', ') : 'no effort flag'})`)
     }
   }
   lines.push(view.ttlMs === null

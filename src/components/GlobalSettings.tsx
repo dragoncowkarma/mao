@@ -4,9 +4,11 @@ import type { AgentStage, AiProviderConfig, ModelEffortPreset, ProviderKindId } 
 import {
   DISCOVERABLE_PROVIDER_KINDS,
   MODEL_CATALOG_FAILURE_TEXT,
+  catalogModelRows,
   effortOptionsForModel,
   providerOptionsWithCatalog,
   type DiscoverableProviderKind,
+  type EffortOption,
   type ModelCatalogView,
   type ModelOption,
   type ProviderOptions,
@@ -81,6 +83,16 @@ function withSelectedModel(models: readonly ModelOption[], selected: string | un
   return [...models, { value: selected, label: `${selected} (not in catalog)` }]
 }
 
+/**
+ * The same guard for a preset's effort. The choices narrow to the chosen model's levels, so a preset saved
+ * before that (Luna with `ultra`) would otherwise read "Effort: —" while the saved level is still sent —
+ * and rejected by the CLI. Shown as what it is, it can be seen and changed.
+ */
+function withSelectedEffort(efforts: readonly EffortOption[], selected: string | undefined): EffortOption[] {
+  if (!selected || efforts.length === 0 || efforts.some((effort) => effort.value === selected)) return [...efforts]
+  return [...efforts, { value: selected as EffortOption['value'], label: `${selected} (not supported by this model)` }]
+}
+
 /** One line per provider: where its list came from and when, and why the last refresh did not help. */
 function catalogStatus(kind: DiscoverableProviderKind, catalog: ModelCatalogView | undefined): string {
   const label = PROVIDER_KIND_LABELS[kind]
@@ -109,7 +121,7 @@ interface PresetRowProps {
 function PresetRow({ preset, kindOptions, isSelected, onSelect, onChange, onRemove }: PresetRowProps) {
   const catalogModels = kindOptions?.models ?? []
   const modelOpts = catalogModels.length > 0 ? withSelectedModel(catalogModels, preset.model) : []
-  const effortOpts = kindOptions ? effortOptionsForModel(kindOptions, preset.model) : []
+  const effortOpts = withSelectedEffort(kindOptions ? effortOptionsForModel(kindOptions, preset.model) : [], preset.effort)
 
   const selectedModelOpt = modelOpts.find((m) => m.value === preset.model)
   const noEffort = selectedModelOpt?.noEffort ?? false
@@ -493,8 +505,12 @@ export default function GlobalSettings({
     try {
       const report = await electronApi().ai.refreshModelCatalog()
       setCatalog(report.catalog)
-      const clean = report.persisted && report.results.every((result) => result.outcome !== 'failed')
-      setCatalogMessage(clean ? 'Model lists refreshed.' : 'Model lists refreshed with problems — see each provider above.')
+      const failed = report.results.some((result) => result.outcome === 'failed')
+      setCatalogMessage(
+        (failed ? 'Model lists refreshed with problems — see each provider above.' : 'Model lists refreshed.') +
+          // Nothing above can say this: the lines describe what was fetched, which did arrive.
+          (report.persisted ? '' : ' They could not be saved, so the rest of MAO keeps the previous lists.'),
+      )
     } catch {
       // Fixed wording: a rejection could quote a command line or an API response.
       setCatalogError('Could not refresh the model lists. The cached and built-in lists stay in use.')
@@ -731,20 +747,39 @@ export default function GlobalSettings({
           </button>
         </div>
         <p className="text-muted mb-2 text-xs">
-          The model pickers above combine the built-in list with what each CLI last reported. MAO refreshes it
-          {catalog?.ttlMs ? ` every ${Math.round((catalog.ttlMs / 3_600_000) * 100) / 100} h` : ' on request only'};
-          refreshing lists models without running or billing any.
+          The model pickers above combine the built-in list with what each CLI last reported; refreshing lists
+          models without running or billing any.
+          {/* Only once known: the main process refreshes on its own whether or not this read succeeded. */}
+          {catalog &&
+            (catalog.ttlMs === null
+              ? ' Automatic refresh is off, so the lists change only when refreshed here or from the CLI.'
+              : ` MAO also refreshes them every ${Math.round((catalog.ttlMs / 3_600_000) * 100) / 100} h.`)}
         </p>
         <ul className="flex flex-col gap-1 text-xs">
           {DISCOVERABLE_PROVIDER_KINDS.map((kind) => (
-            <li key={kind}>{catalogStatus(kind, catalog)}</li>
+            <li key={kind}>
+              {/* The models themselves, so a kind no provider uses yet is still visible — the GUI half of
+                  `mao providers models`, from the same rows (`catalogModelRows`). */}
+              <details>
+                <summary className="cursor-pointer">{catalogStatus(kind, catalog)}</summary>
+                <ul className="mt-1 flex flex-col gap-0.5 pl-4" aria-label={`${PROVIDER_KIND_LABELS[kind]} models`}>
+                  {catalogModelRows(kind, catalog).map((row) => (
+                    <li key={row.id}>
+                      <span className="font-mono">{row.id}</span>{' '}
+                      <span className="text-muted">
+                        {row.efforts.length > 0 ? row.efforts.join(', ') : 'no effort flag'}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              </details>
+            </li>
           ))}
         </ul>
-        {catalogMessage && (
-          <p className="mt-2 text-xs text-accent" role="status">
-            {catalogMessage}
-          </p>
-        )}
+        {/* Always mounted, so a screen reader announces each change, the busy state included. */}
+        <p className="mt-2 text-xs text-accent" role="status">
+          {catalogRefreshing ? 'Refreshing model lists…' : catalogMessage}
+        </p>
         {catalogError && (
           <p className="mt-2 text-xs text-danger" role="alert">
             {catalogError}

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { execFileSync, spawn } from 'node:child_process'
+import { execFileSync, spawn, spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 
 // Exercise a copied single bundle with no Python on PATH, no source tree and no network.
@@ -15,7 +15,11 @@ const repo = path.join(root, 'repo')
 const dataDir = path.join(root, 'data')
 const catalogFile = path.join(dataDir, 'model-catalog.json')
 const env = { ...process.env, PATH: bin, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null',
-  GH_REPO: 'wrong/wrong', GH_HOST: 'wrong.example', MAO_DATA_DIR: dataDir, MAO_MODEL_CATALOG_TTL_HOURS: '' }
+  GH_REPO: 'wrong/wrong', GH_HOST: 'wrong.example', MAO_DATA_DIR: dataDir, MAO_MODEL_CATALOG_TTL_HOURS: '',
+  // Claude's local model sources are the operator's: point them at nothing so the run is hermetic.
+  CLAUDE_CONFIG_DIR: path.join(root, 'claude-config'), ANTHROPIC_MODEL: '', ANTHROPIC_DEFAULT_OPUS_MODEL: '',
+  ANTHROPIC_DEFAULT_SONNET_MODEL: '', ANTHROPIC_DEFAULT_FABLE_MODEL: '', ANTHROPIC_DEFAULT_HAIKU_MODEL: '',
+  ANTHROPIC_SMALL_FAST_MODEL: '', CLAUDE_CODE_SUBAGENT_MODEL: '' }
 const bundle = path.join(root, 'mao.cjs')
 const run = (command, args, options = {}) => execFileSync(command, args,
   { cwd: repo, env, encoding: 'utf8', timeout: 15_000, ...options })
@@ -89,6 +93,26 @@ try {
     assert.equal(worker.record.exit_code, 0)
     assert.equal(worker.failure_count, 0)
     assert.deepEqual(registry.provider_cooldowns, {})
+    // The CLI half of the catalog's GUI/CLI parity, against the cache the runs above wrote.
+    const cli = (args) => spawnSync(node, [bundle, ...args], { cwd: repo, env, encoding: 'utf8', timeout: 15_000 })
+    const listed = cli(['providers', 'models'])
+    assert.equal(listed.status, 0, listed.stderr)
+    assert.match(listed.stdout, /^ {2}gpt-7-nova \(low, medium, high, xhigh\)$/m)
+    assert.match(listed.stdout, /^ {2}gemini-4-neon \(low, medium, high, xhigh\)$/m)
+    const listedJson = JSON.parse(cli(['providers', 'models', '--json']).stdout)
+    assert.ok(listedJson.models.codex.models.some((model) => model.value === 'gpt-7-nova'))
+    const refreshed = cli(['providers', 'refresh-models', '--provider', 'codex'])
+    assert.equal(refreshed.status, 0, refreshed.stderr)
+    assert.match(refreshed.stdout, /Codex: refreshed, 1 model\(s\) from `codex debug models`/)
+    // `agy` is the CLI's own name and is accepted; it is not installed here, so the command says so and fails.
+    const missing = cli(['providers', 'refresh-models', '--provider', 'agy'])
+    assert.equal(missing.status, 1)
+    assert.match(missing.stdout, /Antigravity \(agy\): refresh failed — the CLI is not installed or not on PATH/)
+    const before = fs.readFileSync(catalogFile, 'utf8')
+    const unknown = cli(['providers', 'refresh-models', '--provider', 'gemini'])
+    assert.equal(unknown.status, 1)
+    assert.match(unknown.stderr, /Unknown provider "gemini"/)
+    assert.equal(fs.readFileSync(catalogFile, 'utf8'), before)
     const child = spawn(node, [bundle, 'swarm', '--repo-root', repo, '--interval', '1'], { cwd: repo, env })
     let output = ''
     child.stdout.on('data', (data) => { output += data })

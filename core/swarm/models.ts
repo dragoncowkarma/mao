@@ -3,6 +3,7 @@ import {
   AGY_EFFORT_SUFFIX,
   AGY_FALLBACK_STEM,
   REASONING_LADDER,
+  UNIDENTIFIED_EFFORT_CEILING,
   agyStemEfforts,
   buildModelEffortArgs,
   findCatalogModel,
@@ -140,12 +141,16 @@ function agyStem(model: string, catalog?: ModelCatalogSnapshot): string | undefi
  * that would forward the prompt to one: both fall back to Gemini Flash. The level clamps to what agy
  * lists for the stem — Neon and Hydrogen reach `xhigh`, Argon and Flash `high`, an unknown custom Gemini
  * `high` — and travels as the slug's suffix, never as an `--effort` flag.
+ *
+ * A custom Gemini id names its own stem: it is never re-aliased (`custom:gemini-3-pro` stays Gemini 3 Pro,
+ * where the prose tag means Argon), only re-suffixed with the role's level.
  */
 export function resolveAgyModel(
   model: string, reasoning: string, allowCustom = false, catalog?: ModelCatalogSnapshot,
 ): string {
-  let stem = agyStem(model, catalog)
-  if (!stem && allowCustom && /^gemini[- ]/i.test(model.trim())) stem = agyKey(model).replace(AGY_EFFORT_SUFFIX, '')
+  let stem = allowCustom && /^gemini[- ]/i.test(model.trim())
+    ? agyKey(model).replace(AGY_EFFORT_SUFFIX, '')
+    : agyStem(model, catalog)
   if (!stem || !eligibleAgy(stem)) stem = AGY_FALLBACK_STEM
   return `${stem}-${resolveReasoning(reasoning, agyStemEfforts(stem, catalog) ?? REASONING_LADDER.slice(0, 3))}`
 }
@@ -221,7 +226,7 @@ export function buildAiArgv(
   // must run Opus 5 even though the prose tag `opus 5` now means the newest Opus.
   const resolvedModel = custom ? model
     : ownValue(kind === 'codex' ? CODEX_ALIASES : CLAUDE_ALIASES, aliasKey(model)) ?? findCatalogModel(catalog, kind, model)?.id ?? model
-  const supported = modelEfforts(kind, resolvedModel, catalog) ?? REASONING_LADDER.slice(0, 5)
+  const supported = modelEfforts(kind, resolvedModel, catalog) ?? UNIDENTIFIED_EFFORT_CEILING
   const effort = supported.length > 0 ? resolveReasoning(reasoning, supported) : undefined
   if (kind === 'codex') {
     return ['codex', 'exec', ...buildModelEffortArgs('codex', resolvedModel, effort),

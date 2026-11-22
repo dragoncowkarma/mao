@@ -5,9 +5,10 @@ import { describe, expect, it } from 'vitest'
 /**
  * Where the model-catalog refresher may and may not start (#140), asserted as source text for the reason
  * `core/shell-queue-gate.test.ts` gives: `cli/index.ts` builds a commander program and `electron/ipc.ts`
- * needs a live Electron app, so neither can be imported here. The refresher's interval would keep every
- * one-shot command alive (architecture rule 5), and a host that never stops it leaks a timer and a child
- * CLI into shutdown.
+ * needs a live Electron app, so neither can be imported here. The refresher's interval is unref'd, but its
+ * first tick runs the AI CLIs and writes the cache, so started from `createMaoApp()` it would do that on every
+ * one-shot command (architecture rule 5); and a host that never stops it leaves a child CLI running into
+ * shutdown.
  */
 const REPO_ROOT = path.join(
   (import.meta as unknown as { dirname?: string }).dirname ?? path.join(process.cwd(), 'core'),

@@ -28,6 +28,13 @@ export interface ProviderOptions {
 export const REASONING_LADDER = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const
 export type ReasoningLevel = (typeof REASONING_LADDER)[number]
 
+/**
+ * The ceiling for a model nothing describes — a `custom:` id, or a refreshed entry whose source named no
+ * levels. Every current model accepts `max`; only some accept `ultra`, and a CLI answers an unsupported
+ * level with an error rather than a clamp.
+ */
+export const UNIDENTIFIED_EFFORT_CEILING: readonly ReasoningLevel[] = REASONING_LADDER.slice(0, 5)
+
 const REASONING_ALIASES: Record<string, ReasoningLevel> = {
   low: 'low', 낮음: 'low', light: 'low', medium: 'medium', 중간: 'medium',
   high: 'high', 높음: 'high', thinking: 'high', xhigh: 'xhigh',
@@ -74,6 +81,16 @@ const efforts = (levels: readonly AiEffort[]): EffortOption[] => levels.map((val
  */
 export const DISCOVERABLE_PROVIDER_KINDS = ['antigravity', 'claude', 'codex'] as const
 export type DiscoverableProviderKind = (typeof DISCOVERABLE_PROVIDER_KINDS)[number]
+
+/**
+ * A provider name as an operator types it — any case, and `agy` for Antigravity, the name its CLI goes by —
+ * or `undefined` when it names none of them.
+ */
+export function parseDiscoverableKind(name: string): DiscoverableProviderKind | undefined {
+  const key = name.trim().toLowerCase()
+  const kind = key === 'agy' ? 'antigravity' : key
+  return (DISCOVERABLE_PROVIDER_KINDS as readonly string[]).includes(kind) ? kind as DiscoverableProviderKind : undefined
+}
 
 /**
  * The levels each CLI's own effort encoding can carry, which bounds any catalog's claim: `claude --effort`
@@ -150,7 +167,9 @@ export const PROVIDER_OPTIONS: Record<ProviderKindId, ProviderOptions> = {
       ...['opus', 'sonnet', 'fable'].map((value) => ({ value, label: `${value} (latest)` })),
       // Keep no-effort metadata for stored legacy ids. Removing an old catalog entry must not turn a
       // formerly suppressed effort into an unsupported flag. `haiku` stays here too: configurations saved
-      // with it have always run without an effort, and a catalog refresh is no reason to change that.
+      // with it have always run without an effort, and a Claude CLI older than Haiku 5.5 still resolves the
+      // alias to Haiku 4.5, which rejects `--effort`. Name `claude-haiku-5-5` to set one. (Swarm's prose tag
+      // `haiku` already resolves to that id itself, so it does pass an effort.)
       ...['claude-haiku-4-5', 'claude-haiku-4-5-20251001', 'claude-3-5-haiku', 'claude-3.5-haiku', 'haiku']
         .map((value) => ({ value, label: value, noEffort: true })),
     ],
@@ -201,7 +220,8 @@ export interface ProviderModelCatalog {
  */
 export const MODEL_CATALOG_FAILURES = [
   'command-not-found', 'command-failed', 'command-timeout', 'output-too-large', 'parse-failed', 'no-models',
-  'unauthorized', 'http-error', 'network-error', 'request-timeout', 'no-source', 'aborted', 'unexpected-error',
+  'unauthorized', 'http-error', 'network-error', 'request-timeout', 'no-source', 'kept-api-list', 'aborted',
+  'unexpected-error',
 ] as const
 export type ModelCatalogFailure = (typeof MODEL_CATALOG_FAILURES)[number]
 
@@ -218,6 +238,7 @@ export const MODEL_CATALOG_FAILURE_TEXT: Readonly<Record<ModelCatalogFailure, st
   'network-error': 'the Anthropic API could not be reached',
   'request-timeout': 'the Anthropic API did not answer in time',
   'no-source': 'no Anthropic API key or Claude model setting was found, so the built-in list stays in use',
+  'kept-api-list': 'only Claude Code\'s model settings are available here, so the Anthropic API listing stays in use',
   aborted: 'the refresh was interrupted',
   'unexpected-error': 'an unexpected error occurred',
 }
@@ -286,8 +307,11 @@ function mergeModelOptions(discovered: ModelOption[], builtIn: readonly ModelOpt
     seen.add(option.value)
     const builtInOption = known.get(option.value)
     if (builtInOption?.noEffort) merged.push({ value: option.value, label: option.label, noEffort: true })
-    else if (!option.noEffort && option.efforts === undefined && builtInOption?.efforts) {
-      merged.push({ ...option, efforts: builtInOption.efforts })
+    else if (!option.noEffort && option.efforts === undefined) {
+      // Named without its levels: the built-in ceiling when MAO knows the model, else the unidentified one —
+      // never the provider's widest, which for Codex is `ultra`, a level Luna-class models reject.
+      if (!builtInOption) merged.push({ ...option, efforts: UNIDENTIFIED_EFFORT_CEILING })
+      else merged.push(builtInOption.efforts ? { ...option, efforts: builtInOption.efforts } : option)
     } else merged.push(option)
   }
   for (const option of builtIn) {
@@ -360,6 +384,36 @@ export function agyStemEfforts(stem: string, catalog?: ModelCatalogSnapshot): re
 /** Whether `stem` names an Antigravity model the refreshed or built-in list knows. */
 export function isKnownAgyStem(stem: string, catalog?: ModelCatalogSnapshot): boolean {
   return agyStemEfforts(stem, catalog) !== undefined
+}
+
+/** One model as `mao providers models` prints it and Global settings lists it. */
+export interface CatalogModelRow {
+  /** The id a tag or a provider names; for Antigravity, the stem its level suffix attaches to. */
+  id: string
+  /** The levels it accepts, lowest first; `[]` when it takes no effort flag at all. */
+  efforts: readonly ReasoningLevel[]
+}
+
+/**
+ * Every model one provider offers once refreshed lists are merged in, with its levels — one rule for the
+ * CLI's listing and the GUI's, so the two cannot disagree (AGENTS.md rule 2). Antigravity rows are stems:
+ * agy's slugs are a stem plus a level, and listing each slug would repeat every model four times.
+ */
+export function catalogModelRows(kind: DiscoverableProviderKind, catalog?: ModelCatalogSnapshot): CatalogModelRow[] {
+  if (kind === 'antigravity') {
+    const refreshed = (catalog?.providers?.antigravity?.models ?? [])
+      .flatMap((model) => typeof model?.id === 'string' ? [model.id.toLowerCase()] : [])
+    return [...new Set([...refreshed, ...AGY_STATIC_STEMS.map((entry) => entry.stem)])].flatMap((id) => {
+      const efforts = agyStemEfforts(id, catalog)
+      return efforts && efforts.length > 0 ? [{ id, efforts }] : []
+    })
+  }
+  const options = providerOptionsWithCatalog(catalog)[kind]
+  const ladder = PROVIDER_EFFORT_LADDERS[kind]
+  return options.models.map((option) => ({
+    id: option.value,
+    efforts: option.noEffort ? [] : withinLadder(option.efforts ?? options.efforts.map((entry) => entry.value), ladder) ?? [],
+  }))
 }
 
 /**

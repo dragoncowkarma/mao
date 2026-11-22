@@ -1,5 +1,8 @@
 import { execFile } from 'node:child_process'
-import { describe, expect, it, vi } from 'vitest'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   ANTHROPIC_MODEL_PAGES,
   MODEL_DISCOVERY_MAX_BUFFER,
@@ -7,6 +10,7 @@ import {
   ModelDiscoveryError,
   anthropicModelsUrl,
   claudeModelsFromEnvironment,
+  claudeModelsFromSettings,
   createDiscoveryCommandRunner,
   discoverClaudeModels,
   discoverModels,
@@ -320,5 +324,52 @@ describe('Claude discovery sources', () => {
     await expect(discoverModels('antigravity', [], { run })).resolves.toMatchObject({ kind: 'catalog', source: 'agy-models' })
     await expect(discoverModels('codex', [], { run })).resolves.toMatchObject({ kind: 'catalog', source: 'codex-debug-models' })
     expect(run.mock.calls.map((call) => [call[0], call[1]])).toEqual([['agy', ['models']], ['codex', ['debug', 'models']]])
+  })
+})
+
+describe('review follow-ups (#140)', () => {
+  const dirs: string[] = []
+  afterEach(() => { for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }) })
+  const settingsDir = (settings: unknown) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mao-claude-settings-'))
+    dirs.push(dir)
+    fs.writeFileSync(path.join(dir, 'settings.json'), typeof settings === 'string' ? settings : JSON.stringify(settings))
+    return dir
+  }
+
+  it('reads only the model settings from Claude Code\'s settings.json, never anything else in it', () => {
+    const dir = settingsDir({
+      model: 'claude-opus-5-5',
+      env: { ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-sonnet-5-5', ANTHROPIC_API_KEY: 'sk-ant-SECRET', OTHER: 'claude-x-1' },
+      permissions: { allow: ['Bash(claude-fable-9)'] },
+    })
+    const models = claudeModelsFromSettings({ CLAUDE_CONFIG_DIR: dir })
+    expect(models).toEqual([{ id: 'claude-opus-5-5' }, { id: 'claude-sonnet-5-5' }])
+    expect(JSON.stringify(models)).not.toContain('SECRET')
+  })
+
+  it('finds ~/.claude through the given HOME only, so a test never reads the operator\'s file', async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'mao-home-'))
+    dirs.push(home)
+    fs.mkdirSync(path.join(home, '.claude'))
+    fs.writeFileSync(path.join(home, '.claude', 'settings.json'), JSON.stringify({ model: 'claude-fable-5-2' }))
+    expect(claudeModelsFromSettings({ HOME: home })).toEqual([{ id: 'claude-fable-5-2' }])
+    expect(claudeModelsFromSettings({})).toEqual([])
+    await expect(discoverClaudeModels([], { env: { HOME: home } })).resolves.toEqual({
+      kind: 'catalog', source: 'claude-local-settings', models: [{ id: 'claude-fable-5-2' }],
+    })
+  })
+
+  it.each([['malformed JSON', '{"model": '], ['a list', '["claude-opus-5-5"]'], ['an alias only', { model: 'opus' }]])(
+    'reads %s as nothing', (_name, settings) => {
+      expect(claudeModelsFromSettings({ CLAUDE_CONFIG_DIR: settingsDir(settings) })).toEqual([])
+    },
+  )
+
+  it('never follows a redirect with the API key: a 3xx is an error', async () => {
+    const fetchImpl = vi.fn(async () => new Response(null, { status: 302, headers: { location: 'https://elsewhere.example/' } }))
+    expect(await reasonOf(fetchAnthropicModels('https://gw.example/v1/models', 'k', fetchImpl as unknown as typeof fetch)))
+      .toBe('http-error')
+    expect((fetchImpl.mock.calls[0] as unknown as [URL, RequestInit])[1].redirect).toBe('manual')
   })
 })

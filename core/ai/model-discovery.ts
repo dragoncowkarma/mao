@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process'
+import fs from 'node:fs'
 import path from 'node:path'
 import {
   AGY_EFFORT_SUFFIX,
@@ -319,6 +320,9 @@ export async function fetchAnthropicModels(
         response = await fetchImpl(pageUrl, {
           method: 'GET',
           headers: { 'x-api-key': apiKey, 'anthropic-version': ANTHROPIC_VERSION },
+          // Never followed: fetch strips Authorization on a cross-origin redirect but forwards `x-api-key`,
+          // and this request runs unattended against a path the operator never configured. A 3xx is an error.
+          redirect: 'manual',
           signal: bound.signal,
         })
       } catch {
@@ -350,8 +354,9 @@ export async function fetchAnthropicModels(
 }
 
 /**
- * The environment variables Claude Code reads to pin a model or an alias's target — the zero-cost local
- * source for a CLI-only setup (names verified in the Claude Code 2.1.330 binary). Nothing else is read.
+ * The environment variables Claude Code reads to pin a model or an alias's target — with its `settings.json`
+ * (`claudeModelsFromSettings`), the zero-cost local source for a CLI-only setup (names verified in the
+ * Claude Code 2.1.330 binary). Only these keys are read.
  */
 export const CLAUDE_MODEL_ENV_KEYS = [
   'ANTHROPIC_MODEL',
@@ -367,7 +372,7 @@ export const CLAUDE_MODEL_ENV_KEYS = [
  * First-party Claude ids pinned in the environment, deduplicated. A trailing context marker such as
  * `[1m]` is dropped; platform-prefixed ids (Bedrock, Vertex) and aliases are not ids and are skipped.
  */
-export function claudeModelsFromEnvironment(env: NodeJS.ProcessEnv): CatalogModel[] {
+export function claudeModelsFromEnvironment(env: Readonly<Record<string, unknown>>): CatalogModel[] {
   const ids: string[] = []
   for (const key of CLAUDE_MODEL_ENV_KEYS) {
     const value = env[key]
@@ -376,6 +381,35 @@ export function claudeModelsFromEnvironment(env: NodeJS.ProcessEnv): CatalogMode
     if (CLAUDE_MODEL_ID.test(id) && !ids.includes(id)) ids.push(id)
   }
   return ids.map((id) => ({ id }))
+}
+
+/** A settings file larger than this is not Claude Code's: it is skipped, not parsed. */
+const CLAUDE_SETTINGS_MAX_BYTES = 1024 * 1024
+
+/**
+ * Claude Code's user settings — `$CLAUDE_CONFIG_DIR/settings.json`, else `~/.claude/settings.json`, located
+ * through `env` so a test (or a host with another home) never reads the operator's file by accident. Only
+ * the `model` setting and the model keys of its `env` block are read: the file can also hold an API key,
+ * which is neither kept nor reported. Anything missing, unreadable or malformed reads as nothing.
+ */
+export function claudeModelsFromSettings(env: NodeJS.ProcessEnv): CatalogModel[] {
+  const home = env.HOME?.trim() || env.USERPROFILE?.trim()
+  const configDir = env.CLAUDE_CONFIG_DIR?.trim() || (home ? path.join(home, '.claude') : undefined)
+  if (!configDir) return []
+  const file = path.join(configDir, 'settings.json')
+  let settings: unknown
+  try {
+    if (fs.statSync(file).size > CLAUDE_SETTINGS_MAX_BYTES) return []
+    settings = JSON.parse(fs.readFileSync(file, 'utf8'))
+  } catch {
+    return []
+  }
+  if (!isRecord(settings)) return []
+  const models = [
+    ...claudeModelsFromEnvironment({ ANTHROPIC_MODEL: settings.model }),
+    ...claudeModelsFromEnvironment(isRecord(settings.env) ? settings.env : {}),
+  ]
+  return models.filter((model, index) => models.findIndex((other) => other.id === model.id) === index)
 }
 
 export interface ModelDiscoveryDeps {
@@ -388,8 +422,9 @@ export interface ModelDiscoveryDeps {
  * Claude has no listing command. With an Anthropic-format API provider configured, its key lists models
  * through the API: the first key that answers wins, and if every one fails the refresh fails, keeping the
  * cached list — a key rejected today is no reason to forget yesterday's models. Without one, Claude Code's
- * own model settings in the environment are the source; with neither, the built-in list and the family
- * aliases (`opus`, `sonnet`, `fable`, `haiku`) are the answer, which is not a failure.
+ * own model settings are the source, from the environment and its `settings.json`; with neither, the
+ * built-in list and the family aliases (`opus`, `sonnet`, `fable`, `haiku`) are the answer, which is not a
+ * failure.
  */
 export async function discoverClaudeModels(
   providers: readonly AiProviderConfig[], deps: ModelDiscoveryDeps = {}, signal?: AbortSignal,
@@ -407,7 +442,9 @@ export async function discoverClaudeModels(
     }
     throw new ModelDiscoveryError(failure)
   }
-  const local = claudeModelsFromEnvironment(deps.env ?? process.env)
+  const env = deps.env ?? process.env
+  const local = [...claudeModelsFromEnvironment(env), ...claudeModelsFromSettings(env)]
+    .filter((model, index, all) => all.findIndex((other) => other.id === model.id) === index)
   if (local.length > 0) return { kind: 'catalog', source: 'claude-local-settings', models: local }
   return { kind: 'static', reason: 'no-source' }
 }

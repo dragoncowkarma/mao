@@ -250,6 +250,10 @@ describe('the 2026-11 catalog (#140)', () => {
     expect(buildAiArgv(resolveRoleAssignment(
       { ai: 'antigravity', model: 'custom:gemini-4-neon', reasoning: 'xhigh' }, 'worker'), 'prompt', true))
       .toContain('gemini-4-neon-xhigh')
+    // A custom Gemini slug that already names a level gets the role's level instead of a second suffix.
+    expect(buildAiArgv(resolveRoleAssignment(
+      { ai: 'antigravity', model: 'custom:gemini-private-high', reasoning: 'max' }, 'reviewer'), 'prompt', false))
+      .toContain('gemini-private-medium')
   })
 
   it('offers every alias target, default and table entry from the provider tables Global settings shows', () => {
@@ -282,7 +286,8 @@ describe('the refreshed catalog at dispatch (#140)', () => {
       { id: 'gpt-6.2-sol', efforts: ['low', 'medium', 'high'] },
     ] },
     claude: { updatedAt: '2026-11-22T00:00:00.000Z', source: 'anthropic-models-api', models: [
-      { id: 'claude-mythos-5-2', efforts: ['low', 'medium', 'high', 'xhigh', 'max'] },
+      // A listing may claim more than `claude --effort` accepts; the CLI's own ladder still caps it.
+      { id: 'claude-mythos-5-2', efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] },
       { id: 'claude-plain-9', efforts: [] },
     ] },
     antigravity: { updatedAt: '2026-11-22T00:00:00.000Z', source: 'agy-models', models: [
@@ -324,5 +329,24 @@ describe('the refreshed catalog at dispatch (#140)', () => {
   it('threads the catalog through role resolution', () => {
     const reviewer = resolveRoleAssignment({ ai: 'codex', model: 'gpt-7-nova', reasoning: 'ultra' }, 'reviewer', catalog)
     expect(reviewer).toEqual({ ai: 'codex', model: 'gpt-7-nova', reasoning: 'medium' })
+  })
+})
+
+describe('review follow-ups (#140)', () => {
+  it('keeps a custom Gemini stem rather than re-aliasing it, as the prose tag would', () => {
+    expect(modelArg(buildAiArgv({ ai: 'antigravity', model: 'custom:gemini-3-pro', reasoning: 'high' }, 'p', false)))
+      .toBe('gemini-3-pro-high')
+    expect(modelArg(buildAiArgv({ ai: 'antigravity', model: 'gemini-3-pro', reasoning: 'high' }, 'p', false)))
+      .toBe('gemini-4-argon-high')
+    expect(modelArg(buildAiArgv({ ai: 'antigravity', model: 'custom:Gemini 3.6 Flash', reasoning: 'low' }, 'p', false)))
+      .toBe('gemini-3.6-flash-low')
+  })
+
+  it('dispatches a catalog model listed without levels at max at most', () => {
+    const catalog: ModelCatalogSnapshot = { providers: {
+      codex: { updatedAt: '2026-11-22T00:00:00.000Z', source: 'codex-debug-models', models: [{ id: 'gpt-7-luna' }] },
+    } }
+    expect(effortArg(buildAiArgv({ ai: 'codex', model: 'gpt-7-luna', reasoning: 'ultra' }, 'p', false, undefined, catalog)))
+      .toBe('max')
   })
 })

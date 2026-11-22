@@ -73,12 +73,16 @@ Tier 3 reference — read when changing the workflow engine, agent routing, `cor
 `buildModelEffortArgs()` in `core/ai/provider-options.ts` encodes resolved arguments without rewriting
 ordinary saved provider models or efforts, including custom wrappers named after built-in CLIs. Codex
 uses `-c model_reasoning_effort=<value>`; an existing explicit model/effort flag is not duplicated.
-Retain `noEffort` metadata for current Haiku and stored legacy ids so a catalog refresh cannot add an
-unsupported flag to an old configuration.
+Retain `noEffort` metadata for stored legacy Haiku ids and the bare `haiku` alias, so a catalog refresh
+cannot add an unsupported flag to an old configuration. The current Haiku, `claude-haiku-5-5`, takes an
+effort: a saved provider names it to set one (Swarm's prose `haiku` already resolves to it).
 
 Only native Swarm prose tags use alias normalization, the reasoning ladder and model clamping in
 `core/swarm/models.ts`. Its last-unquoted-tag parser, role cost overrides, custom-model policy and
 CLI prompt transports are documented in [repo-preflight-and-swarm.md](repo-preflight-and-swarm.md).
+Swarm runs inside the CLI bundle, using active gh credentials and its own process registry; it neither
+loads the app queue nor starts through `createMaoApp()`. Its `--once` child drain has a shared 50-minute
+cap, and a latched app queue does not stop this separate engine.
 
 ### Model catalog refresh
 
@@ -90,28 +94,29 @@ settings offers the merged list, and Swarm accepts and clamps against it.
 | --- | --- | --- |
 | `antigravity` | `agy models` (`<slug>\t<name>`) | Gemini stems with their `-<effort>` suffixes; never `claude-*`/`gpt-*` or `gemini-pro-orchestrator-*` |
 | `codex` | `codex debug models` (JSON, ~840 KB: 16 MiB `maxBuffer`) | `visibility: "list"` slugs with `supported_reasoning_levels` |
-| `claude` | `GET /v1/models` with a saved Anthropic-format API key; else Claude Code's model env vars (`ANTHROPIC_MODEL`, `ANTHROPIC_DEFAULT_*_MODEL`, …); else nothing | ids with `capabilities.effort`; no source keeps the built-in list and the family aliases |
+| `claude` | `GET /v1/models` with a saved Anthropic-format API key (redirects refused, so the key never follows one); else Claude Code's model settings (`ANTHROPIC_MODEL`, `ANTHROPIC_DEFAULT_*_MODEL`, … in the environment, or `model` and those keys in `$CLAUDE_CONFIG_DIR` or `~/.claude` `settings.json`); else nothing | ids with `capabilities.effort`; no source keeps the built-in list and the family aliases |
 
 - `core/ai/model-discovery.ts` runs each source: argv `execFile`, no shell, stdin closed, 60 s, output
   capped; `fetch` with the same deadline and at most 10 pages. Failures are fixed `ModelCatalogFailure`
   categories, never output, URLs or bodies.
 - `core/model-catalog.ts` caches in `<data dir>/model-catalog.json` (`MAO_DATA_DIR`, or Electron
   `userData`), never in `config.json`: per-provider list, levels, `updatedAt`, last attempt. Writes take
-  the store's write lock and replace atomically. An unreadable or hand-edited file is re-validated or
-  read as empty.
+  their own cross-process lock (`createStoreWriteLock` on `model-catalog.json`, never `config.json`'s) and
+  replace atomically. An unreadable or hand-edited file is re-validated or read as empty; a timestamp more
+  than five minutes ahead counts for nothing.
 - Fail-safe: a failed, empty or unparseable answer keeps the cached list; Claude local settings never
-  replace an API listing; nothing a refresh does can stop the app, the queue or Swarm.
+  replace an API listing (reported as `kept-api-list`), and a host with no source records nothing over a
+  cached list; nothing a refresh does can stop the app, the queue or Swarm. A model a source lists
+  without levels gets the built-in ceiling, else `max` (`UNIDENTIFIED_EFFORT_CEILING`).
 - Due: a list missing or older than the TTL (24 h; `MAO_MODEL_CATALOG_TTL_HOURS`, `0` = manual only),
   unless this process tried it within the TTL, or within an hour after a failure. Another host's recent
   failure counts too, except `command-not-found` (a Dock-launched GUI's PATH lacks the CLIs).
 - Who refreshes: `electron/ipc.ts` and `mao run` start `startModelCatalogRefresher()` (15-minute check,
   unref'd, stopped on quit/SIGINT); real Swarm cycles call `refreshDue()`. Never `createMaoApp()`
   (architecture rule 5; proof: `core/shell-model-catalog.test.ts`).
-- Manual: `ai:getModelCatalog` / `ai:refreshModelCatalog` (Global settings' Refresh button) and
-  `mao providers models` / `mao providers refresh-models`.
-Swarm runs inside the CLI bundle, using active gh credentials and its own process registry; it neither
-loads the app queue nor starts through `createMaoApp()`. Its `--once` child drain has a shared 50-minute
-cap, and a latched app queue does not stop this separate engine.
+- Manual: `ai:getModelCatalog` / `ai:refreshModelCatalog` (Global settings' Model catalog section, which
+  lists each provider's models and levels) and `mao providers models` / `mao providers refresh-models`;
+  both list from `catalogModelRows()`.
 
 ## RunOverride: one-shot, stricter
 
@@ -248,7 +253,7 @@ config set-theme <light|dark|system>
 config set-design <classic|crimson|console>
 config show  # secrets redacted as '[set]'
 providers models [--json]  # built-in + refreshed model lists, per provider
-providers refresh-models [--provider <antigravity|claude|codex>]  # exit 1 if one failed
+providers refresh-models [--provider <agy|claude|codex>]  # exit 1 if one failed or the cache was not saved
 config clear-persistence-broken
 repos add <owner> <repo> [--no-auto-trigger] [--poll-interval-ms <ms>]  # preflights write access
 repos remove <owner> <repo>

@@ -690,6 +690,29 @@ describe('model catalog at dispatch (#140)', () => {
     expect(log.mock.calls.flat().join('\n')).not.toContain('ENOSPC')
   })
 
+  it('lets a shutdown interrupt a refresh in flight, dispatching nothing and reporting no catalog failure', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+    let seen: AbortSignal | undefined
+    const { engine, spawnProcess } = catalogFixture(false, {
+      refreshDue: vi.fn((signal?: AbortSignal) => new Promise<ModelCatalogRefreshReport | undefined>((resolve) => {
+        seen = signal
+        signal?.addEventListener('abort', () => resolve({
+          results: [{ kind: 'codex', outcome: 'failed', reason: 'aborted', models: 0 }], catalog: novaView, persisted: true,
+        }))
+      })),
+    })
+    const cycle = engine.cycle(true)
+    await vi.waitFor(() => expect(seen).toBeDefined())
+    // What the engine's own SIGTERM handler does (SwarmEngine.run()).
+    const internals = engine as unknown as { shutdownSignal?: NodeJS.Signals; sleepAbort?: AbortController }
+    internals.shutdownSignal = 'SIGTERM'
+    internals.sleepAbort?.abort()
+    await expect(cycle).rejects.toThrow()
+    expect(seen?.aborted).toBe(true)
+    expect(spawnProcess).not.toHaveBeenCalled()
+    expect(log.mock.calls.flat().join('\n')).not.toContain('Model catalog')
+  })
+
   it('builds its own maintainer from the data directory the CLI passes', async () => {
     const log = vi.spyOn(console, 'log').mockImplementation(() => {})
     const { root, platform } = fixture(true)

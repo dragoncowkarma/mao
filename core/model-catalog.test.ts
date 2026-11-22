@@ -930,27 +930,87 @@ describe('an unsaved list a newer saved one replaced (PR #141 follow-up review)'
     expect(a.read().attempts.claude).toEqual({ at: future, outcome: 'failed', reason: 'network-error' })
   }, 20_000)
 
-  it('forgets a copy of a fresher saved list a refresh could not write, as soon as it is recorded', async () => {
+  /** A clock that advances on every reading and, once armed, steps back an hour right after the next one. */
+  function clockSteppingAfterFold() {
+    const state = { clock: T0, armed: false }
+    const now = () => {
+      const reading = (state.clock += 1)
+      if (state.armed) {
+        state.armed = false
+        state.clock = T0 - HOUR
+      }
+      return reading
+    }
+    return { state, now }
+  }
+  const holdLock = (dir: string) =>
+    fs.writeFileSync(`${modelCatalogPath(dir)}.lock`, JSON.stringify({ pid: process.ppid, host: os.hostname(), nonce: 'other-writer' }))
+
+  it('never keeps a list or attempt another host stored later, even if the clock steps back right after', async () => {
     const dir = tempDir()
-    const lock = `${modelCatalogPath(dir)}.lock`
-    // While this process asks codex, another host saves a list stamped after this refresh began; then the lock
-    // is held, so this refresh folds over that list ("fresher", it stands) but cannot write.
+    const { state, now } = clockSteppingAfterFold()
+    // While this process asks codex, another host saves a list and an attempt stamped after this refresh began,
+    // then holds the lock: this refresh folds over them ("fresher", they stand) but cannot write.
     const run = vi.fn<DiscoveryCommandRunner>(async (command) => {
       if (command !== 'codex') throw new ModelDiscoveryError('command-not-found')
       writeCache(dir, codexList('gpt-7-orbit', T0 + 60_000))
-      fs.writeFileSync(lock, JSON.stringify({ pid: process.ppid, host: os.hostname(), nonce: 'other-writer' }))
+      holdLock(dir)
+      state.armed = true
       return CODEX
     })
-    const a = createModelCatalogMaintainer({ dataDir: dir, ttlMs: 24 * HOUR, now: () => T0, deps: { run, env: {} } })
+    const a = createModelCatalogMaintainer({ dataDir: dir, ttlMs: 24 * HOUR, now, deps: { run, env: {} } })
     const report = await a.refreshNow(['codex'])
     expect(report.persisted).toBe(false)
     expect(report.catalog.providers.codex?.models[0].id).toBe('gpt-7-orbit')
-    // The copy ties with the file, which holds it already: a reset must not bring it back from memory.
-    fs.rmSync(lock)
+    // Not this refresh's to keep: with the clock now behind, a copy would be moved to the clock and outlive the file.
+    fs.rmSync(`${modelCatalogPath(dir)}.lock`)
     fs.rmSync(modelCatalogPath(dir))
     expect(a.read().providers.codex).toBeUndefined()
     expect(a.read().attempts.codex).toBeUndefined()
   }, 20_000)
+
+  it('forgets what the file supersedes at a failed write too, before a clock step can revive it', async () => {
+    const dir = tempDir()
+    const { state, now } = clockSteppingAfterFold()
+    const run = vi.fn<DiscoveryCommandRunner>(async (command) => {
+      if (command === 'codex') return CODEX
+      if (command !== 'agy') throw new ModelDiscoveryError('command-not-found')
+      if (state.clock > T0 + 10 * 60_000) state.armed = true
+      return AGY
+    })
+    holdLock(dir)
+    const a = createModelCatalogMaintainer({ dataDir: dir, ttlMs: 24 * HOUR, now, deps: { run, env: {} } })
+    expect((await a.refreshNow(['codex'])).persisted).toBe(false)
+    // Another host saves a newer codex list; this process sees it in its next fold, which also cannot be written.
+    writeCache(dir, codexList('gpt-7-orbit', T0 + 10 * 60_000))
+    state.clock = T0 + 11 * 60_000
+    expect((await a.refreshNow(['antigravity'])).persisted).toBe(false)
+    fs.rmSync(`${modelCatalogPath(dir)}.lock`)
+    // The clock stepped back right after that fold: the older own list must not come back, nor be saved.
+    expect(a.read().providers.codex?.models[0].id).toBe('gpt-7-orbit')
+    expect((await a.refreshNow(['antigravity'])).persisted).toBe(true)
+    expect(readModelCatalog(dir).providers.codex?.models[0].id).toBe('gpt-7-orbit')
+  }, 30_000)
+
+  it('lets an Anthropic API listing it fetches replace Claude Code settings stamped after it began', async () => {
+    const dir = blockedDir()
+    let now = T0
+    let providers: AiProviderConfig[] = []
+    const fetch = vi.fn(async () => new Response(JSON.stringify({ data: [{ id: 'claude-opus-5-5' }, { id: 'claude-sonnet-5-5' }], has_more: false })))
+    const a = createModelCatalogMaintainer({
+      dataDir: dir, ttlMs: 24 * HOUR, now: () => now, listProviders: () => providers,
+      deps: { run: cliDeps({}).run, env: { ANTHROPIC_MODEL: 'claude-fable-5-2' }, fetch: fetch as unknown as typeof globalThis.fetch },
+    })
+    expect((await a.refreshNow(['claude'])).catalog.providers.claude?.source).toBe('claude-local-settings')
+    // Two minutes back (within the skew, so nothing moves), a key is added and the API answers.
+    now = T0 - 2 * 60_000
+    providers = [{ id: 'a', name: 'API', kind: 'api', apiFormat: 'anthropic', apiKey: 'sk-test' }]
+    unblock(dir)
+    const report = await a.refreshNow(['claude'])
+    expect(report.results).toEqual([{ kind: 'claude', outcome: 'updated', models: 2 }])
+    expect(readModelCatalog(dir).providers.claude?.source).toBe('anthropic-models-api')
+    expect(a.read().providers.claude?.source).toBe('anthropic-models-api')
+  })
 
   it('reports the caller\'s unsaved lists under an interrupted refresh, and writes nothing', async () => {
     const dir = tempDir()

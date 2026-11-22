@@ -209,9 +209,10 @@ interface AppliedOutcomes {
  *   built-in tables cover what the cache does not. A `static` attempt is not even recorded over a cached
  *   list — "this host has no source" says nothing about a list another host fetched — and is reported as
  *   `kept-cached-list`.
- * - A record stamped after this refresh began belongs to another process that finished later; it stands.
- *   One stamped beyond `CLOCK_SKEW_MS` ahead is a wrong clock or a hand edit and stands for nothing, or a
- *   single bad timestamp would freeze the provider's list until the wall clock caught up.
+ * - A record stamped after this refresh began belongs to another process that finished later; it stands —
+ *   except Claude Code's settings against an Anthropic API listing this refresh fetched, the same rank rule
+ *   the other way round. One stamped beyond `CLOCK_SKEW_MS` ahead is a wrong clock or a hand edit and stands
+ *   for nothing, or a single bad timestamp would freeze the provider's list until the wall clock caught up.
  * - An interrupted refresh records nothing.
  */
 function applyOutcomes(current: ModelCatalogView, outcomes: readonly KindOutcome[], at: string): AppliedOutcomes {
@@ -241,9 +242,11 @@ function applyOutcomes(current: ModelCatalogView, outcomes: readonly KindOutcome
       return { kind, outcome: 'static', reason: 'kept-api-list', models: 0 }
     }
     // A list another process stored after this refresh began is at least as fresh: it stays, and the
-    // report counts what is actually in use.
-    const fresher = existing && isLater(existing.updatedAt) ? existing : undefined
-    if (!fresher) next.providers[kind] = { updatedAt: at, source: outcome.result.source, models: outcome.result.models }
+    // report counts what is actually in use — unless this refresh fetched an Anthropic API listing and that
+    // list is Claude Code's settings, which never stand over a listing, however new (`outranks`).
+    const fetched: ProviderModelCatalog = { updatedAt: at, source: outcome.result.source, models: outcome.result.models }
+    const fresher = existing && isLater(existing.updatedAt) && !outranks(fetched, existing) ? existing : undefined
+    if (!fresher) next.providers[kind] = fetched
     record(kind, { at, outcome: 'updated' })
     return { kind, outcome: 'updated', models: (fresher ?? outcome.result).models.length }
   })
@@ -380,10 +383,6 @@ export interface RefreshModelCatalogOptions {
   unsaved?: Pick<ModelCatalogView, 'providers' | 'attempts'>
 }
 
-/** Whether a result recorded an attempt: `applyOutcomes` records one for everything but the kept-* results. */
-const recordedAttempt = (result: ModelCatalogRefreshResult) =>
-  result.reason !== 'aborted' && result.reason !== 'kept-cached-list' && result.reason !== 'kept-api-list'
-
 /**
  * Asks every requested provider at once (each call bounded by `MODEL_DISCOVERY_TIMEOUT_MS`), then folds the
  * answers into the cache. Never rejects: discovery failures become `failed` results and a cache that
@@ -394,9 +393,10 @@ const recordedAttempt = (result: ModelCatalogRefreshResult) =>
  * before discovery: a clock that steps back during the (up to a minute of) discovery would otherwise leave an
  * entry out of the fold, unranked, and let it outrank the very list this refresh saves. At that instant its
  * stamps are first moved back to the clock (`clampToClock`). Then a saved fold forgets every entry the
- * written file now holds or supersedes, and a fold that could not be written takes in what this refresh
- * produced: each list it fetched, and each attempt it recorded — never the file's attempt for a kept-*
- * result, which may be a stamp from the future that should count for nothing.
+ * written file now holds or supersedes. A fold that could not be written forgets what the file supersedes
+ * too, and takes in only what this refresh produced — the entries stamped with its own instant: each list it
+ * fetched and each attempt it recorded. Never the file's attempt behind a kept-* or interrupted result (it may
+ * be a stamp from the future that should count for nothing), nor a list or attempt another host stored later.
  */
 export async function refreshModelCatalog(options: RefreshModelCatalogOptions): Promise<ModelCatalogRefreshReport> {
   const kinds = DISCOVERABLE_PROVIDER_KINDS.filter((kind) => !options.kinds || options.kinds.includes(kind))
@@ -420,12 +420,17 @@ export async function refreshModelCatalog(options: RefreshModelCatalogOptions): 
   try {
     applied = persistOutcomes(options.dataDir, outcomes, at, ttlMs, unsaved)
   } catch {
-    applied = applyOutcomes(current(), outcomes, at)
-    for (const result of applied.results) {
-      const list = applied.catalog.providers[result.kind]
-      if (result.outcome === 'updated' && list) unsaved.providers[result.kind] = list
-      const attempt = applied.catalog.attempts[result.kind]
-      if (recordedAttempt(result) && attempt) unsaved.attempts[result.kind] = attempt
+    const file = readModelCatalog(options.dataDir, ttlMs)
+    // As after a write: forget what the file supersedes at this instant, before a clock step can revive it.
+    pruneSuperseded(unsaved, file, time)
+    applied = applyOutcomes(withUnsaved(file, unsaved, time), outcomes, at)
+    // Take in only what this refresh produced. Whatever it made carries its own instant, `at`; a list or an
+    // attempt another host stored later (a fresher list, a later attempt) does not, and the file still has it.
+    for (const kind of DISCOVERABLE_PROVIDER_KINDS) {
+      const list = applied.catalog.providers[kind]
+      if (list?.updatedAt === at) unsaved.providers[kind] = list
+      const attempt = applied.catalog.attempts[kind]
+      if (attempt?.at === at) unsaved.attempts[kind] = attempt
     }
     return { ...applied, persisted: false }
   }

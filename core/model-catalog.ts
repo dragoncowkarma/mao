@@ -264,16 +264,17 @@ const outranks = (a: ProviderModelCatalog | undefined, b: ProviderModelCatalog |
 
 /**
  * Which of an unsaved entry and the file's entry for the same provider is current. `unsaved`: it is newer, or
- * the file has nothing that counts — another host's refresh, or this process's own once the file is writable
- * again, is what makes the file current. `file`: the file holds an entry that counts and is at least as new.
- * `neither`: no stamp on either side counts, as when the clock has stepped back past this process's own stamp;
- * the entry is not used then, but nothing superseded it either.
+ * the file has nothing that counts. `file`: the file's entry is at least as new — another host's refresh, or
+ * this process's own write of this very entry. `neither`: this process's own stamp does not count, as when the
+ * clock has stepped back past it. Such an entry cannot be compared with anything — a list another host saved
+ * meanwhile looks exactly like the older list this one replaced — so it is not used, and not forgotten either:
+ * it is current again once the clock catches up.
  *
  * Stamps beyond `CLOCK_SKEW_MS` ahead count for nothing, on both sides. As in `applyOutcomes`, an Anthropic API
  * listing and Claude Code's local settings never trade places by age, in either direction: an unsaved listing
  * stands over settings another host saved later, exactly as a saved listing would have stood over that host's
- * refresh. One rule for `withUnsaved` (what is used) and `pruneSuperseded` (what is forgotten), so they cannot
- * disagree: an entry is used only when `unsaved`, and forgotten only when `file`.
+ * refresh. One rule for `withUnsaved` (what is used, and what a write saves) and `pruneSuperseded` (what is
+ * forgotten), so they cannot disagree: an entry is used only when `unsaved`, and forgotten only when `file`.
  */
 type Current = 'unsaved' | 'file' | 'neither'
 
@@ -283,8 +284,8 @@ function currentEntries(view: ModelCatalogView, unsaved: UnsavedCatalog, kind: D
     return Number.isFinite(at) && at <= time + CLOCK_SKEW_MS ? at : -Infinity
   }
   const byAge = (mine: string, theirs: string | undefined): Current => {
-    if (stamp(mine) > stamp(theirs)) return 'unsaved'
-    return stamp(theirs) !== -Infinity && stamp(theirs) >= stamp(mine) ? 'file' : 'neither'
+    if (stamp(mine) === -Infinity) return 'neither'
+    return stamp(mine) > stamp(theirs) ? 'unsaved' : 'file'
   }
   const list = unsaved.providers[kind]
   const saved = view.providers[kind]
@@ -433,9 +434,9 @@ export interface ModelCatalogMaintainer {
  * Swarm dispatch, `ai:getModelCatalog` and the due check, keep using it rather than the older file — which
  * would otherwise undo the refresh at the next read while its report said the result was in use. Later
  * refreshes fold over it as they would over a saved list (a failure or a missing source leaves it in place),
- * and the next one that writes the file saves it too; only then is it dropped from memory. It is dropped
- * earlier for a provider whose file entry supersedes it (`pruneSuperseded`, at every read): kept, it would
- * resurface when that entry disappeared, and be written back over everyone's.
+ * and the next one that writes the file saves it too. Memory lets it go once the file holds it or something
+ * that supersedes it (`pruneSuperseded`, at every read): kept, a superseded list would resurface when the
+ * newer entry disappeared, and be written back over everyone's.
  */
 export function createModelCatalogMaintainer(options: ModelCatalogMaintainerOptions): ModelCatalogMaintainer {
   const ttlMs = options.ttlMs === undefined ? modelCatalogTtlMs() : options.ttlMs
@@ -494,15 +495,10 @@ export function createModelCatalogMaintainer(options: ModelCatalogMaintainerOpti
         const wait = result.outcome === 'failed' ? Math.min(retryMs, ttlMs ?? retryMs) : (ttlMs ?? retryMs)
         notBefore.set(result.kind, time + wait)
       }
-      // An interrupted refresh wrote nothing and changes nothing here.
-      if (attempted.length > 0 && report.persisted) {
-        // That write folded every unsaved list in, so the file holds each one now, or something newer. From
-        // here the file is the truth; nothing old may resurface from memory if it is later deleted or damaged.
-        for (const kind of DISCOVERABLE_PROVIDER_KINDS) {
-          delete unsaved.providers[kind]
-          delete unsaved.attempts[kind]
-        }
-      } else if (attempted.length > 0) {
+      // An interrupted refresh wrote nothing and changes nothing here. A saved one needs nothing here either:
+      // its write folded in every unsaved entry that was current, so those now tie with the file and the read
+      // below forgets them, while one whose stamp did not count yet (`neither`) was not written and stays.
+      if (attempted.length > 0 && !report.persisted) {
         // Still unwritable: the report's catalog (file, earlier unsaved lists, this refresh) is in use now.
         for (const result of attempted) {
           const list = report.catalog.providers[result.kind]
@@ -511,8 +507,8 @@ export function createModelCatalogMaintainer(options: ModelCatalogMaintainerOpti
           if (attempt) unsaved.attempts[result.kind] = attempt
         }
       }
-      // Whatever the path, the report shows what `read()` returns now. That read also forgets any unsaved list
-      // the file superseded while this refresh ran — a refresh sees the file too, not only an explicit read.
+      // Whatever the path, the report shows what `read()` returns now. That read also forgets every unsaved entry
+      // the file now holds or supersedes — a refresh sees the file too, not only an explicit read.
       return { ...report, catalog: read() }
     })
   }

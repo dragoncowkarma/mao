@@ -659,19 +659,40 @@ describe('an unsaved list a newer saved one replaced (PR #141 follow-up review)'
     expect(readModelCatalog(dir).providers.codex?.models[0].id).toBe('gpt-7-nova')
   })
 
-  it('gives way to a list another host saved while the clock was behind', async () => {
-    const dir = blockedDir()
+  it('is only hidden while the clock is behind it, even by the older list it replaced, and then back', async () => {
+    // The usual shape of an unsaved list: the file already holds the list this refresh replaces, and another
+    // writer holds the lock, so the write times out.
+    const dir = tempDir()
+    writeCache(dir, codexList('gpt-7-old', T0 - HOUR))
+    const lock = `${modelCatalogPath(dir)}.lock`
+    fs.writeFileSync(lock, JSON.stringify({ pid: process.ppid, host: os.hostname(), nonce: 'other-writer' }))
     let now = T0
     const a = createModelCatalogMaintainer({ dataDir: dir, ttlMs: 24 * HOUR, now: () => now, deps: cliDeps({ codex: CODEX }).deps })
+    expect((await a.refreshNow(['codex'])).persisted).toBe(false)
+    fs.rmSync(lock)
+    // Ten minutes back, the saved list is the one that can be used; it looks no different from a list another
+    // host might have saved meanwhile, so the unsaved one cannot be judged older and is kept...
+    now = T0 - 10 * 60_000
+    expect(a.read().providers.codex?.models[0].id).toBe('gpt-7-old')
+    // ...and is current again once the clock catches up.
+    now = T0 + 60_000
+    expect(a.read().providers.codex?.models[0].id).toBe('gpt-7-nova')
+  }, 20_000)
+
+  it('keeps a list a successful write left out while the clock was behind it, and saves it once it catches up', async () => {
+    const dir = blockedDir()
+    let now = T0
+    const a = createModelCatalogMaintainer({ dataDir: dir, ttlMs: 24 * HOUR, now: () => now, deps: cliDeps({ codex: CODEX, agy: AGY }).deps })
     await a.refreshNow(['codex'])
     now = T0 - 10 * 60_000
     unblock(dir)
-    writeCache(dir, codexList('gpt-7-orbit', now))
-    // Its stamp counts and ours does not: the saved list is current, and ours is forgotten.
-    expect(a.read().providers.codex?.models[0].id).toBe('gpt-7-orbit')
+    expect((await a.refreshNow(['antigravity'])).persisted).toBe(true)
+    // Its stamp did not count yet, so that write left it out; it must not have been dropped either.
+    expect(readModelCatalog(dir).providers.codex).toBeUndefined()
     now = T0 + 60_000
-    fs.rmSync(modelCatalogPath(dir))
-    expect(a.read().providers.codex).toBeUndefined()
+    expect(a.read().providers.codex?.models[0].id).toBe('gpt-7-nova')
+    expect((await a.refreshNow(['antigravity'])).persisted).toBe(true)
+    expect(readModelCatalog(dir).providers.codex?.models[0].id).toBe('gpt-7-nova')
   })
 
   it('forgets a copy of a fresher saved list a refresh could not write, as soon as it is recorded', async () => {

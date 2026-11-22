@@ -267,19 +267,13 @@ export type ModelCatalogSnapshot = Pick<ModelCatalogView, 'providers'>
 const withinLadder = (levels: readonly string[] | undefined, ladder: readonly ReasoningLevel[]) =>
   levels === undefined ? undefined : ladder.filter((level) => levels.includes(level))
 
-/** A refreshed list as picker options. Antigravity stems expand to one no-effort slug per level. */
-function discoveredOptions(kind: DiscoverableProviderKind, catalog: ProviderModelCatalog | undefined): ModelOption[] {
+/** A refreshed Claude or Codex list as picker options. Antigravity's are built by `agyStems()`. */
+function discoveredOptions(kind: 'claude' | 'codex', catalog: ProviderModelCatalog | undefined): ModelOption[] {
   if (!catalog || !Array.isArray(catalog.models)) return []
   const ladder = PROVIDER_EFFORT_LADDERS[kind]
   const options: ModelOption[] = []
   for (const model of catalog.models) {
     if (!model || typeof model.id !== 'string' || !model.id) continue
-    if (kind === 'antigravity') {
-      if (!isEligibleAgyStem(model.id)) continue
-      const levels = withinLadder(model.efforts, ladder) ?? REASONING_LADDER.slice(0, 3)
-      options.push(...agyModelOptions([{ stem: model.id, efforts: levels }]))
-      continue
-    }
     const levels = withinLadder(model.efforts, ladder)
     options.push({
       value: model.id,
@@ -327,11 +321,19 @@ function mergeModelOptions(discovered: ModelOption[], builtIn: readonly ModelOpt
 /**
  * The built-in provider options with every refreshed list merged in: what Global settings offers and what
  * Swarm accepts, from one rule. Pure, so the renderer can call it on the IPC answer (AGENTS.md rule 6).
+ *
+ * Antigravity is the exception to "built-in entries after the refreshed ones": its slugs come from
+ * `agyStems()`, so a stem `agy models` listed offers only the levels it listed. The built-in table's other
+ * levels for that stem would be slugs agy no longer serves, which Swarm already refuses — a picker offering
+ * them would let Global settings save a model the workflow then passes to agy as is.
  */
 export function providerOptionsWithCatalog(catalog?: ModelCatalogSnapshot): Record<ProviderKindId, ProviderOptions> {
   if (!catalog?.providers) return PROVIDER_OPTIONS
   const merged: Record<ProviderKindId, ProviderOptions> = { ...PROVIDER_OPTIONS }
-  for (const kind of DISCOVERABLE_PROVIDER_KINDS) {
+  if (catalog.providers.antigravity) {
+    merged.antigravity = { ...PROVIDER_OPTIONS.antigravity, models: agyModelOptions(agyStems(catalog)) }
+  }
+  for (const kind of ['claude', 'codex'] as const) {
     const discovered = discoveredOptions(kind, catalog.providers[kind])
     if (discovered.length > 0) {
       merged[kind] = { ...PROVIDER_OPTIONS[kind], models: mergeModelOptions(discovered, PROVIDER_OPTIONS[kind].models) }
@@ -387,6 +389,23 @@ export function isKnownAgyStem(stem: string, catalog?: ModelCatalogSnapshot): bo
   return agyStemEfforts(stem, catalog) !== undefined
 }
 
+/**
+ * Every Antigravity stem MAO offers, each with the suffixes `agyStemEfforts()` allows it: refreshed stems
+ * first, in their source's order, then built-in stems the refresh did not list. The picker
+ * (`providerOptionsWithCatalog`), the listing (`catalogModelRows`) and Swarm's resolution all read this one
+ * rule, so a level `agy models` stopped listing for a stem is offered by none of them.
+ */
+function agyStems(catalog?: ModelCatalogSnapshot): AgyModelStem[] {
+  const models = catalog?.providers?.antigravity?.models
+  const refreshed = Array.isArray(models)
+    ? models.flatMap((model) => typeof model?.id === 'string' ? [model.id.toLowerCase()] : [])
+    : []
+  return [...new Set([...refreshed, ...AGY_STATIC_STEMS.map((entry) => entry.stem)])].flatMap((stem) => {
+    const efforts = agyStemEfforts(stem, catalog)
+    return efforts && efforts.length > 0 ? [{ stem, efforts }] : []
+  })
+}
+
 /** One model as `mao providers models` prints it and Global settings lists it. */
 export interface CatalogModelRow {
   /** The id a tag or a provider names; for Antigravity, the stem its level suffix attaches to. */
@@ -401,14 +420,7 @@ export interface CatalogModelRow {
  * agy's slugs are a stem plus a level, and listing each slug would repeat every model four times.
  */
 export function catalogModelRows(kind: DiscoverableProviderKind, catalog?: ModelCatalogSnapshot): CatalogModelRow[] {
-  if (kind === 'antigravity') {
-    const refreshed = (catalog?.providers?.antigravity?.models ?? [])
-      .flatMap((model) => typeof model?.id === 'string' ? [model.id.toLowerCase()] : [])
-    return [...new Set([...refreshed, ...AGY_STATIC_STEMS.map((entry) => entry.stem)])].flatMap((id) => {
-      const efforts = agyStemEfforts(id, catalog)
-      return efforts && efforts.length > 0 ? [{ id, efforts }] : []
-    })
-  }
+  if (kind === 'antigravity') return agyStems(catalog).map(({ stem, efforts }) => ({ id: stem, efforts }))
   const options = providerOptionsWithCatalog(catalog)[kind]
   const ladder = PROVIDER_EFFORT_LADDERS[kind]
   return options.models.map((option) => ({

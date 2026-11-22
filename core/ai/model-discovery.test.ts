@@ -20,6 +20,7 @@ import {
   parseAnthropicModelPage,
   parseCodexModels,
 } from './model-discovery.ts'
+import { anthropicMessagesUrl } from './api-provider.ts'
 import type { AiProviderConfig } from './types.ts'
 import type { DiscoveryCommandRunner } from './model-discovery.ts'
 
@@ -371,5 +372,90 @@ describe('review follow-ups (#140)', () => {
     expect(await reasonOf(fetchAnthropicModels('https://gw.example/v1/models', 'k', fetchImpl as unknown as typeof fetch)))
       .toBe('http-error')
     expect((fetchImpl.mock.calls[0] as unknown as [URL, RequestInit])[1].redirect).toBe('manual')
+  })
+})
+
+describe('PR #141 review fixes', () => {
+  const api = (apiKey: string, extra: Partial<AiProviderConfig> = {}): AiProviderConfig =>
+    ({ id: `api-${apiKey}`, name: 'API', kind: 'api', apiFormat: 'anthropic', apiKey, ...extra })
+  const listing = (ids: string[], hasMore = false) => ({
+    ok: true, status: 200,
+    json: async () => ({ data: ids.map((id) => ({ id })), has_more: hasMore, last_id: ids.at(-1) }),
+  }) as unknown as Response
+  /** A request that answers only by failing when its signal aborts, as `fetch` does. */
+  const hang = (init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+    init?.signal?.addEventListener('abort', () => reject(new DOMException('The operation was aborted.', 'AbortError')), { once: true })
+  })
+  const later = <T>(ms: number, value: T) => new Promise<T>((resolve) => setTimeout(() => resolve(value), ms))
+  /** Records how a promise settled, so a fake-timer test can check when it did. */
+  const track = (promise: Promise<unknown>) => {
+    const state: { settled: boolean; value?: unknown; reason?: string } = { settled: false }
+    promise.then(
+      (value) => { Object.assign(state, { settled: true, value }) },
+      (error: unknown) => { Object.assign(state, { settled: true, reason: (error as ModelDiscoveryError).reason ?? 'not-a-discovery-error' }) },
+    )
+    return state
+  }
+  const keyOf = (init?: RequestInit) => (init?.headers as Record<string, string> | undefined)?.['x-api-key']
+
+  afterEach(() => { vi.useRealTimers() })
+
+  it('lists nothing for an empty or blank baseUrl, which inference never sends to, instead of the public API', () => {
+    expect(anthropicModelsUrl(undefined)).toBe('https://api.anthropic.com/v1/models')
+    expect(anthropicModelsUrl('')).toBeUndefined()
+    expect(anthropicModelsUrl('   ')).toBeUndefined()
+    // One rule with inference: wherever the messages URL is unusable, nothing is listed; elsewhere the listing
+    // goes to the same origin inference posts to.
+    for (const baseUrl of [undefined, '', ' \t', 'https://proxy.example/v1/messages', ' https://proxy.example/v1/messages ',
+      'https://proxy.example/v1/complete', 'not a url']) {
+      let inference: URL | undefined
+      try { inference = new URL(anthropicMessagesUrl(baseUrl)) } catch { inference = undefined }
+      const models = anthropicModelsUrl(baseUrl)
+      if (!inference) expect(models).toBeUndefined()
+      else if (models) expect(new URL(models).origin).toBe(inference.origin)
+    }
+  })
+
+  it('never sends a key saved with an empty or blank baseUrl, and falls back as if no key were saved', async () => {
+    const fetchImpl = vi.fn(async () => listing(['claude-opus-5-5']))
+    const providers = [api('sk-ant-EMPTY', { baseUrl: '' }), api('sk-ant-BLANK', { baseUrl: '  ' })]
+    await expect(discoverClaudeModels(providers, { fetch: fetchImpl as unknown as typeof fetch, env: { ANTHROPIC_MODEL: 'claude-fable-5-2' } }))
+      .resolves.toEqual({ kind: 'catalog', source: 'claude-local-settings', models: [{ id: 'claude-fable-5-2' }] })
+    await expect(discoverClaudeModels(providers, { fetch: fetchImpl as unknown as typeof fetch, env: {} }))
+      .resolves.toEqual({ kind: 'static', reason: 'no-source' })
+    expect(fetchImpl).not.toHaveBeenCalled()
+  })
+
+  it('gives every page one deadline: a page that answers late leaves the next only the rest of it', async () => {
+    vi.useFakeTimers()
+    const fetchImpl = vi.fn((url: URL | RequestInfo, init?: RequestInit) => new URL(String(url)).searchParams.get('after_id')
+      ? hang(init)
+      : later(MODEL_DISCOVERY_TIMEOUT_MS - 1000, listing(['claude-opus-5-5'], true)))
+    const state = track(fetchAnthropicModels('https://api.anthropic.com/v1/models', 'k', fetchImpl as unknown as typeof fetch))
+    await vi.advanceTimersByTimeAsync(MODEL_DISCOVERY_TIMEOUT_MS - 1000)
+    expect(fetchImpl).toHaveBeenCalledTimes(2)
+    expect(state.settled).toBe(false)
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(state).toEqual({ settled: true, reason: 'request-timeout' })
+  })
+
+  it('gives every saved key the same deadline: after a key that hangs, the next is never sent', async () => {
+    vi.useFakeTimers()
+    const fetchImpl = vi.fn((_url: URL | RequestInfo, init?: RequestInit) =>
+      keyOf(init) === 'hangs' ? hang(init) : Promise.resolve(listing(['claude-opus-5-5'])))
+    const state = track(discoverClaudeModels([api('hangs'), api('answers')], { fetch: fetchImpl as unknown as typeof fetch, env: {} }))
+    await vi.advanceTimersByTimeAsync(MODEL_DISCOVERY_TIMEOUT_MS)
+    expect(state).toEqual({ settled: true, reason: 'request-timeout' })
+    expect(fetchImpl.mock.calls.map(([, init]) => keyOf(init))).toEqual(['hangs'])
+  })
+
+  it('still falls back to the next key within that deadline when one is refused early', async () => {
+    vi.useFakeTimers()
+    const refused = { ok: false, status: 401, json: async () => ({}) } as unknown as Response
+    const fetchImpl = vi.fn((_url: URL | RequestInfo, init?: RequestInit) =>
+      keyOf(init) === 'refused' ? later(10_000, refused) : later(45_000, listing(['claude-opus-5-5'])))
+    const state = track(discoverClaudeModels([api('refused'), api('answers')], { fetch: fetchImpl as unknown as typeof fetch, env: {} }))
+    await vi.advanceTimersByTimeAsync(55_000)
+    expect(state).toEqual({ settled: true, value: { kind: 'catalog', source: 'anthropic-models-api', models: [{ id: 'claude-opus-5-5' }] } })
   })
 })

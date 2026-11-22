@@ -88,7 +88,8 @@ cap, and a latched app queue does not stop this separate engine.
 
 The built-in tables in `core/ai/provider-options.ts` are the fallback; each CLI's own listing, cached,
 is merged over them by `providerOptionsWithCatalog()` (pure, so the renderer calls it too). Global
-settings offers the merged list, and Swarm accepts and clamps against it.
+settings offers the merged list, and Swarm accepts and clamps against it. An Antigravity stem `agy models`
+listed is offered only at the levels it listed: picker, listing and Swarm all read `agyStemEfforts()`.
 
 | Provider | Source (read-only, billing-free) | Kept |
 | --- | --- | --- |
@@ -97,8 +98,11 @@ settings offers the merged list, and Swarm accepts and clamps against it.
 | `claude` | `GET /v1/models` with a saved Anthropic-format API key (redirects refused, so the key never follows one); else Claude Code's model settings (`ANTHROPIC_MODEL`, `ANTHROPIC_DEFAULT_*_MODEL`, … in the environment, or `model` and those keys in `$CLAUDE_CONFIG_DIR` or `~/.claude` `settings.json`); else nothing | ids with `capabilities.effort`; no source keeps the built-in list and the family aliases |
 
 - `core/ai/model-discovery.ts` runs each source: argv `execFile`, no shell, stdin closed, 60 s, output
-  capped; `fetch` with the same deadline and at most 10 pages. Failures are fixed `ModelCatalogFailure`
-  categories, never output, URLs or bodies.
+  capped. The Claude listing gets one 60 s deadline for all its pages (at most 10) and saved keys
+  together, and sends nothing once it passes. A key goes only where inference would send it: both use
+  `anthropicMessagesUrl()` (`core/ai/api-provider.ts`), so an empty or blank `baseUrl` lists nothing rather
+  than falling back to the public API. Failures are fixed `ModelCatalogFailure` categories, never output,
+  URLs or bodies.
 - `core/model-catalog.ts` caches in `<data dir>/model-catalog.json` (`MAO_DATA_DIR`, or Electron
   `userData`), never in `config.json`: per-provider list, levels, `updatedAt`, last attempt. Writes take
   their own cross-process lock (`createStoreWriteLock` on `model-catalog.json`, never `config.json`'s) and
@@ -108,6 +112,9 @@ settings offers the merged list, and Swarm accepts and clamps against it.
   replace an API listing (reported as `kept-api-list`), and a host with no source records nothing over a
   cached list; nothing a refresh does can stop the app, the queue or Swarm. A model a source lists
   without levels gets the built-in ceiling, else `max` (`UNIDENTIFIED_EFFORT_CEILING`).
+- Unsaved (`persisted: false`): the list stays in use in the process that fetched it. The maintainer's
+  `read()` lays it over the file until the file holds a newer one, so Swarm dispatch, `ai:getModelCatalog`
+  and the due check all see it, and the CLI is not asked again every poll.
 - Due: a list missing or older than the TTL (24 h; `MAO_MODEL_CATALOG_TTL_HOURS`, `0` = manual only),
   unless this process tried it within the TTL, or within an hour after a failure. Another host's recent
   failure counts too, except `command-not-found` (a Dock-launched GUI's PATH lacks the CLIs).

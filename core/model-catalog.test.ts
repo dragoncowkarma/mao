@@ -419,3 +419,81 @@ describe('operator-facing text', () => {
     expect(lines.at(-1)).toBe('Long-running hosts refresh every 24 h (MAO_MODEL_CATALOG_TTL_HOURS).')
   })
 })
+
+describe('a refresh the cache file refused (PR #141 review)', () => {
+  /** A data directory path that is a file, so every write fails until the test turns it into a directory. */
+  const blockedDir = () => {
+    const blocker = path.join(tempDir(), 'not-a-directory')
+    fs.writeFileSync(blocker, '')
+    return blocker
+  }
+  const unblock = (dir: string) => {
+    fs.rmSync(dir)
+    fs.mkdirSync(dir)
+  }
+  const codexList = (id: string, at: number) => ({ providers: {
+    codex: { updatedAt: new Date(at).toISOString(), source: 'codex-debug-models', models: [{ id }] },
+  } })
+
+  it('stays this process\'s catalog in every read and due check, until the file holds a newer list', async () => {
+    const dir = blockedDir()
+    let now = T0
+    const { run, deps } = cliDeps({ codex: CODEX })
+    const maintainer = createModelCatalogMaintainer({ dataDir: dir, ttlMs: 24 * HOUR, now: () => now, deps })
+    const report = await maintainer.refreshNow(['codex'])
+    expect(report.persisted).toBe(false)
+    expect(maintainer.read().providers.codex?.models.map((model) => model.id)).toEqual(['gpt-7-nova'])
+    expect(maintainer.read().attempts.codex).toEqual({ at: new Date(T0).toISOString(), outcome: 'updated' })
+
+    // Later reads keep it, and the schedule does not re-run the CLI every poll while the disk refuses.
+    now = T0 + 2 * HOUR
+    expect(maintainer.dueKinds()).not.toContain('codex')
+    await maintainer.refreshDue()
+    expect(run.mock.calls.filter(([command]) => command === 'codex')).toHaveLength(1)
+    expect(maintainer.read().providers.codex?.models[0].id).toBe('gpt-7-nova')
+
+    // An older file does not undo it, nor does a hand-edited far-future stamp; a newer one (another host's
+    // refresh) wins.
+    unblock(dir)
+    writeCache(dir, codexList('gpt-6.2-sol', T0 - HOUR))
+    expect(maintainer.read().providers.codex?.models[0].id).toBe('gpt-7-nova')
+    writeCache(dir, codexList('gpt-6.2-sol', Date.parse('2099-01-01T00:00:00.000Z')))
+    expect(maintainer.read().providers.codex?.models[0].id).toBe('gpt-7-nova')
+    writeCache(dir, codexList('gpt-7-orbit', now))
+    expect(maintainer.read().providers.codex?.models[0].id).toBe('gpt-7-orbit')
+  })
+
+  it('reports every list this process uses, an earlier unsaved one included, and drops it once a refresh is saved', async () => {
+    const dir = blockedDir()
+    let now = T0
+    const { deps } = cliDeps({ codex: CODEX, agy: AGY })
+    const maintainer = createModelCatalogMaintainer({ dataDir: dir, ttlMs: 24 * HOUR, now: () => now, deps })
+    await maintainer.refreshNow(['codex'])
+    now += 60_000
+    const second = await maintainer.refreshNow(['antigravity'])
+    expect(second.persisted).toBe(false)
+    expect(Object.keys(second.catalog.providers).sort()).toEqual(['antigravity', 'codex'])
+    expect(second.catalog).toEqual(maintainer.read())
+
+    // Saved at last: the file is the truth again, so losing it later cannot resurrect the unsaved list.
+    unblock(dir)
+    now += 60_000
+    expect((await maintainer.refreshNow(['codex'])).persisted).toBe(true)
+    fs.rmSync(modelCatalogPath(dir))
+    expect(maintainer.read().providers.codex).toBeUndefined()
+    expect(maintainer.read().providers.antigravity?.models[0].id).toBe('gemini-4-neon')
+  })
+
+  it('never lets an unsaved local-settings list cover an Anthropic API listing in the file', async () => {
+    const dir = blockedDir()
+    const maintainer = createModelCatalogMaintainer({
+      dataDir: dir, ttlMs: 24 * HOUR, now: () => T0, deps: { run: cliDeps({}).run, env: { ANTHROPIC_MODEL: 'claude-fable-5-2' } },
+    })
+    expect((await maintainer.refreshNow(['claude'])).catalog.providers.claude?.source).toBe('claude-local-settings')
+    unblock(dir)
+    writeCache(dir, { providers: { claude: {
+      updatedAt: new Date(T0 - HOUR).toISOString(), source: 'anthropic-models-api', models: [{ id: 'claude-opus-5-5' }],
+    } } })
+    expect(maintainer.read().providers.claude).toMatchObject({ source: 'anthropic-models-api', models: [{ id: 'claude-opus-5-5' }] })
+  })
+})

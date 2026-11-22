@@ -186,7 +186,10 @@ export interface ModelCatalogRefreshReport {
   results: ModelCatalogRefreshResult[]
   /** The catalog after this refresh, as this process will use it. */
   catalog: ModelCatalogView
-  /** False when the cache file could not be written: this process still uses the result, others do not see it. */
+  /**
+   * False when the cache file could not be written: this process still uses the result, others do not see
+   * it. A maintainer (`createModelCatalogMaintainer`) keeps that promise past this report, in `read()`.
+   */
   persisted: boolean
 }
 
@@ -310,6 +313,32 @@ export async function refreshModelCatalog(options: RefreshModelCatalogOptions): 
   }
 }
 
+/** What a maintainer fetched but could not save, per provider. */
+type UnsavedCatalog = Pick<ModelCatalogView, 'providers' | 'attempts'>
+
+/**
+ * `view` with each unsaved entry laid over the file's, unless the file's is newer — another host's
+ * refresh, or this process's own once the file is writable again. A file stamp beyond `CLOCK_SKEW_MS` ahead
+ * counts for nothing here either. As in `applyOutcomes`, Claude Code's local settings never cover an
+ * Anthropic API listing, however new.
+ */
+function withUnsaved(view: ModelCatalogView, unsaved: UnsavedCatalog, time: number): ModelCatalogView {
+  const stamp = (timestamp: string | undefined) => {
+    const at = Date.parse(timestamp ?? '')
+    return Number.isFinite(at) && at <= time + CLOCK_SKEW_MS ? at : -Infinity
+  }
+  const merged: ModelCatalogView = { providers: { ...view.providers }, attempts: { ...view.attempts }, ttlMs: view.ttlMs }
+  for (const kind of DISCOVERABLE_PROVIDER_KINDS) {
+    const list = unsaved.providers[kind]
+    const saved = merged.providers[kind]
+    const demotes = list?.source === 'claude-local-settings' && saved?.source === 'anthropic-models-api'
+    if (list && !demotes && stamp(list.updatedAt) > stamp(saved?.updatedAt)) merged.providers[kind] = list
+    const attempt = unsaved.attempts[kind]
+    if (attempt && stamp(attempt.at) > stamp(merged.attempts[kind]?.at)) merged.attempts[kind] = attempt
+  }
+  return merged
+}
+
 export interface ModelCatalogMaintainerOptions {
   dataDir: string
   /** Read at each refresh, so a key or CLI path saved after start is used. A throw reads as no providers. */
@@ -322,7 +351,10 @@ export interface ModelCatalogMaintainerOptions {
 }
 
 export interface ModelCatalogMaintainer {
-  /** The cached catalog as it is on disk now — another host's refresh included. */
+  /**
+   * The cached catalog as it is on disk now — another host's refresh included — plus any list this
+   * process fetched but could not save, until the file holds a newer one.
+   */
   read(): ModelCatalogView
   /** The providers a refresh would ask now. See `createModelCatalogMaintainer()` for the rule. */
   dueKinds(): DiscoverableProviderKind[]
@@ -339,12 +371,17 @@ export interface ModelCatalogMaintainer {
  * process has not itself tried it within the TTL (or within the retry window, after a failure). A failure
  * another process recorded within the retry window also counts, unless it is host-specific (a CLI one
  * host cannot find, say). Refreshes run one at a time per process; a second request waits its turn.
+ *
+ * A refresh the cache file refused (`persisted: false`) is still this process's catalog: `read()`, and so
+ * Swarm dispatch, `ai:getModelCatalog` and the due check, keep using it rather than the older file — which
+ * would otherwise undo the refresh at the next read while its report said the result was in use.
  */
 export function createModelCatalogMaintainer(options: ModelCatalogMaintainerOptions): ModelCatalogMaintainer {
   const ttlMs = options.ttlMs === undefined ? modelCatalogTtlMs() : options.ttlMs
   const retryMs = options.retryMs ?? MODEL_CATALOG_RETRY_MS
   const now = options.now ?? Date.now
   const notBefore = new Map<DiscoverableProviderKind, number>()
+  const unsaved: UnsavedCatalog = { providers: {}, attempts: {} }
   let queue: Promise<unknown> = Promise.resolve()
   let pendingDue: Promise<ModelCatalogRefreshReport | undefined> | undefined
 
@@ -357,7 +394,7 @@ export function createModelCatalogMaintainer(options: ModelCatalogMaintainerOpti
     }
   }
 
-  const read = () => readModelCatalog(options.dataDir, ttlMs)
+  const read = () => withUnsaved(readModelCatalog(options.dataDir, ttlMs), unsaved, now())
 
   const recent = (timestamp: string | undefined, windowMs: number, time: number) => {
     const at = Date.parse(timestamp ?? '')
@@ -389,8 +426,20 @@ export function createModelCatalogMaintainer(options: ModelCatalogMaintainerOpti
         if (result.reason === 'aborted') continue
         const wait = result.outcome === 'failed' ? Math.min(retryMs, ttlMs ?? retryMs) : (ttlMs ?? retryMs)
         notBefore.set(result.kind, time + wait)
+        if (report.persisted) {
+          // The file holds this provider's state again; an older unsaved list must not resurface from here
+          // if the file is later deleted or damaged.
+          delete unsaved.providers[result.kind]
+          delete unsaved.attempts[result.kind]
+          continue
+        }
+        const list = report.catalog.providers[result.kind]
+        if (result.outcome === 'updated' && list) unsaved.providers[result.kind] = list
+        const attempt = report.catalog.attempts[result.kind]
+        if (attempt) unsaved.attempts[result.kind] = attempt
       }
-      return report
+      // Also what an earlier refresh could not save, so the report matches `read()` for every host.
+      return { ...report, catalog: withUnsaved(report.catalog, unsaved, time) }
     })
   }
 

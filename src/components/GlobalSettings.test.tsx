@@ -552,3 +552,27 @@ describe('GlobalSettings model catalog', () => {
     expect(within(sol).getByRole('option', { name: 'ultra' })).toBeInTheDocument()
   })
 })
+
+describe('GlobalSettings Antigravity levels (PR #141 review)', () => {
+  it('offers a refreshed stem only at the levels agy listed, still showing a saved one it no longer lists', async () => {
+    const stub = createElectronApiStub()
+    stub.listProviders.mockResolvedValue([{
+      id: 'agy', name: 'Antigravity runner', kind: 'cli', command: 'agy', providerKindId: 'antigravity', model: 'gemini-4-neon-xhigh',
+    }])
+    stub.getModelCatalog.mockResolvedValue({
+      providers: { antigravity: { updatedAt: '2026-11-22T00:00:00.000Z', source: 'agy-models',
+        models: [{ id: 'gemini-4-neon', efforts: ['high'] }] } },
+      attempts: {}, ttlMs: 86_400_000,
+    })
+
+    render(<GlobalSettings theme="system" onThemeChange={() => {}} />)
+
+    const saved = await screen.findByRole('option', { name: 'gemini-4-neon-xhigh (not in catalog)' })
+    expect((saved as HTMLOptionElement).selected).toBe(true)
+    expect(screen.getByRole('option', { name: 'gemini-4-neon (high)' })).toBeInTheDocument()
+    expect(screen.queryByRole('option', { name: 'gemini-4-neon (xhigh)' })).toBeNull()
+    expect(screen.queryByRole('option', { name: 'gemini-4-neon (low)' })).toBeNull()
+    // A built-in stem the refresh did not list keeps its built-in levels.
+    expect(screen.getByRole('option', { name: 'gemini-4-hydrogen (xhigh)' })).toBeInTheDocument()
+  })
+})

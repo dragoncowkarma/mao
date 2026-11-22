@@ -151,3 +151,36 @@ describe('review follow-ups (#140)', () => {
     ])
   })
 })
+
+describe('PR #141 review fixes', () => {
+  const at = '2026-11-22T00:00:00.000Z'
+  const STEMS = ['gemini-4-neon', 'gemini-4-hydrogen', 'gemini-4-argon', 'gemini-3.8-flash']
+  const AGY_SLUG = /-(low|medium|high|xhigh|max)$/
+  /** The levels the merged picker offers for `stem`, read back off its slugs. */
+  const offered = (catalog: ModelCatalogSnapshot, stem: string) => providerOptionsWithCatalog(catalog).antigravity.models
+    .filter((option) => AGY_SLUG.test(option.value) && option.value.replace(AGY_SLUG, '') === stem)
+    .map((option) => AGY_SLUG.exec(option.value)![1])
+
+  it.each([
+    ['listed at one level', [{ id: 'gemini-4-neon', efforts: ['high' as const] }], ['high']],
+    ['listed without levels', [{ id: 'gemini-4-neon' }], ['low', 'medium', 'high']],
+    ['listed with no usable level', [{ id: 'gemini-4-neon', efforts: [] }], ['low', 'medium', 'high', 'xhigh']],
+  ])('offers a refreshed Antigravity stem %s exactly as Swarm and the listing accept it', (_case, models, neon) => {
+    const catalog: ModelCatalogSnapshot = { providers: { antigravity: { updatedAt: at, source: 'agy-models', models } } }
+    expect(offered(catalog, 'gemini-4-neon')).toEqual(neon)
+    for (const stem of STEMS) {
+      // One rule for the picker, Swarm (`agyStemEfforts`) and `mao providers models` / the GUI listing.
+      expect(offered(catalog, stem)).toEqual(agyStemEfforts(stem, catalog))
+      expect(catalogModelRows('antigravity', catalog).find((row) => row.id === stem)?.efforts).toEqual(agyStemEfforts(stem, catalog))
+    }
+    // Built-in stems the refresh did not list keep every built-in level.
+    expect(offered(catalog, 'gemini-4-hydrogen')).toEqual(['low', 'medium', 'high', 'xhigh'])
+  })
+
+  it('still lists the built-in Antigravity table when nothing was refreshed for it', () => {
+    const codexOnly: ModelCatalogSnapshot = { providers: {
+      codex: { updatedAt: at, source: 'codex-debug-models', models: [{ id: 'gpt-7-nova' }] },
+    } }
+    expect(providerOptionsWithCatalog(codexOnly).antigravity).toBe(PROVIDER_OPTIONS.antigravity)
+  })
+})

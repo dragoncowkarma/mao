@@ -316,7 +316,9 @@ export class SwarmEngine {
 
   /**
    * Refreshes due model lists, then loads the cache dispatch will use this cycle — including a list another
-   * host refreshed. Bounded by the discovery deadline and interrupted by shutdown like a poll sleep.
+   * host refreshed, and one this process fetched but could not save (`ModelCatalogMaintainer.read()` keeps
+   * those until the file holds newer ones). Bounded by the discovery deadline and interrupted by shutdown
+   * like a poll sleep.
    * `--dry-run` only reads: a refresh writes the cache file, and a dry run promises no local writes.
    *
    * Never a cycle failure. Any problem leaves the previous view (or none: the built-in tables) in place and

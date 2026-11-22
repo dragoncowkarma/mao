@@ -12,6 +12,7 @@ import {
   type ReasoningLevel,
 } from './provider-options.ts'
 import type { AiProviderConfig } from './types.ts'
+import { anthropicMessagesUrl } from './api-provider.ts'
 
 /**
  * Asks each AI CLI (or the Anthropic API) which models it serves right now. Read-only and billing-free:
@@ -23,7 +24,10 @@ import type { AiProviderConfig } from './types.ts'
  * failure, so an outage costs freshness, never a working catalog.
  */
 
-/** Per call. A hung CLI or socket must not stall a refresh, let alone the Swarm cycle that awaits one. */
+/**
+ * Per provider: one CLI run, or the whole Claude listing — every page with every saved key, one deadline
+ * between them. A hung CLI or socket must not stall a refresh, let alone the Swarm cycle that awaits one.
+ */
 export const MODEL_DISCOVERY_TIMEOUT_MS = 60_000
 
 /**
@@ -244,15 +248,16 @@ export function parseAnthropicModelPage(body: unknown): { models: CatalogModel[]
 }
 
 /**
- * The models endpoint beside a provider's messages endpoint. `baseUrl` is the full messages URL
- * (`core/ai/api-provider.ts` posts to it as is), so `…/v1/messages` becomes `…/v1/models`. Anything else
- * is a layout MAO cannot map, and its key is not sent anywhere new.
+ * The models endpoint beside the messages endpoint inference posts to — `anthropicMessagesUrl()`, the rule
+ * `core/ai/api-provider.ts` itself uses, so `…/v1/messages` becomes `…/v1/models`. A `baseUrl` that is empty,
+ * blank or unparseable sends inference nowhere, and so lists nothing here: it is never read as "unset" and
+ * replaced by the public API. Any other layout is one MAO cannot map, and its key is not sent anywhere new.
  */
 export function anthropicModelsUrl(baseUrl?: string): string | undefined {
-  if (baseUrl === undefined || baseUrl.trim() === '') return 'https://api.anthropic.com/v1/models'
   let url: URL
   try {
-    url = new URL(baseUrl.trim())
+    // Parsed exactly as `fetch` parses it, without trimming first: a URL inference cannot use lists nothing.
+    url = new URL(anthropicMessagesUrl(baseUrl))
   } catch {
     return undefined
   }
@@ -277,8 +282,17 @@ export function anthropicApiSources(providers: readonly AiProviderConfig[]): Arr
   return sources
 }
 
+/**
+ * One deadline shared by every request of a listing: `signal` aborts when it passes (or the caller aborts),
+ * and `timedOut()` tells the two apart.
+ */
+export interface DiscoveryDeadline {
+  readonly signal: AbortSignal
+  timedOut(): boolean
+}
+
 /** A signal that aborts after `ms` or when `parent` does, with a disposer for the timer and listener. */
-function boundedSignal(parent: AbortSignal | undefined, ms: number): { signal: AbortSignal; timedOut: () => boolean; dispose: () => void } {
+function boundedSignal(parent: AbortSignal | undefined, ms: number): DiscoveryDeadline & { dispose: () => void } {
   const controller = new AbortController()
   let expired = false
   const timer = setTimeout(() => {
@@ -301,20 +315,28 @@ function boundedSignal(parent: AbortSignal | undefined, ms: number): { signal: A
 /**
  * Pages through `GET /v1/models` with one provider's key. Status codes map to fixed categories; no
  * response body, header or URL is ever surfaced, since an error page can echo the request.
+ *
+ * Every page shares `deadline` — by default one `MODEL_DISCOVERY_TIMEOUT_MS` from the first request, never a
+ * fresh one per page — and nothing is sent once it has passed. `discoverClaudeModels()` passes one deadline
+ * across every saved key as well, so a slow first answer leaves the rest less time, not another minute.
  */
 export async function fetchAnthropicModels(
-  url: string, apiKey: string, fetchImpl: typeof fetch = fetch, signal?: AbortSignal,
+  url: string, apiKey: string, fetchImpl: typeof fetch = fetch, signal?: AbortSignal, deadline?: DiscoveryDeadline,
 ): Promise<CatalogModel[]> {
-  const models: CatalogModel[] = []
-  const seen = new Set<string>()
-  let afterId: string | undefined
-  for (let page = 0; page < ANTHROPIC_MODEL_PAGES; page += 1) {
-    const pageUrl = new URL(url)
-    pageUrl.searchParams.set('limit', '1000')
-    if (afterId) pageUrl.searchParams.set('after_id', afterId)
-    const bound = boundedSignal(signal, MODEL_DISCOVERY_TIMEOUT_MS)
-    let body: unknown
-    try {
+  const own = deadline ? undefined : boundedSignal(signal, MODEL_DISCOVERY_TIMEOUT_MS)
+  const bound = deadline ?? own!
+  const failure = (otherwise: ModelCatalogFailure) =>
+    new ModelDiscoveryError(signal?.aborted ? 'aborted' : bound.timedOut() ? 'request-timeout' : otherwise)
+  try {
+    const models: CatalogModel[] = []
+    const seen = new Set<string>()
+    let afterId: string | undefined
+    for (let page = 0; page < ANTHROPIC_MODEL_PAGES; page += 1) {
+      // Checked before sending, not left to `fetch`: past the deadline the key goes nowhere at all.
+      if (signal?.aborted || bound.signal.aborted) throw failure('request-timeout')
+      const pageUrl = new URL(url)
+      pageUrl.searchParams.set('limit', '1000')
+      if (afterId) pageUrl.searchParams.set('after_id', afterId)
       let response: Response
       try {
         response = await fetchImpl(pageUrl, {
@@ -326,31 +348,30 @@ export async function fetchAnthropicModels(
           signal: bound.signal,
         })
       } catch {
-        if (signal?.aborted) throw new ModelDiscoveryError('aborted')
-        throw new ModelDiscoveryError(bound.timedOut() ? 'request-timeout' : 'network-error')
+        throw failure('network-error')
       }
       if (response.status === 401 || response.status === 403) throw new ModelDiscoveryError('unauthorized')
       if (!response.ok) throw new ModelDiscoveryError('http-error')
+      let body: unknown
       try {
         body = await response.json()
       } catch {
-        if (signal?.aborted) throw new ModelDiscoveryError('aborted')
-        throw new ModelDiscoveryError(bound.timedOut() ? 'request-timeout' : 'parse-failed')
+        throw failure('parse-failed')
       }
-    } finally {
-      bound.dispose()
+      const parsed = parseAnthropicModelPage(body)
+      for (const model of parsed.models) {
+        if (seen.has(model.id)) continue
+        seen.add(model.id)
+        models.push(model)
+      }
+      if (!parsed.hasMore || !parsed.lastId) break
+      afterId = parsed.lastId
     }
-    const parsed = parseAnthropicModelPage(body)
-    for (const model of parsed.models) {
-      if (seen.has(model.id)) continue
-      seen.add(model.id)
-      models.push(model)
-    }
-    if (!parsed.hasMore || !parsed.lastId) break
-    afterId = parsed.lastId
+    if (models.length === 0) throw new ModelDiscoveryError('no-models')
+    return models
+  } finally {
+    own?.dispose()
   }
-  if (models.length === 0) throw new ModelDiscoveryError('no-models')
-  return models
 }
 
 /**
@@ -421,24 +442,31 @@ export interface ModelDiscoveryDeps {
 /**
  * Claude has no listing command. With an Anthropic-format API provider configured, its key lists models
  * through the API: the first key that answers wins, and if every one fails the refresh fails, keeping the
- * cached list — a key rejected today is no reason to forget yesterday's models. Without one, Claude Code's
- * own model settings are the source, from the environment and its `settings.json`; with neither, the
- * built-in list and the family aliases (`opus`, `sonnet`, `fable`, `haiku`) are the answer, which is not a
- * failure.
+ * cached list — a key rejected today is no reason to forget yesterday's models. All the keys share one
+ * `MODEL_DISCOVERY_TIMEOUT_MS`, so the listing ends within it however many keys or pages there are. Without
+ * one, Claude Code's own model settings are the source, from the environment and its `settings.json`; with
+ * neither, the built-in list and the family aliases (`opus`, `sonnet`, `fable`, `haiku`) are the answer,
+ * which is not a failure.
  */
 export async function discoverClaudeModels(
   providers: readonly AiProviderConfig[], deps: ModelDiscoveryDeps = {}, signal?: AbortSignal,
 ): Promise<DiscoveryOutcome> {
   const sources = anthropicApiSources(providers)
   if (sources.length > 0) {
+    const deadline = boundedSignal(signal, MODEL_DISCOVERY_TIMEOUT_MS)
     let failure: ModelCatalogFailure = 'no-models'
-    for (const source of sources) {
-      try {
-        return { kind: 'catalog', source: 'anthropic-models-api', models: await fetchAnthropicModels(source.url, source.apiKey, deps.fetch, signal) }
-      } catch (error) {
-        failure = error instanceof ModelDiscoveryError ? error.reason : 'unexpected-error'
-        if (failure === 'aborted') break
+    try {
+      for (const source of sources) {
+        try {
+          const models = await fetchAnthropicModels(source.url, source.apiKey, deps.fetch, signal, deadline)
+          return { kind: 'catalog', source: 'anthropic-models-api', models }
+        } catch (error) {
+          failure = error instanceof ModelDiscoveryError ? error.reason : 'unexpected-error'
+          if (failure === 'aborted') break
+        }
       }
+    } finally {
+      deadline.dispose()
     }
     throw new ModelDiscoveryError(failure)
   }

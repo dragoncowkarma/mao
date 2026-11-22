@@ -14,7 +14,9 @@ import type { EnginePlatform, SwarmComment, SwarmIssue, SwarmPR } from './engine
 import { SwarmPreflightConfigError } from './platform.ts'
 import { processGroupExists, terminateProcessGroups } from './registry.ts'
 import type { ModelCatalogMaintainer, ModelCatalogRefreshReport } from '../model-catalog.ts'
+import { createModelCatalogMaintainer } from '../model-catalog.ts'
 import type { ModelCatalogView } from '../ai/provider-options.ts'
+import { ModelDiscoveryError, type DiscoveryCommandRunner } from '../ai/model-discovery.ts'
 
 const WORKER = '[Worker: claude | Model: claude-sonnet-5 | Reasoning: high]'
 const REVIEWER = '[Reviewer: codex | Model: gpt-5.6-sol | Reasoning: high]'
@@ -724,5 +726,53 @@ describe('model catalog at dispatch (#140)', () => {
     expect(new SwarmEngine(root, { dryRun: true }, platform).modelCatalog).toBeUndefined()
     await engine.cycle()
     expect(log.mock.calls.flat().join('\n')).toContain('using codex (gpt-7-nova, ultra)')
+  })
+
+  describe('when the cache file refuses the refresh (PR #141 review)', () => {
+    /** A real maintainer whose data directory is a file, and a fake `codex debug models` that lists gpt-7-nova. */
+    function refusingMaintainer() {
+      const blocker = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'mao-unsaved-catalog-')), 'not-a-directory')
+      fs.writeFileSync(blocker, '')
+      const run = vi.fn<DiscoveryCommandRunner>(async (command) => {
+        if (command !== 'codex') throw new ModelDiscoveryError('command-not-found')
+        return JSON.stringify({ models: [{ slug: 'gpt-7-nova', visibility: 'list', priority: 1,
+          supported_reasoning_levels: [{ effort: 'low' }, { effort: 'high' }] }] })
+      })
+      const maintainer = createModelCatalogMaintainer({ dataDir: blocker, ttlMs: 86_400_000, deps: { run, env: {} } })
+      return { maintainer, run, cleanup: () => fs.rmSync(path.dirname(blocker), { recursive: true, force: true }) }
+    }
+    const dispatchedArgs = (spawnProcess: { mock: { calls: unknown[][] } }) => (spawnProcess.mock.calls[0] as [string, string[]])[1]
+
+    it('dispatches with the list it just fetched, as its log says, not the file it could not write', async () => {
+      const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+      const { maintainer, cleanup } = refusingMaintainer()
+      const { engine, spawnProcess } = catalogFixture(false, maintainer)
+      try {
+        await engine.cycle(true)
+        expect(log.mock.calls.flat().join('\n')).toContain('Model catalog: the refreshed lists could not be saved; this process still uses them')
+        expect(dispatchedArgs(spawnProcess)).toEqual(expect.arrayContaining(['--model', 'gpt-7-nova', 'model_reasoning_effort=high']))
+      } finally {
+        await engine.tracker.killAll()
+        cleanup()
+      }
+    })
+
+    it('keeps dispatching with it in later cycles, without asking the CLI again', async () => {
+      vi.spyOn(console, 'log').mockImplementation(() => {})
+      const { maintainer, run, cleanup } = refusingMaintainer()
+      const issues: SwarmIssue[] = []
+      const { engine, spawnProcess } = catalogFixture(false, maintainer, issues)
+      try {
+        await engine.cycle(true)
+        expect(spawnProcess).not.toHaveBeenCalled()
+        issues.push(novaIssue)
+        await engine.cycle(true)
+        expect(run.mock.calls.filter(([command]) => command === 'codex')).toHaveLength(1)
+        expect(dispatchedArgs(spawnProcess)).toEqual(expect.arrayContaining(['--model', 'gpt-7-nova', 'model_reasoning_effort=high']))
+      } finally {
+        await engine.tracker.killAll()
+        cleanup()
+      }
+    })
   })
 })

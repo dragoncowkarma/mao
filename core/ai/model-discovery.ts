@@ -325,8 +325,10 @@ export async function fetchAnthropicModels(
 ): Promise<CatalogModel[]> {
   const own = deadline ? undefined : boundedSignal(signal, MODEL_DISCOVERY_TIMEOUT_MS)
   const bound = deadline ?? own!
+  // A deadline that fired without timing out was aborted by whoever owns it, even if no `signal` came along.
+  const aborted = () => signal?.aborted === true || (bound.signal.aborted && !bound.timedOut())
   const failure = (otherwise: ModelCatalogFailure) =>
-    new ModelDiscoveryError(signal?.aborted ? 'aborted' : bound.timedOut() ? 'request-timeout' : otherwise)
+    new ModelDiscoveryError(aborted() ? 'aborted' : bound.timedOut() ? 'request-timeout' : otherwise)
   try {
     const models: CatalogModel[] = []
     const seen = new Set<string>()

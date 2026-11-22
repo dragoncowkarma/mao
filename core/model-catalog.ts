@@ -250,71 +250,10 @@ function applyOutcomes(current: ModelCatalogView, outcomes: readonly KindOutcome
   return { catalog: next, results }
 }
 
-/**
- * Read, fold and replace under the cache's own cross-process lock (the store's lock mechanism,
- * `createStoreWriteLock`, on `model-catalog.json` — never `config.json`'s), so two hosts refreshing
- * different providers at once both land. The lock is synchronous and held only for this read-merge-write,
- * never across the discovery awaits. The replace is atomic (`writeStoreFileAtomic`): a reader sees the old
- * file or the new one.
- */
-function persistOutcomes(dataDir: string, outcomes: readonly KindOutcome[], at: string, ttlMs: number | null): AppliedOutcomes {
-  const file = modelCatalogPath(dataDir)
-  fs.mkdirSync(dataDir, { recursive: true })
-  return createStoreWriteLock(file)(() => {
-    const applied = applyOutcomes(readModelCatalog(dataDir, ttlMs), outcomes, at)
-    const document = { version: MODEL_CATALOG_VERSION, providers: applied.catalog.providers, attempts: applied.catalog.attempts }
-    writeStoreFileAtomic(file, `${JSON.stringify(document, null, 2)}\n`)
-    return applied
-  })
-}
-
-const toResult = (outcome: KindOutcome): ModelCatalogRefreshResult => {
-  if ('failure' in outcome) return { kind: outcome.kind, outcome: 'failed', reason: outcome.failure, models: 0 }
-  if (outcome.result.kind === 'static') return { kind: outcome.kind, outcome: 'static', reason: outcome.result.reason, models: 0 }
-  return { kind: outcome.kind, outcome: 'updated', models: outcome.result.models.length }
-}
-
-export interface RefreshModelCatalogOptions {
-  dataDir: string
-  /** Providers to refresh; all three when omitted. */
-  kinds?: readonly DiscoverableProviderKind[]
-  /** Saved provider configs: the source of an Anthropic API key and of absolute CLI paths. */
-  providers?: readonly AiProviderConfig[]
-  deps?: ModelDiscoveryDeps
-  signal?: AbortSignal
-  now?: () => number
-  ttlMs?: number | null
-}
-
-/**
- * Asks every requested provider at once (each call bounded by `MODEL_DISCOVERY_TIMEOUT_MS`), then folds the
- * answers into the cache. Never rejects: discovery failures become `failed` results and a cache that
- * cannot be written becomes `persisted: false`. Hosts depend on that — a refresh must never stop the app,
- * the queue or Swarm dispatch.
- */
-export async function refreshModelCatalog(options: RefreshModelCatalogOptions): Promise<ModelCatalogRefreshReport> {
-  const kinds = DISCOVERABLE_PROVIDER_KINDS.filter((kind) => !options.kinds || options.kinds.includes(kind))
-  const ttlMs = options.ttlMs === undefined ? modelCatalogTtlMs() : options.ttlMs
-  const outcomes: KindOutcome[] = await Promise.all(kinds.map(async (kind): Promise<KindOutcome> => {
-    try {
-      return { kind, result: await discoverModels(kind, options.providers ?? [], options.deps ?? {}, options.signal) }
-    } catch (error) {
-      return { kind, failure: error instanceof ModelDiscoveryError ? error.reason : 'unexpected-error' }
-    }
-  }))
-  const at = new Date((options.now ?? Date.now)()).toISOString()
-  if (outcomes.every((outcome) => 'failure' in outcome && outcome.failure === 'aborted')) {
-    return { results: outcomes.map(toResult), catalog: readModelCatalog(options.dataDir, ttlMs), persisted: true }
-  }
-  try {
-    return { ...persistOutcomes(options.dataDir, outcomes, at, ttlMs), persisted: true }
-  } catch {
-    return { ...applyOutcomes(readModelCatalog(options.dataDir, ttlMs), outcomes, at), persisted: false }
-  }
-}
-
-/** What a maintainer fetched but could not save, per provider. */
+/** Lists and attempts a process fetched but could not save, per provider (`createModelCatalogMaintainer`). */
 type UnsavedCatalog = Pick<ModelCatalogView, 'providers' | 'attempts'>
+
+const NO_UNSAVED: UnsavedCatalog = { providers: {}, attempts: {} }
 
 /**
  * `view` with each unsaved entry laid over the file's, unless the file's is newer — another host's
@@ -339,6 +278,80 @@ function withUnsaved(view: ModelCatalogView, unsaved: UnsavedCatalog, time: numb
   return merged
 }
 
+/**
+ * Read, fold and replace under the cache's own cross-process lock (the store's lock mechanism,
+ * `createStoreWriteLock`, on `model-catalog.json` — never `config.json`'s), so two hosts refreshing
+ * different providers at once both land. The lock is synchronous and held only for this read-merge-write,
+ * never across the discovery awaits. The replace is atomic (`writeStoreFileAtomic`): a reader sees the old
+ * file or the new one. The caller's unsaved lists are folded in first, so this write saves them too.
+ */
+function persistOutcomes(
+  dataDir: string, outcomes: readonly KindOutcome[], at: string, ttlMs: number | null, unsaved: UnsavedCatalog,
+): AppliedOutcomes {
+  const file = modelCatalogPath(dataDir)
+  fs.mkdirSync(dataDir, { recursive: true })
+  return createStoreWriteLock(file)(() => {
+    const applied = applyOutcomes(withUnsaved(readModelCatalog(dataDir, ttlMs), unsaved, Date.parse(at)), outcomes, at)
+    const document = { version: MODEL_CATALOG_VERSION, providers: applied.catalog.providers, attempts: applied.catalog.attempts }
+    writeStoreFileAtomic(file, `${JSON.stringify(document, null, 2)}\n`)
+    return applied
+  })
+}
+
+const toResult = (outcome: KindOutcome): ModelCatalogRefreshResult => {
+  if ('failure' in outcome) return { kind: outcome.kind, outcome: 'failed', reason: outcome.failure, models: 0 }
+  if (outcome.result.kind === 'static') return { kind: outcome.kind, outcome: 'static', reason: outcome.result.reason, models: 0 }
+  return { kind: outcome.kind, outcome: 'updated', models: outcome.result.models.length }
+}
+
+export interface RefreshModelCatalogOptions {
+  dataDir: string
+  /** Providers to refresh; all three when omitted. */
+  kinds?: readonly DiscoverableProviderKind[]
+  /** Saved provider configs: the source of an Anthropic API key and of absolute CLI paths. */
+  providers?: readonly AiProviderConfig[]
+  deps?: ModelDiscoveryDeps
+  signal?: AbortSignal
+  now?: () => number
+  ttlMs?: number | null
+  /**
+   * Lists and attempts the calling process holds but could not save (a maintainer's). The refresh folds its
+   * answers over the file with these laid on top, so `kept-cached-list` and `kept-api-list` are judged
+   * against what the process actually uses, and a successful write saves them along with it.
+   */
+  unsaved?: Pick<ModelCatalogView, 'providers' | 'attempts'>
+}
+
+/**
+ * Asks every requested provider at once (each call bounded by `MODEL_DISCOVERY_TIMEOUT_MS`), then folds the
+ * answers into the cache. Never rejects: discovery failures become `failed` results and a cache that
+ * cannot be written becomes `persisted: false`. Hosts depend on that — a refresh must never stop the app,
+ * the queue or Swarm dispatch.
+ */
+export async function refreshModelCatalog(options: RefreshModelCatalogOptions): Promise<ModelCatalogRefreshReport> {
+  const kinds = DISCOVERABLE_PROVIDER_KINDS.filter((kind) => !options.kinds || options.kinds.includes(kind))
+  const ttlMs = options.ttlMs === undefined ? modelCatalogTtlMs() : options.ttlMs
+  const outcomes: KindOutcome[] = await Promise.all(kinds.map(async (kind): Promise<KindOutcome> => {
+    try {
+      return { kind, result: await discoverModels(kind, options.providers ?? [], options.deps ?? {}, options.signal) }
+    } catch (error) {
+      return { kind, failure: error instanceof ModelDiscoveryError ? error.reason : 'unexpected-error' }
+    }
+  }))
+  const time = (options.now ?? Date.now)()
+  const at = new Date(time).toISOString()
+  const unsaved = options.unsaved ?? NO_UNSAVED
+  const current = () => withUnsaved(readModelCatalog(options.dataDir, ttlMs), unsaved, time)
+  if (outcomes.every((outcome) => 'failure' in outcome && outcome.failure === 'aborted')) {
+    return { results: outcomes.map(toResult), catalog: current(), persisted: true }
+  }
+  try {
+    return { ...persistOutcomes(options.dataDir, outcomes, at, ttlMs, unsaved), persisted: true }
+  } catch {
+    return { ...applyOutcomes(current(), outcomes, at), persisted: false }
+  }
+}
+
 export interface ModelCatalogMaintainerOptions {
   dataDir: string
   /** Read at each refresh, so a key or CLI path saved after start is used. A throw reads as no providers. */
@@ -353,7 +366,7 @@ export interface ModelCatalogMaintainerOptions {
 export interface ModelCatalogMaintainer {
   /**
    * The cached catalog as it is on disk now — another host's refresh included — plus any list this
-   * process fetched but could not save, until the file holds a newer one.
+   * process fetched but could not save, until a write saves it or the file holds a newer one.
    */
   read(): ModelCatalogView
   /** The providers a refresh would ask now. See `createModelCatalogMaintainer()` for the rule. */
@@ -374,7 +387,9 @@ export interface ModelCatalogMaintainer {
  *
  * A refresh the cache file refused (`persisted: false`) is still this process's catalog: `read()`, and so
  * Swarm dispatch, `ai:getModelCatalog` and the due check, keep using it rather than the older file — which
- * would otherwise undo the refresh at the next read while its report said the result was in use.
+ * would otherwise undo the refresh at the next read while its report said the result was in use. Later
+ * refreshes fold over it as they would over a saved list (a failure or a missing source leaves it in place),
+ * and the next one that writes the file saves it too; only then is it dropped from memory.
  */
 export function createModelCatalogMaintainer(options: ModelCatalogMaintainerOptions): ModelCatalogMaintainer {
   const ttlMs = options.ttlMs === undefined ? modelCatalogTtlMs() : options.ttlMs
@@ -417,29 +432,35 @@ export function createModelCatalogMaintainer(options: ModelCatalogMaintainerOpti
 
   const run = (kinds: readonly DiscoverableProviderKind[], signal?: AbortSignal): Promise<ModelCatalogRefreshReport> => {
     const task = queue.then(() => refreshModelCatalog({
-      dataDir: options.dataDir, kinds, providers: providers(), deps: options.deps, signal, now, ttlMs,
+      dataDir: options.dataDir, kinds, providers: providers(), deps: options.deps, signal, now, ttlMs, unsaved,
     }))
     queue = task.catch(() => {})
     return task.then((report) => {
       const time = now()
-      for (const result of report.results) {
-        if (result.reason === 'aborted') continue
+      const attempted = report.results.filter((result) => result.reason !== 'aborted')
+      for (const result of attempted) {
         const wait = result.outcome === 'failed' ? Math.min(retryMs, ttlMs ?? retryMs) : (ttlMs ?? retryMs)
         notBefore.set(result.kind, time + wait)
-        if (report.persisted) {
-          // The file holds this provider's state again; an older unsaved list must not resurface from here
-          // if the file is later deleted or damaged.
-          delete unsaved.providers[result.kind]
-          delete unsaved.attempts[result.kind]
-          continue
+      }
+      // An interrupted refresh wrote nothing and changed nothing: whatever is unsaved stays as it was.
+      if (attempted.length === 0) return report
+      if (report.persisted) {
+        // That write folded every unsaved list in, so the file holds each one now, or something newer. From
+        // here the file is the truth; nothing old may resurface from memory if it is later deleted or damaged.
+        for (const kind of DISCOVERABLE_PROVIDER_KINDS) {
+          delete unsaved.providers[kind]
+          delete unsaved.attempts[kind]
         }
+        return report
+      }
+      // Still unwritable: the report's catalog (file, earlier unsaved lists, this refresh) is in use now.
+      for (const result of attempted) {
         const list = report.catalog.providers[result.kind]
         if (result.outcome === 'updated' && list) unsaved.providers[result.kind] = list
         const attempt = report.catalog.attempts[result.kind]
         if (attempt) unsaved.attempts[result.kind] = attempt
       }
-      // Also what an earlier refresh could not save, so the report matches `read()` for every host.
-      return { ...report, catalog: withUnsaved(report.catalog, unsaved, time) }
+      return report
     })
   }
 

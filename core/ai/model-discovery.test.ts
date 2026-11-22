@@ -459,3 +459,13 @@ describe('PR #141 review fixes', () => {
     expect(state).toEqual({ settled: true, value: { kind: 'catalog', source: 'anthropic-models-api', models: [{ id: 'claude-opus-5-5' }] } })
   })
 })
+
+describe('PR #141 second review', () => {
+  it('reads a deadline its owner aborted as an interruption, even when no signal came with it', async () => {
+    const fetchImpl = vi.fn(async () => new Response('{}'))
+    const deadline = { signal: AbortSignal.abort(), timedOut: () => false }
+    expect(await reasonOf(fetchAnthropicModels('https://api.anthropic.com/v1/models', 'k', fetchImpl as unknown as typeof fetch, undefined, deadline)))
+      .toBe('aborted')
+    expect(fetchImpl).not.toHaveBeenCalled()
+  })
+})

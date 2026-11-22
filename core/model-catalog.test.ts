@@ -18,6 +18,7 @@ import {
 } from './model-catalog.ts'
 import type { DiscoveryCommandRunner, ModelDiscoveryDeps } from './ai/model-discovery.ts'
 import { ModelDiscoveryError } from './ai/model-discovery.ts'
+import type { AiProviderConfig } from './ai/types.ts'
 
 const dirs: string[] = []
 const tempDir = () => {
@@ -463,7 +464,7 @@ describe('a refresh the cache file refused (PR #141 review)', () => {
     expect(maintainer.read().providers.codex?.models[0].id).toBe('gpt-7-orbit')
   })
 
-  it('reports every list this process uses, an earlier unsaved one included, and drops it once a refresh is saved', async () => {
+  it('reports every list this process uses, and saves them all with the next write it makes', async () => {
     const dir = blockedDir()
     let now = T0
     const { deps } = cliDeps({ codex: CODEX, agy: AGY })
@@ -475,13 +476,75 @@ describe('a refresh the cache file refused (PR #141 review)', () => {
     expect(Object.keys(second.catalog.providers).sort()).toEqual(['antigravity', 'codex'])
     expect(second.catalog).toEqual(maintainer.read())
 
-    // Saved at last: the file is the truth again, so losing it later cannot resurrect the unsaved list.
+    // Saved at last: the write takes the unsaved Antigravity list along, so other processes see it too...
     unblock(dir)
     now += 60_000
     expect((await maintainer.refreshNow(['codex'])).persisted).toBe(true)
+    expect(Object.keys(readModelCatalog(dir).providers).sort()).toEqual(['antigravity', 'codex'])
+    // ...and from then on the file is the truth: losing it cannot resurrect anything from memory.
     fs.rmSync(modelCatalogPath(dir))
-    expect(maintainer.read().providers.codex).toBeUndefined()
-    expect(maintainer.read().providers.antigravity?.models[0].id).toBe('gemini-4-neon')
+    expect(maintainer.read().providers).toEqual({})
+  })
+
+  it('changes nothing for an interrupted refresh, which writes nothing either', async () => {
+    const dir = blockedDir()
+    const { deps } = cliDeps({ codex: CODEX, agy: new ModelDiscoveryError('aborted') })
+    const maintainer = createModelCatalogMaintainer({ dataDir: dir, ttlMs: 24 * HOUR, now: () => T0, deps })
+    await maintainer.refreshNow(['codex'])
+    unblock(dir)
+    const interrupted = await maintainer.refreshNow(['antigravity'])
+    expect(interrupted.results).toEqual([{ kind: 'antigravity', outcome: 'failed', reason: 'aborted', models: 0 }])
+    expect(interrupted.catalog.providers.codex?.models[0].id).toBe('gpt-7-nova')
+    expect(fs.existsSync(modelCatalogPath(dir))).toBe(false)
+    expect(maintainer.read().providers.codex?.models[0].id).toBe('gpt-7-nova')
+  })
+
+  it('keeps an unsaved list through a later refresh that is saved but fails, and saves the list with it', async () => {
+    const dir = blockedDir()
+    let now = T0
+    let codex: string | ModelDiscoveryError = CODEX
+    const run = vi.fn<DiscoveryCommandRunner>(async (command) => {
+      if (command !== 'codex') throw new ModelDiscoveryError('command-not-found')
+      if (codex instanceof ModelDiscoveryError) throw codex
+      return codex
+    })
+    const maintainer = createModelCatalogMaintainer({ dataDir: dir, ttlMs: 24 * HOUR, now: () => now, deps: { run, env: {} } })
+    await maintainer.refreshNow(['codex'])
+    unblock(dir)
+    writeCache(dir, codexList('gpt-6.1-terra', T0 - 30 * HOUR))
+    now = T0 + 25 * HOUR
+    codex = new ModelDiscoveryError('command-timeout')
+    const report = await maintainer.refreshNow(['codex'])
+    expect(report.persisted).toBe(true)
+    expect(report.results).toEqual([{ kind: 'codex', outcome: 'failed', reason: 'command-timeout', models: 0 }])
+    // A failure never costs a list: not the file's, and not one this process could not save before.
+    expect(maintainer.read().providers.codex?.models[0].id).toBe('gpt-7-nova')
+    expect(readModelCatalog(dir).providers.codex?.models[0].id).toBe('gpt-7-nova')
+    expect(readModelCatalog(dir).attempts.codex).toEqual({ at: new Date(now).toISOString(), outcome: 'failed', reason: 'command-timeout' })
+  })
+
+  it('judges a later refresh against the unsaved lists, as it would against saved ones', async () => {
+    // A source that disappears leaves the unsaved list in use, and says so.
+    const env: NodeJS.ProcessEnv = { ANTHROPIC_MODEL: 'claude-fable-5-2' }
+    const local = createModelCatalogMaintainer({ dataDir: blockedDir(), ttlMs: 24 * HOUR, now: () => T0, deps: { run: cliDeps({}).run, env } })
+    await local.refreshNow(['claude'])
+    delete env.ANTHROPIC_MODEL
+    const gone = await local.refreshNow(['claude'])
+    expect(gone.results).toEqual([{ kind: 'claude', outcome: 'static', reason: 'kept-cached-list', models: 0 }])
+    expect(local.read().providers.claude?.models).toEqual([{ id: 'claude-fable-5-2' }])
+
+    // Claude Code's settings never replace an Anthropic API listing, saved or not.
+    let providers: AiProviderConfig[] = [{ id: 'a', name: 'API', kind: 'api', apiFormat: 'anthropic', apiKey: 'sk-test' }]
+    const fetch = vi.fn(async () => new Response(JSON.stringify({ data: [{ id: 'claude-opus-5-5' }, { id: 'claude-sonnet-5-5' }], has_more: false })))
+    const api = createModelCatalogMaintainer({
+      dataDir: blockedDir(), ttlMs: 24 * HOUR, now: () => T0, listProviders: () => providers,
+      deps: { run: cliDeps({}).run, env: { ANTHROPIC_MODEL: 'claude-fable-5-2' }, fetch: fetch as unknown as typeof globalThis.fetch },
+    })
+    expect((await api.refreshNow(['claude'])).catalog.providers.claude?.source).toBe('anthropic-models-api')
+    providers = []
+    const local2 = await api.refreshNow(['claude'])
+    expect(local2.results).toEqual([{ kind: 'claude', outcome: 'static', reason: 'kept-api-list', models: 0 }])
+    expect(api.read().providers.claude).toMatchObject({ source: 'anthropic-models-api', models: [{ id: 'claude-opus-5-5' }, { id: 'claude-sonnet-5-5' }] })
   })
 
   it('never lets an unsaved local-settings list cover an Anthropic API listing in the file', async () => {

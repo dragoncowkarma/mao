@@ -256,10 +256,18 @@ type UnsavedCatalog = Pick<ModelCatalogView, 'providers' | 'attempts'>
 const NO_UNSAVED: UnsavedCatalog = { providers: {}, attempts: {} }
 
 /**
+ * Whether list `a` stands over list `b` whatever their ages: an Anthropic API listing (the whole catalog)
+ * over Claude Code's local settings (a model or two), the rule `applyOutcomes` applies to a refresh.
+ */
+const outranks = (a: ProviderModelCatalog | undefined, b: ProviderModelCatalog | undefined) =>
+  a?.source === 'anthropic-models-api' && b?.source === 'claude-local-settings'
+
+/**
  * `view` with each unsaved entry laid over the file's, unless the file's is newer — another host's
  * refresh, or this process's own once the file is writable again. A file stamp beyond `CLOCK_SKEW_MS` ahead
- * counts for nothing here either. As in `applyOutcomes`, Claude Code's local settings never cover an
- * Anthropic API listing, however new.
+ * counts for nothing here either. As in `applyOutcomes`, an Anthropic API listing and Claude Code's local
+ * settings never trade places by age, in either direction: an unsaved listing stands over settings another
+ * host saved later, exactly as a saved listing would have stood over that host's refresh.
  */
 function withUnsaved(view: ModelCatalogView, unsaved: UnsavedCatalog, time: number): ModelCatalogView {
   const stamp = (timestamp: string | undefined) => {
@@ -270,8 +278,8 @@ function withUnsaved(view: ModelCatalogView, unsaved: UnsavedCatalog, time: numb
   for (const kind of DISCOVERABLE_PROVIDER_KINDS) {
     const list = unsaved.providers[kind]
     const saved = merged.providers[kind]
-    const demotes = list?.source === 'claude-local-settings' && saved?.source === 'anthropic-models-api'
-    if (list && !demotes && stamp(list.updatedAt) > stamp(saved?.updatedAt)) merged.providers[kind] = list
+    const newer = stamp(list?.updatedAt) > stamp(saved?.updatedAt)
+    if (list && (outranks(list, saved) || (!outranks(saved, list) && newer))) merged.providers[kind] = list
     const attempt = unsaved.attempts[kind]
     if (attempt && stamp(attempt.at) > stamp(merged.attempts[kind]?.at)) merged.attempts[kind] = attempt
   }

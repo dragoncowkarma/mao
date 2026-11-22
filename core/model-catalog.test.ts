@@ -559,4 +559,28 @@ describe('a refresh the cache file refused (PR #141 review)', () => {
     } } })
     expect(maintainer.read().providers.claude).toMatchObject({ source: 'anthropic-models-api', models: [{ id: 'claude-opus-5-5' }] })
   })
+
+  it('keeps an unsaved Anthropic API listing over newer settings another host saved, and saves it back', async () => {
+    const dir = blockedDir()
+    let now = T0
+    const fetch = vi.fn(async () => new Response(JSON.stringify({ data: [{ id: 'claude-opus-5-5' }, { id: 'claude-sonnet-5-5' }], has_more: false })))
+    const maintainer = createModelCatalogMaintainer({
+      dataDir: dir, ttlMs: 24 * HOUR, now: () => now,
+      listProviders: () => [{ id: 'a', name: 'API', kind: 'api', apiFormat: 'anthropic', apiKey: 'sk-test' }],
+      deps: { run: cliDeps({ codex: CODEX }).run, env: {}, fetch: fetch as unknown as typeof globalThis.fetch },
+    })
+    expect((await maintainer.refreshNow(['claude'])).persisted).toBe(false)
+    // Half an hour later a host with no key saves Claude Code's settings: it could not see the unsaved listing.
+    unblock(dir)
+    writeCache(dir, { providers: { claude: {
+      updatedAt: new Date(T0 + 30 * 60_000).toISOString(), source: 'claude-local-settings', models: [{ id: 'claude-fable-5-2' }],
+    } } })
+    now = T0 + HOUR
+    expect(maintainer.read().providers.claude).toMatchObject({ source: 'anthropic-models-api' })
+    // This process's next write puts the listing back, as a saved listing would have stood over that refresh.
+    expect((await maintainer.refreshNow(['codex'])).persisted).toBe(true)
+    expect(readModelCatalog(dir).providers.claude).toMatchObject({
+      source: 'anthropic-models-api', models: [{ id: 'claude-opus-5-5' }, { id: 'claude-sonnet-5-5' }],
+    })
+  })
 })

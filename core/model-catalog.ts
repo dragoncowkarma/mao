@@ -550,8 +550,8 @@ export function createModelCatalogMaintainer(options: ModelCatalogMaintainerOpti
         const wait = result.outcome === 'failed' ? Math.min(retryMs, ttlMs ?? retryMs) : (ttlMs ?? retryMs)
         notBefore.set(result.kind, time + wait)
       }
-      // The report shows what `read()` returns now, which also takes in a list another host saved meanwhile.
-      return { ...report, catalog: read() }
+      // The report's catalog is already what `read()` would return: the refresh pruned and took in at its fold.
+      return report
     })
   }
 

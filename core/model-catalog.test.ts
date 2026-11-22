@@ -766,6 +766,170 @@ describe('an unsaved list a newer saved one replaced (PR #141 follow-up review)'
     },
   )
 
+  describe('when the clock steps back during discovery, on a clock that keeps moving', () => {
+    const ORBIT = JSON.stringify({ models: [{ slug: 'gpt-7-orbit', visibility: 'list', priority: 1, supported_reasoning_levels: [{ effort: 'low' }] }] })
+    /** A clock that advances on every reading, and a codex that steps it back an hour while it is being asked. */
+    function steppingClock() {
+      const state = { clock: T0, stepNext: false }
+      const now = () => (state.clock += 1)
+      const step = () => {
+        if (state.stepNext) state.clock = T0 - HOUR
+        state.stepNext = false
+      }
+      return { state, now, step }
+    }
+
+    it('keeps its own fresh list over an older unsaved one, and never saves the older one back', async () => {
+      const dir = blockedDir()
+      const { state, now, step } = steppingClock()
+      let answer = CODEX
+      const run = vi.fn<DiscoveryCommandRunner>(async (command) => {
+        if (command === 'agy') return AGY
+        if (command !== 'codex') throw new ModelDiscoveryError('command-not-found')
+        step()
+        return answer
+      })
+      const a = createModelCatalogMaintainer({ dataDir: dir, ttlMs: 24 * HOUR, now, deps: { run, env: {} } })
+      await a.refreshNow(['codex'])
+      unblock(dir)
+      answer = ORBIT
+      state.stepNext = true
+      const report = await a.refreshNow(['codex'])
+      expect(report.persisted).toBe(true)
+      expect(report.catalog.providers.codex?.models[0].id).toBe('gpt-7-orbit')
+      expect(a.read().providers.codex?.models[0].id).toBe('gpt-7-orbit')
+      state.clock = T0 + 60_000
+      expect(a.read().providers.codex?.models[0].id).toBe('gpt-7-orbit')
+      await a.refreshNow(['antigravity'])
+      expect(readModelCatalog(dir).providers.codex?.models[0].id).toBe('gpt-7-orbit')
+    })
+
+    it.each([['saved', true], ['still unsaved', false]])(
+      'still keeps an Anthropic API listing over Claude Code settings (%s)', async (_case, writable) => {
+        const dir = blockedDir()
+        const { state, now, step } = steppingClock()
+        let providers: AiProviderConfig[] = [{ id: 'a', name: 'API', kind: 'api', apiFormat: 'anthropic', apiKey: 'sk-test' }]
+        const fetch = vi.fn(async () => new Response(JSON.stringify({ data: [{ id: 'claude-opus-5-5' }], has_more: false })))
+        const run = vi.fn<DiscoveryCommandRunner>(async (command) => {
+          if (command !== 'codex') throw new ModelDiscoveryError('command-not-found')
+          step()
+          return CODEX
+        })
+        const a = createModelCatalogMaintainer({
+          dataDir: dir, ttlMs: 24 * HOUR, now, listProviders: () => providers,
+          deps: { run, env: { ANTHROPIC_MODEL: 'claude-fable-5-2' }, fetch: fetch as unknown as typeof globalThis.fetch },
+        })
+        expect((await a.refreshNow(['claude'])).persisted).toBe(false)
+        providers = []
+        if (writable) unblock(dir)
+        state.stepNext = true
+        const report = await a.refreshNow(['claude', 'codex'])
+        expect(report.persisted).toBe(writable)
+        expect(report.results.find((result) => result.kind === 'claude'))
+          .toEqual({ kind: 'claude', outcome: 'static', reason: 'kept-api-list', models: 0 })
+        state.clock = T0 + 60_000
+        expect(a.read().providers.claude).toMatchObject({ source: 'anthropic-models-api', models: [{ id: 'claude-opus-5-5' }] })
+        if (writable) expect(readModelCatalog(dir).providers.claude?.source).toBe('anthropic-models-api')
+      },
+    )
+
+    it('lets go of what it saved at the instant of the write, even if the clock steps back right after', async () => {
+      const dir = blockedDir()
+      const state = { clock: T0, stepAfterNextReading: false }
+      // The first reading after codex answers is the fold's own instant; the clock steps back right after it.
+      const now = () => {
+        const reading = (state.clock += 1)
+        if (state.stepAfterNextReading) {
+          state.stepAfterNextReading = false
+          state.clock = T0 - HOUR
+        }
+        return reading
+      }
+      let answer = CODEX
+      const run = vi.fn<DiscoveryCommandRunner>(async (command) => {
+        if (command !== 'codex') throw new ModelDiscoveryError('command-not-found')
+        if (answer === ORBIT) state.stepAfterNextReading = true
+        return answer
+      })
+      const a = createModelCatalogMaintainer({ dataDir: dir, ttlMs: 24 * HOUR, now, deps: { run, env: {} } })
+      await a.refreshNow(['codex'])
+      unblock(dir)
+      answer = ORBIT
+      expect((await a.refreshNow(['codex'])).persisted).toBe(true)
+      // The older unsaved list was let go at the write: a later read, with the clock behind, cannot revive it.
+      expect(a.read().providers.codex?.models[0].id).toBe('gpt-7-orbit')
+      state.clock = T0 + HOUR
+      expect(a.read().providers.codex?.models[0].id).toBe('gpt-7-orbit')
+    })
+
+    it('still keeps its unsaved list when the source is gone (kept-cached-list), and says so', async () => {
+      const dir = blockedDir()
+      const { state, now, step } = steppingClock()
+      const env: NodeJS.ProcessEnv = { ANTHROPIC_MODEL: 'claude-fable-5-2' }
+      const run = vi.fn<DiscoveryCommandRunner>(async (command) => {
+        if (command !== 'codex') throw new ModelDiscoveryError('command-not-found')
+        step()
+        return CODEX
+      })
+      const a = createModelCatalogMaintainer({ dataDir: dir, ttlMs: 24 * HOUR, now, deps: { run, env } })
+      await a.refreshNow(['claude'])
+      delete env.ANTHROPIC_MODEL
+      state.stepNext = true
+      const report = await a.refreshNow(['claude', 'codex'])
+      expect(report.results.find((result) => result.kind === 'claude'))
+        .toEqual({ kind: 'claude', outcome: 'static', reason: 'kept-cached-list', models: 0 })
+      expect(a.read().providers.claude?.models).toEqual([{ id: 'claude-fable-5-2' }])
+      expect(a.read().attempts.claude?.outcome).toBe('updated')
+    })
+  })
+
+  it('never turns the file\'s attempt from the future into a current one behind a kept-* result', async () => {
+    const dir = tempDir()
+    const at = (time: number) => new Date(time).toISOString()
+    // A stale Claude list, and an attempt stamped a day ahead: a wrong clock or a hand edit, which counts for nothing.
+    writeCache(dir, {
+      providers: { claude: { updatedAt: at(T0 - 48 * HOUR), source: 'claude-local-settings', models: [{ id: 'claude-old-1' }] } },
+      attempts: { claude: { at: at(T0 + 24 * HOUR), outcome: 'failed', reason: 'network-error' } },
+    })
+    const due = () => createModelCatalogMaintainer({ dataDir: dir, ttlMs: 24 * HOUR, now: () => T0 }).dueKinds()
+    expect(due()).toContain('claude')
+    const lock = `${modelCatalogPath(dir)}.lock`
+    fs.writeFileSync(lock, JSON.stringify({ pid: process.ppid, host: os.hostname(), nonce: 'other-writer' }))
+    const a = createModelCatalogMaintainer({ dataDir: dir, ttlMs: 24 * HOUR, now: () => T0, deps: cliDeps({ codex: CODEX }).deps })
+    expect((await a.refreshNow(['claude'])).results)
+      .toEqual([{ kind: 'claude', outcome: 'static', reason: 'kept-cached-list', models: 0 }])
+    fs.rmSync(lock)
+    expect((await a.refreshNow(['codex'])).persisted).toBe(true)
+    // The next write leaves that attempt as it was, so other hosts still find Claude due.
+    expect(readModelCatalog(dir).attempts.claude).toEqual({ at: at(T0 + 24 * HOUR), outcome: 'failed', reason: 'network-error' })
+    expect(due()).toContain('claude')
+  }, 20_000)
+
+  it('never turns the file\'s attempt from the future into a current one behind an interrupted result', async () => {
+    const dir = tempDir()
+    const future = new Date(T0 + 24 * HOUR).toISOString()
+    writeCache(dir, { attempts: { claude: { at: future, outcome: 'failed', reason: 'network-error' } } })
+    const lock = `${modelCatalogPath(dir)}.lock`
+    fs.writeFileSync(lock, JSON.stringify({ pid: process.ppid, host: os.hostname(), nonce: 'other-writer' }))
+    // Claude's listing is interrupted (its request waits on the signal); codex answers, so a write is attempted.
+    const controller = new AbortController()
+    const fetch = vi.fn((_url: URL | RequestInfo, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(new DOMException('The operation was aborted.', 'AbortError')), { once: true })
+      controller.abort()
+    }))
+    const a = createModelCatalogMaintainer({
+      dataDir: dir, ttlMs: 24 * HOUR, now: () => T0,
+      listProviders: () => [{ id: 'a', name: 'API', kind: 'api', apiFormat: 'anthropic', apiKey: 'sk-test' }],
+      deps: { run: cliDeps({ codex: CODEX }).run, env: {}, fetch: fetch as unknown as typeof globalThis.fetch },
+    })
+    const report = await a.refreshNow(['claude', 'codex'], controller.signal)
+    expect(report.persisted).toBe(false)
+    expect(report.results.find((result) => result.kind === 'claude')).toMatchObject({ outcome: 'failed', reason: 'aborted' })
+    fs.rmSync(lock)
+    // Nothing was recorded for Claude, so nothing from the file may come back stamped now.
+    expect(a.read().attempts.claude).toEqual({ at: future, outcome: 'failed', reason: 'network-error' })
+  }, 20_000)
+
   it('forgets a copy of a fresher saved list a refresh could not write, as soon as it is recorded', async () => {
     const dir = tempDir()
     const lock = `${modelCatalogPath(dir)}.lock`

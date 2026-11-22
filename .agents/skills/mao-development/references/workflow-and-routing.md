@@ -119,8 +119,10 @@ listed is offered only at the levels it listed: picker, listing and Swarm all re
   and the next write that succeeds saves it too. A file entry supersedes it when it is at least as new (an
   Anthropic API listing and local settings never trade places by age); once the process reads one, it forgets
   its own, so a deleted or damaged cache file cannot bring the stale list back. A clock that steps back past
-  the list's stamp moves that stamp back to the clock (`clampToClock`): the list stays in use, comparable and
-  saveable, though a list saved shortly before may then count as newer.
+  the list's stamp moves that stamp back to the clock (`clampToClock`, at the instant of each read and each
+  refresh's fold, even mid-discovery): the list stays in use, comparable and saveable, though a list saved
+  shortly before may then count as newer. A failed write keeps only what its refresh produced: each list it
+  fetched and each attempt it recorded, never the file's attempt behind a kept-* result.
 - Due: a list missing or older than the TTL (24 h; `MAO_MODEL_CATALOG_TTL_HOURS`, `0` = manual only),
   unless this process tried it within the TTL, or within an hour after a failure. Another host's recent
   failure counts too, except `command-not-found` (a Dock-launched GUI's PATH lacks the CLIs).

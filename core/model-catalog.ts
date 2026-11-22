@@ -253,8 +253,6 @@ function applyOutcomes(current: ModelCatalogView, outcomes: readonly KindOutcome
 /** Lists and attempts a process fetched but could not save, per provider (`createModelCatalogMaintainer`). */
 type UnsavedCatalog = Pick<ModelCatalogView, 'providers' | 'attempts'>
 
-const NO_UNSAVED: UnsavedCatalog = { providers: {}, attempts: {} }
-
 /**
  * Whether list `a` stands over list `b` whatever their ages: an Anthropic API listing (the whole catalog)
  * over Claude Code's local settings (a model or two), the rule `applyOutcomes` applies to a refresh.
@@ -268,7 +266,8 @@ const outranks = (a: ProviderModelCatalog | undefined, b: ProviderModelCatalog |
  * neither used, nor saved, nor told apart from the older list it replaced. At the clock's time it is all three,
  * and every rule that ranks lists (`applyOutcomes`' included) sees it. The price: a list another host saved
  * shortly before may now count as newer, which costs a few minutes of freshness and never a list. Mutates
- * `unsaved`; a maintainer calls it before every read and every refresh, so the entries it holds always count.
+ * `unsaved`. It runs at the instant the entries are ranked — in a maintainer's read(), and in
+ * `refreshModelCatalog` once discovery is over — never earlier, so a step in between cannot undo it.
  */
 function clampToClock(unsaved: UnsavedCatalog, time: number): void {
   const clock = new Date(time).toISOString()
@@ -284,8 +283,9 @@ function clampToClock(unsaved: UnsavedCatalog, time: number): void {
 /**
  * Which of an unsaved entry and the file's entry for the same provider is current. `unsaved`: it is newer, or
  * the file has nothing that counts. `file`: the file's entry is at least as new — another host's refresh, or
- * this process's own write of this very entry. Stamps beyond `CLOCK_SKEW_MS` ahead count for nothing; a
- * maintainer has already moved its own back to the clock (`clampToClock`), so only a file stamp can be one.
+ * this process's own write of this very entry. Stamps beyond `CLOCK_SKEW_MS` ahead count for nothing; the
+ * unsaved ones have been moved back to the clock at this same instant (`clampToClock`), so only a file stamp can
+ * be one.
  *
  * As in `applyOutcomes`, an Anthropic API listing and Claude Code's local settings never trade places by age, in
  * either direction: an unsaved listing stands over settings another host saved later, exactly as a saved listing
@@ -372,18 +372,31 @@ export interface RefreshModelCatalogOptions {
   now?: () => number
   ttlMs?: number | null
   /**
-   * Lists and attempts the calling process holds but could not save (a maintainer's). The refresh folds its
-   * answers over the file with these laid on top, so `kept-cached-list` and `kept-api-list` are judged
-   * against what the process actually uses, and a successful write saves them along with it.
+   * Lists and attempts the calling process holds but could not save (a maintainer's overlay), which this refresh
+   * also maintains, all at the instant it folds (see `refreshModelCatalog`). The fold lays them over the file,
+   * so `kept-cached-list` and `kept-api-list` are judged against what the process actually uses, and a
+   * successful write saves them along with it.
    */
   unsaved?: Pick<ModelCatalogView, 'providers' | 'attempts'>
 }
+
+/** Whether a result recorded an attempt: `applyOutcomes` records one for everything but the kept-* results. */
+const recordedAttempt = (result: ModelCatalogRefreshResult) =>
+  result.reason !== 'aborted' && result.reason !== 'kept-cached-list' && result.reason !== 'kept-api-list'
 
 /**
  * Asks every requested provider at once (each call bounded by `MODEL_DISCOVERY_TIMEOUT_MS`), then folds the
  * answers into the cache. Never rejects: discovery failures become `failed` results and a cache that
  * cannot be written becomes `persisted: false`. Hosts depend on that — a refresh must never stop the app,
  * the queue or Swarm dispatch.
+ *
+ * The caller's `unsaved` overlay changes here, and only at the one instant the answers are folded, never
+ * before discovery: a clock that steps back during the (up to a minute of) discovery would otherwise leave an
+ * entry out of the fold, unranked, and let it outrank the very list this refresh saves. At that instant its
+ * stamps are first moved back to the clock (`clampToClock`). Then a saved fold forgets every entry the
+ * written file now holds or supersedes, and a fold that could not be written takes in what this refresh
+ * produced: each list it fetched, and each attempt it recorded — never the file's attempt for a kept-*
+ * result, which may be a stamp from the future that should count for nothing.
  */
 export async function refreshModelCatalog(options: RefreshModelCatalogOptions): Promise<ModelCatalogRefreshReport> {
   const kinds = DISCOVERABLE_PROVIDER_KINDS.filter((kind) => !options.kinds || options.kinds.includes(kind))
@@ -397,16 +410,29 @@ export async function refreshModelCatalog(options: RefreshModelCatalogOptions): 
   }))
   const time = (options.now ?? Date.now)()
   const at = new Date(time).toISOString()
-  const unsaved = options.unsaved ?? NO_UNSAVED
+  const unsaved: UnsavedCatalog = options.unsaved ?? { providers: {}, attempts: {} }
+  clampToClock(unsaved, time)
   const current = () => withUnsaved(readModelCatalog(options.dataDir, ttlMs), unsaved, time)
   if (outcomes.every((outcome) => 'failure' in outcome && outcome.failure === 'aborted')) {
     return { results: outcomes.map(toResult), catalog: current(), persisted: true }
   }
+  let applied: AppliedOutcomes
   try {
-    return { ...persistOutcomes(options.dataDir, outcomes, at, ttlMs, unsaved), persisted: true }
+    applied = persistOutcomes(options.dataDir, outcomes, at, ttlMs, unsaved)
   } catch {
-    return { ...applyOutcomes(current(), outcomes, at), persisted: false }
+    applied = applyOutcomes(current(), outcomes, at)
+    for (const result of applied.results) {
+      const list = applied.catalog.providers[result.kind]
+      if (result.outcome === 'updated' && list) unsaved.providers[result.kind] = list
+      const attempt = applied.catalog.attempts[result.kind]
+      if (recordedAttempt(result) && attempt) unsaved.attempts[result.kind] = attempt
+    }
+    return { ...applied, persisted: false }
   }
+  // The write folded every unsaved entry in, so each now ties with the file or loses to it: forget them here,
+  // at the instant of the write, before a clock that steps back again can make any of them look newer.
+  pruneSuperseded(unsaved, applied.catalog, time)
+  return { ...applied, persisted: true }
 }
 
 export interface ModelCatalogMaintainerOptions {
@@ -497,36 +523,19 @@ export function createModelCatalogMaintainer(options: ModelCatalogMaintainerOpti
   }
 
   const run = (kinds: readonly DiscoverableProviderKind[], signal?: AbortSignal): Promise<ModelCatalogRefreshReport> => {
-    const task = queue.then(() => {
-      // The fold below ranks these entries against the file and this refresh: their stamps must count.
-      clampToClock(unsaved, now())
-      return refreshModelCatalog({
-        dataDir: options.dataDir, kinds, providers: providers(), deps: options.deps, signal, now, ttlMs, unsaved,
-      })
-    })
+    // The refresh itself keeps `unsaved` up to date, at the instant it folds (`refreshModelCatalog`).
+    const task = queue.then(() => refreshModelCatalog({
+      dataDir: options.dataDir, kinds, providers: providers(), deps: options.deps, signal, now, ttlMs, unsaved,
+    }))
     queue = task.catch(() => {})
     return task.then((report) => {
       const time = now()
-      const attempted = report.results.filter((result) => result.reason !== 'aborted')
-      for (const result of attempted) {
+      for (const result of report.results) {
+        if (result.reason === 'aborted') continue
         const wait = result.outcome === 'failed' ? Math.min(retryMs, ttlMs ?? retryMs) : (ttlMs ?? retryMs)
         notBefore.set(result.kind, time + wait)
       }
-      // An interrupted refresh wrote nothing and changes nothing here. A saved one needs nothing here either: its
-      // write folded in every unsaved entry, each of which was current (and saved) or superseded, so all of them
-      // now tie with the file or lose to it, and the read below forgets them.
-      if (!report.persisted) {
-        // Still unwritable: the report's catalog (file, earlier unsaved lists, this refresh) is in use now. Its
-        // attempt for a kept-* result is the current one, never an older one, so taking it changes nothing.
-        for (const result of attempted) {
-          const list = report.catalog.providers[result.kind]
-          if (result.outcome === 'updated' && list) unsaved.providers[result.kind] = list
-          const attempt = report.catalog.attempts[result.kind]
-          if (attempt) unsaved.attempts[result.kind] = attempt
-        }
-      }
-      // Whatever the path, the report shows what `read()` returns now. That read also forgets every unsaved entry
-      // the file now holds or supersedes — a refresh sees the file too, not only an explicit read.
+      // The report shows what `read()` returns now, which also takes in a list another host saved meanwhile.
       return { ...report, catalog: read() }
     })
   }

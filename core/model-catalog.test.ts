@@ -641,4 +641,70 @@ describe('an unsaved list a newer saved one replaced (PR #141 follow-up review)'
     fs.rmSync(modelCatalogPath(dir))
     expect(a.read().providers.codex).toBeUndefined()
   }, 20_000)
+
+  it('is kept through a clock that steps back: nothing superseded it, so it returns and is saved', async () => {
+    const dir = blockedDir()
+    let now = T0
+    const { deps } = cliDeps({ codex: CODEX, agy: AGY })
+    const a = createModelCatalogMaintainer({ dataDir: dir, ttlMs: 24 * HOUR, now: () => now, deps })
+    await a.refreshNow(['codex'])
+    // Ten minutes back, its own stamp lies too far ahead to count: it is not used, and not forgotten either.
+    now = T0 - 10 * 60_000
+    expect(a.read().providers.codex).toBeUndefined()
+    now = T0 + 60_000
+    expect(a.read().providers.codex?.models[0].id).toBe('gpt-7-nova')
+    expect(a.read().attempts.codex).toEqual({ at: new Date(T0).toISOString(), outcome: 'updated' })
+    unblock(dir)
+    expect((await a.refreshNow(['antigravity'])).persisted).toBe(true)
+    expect(readModelCatalog(dir).providers.codex?.models[0].id).toBe('gpt-7-nova')
+  })
+
+  it('gives way to a list another host saved while the clock was behind', async () => {
+    const dir = blockedDir()
+    let now = T0
+    const a = createModelCatalogMaintainer({ dataDir: dir, ttlMs: 24 * HOUR, now: () => now, deps: cliDeps({ codex: CODEX }).deps })
+    await a.refreshNow(['codex'])
+    now = T0 - 10 * 60_000
+    unblock(dir)
+    writeCache(dir, codexList('gpt-7-orbit', now))
+    // Its stamp counts and ours does not: the saved list is current, and ours is forgotten.
+    expect(a.read().providers.codex?.models[0].id).toBe('gpt-7-orbit')
+    now = T0 + 60_000
+    fs.rmSync(modelCatalogPath(dir))
+    expect(a.read().providers.codex).toBeUndefined()
+  })
+
+  it('forgets a copy of a fresher saved list a refresh could not write, as soon as it is recorded', async () => {
+    const dir = tempDir()
+    const lock = `${modelCatalogPath(dir)}.lock`
+    // While this process asks codex, another host saves a list stamped after this refresh began; then the lock
+    // is held, so this refresh folds over that list ("fresher", it stands) but cannot write.
+    const run = vi.fn<DiscoveryCommandRunner>(async (command) => {
+      if (command !== 'codex') throw new ModelDiscoveryError('command-not-found')
+      writeCache(dir, codexList('gpt-7-orbit', T0 + 60_000))
+      fs.writeFileSync(lock, JSON.stringify({ pid: process.ppid, host: os.hostname(), nonce: 'other-writer' }))
+      return CODEX
+    })
+    const a = createModelCatalogMaintainer({ dataDir: dir, ttlMs: 24 * HOUR, now: () => T0, deps: { run, env: {} } })
+    const report = await a.refreshNow(['codex'])
+    expect(report.persisted).toBe(false)
+    expect(report.catalog.providers.codex?.models[0].id).toBe('gpt-7-orbit')
+    // The copy ties with the file, which holds it already: a reset must not bring it back from memory.
+    fs.rmSync(lock)
+    fs.rmSync(modelCatalogPath(dir))
+    expect(a.read().providers.codex).toBeUndefined()
+    expect(a.read().attempts.codex).toBeUndefined()
+  }, 20_000)
+
+  it('reports the caller\'s unsaved lists under an interrupted refresh, and writes nothing', async () => {
+    const dir = tempDir()
+    const unsaved = {
+      providers: { codex: { updatedAt: new Date(T0).toISOString(), source: 'codex-debug-models' as const, models: [{ id: 'gpt-7-nova' }] } },
+      attempts: {},
+    }
+    const { deps } = cliDeps({ agy: new ModelDiscoveryError('aborted') })
+    const report = await refreshModelCatalog({ dataDir: dir, kinds: ['antigravity'], deps, now: () => T0 + 60_000, unsaved })
+    expect(report.catalog.providers.codex?.models).toEqual([{ id: 'gpt-7-nova' }])
+    expect(fs.existsSync(modelCatalogPath(dir))).toBe(false)
+  })
 })

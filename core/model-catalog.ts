@@ -263,49 +263,62 @@ const outranks = (a: ProviderModelCatalog | undefined, b: ProviderModelCatalog |
   a?.source === 'anthropic-models-api' && b?.source === 'claude-local-settings'
 
 /**
- * Which of one provider's unsaved entries stand over the file's: an unsaved entry wins unless the file's is
- * newer — another host's refresh, or this process's own once the file is writable again. A file stamp beyond
- * `CLOCK_SKEW_MS` ahead counts for nothing here either. As in `applyOutcomes`, an Anthropic API listing and
- * Claude Code's local settings never trade places by age, in either direction: an unsaved listing stands over
- * settings another host saved later, exactly as a saved listing would have stood over that host's refresh.
- * One rule for `withUnsaved` (what is used) and `pruneSuperseded` (what is forgotten), so they cannot disagree.
+ * Which of an unsaved entry and the file's entry for the same provider is current. `unsaved`: it is newer, or
+ * the file has nothing that counts — another host's refresh, or this process's own once the file is writable
+ * again, is what makes the file current. `file`: the file holds an entry that counts and is at least as new.
+ * `neither`: no stamp on either side counts, as when the clock has stepped back past this process's own stamp;
+ * the entry is not used then, but nothing superseded it either.
+ *
+ * Stamps beyond `CLOCK_SKEW_MS` ahead count for nothing, on both sides. As in `applyOutcomes`, an Anthropic API
+ * listing and Claude Code's local settings never trade places by age, in either direction: an unsaved listing
+ * stands over settings another host saved later, exactly as a saved listing would have stood over that host's
+ * refresh. One rule for `withUnsaved` (what is used) and `pruneSuperseded` (what is forgotten), so they cannot
+ * disagree: an entry is used only when `unsaved`, and forgotten only when `file`.
  */
-function unsavedWins(view: ModelCatalogView, unsaved: UnsavedCatalog, kind: DiscoverableProviderKind, time: number) {
+type Current = 'unsaved' | 'file' | 'neither'
+
+function currentEntries(view: ModelCatalogView, unsaved: UnsavedCatalog, kind: DiscoverableProviderKind, time: number) {
   const stamp = (timestamp: string | undefined) => {
     const at = Date.parse(timestamp ?? '')
     return Number.isFinite(at) && at <= time + CLOCK_SKEW_MS ? at : -Infinity
+  }
+  const byAge = (mine: string, theirs: string | undefined): Current => {
+    if (stamp(mine) > stamp(theirs)) return 'unsaved'
+    return stamp(theirs) !== -Infinity && stamp(theirs) >= stamp(mine) ? 'file' : 'neither'
   }
   const list = unsaved.providers[kind]
   const saved = view.providers[kind]
   const attempt = unsaved.attempts[kind]
   return {
-    list: list !== undefined
-      && (outranks(list, saved) || (!outranks(saved, list) && stamp(list.updatedAt) > stamp(saved?.updatedAt))),
-    attempt: attempt !== undefined && stamp(attempt.at) > stamp(view.attempts[kind]?.at),
+    list: list === undefined ? undefined
+      : outranks(list, saved) ? 'unsaved' : outranks(saved, list) ? 'file' : byAge(list.updatedAt, saved?.updatedAt),
+    attempt: attempt === undefined ? undefined : byAge(attempt.at, view.attempts[kind]?.at),
   }
 }
 
-/** `view` with each unsaved entry that wins (`unsavedWins`) laid over the file's. */
+/** `view` with each unsaved entry that is current (`currentEntries`) laid over the file's. */
 function withUnsaved(view: ModelCatalogView, unsaved: UnsavedCatalog, time: number): ModelCatalogView {
   const merged: ModelCatalogView = { providers: { ...view.providers }, attempts: { ...view.attempts }, ttlMs: view.ttlMs }
   for (const kind of DISCOVERABLE_PROVIDER_KINDS) {
-    const wins = unsavedWins(view, unsaved, kind, time)
-    if (wins.list) merged.providers[kind] = unsaved.providers[kind]
-    if (wins.attempt) merged.attempts[kind] = unsaved.attempts[kind]
+    const current = currentEntries(view, unsaved, kind, time)
+    if (current.list === 'unsaved') merged.providers[kind] = unsaved.providers[kind]
+    if (current.attempt === 'unsaved') merged.attempts[kind] = unsaved.attempts[kind]
   }
   return merged
 }
 
 /**
- * Forgets each unsaved entry the file has superseded (it no longer wins: `unsavedWins`). Kept, it would come
- * back the moment the newer file entry went away — a deleted or damaged cache file — and the next write would
- * save the stale list over everyone's. Mutates `unsaved`; a maintainer calls it whenever it reads the file.
+ * Forgets each unsaved entry the file has superseded: one the file's own entry beats (`currentEntries` says
+ * `file`). Kept, it would come back the moment that entry went away — a deleted or damaged cache file — and the
+ * next write would save the stale list over everyone's. Never an entry the file has nothing against: a clock
+ * stepping back hides it for a while, and it returns when the clock catches up. Mutates `unsaved`; a maintainer
+ * calls it whenever it reads the file.
  */
 function pruneSuperseded(unsaved: UnsavedCatalog, view: ModelCatalogView, time: number): void {
   for (const kind of DISCOVERABLE_PROVIDER_KINDS) {
-    const wins = unsavedWins(view, unsaved, kind, time)
-    if (!wins.list) delete unsaved.providers[kind]
-    if (!wins.attempt) delete unsaved.attempts[kind]
+    const current = currentEntries(view, unsaved, kind, time)
+    if (current.list === 'file') delete unsaved.providers[kind]
+    if (current.attempt === 'file') delete unsaved.attempts[kind]
   }
 }
 
@@ -397,7 +410,7 @@ export interface ModelCatalogMaintainerOptions {
 export interface ModelCatalogMaintainer {
   /**
    * The cached catalog as it is on disk now — another host's refresh included — plus any list this
-   * process fetched but could not save, until a write saves it or the file holds a newer one.
+   * process fetched but could not save, until a write saves it or the file holds one that supersedes it.
    */
   read(): ModelCatalogView
   /** The providers a refresh would ask now. See `createModelCatalogMaintainer()` for the rule. */
@@ -422,7 +435,7 @@ export interface ModelCatalogMaintainer {
  * refreshes fold over it as they would over a saved list (a failure or a missing source leaves it in place),
  * and the next one that writes the file saves it too; only then is it dropped from memory. It is dropped
  * earlier for a provider whose file entry supersedes it (`pruneSuperseded`, at every read): kept, it would
- * resurface when that newer entry disappeared, and be written back over everyone's.
+ * resurface when that entry disappeared, and be written back over everyone's.
  */
 export function createModelCatalogMaintainer(options: ModelCatalogMaintainerOptions): ModelCatalogMaintainer {
   const ttlMs = options.ttlMs === undefined ? modelCatalogTtlMs() : options.ttlMs

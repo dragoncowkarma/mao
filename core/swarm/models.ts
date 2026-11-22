@@ -142,15 +142,16 @@ function agyStem(model: string, catalog?: ModelCatalogSnapshot): string | undefi
  * lists for the stem — Neon and Hydrogen reach `xhigh`, Argon and Flash `high`, an unknown custom Gemini
  * `high` — and travels as the slug's suffix, never as an `--effort` flag.
  *
- * A custom Gemini id names its own stem: it is never re-aliased (`custom:gemini-3-pro` stays Gemini 3 Pro,
- * where the prose tag means Argon), only re-suffixed with the role's level.
+ * A custom Gemini id written as a slug names its own stem: it is never re-aliased (`custom:gemini-3-pro`
+ * stays Gemini 3 Pro, where the prose tag means Argon), only re-suffixed with the role's level. Prose such as
+ * `custom:gemini flash` is no slug agy lists, so it resolves through the alias table first, as before.
  */
 export function resolveAgyModel(
   model: string, reasoning: string, allowCustom = false, catalog?: ModelCatalogSnapshot,
 ): string {
-  let stem = allowCustom && /^gemini[- ]/i.test(model.trim())
-    ? agyKey(model).replace(AGY_EFFORT_SUFFIX, '')
-    : agyStem(model, catalog)
+  const slug = allowCustom && /^gemini-\S*$/i.test(model.trim())
+  let stem = slug ? agyKey(model).replace(AGY_EFFORT_SUFFIX, '') : agyStem(model, catalog)
+  if (!stem && allowCustom && /^gemini[- ]/i.test(model.trim())) stem = agyKey(model).replace(AGY_EFFORT_SUFFIX, '')
   if (!stem || !eligibleAgy(stem)) stem = AGY_FALLBACK_STEM
   return `${stem}-${resolveReasoning(reasoning, agyStemEfforts(stem, catalog) ?? REASONING_LADDER.slice(0, 3))}`
 }

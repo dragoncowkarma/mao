@@ -108,6 +108,20 @@ try {
     const missing = cli(['providers', 'refresh-models', '--provider', 'agy'])
     assert.equal(missing.status, 1)
     assert.match(missing.stdout, /Antigravity \(agy\): refresh failed — the CLI is not installed or not on PATH/)
+    // No Claude source here (no key, no settings): the built-in list is the answer, not a failure.
+    const noSource = cli(['providers', 'refresh-models', '--provider', 'claude'])
+    assert.equal(noSource.status, 0, noSource.stderr)
+    assert.match(noSource.stdout, /Claude: no Anthropic API key or Claude model setting was found/)
+    if (process.getuid?.() !== 0) {
+      // An unwritable data directory: the fetched list is reported, the failed save makes the command fail.
+      const readOnly = path.join(root, 'read-only-data')
+      fs.mkdirSync(readOnly, { mode: 0o555 })
+      const unsaved = spawnSync(node, [bundle, 'providers', 'refresh-models', '--provider', 'codex'],
+        { cwd: repo, env: { ...env, MAO_DATA_DIR: readOnly }, encoding: 'utf8', timeout: 15_000 })
+      assert.equal(unsaved.status, 1, unsaved.stderr)
+      assert.match(unsaved.stdout, /could not be saved to model-catalog\.json/)
+      fs.chmodSync(readOnly, 0o755)
+    }
     const before = fs.readFileSync(catalogFile, 'utf8')
     const unknown = cli(['providers', 'refresh-models', '--provider', 'gemini'])
     assert.equal(unknown.status, 1)

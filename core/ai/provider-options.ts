@@ -220,8 +220,8 @@ export interface ProviderModelCatalog {
  */
 export const MODEL_CATALOG_FAILURES = [
   'command-not-found', 'command-failed', 'command-timeout', 'output-too-large', 'parse-failed', 'no-models',
-  'unauthorized', 'http-error', 'network-error', 'request-timeout', 'no-source', 'kept-api-list', 'aborted',
-  'unexpected-error',
+  'unauthorized', 'http-error', 'network-error', 'request-timeout', 'no-source', 'kept-cached-list', 'kept-api-list',
+  'aborted', 'unexpected-error',
 ] as const
 export type ModelCatalogFailure = (typeof MODEL_CATALOG_FAILURES)[number]
 
@@ -238,6 +238,7 @@ export const MODEL_CATALOG_FAILURE_TEXT: Readonly<Record<ModelCatalogFailure, st
   'network-error': 'the Anthropic API could not be reached',
   'request-timeout': 'the Anthropic API did not answer in time',
   'no-source': 'no Anthropic API key or Claude model setting was found, so the built-in list stays in use',
+  'kept-cached-list': 'no Anthropic API key or Claude model setting was found here, so the cached list stays in use',
   'kept-api-list': 'only Claude Code\'s model settings are available here, so the Anthropic API listing stays in use',
   aborted: 'the refresh was interrupted',
   'unexpected-error': 'an unexpected error occurred',

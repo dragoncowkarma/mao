@@ -338,8 +338,18 @@ describe('review follow-ups (#140)', () => {
       .toBe('gemini-3-pro-high')
     expect(modelArg(buildAiArgv({ ai: 'antigravity', model: 'gemini-3-pro', reasoning: 'high' }, 'p', false)))
       .toBe('gemini-4-argon-high')
-    expect(modelArg(buildAiArgv({ ai: 'antigravity', model: 'custom:Gemini 3.6 Flash', reasoning: 'low' }, 'p', false)))
+    expect(modelArg(buildAiArgv({ ai: 'antigravity', model: 'custom:gemini-3.6-flash', reasoning: 'low' }, 'p', false)))
       .toBe('gemini-3.6-flash-low')
+  })
+
+  it('still reads custom agy prose through the alias table: no agy slug is spelled with spaces', () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const argv = (model: string, reasoning: string) =>
+      modelArg(buildAiArgv({ ai: 'antigravity', model, reasoning }, 'p', false))
+    expect(argv('custom:Gemini 3.6 Flash', 'low')).toBe('gemini-3.8-flash-low')
+    expect(argv('custom:gemini flash', 'xhigh')).toBe('gemini-3.8-flash-high')
+    expect(argv('custom:gemini 9 ultra', 'high')).toBe('gemini-9-ultra-high')
+    expect(argv('custom:gemini pro orchestrator neon', 'high')).toBe('gemini-3.8-flash-high')
   })
 
   it('dispatches a catalog model listed without levels at max at most', () => {

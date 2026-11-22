@@ -186,11 +186,14 @@ describe('refreshing', () => {
 
   it('keeps a list another process stored after this refresh began', async () => {
     const dir = tempDir()
-    const fresher = { updatedAt: '2026-11-22T00:01:00.000Z', source: 'codex-debug-models', models: [{ id: 'gpt-7-nova-2' }] }
+    const fresher = { updatedAt: '2026-11-22T00:01:00.000Z', source: 'codex-debug-models',
+      models: [{ id: 'gpt-7-nova-2' }, { id: 'gpt-7-nova-3' }] }
     writeCache(dir, { providers: { codex: fresher } })
     const { deps } = cliDeps({ codex: CODEX })
-    await refreshModelCatalog({ dataDir: dir, kinds: ['codex'], deps, now: () => T0 })
+    const report = await refreshModelCatalog({ dataDir: dir, kinds: ['codex'], deps, now: () => T0 })
     expect(readModelCatalog(dir).providers.codex).toEqual(fresher)
+    // The report counts the list in use, not the one this refresh fetched and discarded.
+    expect(report.results).toEqual([{ kind: 'codex', outcome: 'updated', models: 2 }])
   })
 
   it('records no "no source here" attempt over a list another host fetched', async () => {
@@ -200,7 +203,11 @@ describe('refreshing', () => {
     writeCache(dir, { providers: { claude: api }, attempts: { claude: fetched } })
     const { deps } = cliDeps({}, {})
     const report = await refreshModelCatalog({ dataDir: dir, kinds: ['claude'], deps, now: () => T0 })
-    expect(report.results).toEqual([{ kind: 'claude', outcome: 'static', reason: 'no-source', models: 0 }])
+    // Reported as what stays in use — the cached list — never "the built-in list".
+    expect(report.results).toEqual([{ kind: 'claude', outcome: 'static', reason: 'kept-cached-list', models: 0 }])
+    expect(describeModelCatalogRefresh(report)).toEqual([
+      'Claude: no Anthropic API key or Claude model setting was found here, so the cached list stays in use',
+    ])
     expect(readModelCatalog(dir).attempts.claude).toEqual(fetched)
     expect(describeModelCatalog(readModelCatalog(dir)).join('\n')).not.toContain('built-in list stays in use')
   })

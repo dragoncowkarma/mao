@@ -328,9 +328,11 @@ Swarm tag grammar, identical for `Worker`, `Reviewer` and `Maintainer`:
   Unknown models warn and use defaults. Custom agy models must still be eligible Gemini
   (`isEligibleAgyStem`: no foreign family, no orchestrator) to preserve family separation, refreshed
   lists included. Unknown AIs are rejected before launch.
-- A `custom:` model is never re-aliased: `custom:claude-opus-5` runs Opus 5 although the prose `opus 5`
-  now means the newest Opus, and `custom:gemini-3-pro` keeps its stem where the prose means Argon; agy
-  still receives the role's level as the slug suffix. Proof: `core/swarm/models.test.ts`.
+- A `custom:` model written as an id is never re-aliased: `custom:claude-opus-5` runs Opus 5 although
+  the prose `opus 5` now means the newest Opus, and `custom:gemini-3-pro` keeps its stem where the prose
+  means Argon (agy still gets the role's level as the slug suffix). Custom agy prose that no slug spells,
+  such as `custom:gemini flash` or `custom:neon`, still resolves through the alias table. Proof:
+  `core/swarm/models.test.ts`.
 - Initial Worker retains its requested effort; Reviewer and `worker_revise` use `medium`, Maintainer
   `low`. A Reviewer receives the PR description and at most 50,000 diff characters, with a truncation
   notice; it can inspect omitted changes.

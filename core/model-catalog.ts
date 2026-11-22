@@ -204,7 +204,8 @@ interface AppliedOutcomes {
  *   for the host with one to refresh, and reports `static`/`kept-api-list` rather than a refresh.
  * - `static` (no source here) and failures leave the entry alone. Stale is better than empty, and the
  *   built-in tables cover what the cache does not. A `static` attempt is not even recorded over a cached
- *   list: "this host has no source" says nothing about a list another host fetched.
+ *   list — "this host has no source" says nothing about a list another host fetched — and is reported as
+ *   `kept-cached-list`.
  * - A record stamped after this refresh began belongs to another process that finished later; it stands.
  *   One stamped beyond `CLOCK_SKEW_MS` ahead is a wrong clock or a hand edit and stands for nothing, or a
  *   single bad timestamp would freeze the provider's list until the wall clock caught up.
@@ -227,18 +228,21 @@ function applyOutcomes(current: ModelCatalogView, outcomes: readonly KindOutcome
       return { kind, outcome: 'failed', reason: outcome.failure, models: 0 }
     }
     if (outcome.result.kind === 'static') {
-      if (!next.providers[kind]) record(kind, { at, outcome: 'static', reason: outcome.result.reason })
+      // A list another host fetched is what stays in use, not the built-in one: say that, record nothing.
+      if (next.providers[kind]) return { kind, outcome: 'static', reason: 'kept-cached-list', models: 0 }
+      record(kind, { at, outcome: 'static', reason: outcome.result.reason })
       return { kind, outcome: 'static', reason: outcome.result.reason, models: 0 }
     }
     const existing = next.providers[kind]
     if (existing?.source === 'anthropic-models-api' && outcome.result.source === 'claude-local-settings') {
       return { kind, outcome: 'static', reason: 'kept-api-list', models: 0 }
     }
-    if (!isLater(existing?.updatedAt)) {
-      next.providers[kind] = { updatedAt: at, source: outcome.result.source, models: outcome.result.models }
-    }
+    // A list another process stored after this refresh began is at least as fresh: it stays, and the
+    // report counts what is actually in use.
+    const fresher = existing && isLater(existing.updatedAt) ? existing : undefined
+    if (!fresher) next.providers[kind] = { updatedAt: at, source: outcome.result.source, models: outcome.result.models }
     record(kind, { at, outcome: 'updated' })
-    return { kind, outcome: 'updated', models: outcome.result.models.length }
+    return { kind, outcome: 'updated', models: (fresher ?? outcome.result).models.length }
   })
   return { catalog: next, results }
 }

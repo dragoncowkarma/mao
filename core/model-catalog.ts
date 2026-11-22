@@ -268,7 +268,8 @@ const outranks = (a: ProviderModelCatalog | undefined, b: ProviderModelCatalog |
  * this process's own write of this very entry. `neither`: this process's own stamp does not count, as when the
  * clock has stepped back past it. Such an entry cannot be compared with anything — a list another host saved
  * meanwhile looks exactly like the older list this one replaced — so it is not used, and not forgotten either:
- * it is current again once the clock catches up.
+ * it is current again once the clock catches up, unless this process refreshes that provider again meanwhile
+ * (the maintainer's run() replaces it then: a later refresh of its own is newer whatever the clock says).
  *
  * Stamps beyond `CLOCK_SKEW_MS` ahead count for nothing, on both sides. As in `applyOutcomes`, an Anthropic API
  * listing and Claude Code's local settings never trade places by age, in either direction: an unsaved listing
@@ -495,17 +496,26 @@ export function createModelCatalogMaintainer(options: ModelCatalogMaintainerOpti
         const wait = result.outcome === 'failed' ? Math.min(retryMs, ttlMs ?? retryMs) : (ttlMs ?? retryMs)
         notBefore.set(result.kind, time + wait)
       }
-      // An interrupted refresh wrote nothing and changes nothing here. A saved one needs nothing here either:
-      // its write folded in every unsaved entry that was current, so those now tie with the file and the read
-      // below forgets them, while one whose stamp did not count yet (`neither`) was not written and stays.
-      if (attempted.length > 0 && !report.persisted) {
-        // Still unwritable: the report's catalog (file, earlier unsaved lists, this refresh) is in use now.
-        for (const result of attempted) {
-          const list = report.catalog.providers[result.kind]
-          if (result.outcome === 'updated' && list) unsaved.providers[result.kind] = list
-          const attempt = report.catalog.attempts[result.kind]
-          if (attempt) unsaved.attempts[result.kind] = attempt
+      // An interrupted refresh wrote nothing and changes nothing here. Whether a result recorded an attempt is
+      // `applyOutcomes`' rule: everything but `kept-cached-list` and `kept-api-list`, which leave the attempt as is.
+      const recorded = (result: ModelCatalogRefreshResult) =>
+        result.reason !== 'kept-cached-list' && result.reason !== 'kept-api-list'
+      for (const result of attempted) {
+        if (report.persisted) {
+          // Saved. Its write folded in every unsaved entry that was current, so those now tie with the file and
+          // the read below forgets them; one whose stamp does not count yet (`neither`) was not written and stays.
+          // Except for this refresh's own provider: whatever this process held for it, even an entry the clock
+          // cannot judge, came before this refresh, and the file now holds what this refresh produced.
+          if (result.outcome === 'updated') delete unsaved.providers[result.kind]
+          if (recorded(result)) delete unsaved.attempts[result.kind]
+          continue
         }
+        // Still unwritable: the report's catalog (file, earlier unsaved lists, this refresh) is in use now. Only
+        // what this refresh produced replaces what memory holds: a list it fetched, an attempt it recorded.
+        const list = report.catalog.providers[result.kind]
+        if (result.outcome === 'updated' && list) unsaved.providers[result.kind] = list
+        const attempt = report.catalog.attempts[result.kind]
+        if (recorded(result) && attempt) unsaved.attempts[result.kind] = attempt
       }
       // Whatever the path, the report shows what `read()` returns now. That read also forgets every unsaved entry
       // the file now holds or supersedes — a refresh sees the file too, not only an explicit read.

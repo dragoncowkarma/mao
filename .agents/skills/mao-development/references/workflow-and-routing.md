@@ -120,7 +120,7 @@ listed is offered only at the levels it listed: picker, listing and Swarm all re
   Anthropic API listing and local settings never trade places by age); once the process reads one, it forgets
   its own, so a deleted or damaged cache file cannot bring the stale list back. While the clock is behind the
   list's own stamp, nothing can be compared with it, so it is only hidden, and not written, until the clock
-  catches up.
+  catches up — unless this process refreshes that provider again meanwhile, which replaces it.
 - Due: a list missing or older than the TTL (24 h; `MAO_MODEL_CATALOG_TTL_HOURS`, `0` = manual only),
   unless this process tried it within the TTL, or within an hour after a failure. Another host's recent
   failure counts too, except `command-not-found` (a Dock-launched GUI's PATH lacks the CLIs).

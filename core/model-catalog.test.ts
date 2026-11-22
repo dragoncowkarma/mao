@@ -695,6 +695,61 @@ describe('an unsaved list a newer saved one replaced (PR #141 follow-up review)'
     expect(readModelCatalog(dir).providers.codex?.models[0].id).toBe('gpt-7-nova')
   })
 
+  it('lets its own later refresh of that provider replace what the clock still hides, list and attempt', async () => {
+    const dir = blockedDir()
+    let now = T0
+    let codex: string | ModelDiscoveryError = new ModelDiscoveryError('command-timeout')
+    const run = vi.fn<DiscoveryCommandRunner>(async (command) => {
+      if (command === 'agy') return AGY
+      if (command !== 'codex') throw new ModelDiscoveryError('command-not-found')
+      if (codex instanceof ModelDiscoveryError) throw codex
+      return codex
+    })
+    const a = createModelCatalogMaintainer({ dataDir: dir, ttlMs: 24 * HOUR, now: () => now, deps: { run, env: {} } })
+    // At T0: a list, then a failed attempt, neither of which can be saved.
+    codex = CODEX
+    await a.refreshNow(['codex'])
+    codex = new ModelDiscoveryError('command-timeout')
+    await a.refreshNow(['codex'])
+    // The clock steps back an hour; this process refreshes codex again, and this time saves the result.
+    now = T0 - HOUR
+    unblock(dir)
+    codex = JSON.stringify({ models: [{ slug: 'gpt-7-orbit', visibility: 'list', priority: 1, supported_reasoning_levels: [{ effort: 'low' }] }] })
+    expect((await a.refreshNow(['codex'])).persisted).toBe(true)
+    // Once the clock catches up, the older hidden list and attempt must not come back over it, nor be saved.
+    now = T0 + 60_000
+    expect(a.read().providers.codex?.models[0].id).toBe('gpt-7-orbit')
+    expect(a.read().attempts.codex).toEqual({ at: new Date(T0 - HOUR).toISOString(), outcome: 'updated' })
+    await a.refreshNow(['antigravity'])
+    expect(readModelCatalog(dir).providers.codex?.models[0].id).toBe('gpt-7-orbit')
+    expect(readModelCatalog(dir).attempts.codex?.outcome).toBe('updated')
+  })
+
+  it('keeps a hidden attempt with its list when a refresh it could not write recorded no attempt', async () => {
+    const dir = tempDir()
+    const at = (time: number) => new Date(time).toISOString()
+    writeCache(dir, {
+      providers: { claude: { updatedAt: at(T0 - 2 * HOUR), source: 'claude-local-settings', models: [{ id: 'claude-old-1' }] } },
+      attempts: { claude: { at: at(T0 - 2 * HOUR), outcome: 'updated' } },
+    })
+    const lock = `${modelCatalogPath(dir)}.lock`
+    fs.writeFileSync(lock, JSON.stringify({ pid: process.ppid, host: os.hostname(), nonce: 'other-writer' }))
+    const env: NodeJS.ProcessEnv = { ANTHROPIC_MODEL: 'claude-fable-5-2' }
+    let now = T0
+    const a = createModelCatalogMaintainer({ dataDir: dir, ttlMs: 24 * HOUR, now: () => now, deps: { run: cliDeps({}).run, env } })
+    expect((await a.refreshNow(['claude'])).persisted).toBe(false)
+    // An hour back, the source is gone: the file's list stands (kept-cached-list), and no attempt is recorded...
+    now = T0 - HOUR
+    delete env.ANTHROPIC_MODEL
+    expect((await a.refreshNow(['claude'])).results)
+      .toEqual([{ kind: 'claude', outcome: 'static', reason: 'kept-cached-list', models: 0 }])
+    fs.rmSync(lock)
+    // ...so once the clock catches up, the hidden list returns with its own attempt, not the file's.
+    now = T0 + 60_000
+    expect(a.read().providers.claude?.models).toEqual([{ id: 'claude-fable-5-2' }])
+    expect(a.read().attempts.claude).toEqual({ at: at(T0), outcome: 'updated' })
+  }, 30_000)
+
   it('forgets a copy of a fresher saved list a refresh could not write, as soon as it is recorded', async () => {
     const dir = tempDir()
     const lock = `${modelCatalogPath(dir)}.lock`

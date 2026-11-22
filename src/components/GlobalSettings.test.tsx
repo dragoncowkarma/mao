@@ -1,9 +1,10 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 import GlobalSettings from './GlobalSettings'
 import { createElectronApiStub } from '../test/electron-api-stub'
 import type { AiProviderConfig } from '../../core/ai/types'
+import type { ModelCatalogView } from '../../core/ai/provider-options'
 
 /** What `MaoApp.saveProviders` resolves with once the write lands. Cast past the stub's throw-only type. */
 const echoSave = (async (providers: AiProviderConfig[]) => providers) as never
@@ -372,5 +373,99 @@ describe('GlobalSettings design system selector', () => {
 
     await user.click(dismiss)
     expect(onDismiss).toHaveBeenCalledTimes(1)
+  })
+})
+
+/**
+ * Issue #140: the pickers merge the refreshed model catalog over the built-in tables, the pane says where
+ * each list came from, and a manual refresh re-reads every CLI without ever showing raw error text.
+ */
+describe('GlobalSettings model catalog', () => {
+  const codexCli: AiProviderConfig = { id: 'codex', name: 'Codex runner', kind: 'cli', command: 'codex', providerKindId: 'codex' }
+  const refreshed: ModelCatalogView = {
+    providers: { codex: { updatedAt: '2026-11-22T00:00:00.000Z', source: 'codex-debug-models',
+      models: [{ id: 'gpt-7-nova', efforts: ['low', 'medium', 'high'] }] } },
+    attempts: {
+      codex: { at: '2026-11-22T00:00:00.000Z', outcome: 'updated' },
+      antigravity: { at: '2026-11-22T00:00:00.000Z', outcome: 'failed', reason: 'command-not-found' },
+    },
+    ttlMs: 86_400_000,
+  }
+
+  it('offers a model only the refreshed catalog knows, beside the built-in ones', async () => {
+    const stub = createElectronApiStub()
+    stub.listProviders.mockResolvedValue([codexCli])
+    stub.getModelCatalog.mockResolvedValue(refreshed)
+
+    render(<GlobalSettings theme="system" onThemeChange={() => {}} />)
+
+    expect(await screen.findByRole('option', { name: 'gpt-7-nova' })).toBeInTheDocument()
+    expect(screen.getByRole('option', { name: 'gpt-6.2-sol' })).toBeInTheDocument()
+    expect(screen.getByText(/Codex: 1 model\(s\), refreshed/)).toBeInTheDocument()
+    expect(screen.getByText('Antigravity (agy): built-in list — last refresh failed: the CLI is not installed or not on PATH'))
+      .toBeInTheDocument()
+  })
+
+  it('keeps a saved model the catalog no longer lists visible and selected', async () => {
+    const stub = createElectronApiStub()
+    stub.listProviders.mockResolvedValue([{ ...codexCli, providerKindId: 'claude', command: 'claude', model: 'claude-opus-5' }])
+
+    render(<GlobalSettings theme="system" onThemeChange={() => {}} />)
+
+    const retired = await screen.findByRole('option', { name: 'claude-opus-5 (not in catalog)' })
+    expect((retired as HTMLOptionElement).selected).toBe(true)
+  })
+
+  it('refreshes on request and shows each provider\'s outcome', async () => {
+    const stub = createElectronApiStub()
+    stub.listProviders.mockResolvedValue([codexCli])
+    stub.api.ai.refreshModelCatalog.mockImplementation((async () => ({
+      results: [
+        { kind: 'antigravity', outcome: 'failed', reason: 'command-not-found', models: 0 },
+        { kind: 'codex', outcome: 'updated', models: 1 },
+      ],
+      catalog: refreshed,
+      persisted: true,
+    })) as never)
+    const user = userEvent.setup()
+
+    render(<GlobalSettings theme="system" onThemeChange={() => {}} />)
+    await screen.findByDisplayValue('Codex runner')
+    expect(screen.queryByRole('option', { name: 'gpt-7-nova' })).toBeNull()
+
+    await user.click(screen.getByRole('button', { name: 'Refresh model lists' }))
+
+    expect(await screen.findByRole('option', { name: 'gpt-7-nova' })).toBeInTheDocument()
+    expect(screen.getByRole('status')).toHaveTextContent('Model lists refreshed with problems')
+    expect(stub.api.ai.refreshModelCatalog).toHaveBeenCalledTimes(1)
+  })
+
+  it('says a refresh failed in fixed words, never the rejection\'s own text', async () => {
+    const stub = createElectronApiStub()
+    stub.api.ai.refreshModelCatalog.mockRejectedValue(new Error('spawn codex at /home/me with sk-ant-SECRET'))
+    const user = userEvent.setup()
+
+    render(<GlobalSettings theme="system" onThemeChange={() => {}} />)
+    await user.click(await screen.findByRole('button', { name: 'Refresh model lists' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Could not refresh the model lists.')
+    expect(document.body.textContent).not.toContain('sk-ant-SECRET')
+    expect(screen.getByRole('button', { name: 'Refresh model lists' })).toBeEnabled()
+  })
+
+  it('narrows a preset\'s effort choices to the chosen model\'s levels', async () => {
+    const stub = createElectronApiStub()
+    stub.listProviders.mockResolvedValue([{
+      ...codexCli, presets: [{ id: 'p1', model: 'gpt-6-luna' }, { id: 'p2', model: 'gpt-6.2-sol' }], selectedPresetId: 'p1',
+    }])
+    const user = userEvent.setup()
+
+    render(<GlobalSettings theme="system" onThemeChange={() => {}} />)
+    await user.click(await screen.findByRole('button', { name: /Model \/ Effort presets/ }))
+
+    const [luna, sol] = screen.getAllByRole('combobox').filter((select) =>
+      within(select).queryByRole('option', { name: 'Effort: —' }) && within(select).queryByRole('option', { name: 'max' }))
+    expect(within(luna).queryByRole('option', { name: 'ultra' })).toBeNull()
+    expect(within(sol).getByRole('option', { name: 'ultra' })).toBeInTheDocument()
   })
 })

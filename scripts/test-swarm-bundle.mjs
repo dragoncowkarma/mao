@@ -11,8 +11,11 @@ const node = process.execPath
 const git = execFileSync('which', ['git'], { encoding: 'utf8' }).trim()
 const bin = path.join(root, 'bin')
 const repo = path.join(root, 'repo')
+// The model-catalog cache lives in the CLI data directory; keep it inside the fixture, never the operator's.
+const dataDir = path.join(root, 'data')
+const catalogFile = path.join(dataDir, 'model-catalog.json')
 const env = { ...process.env, PATH: bin, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null',
-  GH_REPO: 'wrong/wrong', GH_HOST: 'wrong.example' }
+  GH_REPO: 'wrong/wrong', GH_HOST: 'wrong.example', MAO_DATA_DIR: dataDir, MAO_MODEL_CATALOG_TTL_HOURS: '' }
 const bundle = path.join(root, 'mao.cjs')
 const run = (command, args, options = {}) => execFileSync(command, args,
   { cwd: repo, env, encoding: 'utf8', timeout: 15_000, ...options })
@@ -32,10 +35,16 @@ try {
     if(a[0]==='api' && a.includes('--include')) {
       console.log('HTTP/2.0 200 OK\\nx-oauth-scopes: repo\\n\\n'+JSON.stringify({full_name:'acme/fixture',permissions:{push:true},has_issues:true}));
     } else if(a[0]==='api' && a[1]==='user') console.log(JSON.stringify({login:'operator'}));
-    else if(a[0]==='issue' && a[1]==='list') console.log(process.env.SWARM_SMOKE_TASK ? JSON.stringify([{number:1,title:'[Task] Fixture - large prompt',body:'[Worker: codex | Model: gpt-5.6-terra | Reasoning: high]'+ '한글'.repeat(60000)}]) : '[]');
+    else if(a[0]==='issue' && a[1]==='list') console.log(process.env.SWARM_SMOKE_TASK ? JSON.stringify([{number:1,title:'[Task] Fixture - large prompt',body:'[Worker: codex | Model: gpt-7-nova | Reasoning: ultra]'+ '한글'.repeat(60000)}]) : '[]');
     else if(a[0]==='pr' && a[1]==='list') console.log('[]');
     else process.exit(8);`)
-  executable('codex', `let input=''; process.stdin.setEncoding('utf8');
+  // `codex debug models` lists a model no built-in table knows, capped below ultra: dispatch must use both.
+  executable('codex', `if(process.argv[2]==='debug'&&process.argv[3]==='models'){
+      console.log(JSON.stringify({models:[{slug:'gpt-7-nova',visibility:'list',priority:1,
+        supported_reasoning_levels:['low','medium','high','xhigh'].map((effort)=>({effort}))}]}));
+      process.exit(0);
+    }
+    let input=''; process.stdin.setEncoding('utf8');
     process.stdin.on('data',chunk=>input+=chunk);
     process.stdin.on('end',()=>setTimeout(()=>{
       require('node:fs').writeFileSync(process.env.SWARM_SMOKE_RESULT,JSON.stringify({input,args:process.argv.slice(2)}));
@@ -53,9 +62,15 @@ try {
   run(node, [bundle, 'swarm', '--repo-root', repo, '--dry-run', '--once'])
   assert.equal(fs.existsSync(path.join(repo, '.agents')), false)
   assert.equal(fs.readFileSync(exclude, 'utf8'), before)
+  // A dry run reads the model catalog but never refreshes it: refreshing writes the cache file.
+  assert.equal(fs.existsSync(catalogFile), false)
   if (process.platform !== 'win32') {
     run(node, [bundle, 'swarm', '--repo-root', repo, '--once'])
     assert.ok(fs.existsSync(path.join(repo, '.agents', '.process_registry.json')))
+    // The real cycle refreshed what it could: codex answered, agy is not installed here.
+    const catalog = JSON.parse(fs.readFileSync(catalogFile, 'utf8'))
+    assert.deepEqual(catalog.providers.codex.models, [{ id: 'gpt-7-nova', efforts: ['low', 'medium', 'high', 'xhigh'] }])
+    assert.equal(catalog.attempts.antigravity.reason, 'command-not-found')
     run(node, [bundle, 'swarm', '--repo-root', repo, '--reset', '--once'])
     const resultFile = path.join(root, 'worker-result.json')
     run(node, [bundle, 'swarm', '--repo-root', repo, '--once'], {
@@ -64,6 +79,9 @@ try {
     const result = JSON.parse(fs.readFileSync(resultFile, 'utf8'))
     assert.ok(Buffer.byteLength(result.input) > 128 * 1024)
     assert.ok(result.args.includes('--dangerously-bypass-approvals-and-sandbox'))
+    // The Worker ran the refreshed model, its ultra request clamped to the highest level codex reported.
+    assert.equal(result.args[result.args.indexOf('--model') + 1], 'gpt-7-nova')
+    assert.ok(result.args.includes('model_reasoning_effort=xhigh'))
     assert.ok(result.args.every((arg) => !arg.includes('한글')))
     const registry = JSON.parse(fs.readFileSync(path.join(repo, '.agents', '.process_registry.json'), 'utf8'))
     const worker = registry.lifecycle_states.find((state) => state.record.role === 'worker')
@@ -86,7 +104,9 @@ try {
     clearTimeout(watchdog)
     assert.equal(code, 143, output)
   }
-  console.log('Single-bundle Swarm smoke passed: help, offline status, dry-run, once, reset, polling shutdown; no Python/source assets')
+  run(node, [bundle, 'providers', 'models'])
+  console.log('Single-bundle Swarm smoke passed: help, offline status, dry-run, once, reset, polling shutdown, '
+    + 'model catalog refresh and dispatch; no Python/source assets')
 } finally {
   fs.rmSync(root, { recursive: true, force: true })
 }

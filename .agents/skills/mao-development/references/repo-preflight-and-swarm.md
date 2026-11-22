@@ -131,9 +131,9 @@ task authorization.
 | Invocation | GitHub | Local writes | Exit |
 | --- | --- | --- | --- |
 | `mao swarm --status` | none, no origin or API lookup | none | 0 |
-| `mao swarm --dry-run --once` | reads only; binds origin; skips write probe, `core.sshCommand`/`GIT_SSH*` check | none | 0, or 1 on failure |
-| `mao swarm --once` | real dispatch and writes | runtime paths, task branches, fast-forward of a clean local `main` (`syncMain`) | 0 after owned agents complete; 1 on failure, 50-minute wait expiry or residual trees; SIGINT 130, SIGTERM 143 |
-| `mao swarm [--interval <seconds>]` | same, polling (default 30 s) | runtime paths, task branches, fast-forward of a clean local `main` (`syncMain`) | SIGINT 130, SIGTERM 143; 1 on observed failures or surviving trees |
+| `mao swarm --dry-run --once` | reads only; binds origin; skips write probe, `core.sshCommand`/`GIT_SSH*` check | none (reads the model catalog, never refreshes it) | 0, or 1 on failure |
+| `mao swarm --once` | real dispatch and writes | runtime paths, task branches, fast-forward of a clean local `main` (`syncMain`), the model-catalog cache when due | 0 after owned agents complete; 1 on failure, 50-minute wait expiry or residual trees; SIGINT 130, SIGTERM 143 |
+| `mao swarm [--interval <seconds>]` | same, polling (default 30 s) | same as `--once` | SIGINT 130, SIGTERM 143; 1 on observed failures or surviving trees |
 
 - `--dry-run` without `--once` polls forever.
 - A normal `--once` drains its owned children and records their actual terminal statuses. One monotonic
@@ -153,6 +153,11 @@ task authorization.
 - Real runs also change Git state outside runtime paths: fetch, fast-forward of a clean local `main`
   (`syncMain`), task branches (`createWorktree`), and for merged PRs `git worktree remove` plus
   `git branch -D` (`cleanupWorktree`).
+- Real cycles refresh due model lists before dispatch (`agy models`, `codex debug models`, Claude Code's
+  model settings; never an Anthropic key, since Swarm never reads `config.json`) into
+  `$MAO_DATA_DIR/model-catalog.json`, the CLI data directory, outside the target checkout. A refresh is
+  bounded, interrupted by shutdown, logged once per provider and reason, and never fails a cycle.
+  Lifecycle: [workflow-and-routing.md](workflow-and-routing.md).
 
 | `dispatch blocked`/`deferred` reason | Action |
 | --- | --- |
@@ -308,17 +313,23 @@ Swarm tag grammar, identical for `Worker`, `Reviewer` and `Maintainer`:
 
 | AI | Models and compatibility | Effort encoding |
 | --- | --- | --- |
-| `claude` | `claude-opus-5`, `claude-sonnet-5`, `claude-fable-5`, `claude-haiku-4-5`; old prose aliases normalize | `--effort`; Haiku and retained legacy no-effort ids omit it |
-| `codex` | `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`; retired/short aliases normalize | `-c model_reasoning_effort=<effort>` explicitly overrides local config |
-| `antigravity` | `gemini-4-argon`, `gemini-3.8-flash`; older Gemini aliases normalize; foreign Claude/GPT families redirect to Gemini | `-low`, `-medium`, `-high` suffix, never `--effort` |
+| `claude` | `claude-opus-5-5` (`opus`, `opus 5.5`), `claude-sonnet-5-5` (default), `claude-fable-5-2`, `claude-haiku-5-5`; every earlier generation's prose or id (`opus 5`, `claude-sonnet-5`, `fable 5`, `haiku 4.5`, …) resolves to its family's newest | `--effort`; retained legacy no-effort ids (a `custom:` Haiku 4.5) omit it |
+| `codex` | `gpt-6.2-sol` (`sol`, `6.2`), `gpt-6.2-astra` (`astra`), `gpt-6.1-terra` (default; `terra`, `6.1`), `gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-sol` (`6`), `gpt-6-luna` (`luna`), `gpt-5.6-sol/terra/luna`; retired 5.1–5.5 follow Terra, mini/spark follow Luna | `-c model_reasoning_effort=<effort>` explicitly overrides local config |
+| `antigravity` | `gemini-4-neon` (`neon`), `gemini-4-hydrogen` (`hydrogen`), `gemini-4-argon`, `gemini-3.8-flash` (default); older Gemini aliases normalize; foreign Claude/GPT families and `gemini-pro-orchestrator-*` redirect to Flash | `-low` … `-xhigh` slug suffix, never `--effort` |
 
 - The shared reasoning ladder is `low -> medium -> high -> xhigh -> max -> ultra`; English/Korean
   labels and punctuation normalize through `resolveReasoning()`. Unknown labels become `medium`.
-  Excessive levels clamp: Claude and Codex Luna at `max`, Codex Sol/Terra at `ultra`, agy at `high`.
-- `validateModelAvailability()` accepts registered aliases or explicit `custom:`/`unlisted:` models,
-  reserved Codex review ids, and `SWARM_ALLOWED_CUSTOM_MODELS` comma-separated allowlist entries.
-  Unknown models warn and use defaults. Custom agy models must still be Gemini to preserve family
-  separation. Unknown AIs are rejected before launch.
+  Excessive levels clamp to the model's ceiling: Codex Sol, Terra and Astra `ultra`; Codex Luna,
+  Claude and any unidentified (custom) model `max`; agy Neon and Hydrogen `xhigh`, Argon, Flash and
+  custom Gemini `high`. Levels a refreshed catalog reports for a model replace these.
+- `validateModelAvailability()` accepts registered aliases, models in the refreshed catalog
+  (`core/model-catalog.ts`, merged by `providerOptionsWithCatalog()`), explicit `custom:`/`unlisted:`
+  models, reserved Codex review ids, and `SWARM_ALLOWED_CUSTOM_MODELS` comma-separated allowlist entries.
+  Unknown models warn and use defaults. Custom agy models must still be eligible Gemini
+  (`isEligibleAgyStem`: no foreign family, no orchestrator) to preserve family separation, refreshed
+  lists included. Unknown AIs are rejected before launch.
+- A `custom:` model is passed through verbatim, never re-aliased: `custom:claude-opus-5` runs Opus 5
+  although the prose `opus 5` now means the newest Opus. Proof: `core/swarm/models.test.ts`.
 - Initial Worker retains its requested effort; Reviewer and `worker_revise` use `medium`, Maintainer
   `low`. A Reviewer receives the PR description and at most 50,000 diff characters, with a truncation
   notice; it can inspect omitted changes.

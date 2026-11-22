@@ -11,6 +11,8 @@ import { buildAiArgv, parseRole, resolveRoleAssignment, validateDistinctRoles } 
 import type { RoleAssignment } from './models.ts'
 import { ProcessTracker, lifecycleItemKey } from './registry.ts'
 import type { LifecycleRole, TrackedProcess } from './registry.ts'
+import { createModelCatalogMaintainer, type ModelCatalogMaintainer } from '../model-catalog.ts'
+import { MODEL_CATALOG_FAILURE_TEXT, type ModelCatalogView } from '../ai/provider-options.ts'
 
 /** Leave five minutes beyond agy's 45-minute provider timeout before forcing one-shot cleanup. */
 export const ONCE_DRAIN_TIMEOUT_MS = 50 * 60_000
@@ -146,15 +148,24 @@ export class SwarmEngine {
   private readonly blockers = new Set<string>()
   private readonly dispatchBlockers = new Map<string, string>()
   private cycles = 0
+  /** Refreshed model lists, merged over the built-in tables at dispatch. Absent: built-in tables only. */
+  readonly modelCatalog: ModelCatalogMaintainer | undefined
+  private catalogView: ModelCatalogView | undefined
+  private readonly catalogNotices = new Map<string, string>()
 
   constructor(
     readonly repoRoot: string,
     readonly options: SwarmRunOptions,
     platform?: EnginePlatform,
     private readonly spawnProcess: typeof spawn = spawn,
+    modelCatalog?: ModelCatalogMaintainer,
   ) {
     this.platform = platform ?? new SwarmPlatform(repoRoot)
     this.tracker = new ProcessTracker(path.join(repoRoot, '.agents', '.process_registry.json'))
+    // No Anthropic key here: Swarm never reads `config.json`'s providers, a credential boundary of its own
+    // (safety rail 7). Claude's list therefore comes from Claude Code's local settings or the built-in table.
+    this.modelCatalog = modelCatalog
+      ?? (options.modelCatalogDir ? createModelCatalogMaintainer({ dataDir: options.modelCatalogDir }) : undefined)
   }
 
   private log(message: string): void {
@@ -303,12 +314,47 @@ export class SwarmEngine {
     return this.shutdownSignal ? (this.shutdownSignal === 'SIGTERM' ? 143 : 130) : 0
   }
 
+  /**
+   * Refreshes due model lists, then loads the cache dispatch will use this cycle — including a list another
+   * host refreshed. Bounded by the discovery deadline and interrupted by shutdown like a poll sleep.
+   * `--dry-run` only reads: a refresh writes the cache file, and a dry run promises no local writes.
+   *
+   * Never a cycle failure. Any problem leaves the previous view (or none: the built-in tables) in place and
+   * is logged once per provider and reason, with fixed wording — discovery output can quote a credential.
+   */
+  private async syncModelCatalog(): Promise<void> {
+    if (!this.modelCatalog) return
+    try {
+      if (!this.options.dryRun) {
+        this.sleepAbort = new AbortController()
+        let report: Awaited<ReturnType<ModelCatalogMaintainer['refreshDue']>>
+        try { report = await this.modelCatalog.refreshDue(this.sleepAbort.signal) } finally { this.sleepAbort = undefined }
+        this.checkShutdown()
+        for (const result of report?.results ?? []) {
+          const notice = result.outcome === 'failed'
+            ? `Model catalog: ${result.kind} refresh failed (${MODEL_CATALOG_FAILURE_TEXT[result.reason ?? 'unexpected-error']}); dispatch keeps the cached and built-in lists`
+            : result.outcome === 'updated' ? `Model catalog: ${result.kind} refreshed (${result.models} models)` : undefined
+          if (notice && this.catalogNotices.get(result.kind) !== notice) this.log(notice)
+          this.catalogNotices.set(result.kind, notice ?? '')
+        }
+        if (report && !report.persisted) this.log('Model catalog: the refreshed lists could not be saved; this process still uses them')
+      }
+      this.catalogView = this.modelCatalog.read()
+    } catch (error) {
+      if (error instanceof ShutdownRequested) throw error
+      if (!this.catalogNotices.has('sync')) this.log('Model catalog: could not be loaded; dispatch uses the built-in lists')
+      this.catalogNotices.set('sync', 'failed')
+    }
+  }
+
   async cycle(preflightCompleted = false): Promise<number> {
     this.checkShutdown()
     if (!this.options.dryRun) {
       await this.tracker.poll()
       if (!preflightCompleted) await this.platform.assertRepoWritable()
     }
+    this.checkShutdown()
+    await this.syncModelCatalog()
     this.checkShutdown()
     this.cycles += 1
     if (this.cycles === 1 || this.cycles % 5 === 0) {
@@ -527,7 +573,7 @@ export class SwarmEngine {
     }
     let adopted = false
     try {
-      assignment = resolveRoleAssignment(raw, role)
+      assignment = resolveRoleAssignment(raw, role, this.catalogView)
       record.ai_name = assignment.ai
       record.model = assignment.model
       record.reasoning = assignment.reasoning
@@ -540,7 +586,7 @@ export class SwarmEngine {
         } else cwd = path.join(this.repoRoot, '.worktrees', String(issueNumber))
       }
       record.cwd = cwd
-      const argv = buildAiArgv(assignment, prompt, role === 'worker' || role === 'worker_revise', cwd)
+      const argv = buildAiArgv(assignment, prompt, role === 'worker' || role === 'worker_revise', cwd, this.catalogView)
       record.command = argv[0] ?? ''
       if (this.options.dryRun) { this.log(`[DRY RUN] Would dispatch ${role} ${ref} using ${assignment.ai} (${assignment.model}, ${assignment.reasoning}) in ${cwd}`); return }
       await this.platform.assertRepoWritable()

@@ -62,6 +62,21 @@ and `--dry-run` leave both the checkout and its Git metadata unchanged. `--once`
 and waits up to 50 minutes for its dispatched agents to complete. At the limit it stops owned
 groups and exits non-zero; SIGINT/SIGTERM also terminate owned groups.
 
+### Model catalog
+
+The model pickers and Swarm's role tags start from a built-in model list and merge in what each CLI
+reports itself: `agy models`, `codex debug models`, and for Claude the Anthropic Models API (with a saved
+Anthropic-format API key) or Claude Code's model settings. The result is cached in `model-catalog.json`
+in the data directory, never in `config.json`, and the GUI, `mao run` and `mao swarm` refresh it every 24
+hours (`MAO_MODEL_CATALOG_TTL_HOURS`; `0` leaves refreshing to you). A refresh only lists models — it runs
+and bills none — and a missing CLI, an offline machine or an unreadable answer keeps the cached and
+built-in lists in use. **Settings → Model catalog → Refresh model lists** refreshes on demand, as does:
+
+```bash
+node dist-cli/index.cjs providers models          # what the pickers and Swarm accept now
+node dist-cli/index.cjs providers refresh-models  # ask every CLI again (--provider codex for one)
+```
+
 ### Settings
 
 Open the app and fill in the **Settings** panel:

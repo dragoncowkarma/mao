@@ -79,6 +79,36 @@ unsupported flag to an old configuration.
 Only native Swarm prose tags use alias normalization, the reasoning ladder and model clamping in
 `core/swarm/models.ts`. Its last-unquoted-tag parser, role cost overrides, custom-model policy and
 CLI prompt transports are documented in [repo-preflight-and-swarm.md](repo-preflight-and-swarm.md).
+
+### Model catalog refresh
+
+The built-in tables in `core/ai/provider-options.ts` are the fallback; each CLI's own listing, cached,
+is merged over them by `providerOptionsWithCatalog()` (pure, so the renderer calls it too). Global
+settings offers the merged list, and Swarm accepts and clamps against it.
+
+| Provider | Source (read-only, billing-free) | Kept |
+| --- | --- | --- |
+| `antigravity` | `agy models` (`<slug>\t<name>`) | Gemini stems with their `-<effort>` suffixes; never `claude-*`/`gpt-*` or `gemini-pro-orchestrator-*` |
+| `codex` | `codex debug models` (JSON, ~840 KB: 16 MiB `maxBuffer`) | `visibility: "list"` slugs with `supported_reasoning_levels` |
+| `claude` | `GET /v1/models` with a saved Anthropic-format API key; else Claude Code's model env vars (`ANTHROPIC_MODEL`, `ANTHROPIC_DEFAULT_*_MODEL`, …); else nothing | ids with `capabilities.effort`; no source keeps the built-in list and the family aliases |
+
+- `core/ai/model-discovery.ts` runs each source: argv `execFile`, no shell, stdin closed, 60 s, output
+  capped; `fetch` with the same deadline and at most 10 pages. Failures are fixed `ModelCatalogFailure`
+  categories, never output, URLs or bodies.
+- `core/model-catalog.ts` caches in `<data dir>/model-catalog.json` (`MAO_DATA_DIR`, or Electron
+  `userData`), never in `config.json`: per-provider list, levels, `updatedAt`, last attempt. Writes take
+  the store's write lock and replace atomically. An unreadable or hand-edited file is re-validated or
+  read as empty.
+- Fail-safe: a failed, empty or unparseable answer keeps the cached list; Claude local settings never
+  replace an API listing; nothing a refresh does can stop the app, the queue or Swarm.
+- Due: a list missing or older than the TTL (24 h; `MAO_MODEL_CATALOG_TTL_HOURS`, `0` = manual only),
+  unless this process tried it within the TTL, or within an hour after a failure. Another host's recent
+  failure counts too, except `command-not-found` (a Dock-launched GUI's PATH lacks the CLIs).
+- Who refreshes: `electron/ipc.ts` and `mao run` start `startModelCatalogRefresher()` (15-minute check,
+  unref'd, stopped on quit/SIGINT); real Swarm cycles call `refreshDue()`. Never `createMaoApp()`
+  (architecture rule 5; proof: `core/shell-model-catalog.test.ts`).
+- Manual: `ai:getModelCatalog` / `ai:refreshModelCatalog` (Global settings' Refresh button) and
+  `mao providers models` / `mao providers refresh-models`.
 Swarm runs inside the CLI bundle, using active gh credentials and its own process registry; it neither
 loads the app queue nor starts through `createMaoApp()`. Its `--once` child drain has a shared 50-minute
 cap, and a latched app queue does not stop this separate engine.
@@ -217,6 +247,8 @@ config import-providers <file>  # JSON array of AiProviderConfig
 config set-theme <light|dark|system>
 config set-design <classic|crimson|console>
 config show  # secrets redacted as '[set]'
+providers models [--json]  # built-in + refreshed model lists, per provider
+providers refresh-models [--provider <antigravity|claude|codex>]  # exit 1 if one failed
 config clear-persistence-broken
 repos add <owner> <repo> [--no-auto-trigger] [--poll-interval-ms <ms>]  # preflights write access
 repos remove <owner> <repo>

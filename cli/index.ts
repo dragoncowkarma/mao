@@ -20,6 +20,18 @@ import { sameRepoRef } from '../core/repo-registry.ts'
 import { importProvidersFromFile } from '../core/provider-import.ts'
 import type { AiEffort } from '../core/ai/types.ts'
 import {
+  createModelCatalogMaintainer,
+  describeModelCatalog,
+  describeModelCatalogRefresh,
+  readModelCatalog,
+  startModelCatalogRefresher,
+} from '../core/model-catalog.ts'
+import {
+  DISCOVERABLE_PROVIDER_KINDS,
+  providerOptionsWithCatalog,
+  type DiscoverableProviderKind,
+} from '../core/ai/provider-options.ts'
+import {
   QUEUE_PERSISTENCE_BROKEN,
   type QueuedTask,
   type RepoRef,
@@ -201,6 +213,54 @@ function reportHealedFields(store: MaoApp['store'], before: StoredValueProblem[]
     if (!remaining.some((still) => still.field === problem.field)) log(describeHealedStoredValue(problem))
   }
 }
+
+// --- providers ----------------------------------------------------------------
+
+const providers = program
+  .command('providers')
+  .description('Inspect and refresh the model lists MAO offers for each AI CLI (agy, claude, codex)')
+
+providers
+  .command('models')
+  .description('Print each AI CLI\'s model list: the built-in catalog merged with the last refresh')
+  .option('--json', 'print the cached catalog and the merged model options as JSON')
+  .action((opts: { json?: boolean }) => {
+    // A read of the separate cache file (core/model-catalog.ts) — no store, no network, no CLI run.
+    const catalog = readModelCatalog(resolveDataDir())
+    if (opts.json) {
+      const options = providerOptionsWithCatalog(catalog)
+      printJson({ catalog, models: Object.fromEntries(DISCOVERABLE_PROVIDER_KINDS.map((kind) => [kind, options[kind]])) })
+      return
+    }
+    for (const line of describeModelCatalog(catalog)) console.log(line)
+  })
+
+providers
+  .command('refresh-models')
+  .description(
+    'Ask agy (`agy models`), codex (`codex debug models`) and Claude (the Anthropic Models API with a saved ' +
+      'API key, else Claude Code\'s model settings) for their current model lists and cache them. Read-only ' +
+      'and billing-free; a provider that cannot answer keeps its cached or built-in list.',
+  )
+  .option('--provider <kind>', `refresh only this provider (${DISCOVERABLE_PROVIDER_KINDS.join(', ')}); repeatable`,
+    (value: string, previous: string[] = []) => [...previous, value])
+  .action(async (opts: { provider?: string[] }) => {
+    const requested = opts.provider ?? []
+    const unknown = requested.filter((kind) => !(DISCOVERABLE_PROVIDER_KINDS as readonly string[]).includes(kind))
+    if (unknown.length > 0) {
+      throw new Error(`Unknown provider "${unknown[0]}" — expected one of: ${DISCOVERABLE_PROVIDER_KINDS.join(', ')}`)
+    }
+    const { store } = loadApp()
+    const report = await createModelCatalogMaintainer({
+      dataDir: resolveDataDir(),
+      // An Anthropic-format API provider's saved key is what lists Claude models; the store's read guard
+      // already filters entries it cannot use.
+      listProviders: () => store.get('aiProviders'),
+    }).refreshNow(requested as DiscoverableProviderKind[])
+    for (const line of describeModelCatalogRefresh(report)) log(line)
+    // Scriptable: non-zero when any requested provider could not be refreshed or the cache was not saved.
+    if (!report.persisted || report.results.some((result) => result.outcome === 'failed')) process.exitCode = 1
+  })
 
 // --- repos ------------------------------------------------------------------
 
@@ -507,6 +567,13 @@ program
     }
 
     const autoTrigger = startAutoTrigger(githubService, workflowEngine, () => store.inspect('githubRepos'))
+    // Long-running host, so it keeps the model catalog fresh too (architecture rule 5: never createMaoApp()).
+    // A fresh observation, not the boot snapshot, so an API key saved while this runs is used.
+    const modelCatalog = startModelCatalogRefresher({
+      dataDir: resolveDataDir(),
+      listProviders: () => store.inspect('aiProviders').value,
+      log: (message) => log(`model catalog: ${message}`),
+    })
     log('engine started — press Ctrl+C to stop')
 
     workflowEngine.on('change', (tasks: QueuedTask[]) => {
@@ -538,6 +605,7 @@ program
 
     process.on('SIGINT', () => {
       clearInterval(autoTrigger.handle)
+      modelCatalog.stop()
       log('shutting down')
       process.exit(0)
     })
@@ -567,7 +635,8 @@ program
       reset?: boolean
     }) => {
       try {
-        const exitCode = await runSwarm(opts)
+        // The CLI's own data directory: dispatch merges its refreshed model catalog over the built-in tables.
+        const exitCode = await runSwarm({ ...opts, modelCatalogDir: resolveDataDir() })
         process.exitCode = exitCode
       } catch (error) {
         if (error instanceof SwarmRepositoryPathError) {

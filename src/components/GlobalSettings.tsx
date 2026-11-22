@@ -1,7 +1,16 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { electronApi } from '../electron-api'
 import type { AgentStage, AiProviderConfig, ModelEffortPreset, ProviderKindId } from '../../core/ai/types'
-import { PROVIDER_OPTIONS } from '../../core/ai/provider-options'
+import {
+  DISCOVERABLE_PROVIDER_KINDS,
+  MODEL_CATALOG_FAILURE_TEXT,
+  effortOptionsForModel,
+  providerOptionsWithCatalog,
+  type DiscoverableProviderKind,
+  type ModelCatalogView,
+  type ModelOption,
+  type ProviderOptions,
+} from '../../core/ai/provider-options'
 import { DEFAULT_DESIGN_ID, DESIGN_PRESETS, type DesignId } from '../../core/design-system'
 import type { ThemePreference } from '../../core/store'
 
@@ -61,21 +70,46 @@ const PROVIDER_KIND_LABELS: Record<ProviderKindId, string> = {
   custom: 'Custom',
 }
 
+/**
+ * The catalog's models plus the one already saved when the catalog does not list it. A `<select>` whose
+ * value matches no option shows its first option instead, so a stored model a refresh no longer lists, or
+ * an earlier generation the built-in list retired, would read as "Model: default" — and a save made for any
+ * other reason would look like it kept a setting it could not even show.
+ */
+function withSelectedModel(models: readonly ModelOption[], selected: string | undefined): ModelOption[] {
+  if (!selected || models.some((model) => model.value === selected)) return [...models]
+  return [...models, { value: selected, label: `${selected} (not in catalog)` }]
+}
+
+/** One line per provider: where its list came from and when, and why the last refresh did not help. */
+function catalogStatus(kind: DiscoverableProviderKind, catalog: ModelCatalogView | undefined): string {
+  const label = PROVIDER_KIND_LABELS[kind]
+  const entry = catalog?.providers[kind]
+  const attempt = catalog?.attempts[kind]
+  const base = entry
+    ? `${label}: ${entry.models.length} model(s), refreshed ${new Date(entry.updatedAt).toLocaleString()}`
+    : `${label}: built-in list`
+  if (!attempt || attempt.outcome === 'updated') return base
+  const reason = MODEL_CATALOG_FAILURE_TEXT[attempt.reason ?? 'unexpected-error']
+  return attempt.outcome === 'failed' ? `${base} — last refresh failed: ${reason}` : `${base} — ${reason}`
+}
+
 // ─── Preset row ────────────────────────────────────────────────────────────────
 
 interface PresetRowProps {
   preset: ModelEffortPreset
-  kindId?: ProviderKindId
+  /** The kind's options with the refreshed catalog merged in; absent for a provider with no kind. */
+  kindOptions?: ProviderOptions
   isSelected: boolean
   onSelect: () => void
   onChange: (patch: Partial<ModelEffortPreset>) => void
   onRemove: () => void
 }
 
-function PresetRow({ preset, kindId, isSelected, onSelect, onChange, onRemove }: PresetRowProps) {
-  const opts = kindId ? PROVIDER_OPTIONS[kindId] : null
-  const modelOpts = opts?.models ?? []
-  const effortOpts = opts?.efforts ?? []
+function PresetRow({ preset, kindOptions, isSelected, onSelect, onChange, onRemove }: PresetRowProps) {
+  const catalogModels = kindOptions?.models ?? []
+  const modelOpts = catalogModels.length > 0 ? withSelectedModel(catalogModels, preset.model) : []
+  const effortOpts = kindOptions ? effortOptionsForModel(kindOptions, preset.model) : []
 
   const selectedModelOpt = modelOpts.find((m) => m.value === preset.model)
   const noEffort = selectedModelOpt?.noEffort ?? false
@@ -146,11 +180,13 @@ function PresetRow({ preset, kindId, isSelected, onSelect, onChange, onRemove }:
 
 interface ProviderCardProps {
   provider: AiProviderConfig
+  /** Every kind's options, refreshed catalog merged in (`providerOptionsWithCatalog`). */
+  options: Record<ProviderKindId, ProviderOptions>
   onUpdate: (patch: Partial<AiProviderConfig>) => void
   onRemove: () => void
 }
 
-function ProviderCard({ provider: p, onUpdate, onRemove }: ProviderCardProps) {
+function ProviderCard({ provider: p, options, onUpdate, onRemove }: ProviderCardProps) {
   const [presetsExpanded, setPresetsExpanded] = useState(false)
 
   function updatePreset(presetId: string, patch: Partial<ModelEffortPreset>) {
@@ -201,7 +237,7 @@ function ProviderCard({ provider: p, onUpdate, onRemove }: ProviderCardProps) {
   }
 
   const presetCount = p.presets?.length ?? 0
-  const kindOpts = p.providerKindId ? PROVIDER_OPTIONS[p.providerKindId] : PROVIDER_OPTIONS.custom
+  const kindOpts = p.providerKindId ? options[p.providerKindId] : options.custom
 
   return (
     <div className="card flex flex-col gap-3">
@@ -274,7 +310,7 @@ function ProviderCard({ provider: p, onUpdate, onRemove }: ProviderCardProps) {
             onChange={(e) => onUpdate({ model: e.target.value })}
           >
             <option value="">Model: default</option>
-            {kindOpts.models.map((m) => (
+            {withSelectedModel(kindOpts.models, p.model).map((m) => (
               <option key={m.value} value={m.value}>
                 {m.label}
               </option>
@@ -365,7 +401,7 @@ function ProviderCard({ provider: p, onUpdate, onRemove }: ProviderCardProps) {
                 <PresetRow
                   key={pr.id}
                   preset={pr}
-                  kindId={p.providerKindId}
+                  kindOptions={p.providerKindId ? options[p.providerKindId] : undefined}
                   isSelected={p.selectedPresetId === pr.id}
                   onSelect={() => selectPreset(pr.id)}
                   onChange={(patch) => updatePreset(pr.id, patch)}
@@ -423,6 +459,49 @@ export default function GlobalSettings({
   const loadGeneration = useRef(0)
   /** Whether the save error on screen is the never-loaded refusal — the one a successful load makes moot. */
   const saveErrorIsBlindRefusal = useRef(false)
+  /**
+   * The cached model catalog (`core/model-catalog.ts`), merged over the built-in tables below. Undefined
+   * until it loads — and for good if it cannot: the built-in tables are a complete answer on their own, so
+   * a failed read changes nothing but freshness and is not worth an alert.
+   */
+  const [catalog, setCatalog] = useState<ModelCatalogView | undefined>(undefined)
+  const [catalogRefreshing, setCatalogRefreshing] = useState(false)
+  const [catalogMessage, setCatalogMessage] = useState('')
+  const [catalogError, setCatalogError] = useState('')
+  const providerOptions = useMemo(() => providerOptionsWithCatalog(catalog), [catalog])
+
+  useEffect(() => {
+    let cancelled = false
+    electronApi()
+      .ai.getModelCatalog()
+      .then(
+        (view) => {
+          if (!cancelled) setCatalog(view)
+        },
+        () => { /* The built-in tables stay in use; see `catalog`. */ },
+      )
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  async function refreshCatalog() {
+    if (catalogRefreshing) return
+    setCatalogRefreshing(true)
+    setCatalogMessage('')
+    setCatalogError('')
+    try {
+      const report = await electronApi().ai.refreshModelCatalog()
+      setCatalog(report.catalog)
+      const clean = report.persisted && report.results.every((result) => result.outcome !== 'failed')
+      setCatalogMessage(clean ? 'Model lists refreshed.' : 'Model lists refreshed with problems — see each provider above.')
+    } catch {
+      // Fixed wording: a rejection could quote a command line or an API response.
+      setCatalogError('Could not refresh the model lists. The cached and built-in lists stay in use.')
+    } finally {
+      setCatalogRefreshing(false)
+    }
+  }
 
   function showSaveError(message: string, blindRefusal = false) {
     setSaveError(message)
@@ -616,6 +695,7 @@ export default function GlobalSettings({
           <ProviderCard
             key={p.id}
             provider={p}
+            options={providerOptions}
             onUpdate={(patch) => updateProvider(p.id, patch)}
             onRemove={() => removeProvider(p.id)}
           />
@@ -642,6 +722,35 @@ export default function GlobalSettings({
         {savedMessage && <span className="text-xs text-accent">{savedMessage}</span>}
       </div>
       {saveError && <p className="mt-2 text-xs text-danger">{saveError}</p>}
+
+      <section className="mt-6" aria-labelledby="model-catalog-heading">
+        <div className="mb-2 flex items-center justify-between">
+          <h3 id="model-catalog-heading" className="!m-0">Model catalog</h3>
+          <button onClick={refreshCatalog} className="btn btn-secondary" disabled={catalogRefreshing}>
+            {catalogRefreshing ? 'Refreshing…' : 'Refresh model lists'}
+          </button>
+        </div>
+        <p className="text-muted mb-2 text-xs">
+          The model pickers above combine the built-in list with what each CLI last reported. MAO refreshes it
+          {catalog?.ttlMs ? ` every ${Math.round((catalog.ttlMs / 3_600_000) * 100) / 100} h` : ' on request only'};
+          refreshing lists models without running or billing any.
+        </p>
+        <ul className="flex flex-col gap-1 text-xs">
+          {DISCOVERABLE_PROVIDER_KINDS.map((kind) => (
+            <li key={kind}>{catalogStatus(kind, catalog)}</li>
+          ))}
+        </ul>
+        {catalogMessage && (
+          <p className="mt-2 text-xs text-accent" role="status">
+            {catalogMessage}
+          </p>
+        )}
+        {catalogError && (
+          <p className="mt-2 text-xs text-danger" role="alert">
+            {catalogError}
+          </p>
+        )}
+      </section>
     </div>
   )
 }

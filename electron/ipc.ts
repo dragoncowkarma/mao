@@ -5,7 +5,8 @@ import { createMaoApp } from '../core/app.ts'
 import { startAutoTrigger } from '../core/auto-trigger.ts'
 import { applyRepoListEdit, isRepoRef } from '../core/repo-registry.ts'
 import { assertCanRelaunchForUpdate, checkForUpdates, countRunningWorkflowTasks } from '../core/self-update.ts'
-import { createAiProvider, type AiProviderConfig } from '../core/ai/index.ts'
+import { createAiProvider, type AiProviderConfig, type DiscoverableProviderKind } from '../core/ai/index.ts'
+import { startModelCatalogRefresher } from '../core/model-catalog.ts'
 import { QUEUE_PERSISTENCE_BROKEN, type RepoRef, type RunOverride } from '../core/workflow-engine.ts'
 import type { DesignId, ThemePreference } from '../core/store.ts'
 import {
@@ -31,6 +32,14 @@ export function registerIpcHandlers() {
     resume: true,
   })
   const autoTrigger = startAutoTrigger(githubService, workflowEngine, () => store.inspect('githubRepos'))
+  // The long-running host keeps the model catalog fresh (architecture rule 5: started here, never in
+  // createMaoApp()). Its own file in userData, beside — never inside — the store. Providers are re-read at
+  // each refresh, so an Anthropic API key saved later is used; the timer is unref'd and stopped on quit.
+  const modelCatalog = startModelCatalogRefresher({
+    dataDir: app.getPath('userData'),
+    listProviders: () => store.inspect('aiProviders').value,
+  })
+  app.once('will-quit', () => modelCatalog.stop())
 
   ipcMain.handle('app:checkUpdate', async () => {
     const update = await checkForUpdates(githubService, store.get('buildSha'))
@@ -66,6 +75,15 @@ export function registerIpcHandlers() {
     if (!config) throw new Error(`Unknown AI provider: ${providerId}`)
     return createAiProvider(config).run(prompt)
   })
+
+  // A pure read of the cached catalog; the renderer merges it over the built-in tables itself.
+  ipcMain.handle('ai:getModelCatalog', () => modelCatalog.read())
+
+  // Global settings' manual refresh — read-only CLI listings and `GET /v1/models`, never a GitHub write.
+  // Resolves with fixed-category results only; core never lets command output or an API body through.
+  ipcMain.handle('ai:refreshModelCatalog', (_event, kinds?: DiscoverableProviderKind[]) =>
+    modelCatalog.refreshNow(kinds),
+  )
 
   ipcMain.handle('github:setToken', (_event, token: string) => {
     store.set('githubToken', token)

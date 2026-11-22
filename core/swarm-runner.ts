@@ -30,6 +30,12 @@ export interface SwarmRunOptions {
   status?: boolean
   /** Clear persisted dispatch history before starting. */
   reset?: boolean
+  /**
+   * The MAO data directory whose `model-catalog.json` (`core/model-catalog.ts`) dispatch reads and real
+   * polling cycles refresh when due, so a model the CLIs list after this build still dispatches. Omitted,
+   * Swarm uses the built-in model tables only. The CLI passes its own data directory.
+   */
+  modelCatalogDir?: string
 }
 
 /**

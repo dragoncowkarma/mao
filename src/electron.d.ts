@@ -1,4 +1,6 @@
 import type { AiProviderConfig } from '../core/ai/types'
+import type { DiscoverableProviderKind, ModelCatalogView } from '../core/ai/provider-options'
+import type { ModelCatalogRefreshReport } from '../core/model-catalog'
 import type { GithubTask, GithubTaskDetail } from '../core/github-service'
 import type { RepoWorkflowCapability } from '../core/repo-capabilities'
 import type { QueueRecoveryOutcome, QueueRecoveryState, QueuedTask, RepoRef, RunOverride } from '../core/workflow-engine'
@@ -25,6 +27,10 @@ declare global {
         /** `base` is the list the editor loaded: the save is refused if the stored list moved since. */
         save: (providers: AiProviderConfig[], base?: AiProviderConfig[]) => Promise<AiProviderConfig[]>
         run: (providerId: string, prompt: string) => Promise<string>
+        /** The cached model catalog; merge it over the built-in tables with `providerOptionsWithCatalog()`. */
+        getModelCatalog: () => Promise<ModelCatalogView>
+        /** Refreshes the given providers' model lists now (all when omitted); fixed-category results only. */
+        refreshModelCatalog: (kinds?: DiscoverableProviderKind[]) => Promise<ModelCatalogRefreshReport>
       }
       github: {
         setToken: (token: string) => Promise<void>

@@ -969,6 +969,29 @@ describe('an unsaved list a newer saved one replaced (PR #141 follow-up review)'
     expect(a.read().attempts.codex).toBeUndefined()
   }, 20_000)
 
+  it('keeps only what its own fold produced, even against a list another host stamped the same millisecond', async () => {
+    const dir = tempDir()
+    const { state, now } = clockSteppingAfterFold()
+    // While this process asks codex (which fails), another host saves a codex list and attempt stamped exactly
+    // at the instant this refresh will fold, then holds the lock.
+    const run = vi.fn<DiscoveryCommandRunner>(async (command) => {
+      if (command !== 'codex') throw new ModelDiscoveryError('command-not-found')
+      writeCache(dir, codexList('gpt-7-orbit', state.clock + 1))
+      holdLock(dir)
+      state.armed = true
+      throw new ModelDiscoveryError('command-timeout')
+    })
+    const a = createModelCatalogMaintainer({ dataDir: dir, ttlMs: 24 * HOUR, now, deps: { run, env: {} } })
+    const report = await a.refreshNow(['codex'])
+    expect(report.persisted).toBe(false)
+    expect(report.results).toEqual([{ kind: 'codex', outcome: 'failed', reason: 'command-timeout', models: 0 }])
+    fs.rmSync(`${modelCatalogPath(dir)}.lock`)
+    fs.rmSync(modelCatalogPath(dir))
+    // The list was the other host's, whatever its stamp: gone with the file. The failed attempt was this one's.
+    expect(a.read().providers.codex).toBeUndefined()
+    expect(a.read().attempts.codex).toMatchObject({ outcome: 'failed', reason: 'command-timeout' })
+  }, 20_000)
+
   it('forgets what the file supersedes at a failed write too, before a clock step can revive it', async () => {
     const dir = tempDir()
     const { state, now } = clockSteppingAfterFold()

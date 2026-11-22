@@ -197,6 +197,11 @@ interface AppliedOutcomes {
   catalog: ModelCatalogView
   /** What the fold actually did per provider, which is what a report must say. */
   results: ModelCatalogRefreshResult[]
+  /**
+   * The providers whose list and whose attempt in `catalog` this fold put there itself — known, not inferred
+   * from a stamp, which another writer could share to the millisecond. A failed write keeps exactly these.
+   */
+  produced: { lists: Set<DiscoverableProviderKind>; attempts: Set<DiscoverableProviderKind> }
 }
 
 /**
@@ -222,8 +227,11 @@ function applyOutcomes(current: ModelCatalogView, outcomes: readonly KindOutcome
     const stamped = Date.parse(timestamp ?? '')
     return Number.isFinite(stamped) && stamped > time && stamped <= time + CLOCK_SKEW_MS
   }
+  const produced: AppliedOutcomes['produced'] = { lists: new Set(), attempts: new Set() }
   const record = (kind: DiscoverableProviderKind, attempt: ModelCatalogAttempt) => {
-    if (!isLater(next.attempts[kind]?.at)) next.attempts[kind] = attempt
+    if (isLater(next.attempts[kind]?.at)) return
+    next.attempts[kind] = attempt
+    produced.attempts.add(kind)
   }
   const results = outcomes.map((outcome): ModelCatalogRefreshResult => {
     const { kind } = outcome
@@ -246,11 +254,14 @@ function applyOutcomes(current: ModelCatalogView, outcomes: readonly KindOutcome
     // list is Claude Code's settings, which never stand over a listing, however new (`outranks`).
     const fetched: ProviderModelCatalog = { updatedAt: at, source: outcome.result.source, models: outcome.result.models }
     const fresher = existing && isLater(existing.updatedAt) && !outranks(fetched, existing) ? existing : undefined
-    if (!fresher) next.providers[kind] = fetched
+    if (!fresher) {
+      next.providers[kind] = fetched
+      produced.lists.add(kind)
+    }
     record(kind, { at, outcome: 'updated' })
     return { kind, outcome: 'updated', models: (fresher ?? outcome.result).models.length }
   })
-  return { catalog: next, results }
+  return { catalog: next, results, produced }
 }
 
 /** Lists and attempts a process fetched but could not save, per provider (`createModelCatalogMaintainer`). */
@@ -288,7 +299,9 @@ function clampToClock(unsaved: UnsavedCatalog, time: number): void {
  * the file has nothing that counts. `file`: the file's entry is at least as new — another host's refresh, or
  * this process's own write of this very entry. Stamps beyond `CLOCK_SKEW_MS` ahead count for nothing; the
  * unsaved ones have been moved back to the clock at this same instant (`clampToClock`), so only a file stamp can
- * be one.
+ * be one. A tie goes to the file: after a write it is this very entry. The one other way to tie, another writer
+ * stamping the same millisecond, is left to that choice (`applyOutcomes`, folding a refresh, breaks such a tie
+ * the other way; neither list is older than the other).
  *
  * As in `applyOutcomes`, an Anthropic API listing and Claude Code's local settings never trade places by age, in
  * either direction: an unsaved listing stands over settings another host saved later, exactly as a saved listing
@@ -394,9 +407,9 @@ export interface RefreshModelCatalogOptions {
  * entry out of the fold, unranked, and let it outrank the very list this refresh saves. At that instant its
  * stamps are first moved back to the clock (`clampToClock`). Then a saved fold forgets every entry the
  * written file now holds or supersedes. A fold that could not be written forgets what the file supersedes
- * too, and takes in only what this refresh produced — the entries stamped with its own instant: each list it
- * fetched and each attempt it recorded. Never the file's attempt behind a kept-* or interrupted result (it may
- * be a stamp from the future that should count for nothing), nor a list or attempt another host stored later.
+ * too, and takes in only what this refresh produced, as the fold reports it: each list it fetched and each
+ * attempt it recorded. Never the file's attempt behind a kept-* or interrupted result (it may be a stamp from
+ * the future that should count for nothing), nor a list or attempt another host stored later.
  */
 export async function refreshModelCatalog(options: RefreshModelCatalogOptions): Promise<ModelCatalogRefreshReport> {
   const kinds = DISCOVERABLE_PROVIDER_KINDS.filter((kind) => !options.kinds || options.kinds.includes(kind))
@@ -424,20 +437,17 @@ export async function refreshModelCatalog(options: RefreshModelCatalogOptions): 
     // As after a write: forget what the file supersedes at this instant, before a clock step can revive it.
     pruneSuperseded(unsaved, file, time)
     applied = applyOutcomes(withUnsaved(file, unsaved, time), outcomes, at)
-    // Take in only what this refresh produced. Whatever it made carries its own instant, `at`; a list or an
-    // attempt another host stored later (a fresher list, a later attempt) does not, and the file still has it.
-    for (const kind of DISCOVERABLE_PROVIDER_KINDS) {
-      const list = applied.catalog.providers[kind]
-      if (list?.updatedAt === at) unsaved.providers[kind] = list
-      const attempt = applied.catalog.attempts[kind]
-      if (attempt?.at === at) unsaved.attempts[kind] = attempt
-    }
-    return { ...applied, persisted: false }
+    // Take in only what this refresh produced (`applyOutcomes` says which): never a list or an attempt another
+    // host stored later (a fresher list, a later attempt), nor the file's attempt behind a kept-* or interrupted
+    // result — the file still has those.
+    for (const kind of applied.produced.lists) unsaved.providers[kind] = applied.catalog.providers[kind]
+    for (const kind of applied.produced.attempts) unsaved.attempts[kind] = applied.catalog.attempts[kind]
+    return { results: applied.results, catalog: applied.catalog, persisted: false }
   }
   // The write folded every unsaved entry in, so each now ties with the file or loses to it: forget them here,
   // at the instant of the write, before a clock that steps back again can make any of them look newer.
   pruneSuperseded(unsaved, applied.catalog, time)
-  return { ...applied, persisted: true }
+  return { results: applied.results, catalog: applied.catalog, persisted: true }
 }
 
 export interface ModelCatalogMaintainerOptions {

@@ -1,5 +1,7 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import type { AiProviderConfig } from '../core/ai/types.ts'
+import type { DiscoverableProviderKind, ModelCatalogView } from '../core/ai/provider-options.ts'
+import type { ModelCatalogRefreshReport } from '../core/model-catalog.ts'
 import type { GithubTask, GithubTaskDetail } from '../core/github-service.ts'
 import type { RepoWorkflowCapability } from '../core/repo-capabilities.ts'
 import type {
@@ -55,6 +57,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.invoke('ai:save', providers, base),
     run: (providerId: string, prompt: string): Promise<string> =>
       ipcRenderer.invoke('ai:run', providerId, prompt),
+    /** The cached model catalog (`core/model-catalog.ts`); merge it with `providerOptionsWithCatalog()`. */
+    getModelCatalog: (): Promise<ModelCatalogView> => ipcRenderer.invoke('ai:getModelCatalog'),
+    /** Refreshes the given providers' model lists now (all when omitted). Resolves with fixed-category results. */
+    refreshModelCatalog: (kinds?: DiscoverableProviderKind[]): Promise<ModelCatalogRefreshReport> =>
+      ipcRenderer.invoke('ai:refreshModelCatalog', kinds),
   },
   github: {
     setToken: (token: string): Promise<void> => ipcRenderer.invoke('github:setToken', token),

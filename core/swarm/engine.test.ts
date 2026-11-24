@@ -13,6 +13,10 @@ import {
 import type { EnginePlatform, SwarmComment, SwarmIssue, SwarmPR } from './engine.ts'
 import { SwarmPreflightConfigError } from './platform.ts'
 import { processGroupExists, terminateProcessGroups } from './registry.ts'
+import type { ModelCatalogMaintainer, ModelCatalogRefreshReport } from '../model-catalog.ts'
+import { createModelCatalogMaintainer } from '../model-catalog.ts'
+import type { ModelCatalogView } from '../ai/provider-options.ts'
+import { ModelDiscoveryError, type DiscoveryCommandRunner } from '../ai/model-discovery.ts'
 
 const WORKER = '[Worker: claude | Model: claude-sonnet-5 | Reasoning: high]'
 const REVIEWER = '[Reviewer: codex | Model: gpt-5.6-sol | Reasoning: high]'
@@ -603,5 +607,172 @@ describe('native scheduler', () => {
     })
     expect(await engine.run()).toBe(130)
     expect(platform.json).not.toHaveBeenCalledWith(expect.arrayContaining(['merged']))
+  })
+})
+
+describe('model catalog at dispatch (#140)', () => {
+  const novaView: ModelCatalogView = {
+    providers: { codex: { updatedAt: '2026-11-22T00:00:00.000Z', source: 'codex-debug-models',
+      models: [{ id: 'gpt-7-nova', efforts: ['low', 'medium', 'high'] }] } },
+    attempts: {}, ttlMs: 86_400_000,
+  }
+  const novaIssue: SwarmIssue = { ...issue, body: '[Worker: codex | Model: gpt-7-nova | Reasoning: ultra]' }
+
+  /** A polling (not `--once`) engine, so a cycle never waits on the fake child it dispatches. */
+  function catalogFixture(dryRun: boolean, maintainer: Partial<ModelCatalogMaintainer> = {}, issues: SwarmIssue[] = [novaIssue]) {
+    const base = fixture(dryRun)
+    fs.mkdirSync(path.join(base.root, '.agents', 'logs'), { recursive: true })
+    fs.mkdirSync(path.join(base.root, '.agents', '.prompts'), { recursive: true })
+    const stdin = new Writable({ write(_chunk, _encoding, done) { done() } })
+    const child = Object.assign(new EventEmitter(), { pid: 888140, exitCode: null, signalCode: null, stdin }) as ChildProcess
+    const spawnProcess = vi.fn(() => child)
+    const catalog = {
+      read: vi.fn(() => novaView),
+      dueKinds: vi.fn(() => []),
+      refreshDue: vi.fn(async (_signal?: AbortSignal): Promise<ModelCatalogRefreshReport | undefined> => undefined),
+      refreshNow: vi.fn(async () => { throw new Error('manual refresh is not a Swarm path') }),
+      ...maintainer,
+    }
+    vi.mocked(base.platform.json).mockImplementation(async (args: string[]) => {
+      if (args[0] === 'issue' && args[1] === 'list') return issues as never
+      if (args[0] === 'pr' && args[1] === 'list') return [] as never
+      throw new Error('Unhandled fake API call')
+    })
+    const engine = new SwarmEngine(base.root, { dryRun, once: false }, base.platform,
+      spawnProcess as unknown as typeof spawn, catalog as ModelCatalogMaintainer)
+    return { ...base, engine, spawnProcess, catalog }
+  }
+
+  it('reads the cached catalog in a dry run, never refreshing it, and plans the refreshed model', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+    const { engine, catalog } = catalogFixture(true)
+    await expect(engine.cycle()).resolves.toBe(0)
+    expect(catalog.refreshDue).not.toHaveBeenCalled()
+    expect(catalog.read).toHaveBeenCalled()
+    expect(log.mock.calls.flat().join('\n')).toContain('using codex (gpt-7-nova, ultra)')
+  })
+
+  it('falls back to the default preset when the model is in no catalog', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const { engine } = catalogFixture(true, { read: vi.fn(() => ({ providers: {}, attempts: {}, ttlMs: null })) })
+    await engine.cycle()
+    expect(log.mock.calls.flat().join('\n')).toContain('using codex (gpt-6.1-terra, high)')
+  })
+
+  it('refreshes what is due before a real dispatch, then runs the refreshed model within its levels', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {})
+    const { engine, catalog, spawnProcess } = catalogFixture(false)
+    try {
+      await engine.cycle(true)
+      expect(catalog.refreshDue).toHaveBeenCalledWith(expect.any(AbortSignal))
+      expect(spawnProcess).toHaveBeenCalledTimes(1)
+      expect(vi.mocked(catalog.refreshDue).mock.invocationCallOrder[0]).toBeLessThan(spawnProcess.mock.invocationCallOrder[0])
+      const [command, args] = spawnProcess.mock.calls[0] as unknown as [string, string[]]
+      expect(command).toBe('codex')
+      expect(args).toEqual(expect.arrayContaining(['--model', 'gpt-7-nova', 'model_reasoning_effort=high']))
+    } finally { await engine.tracker.killAll() }
+  })
+
+  it('never fails a cycle over the catalog, and reports a repeated refresh failure once', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+    const report: ModelCatalogRefreshReport = {
+      results: [{ kind: 'codex', outcome: 'failed', reason: 'command-timeout', models: 0 }],
+      catalog: novaView, persisted: true,
+    }
+    const { engine } = catalogFixture(false, { refreshDue: vi.fn(async () => report) }, [])
+    await expect(engine.cycle(true)).resolves.toBe(0)
+    await expect(engine.cycle(true)).resolves.toBe(0)
+    const notices = log.mock.calls.flat().filter((line) => String(line).startsWith('Model catalog:'))
+    expect(notices).toEqual(['Model catalog: codex refresh failed (the CLI did not answer in time); dispatch keeps the cached and built-in lists'])
+
+    const broken = catalogFixture(false, { refreshDue: vi.fn(async () => { throw new Error('ENOSPC with a path') }) }, [])
+    await expect(broken.engine.cycle(true)).resolves.toBe(0)
+    expect(log.mock.calls.flat().join('\n')).toContain('Model catalog: could not be loaded; dispatch uses the built-in lists')
+    expect(log.mock.calls.flat().join('\n')).not.toContain('ENOSPC')
+  })
+
+  it('lets a shutdown interrupt a refresh in flight, dispatching nothing and reporting no catalog failure', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+    let seen: AbortSignal | undefined
+    const { engine, spawnProcess } = catalogFixture(false, {
+      refreshDue: vi.fn((signal?: AbortSignal) => new Promise<ModelCatalogRefreshReport | undefined>((resolve) => {
+        seen = signal
+        signal?.addEventListener('abort', () => resolve({
+          results: [{ kind: 'codex', outcome: 'failed', reason: 'aborted', models: 0 }], catalog: novaView, persisted: true,
+        }))
+      })),
+    })
+    const cycle = engine.cycle(true)
+    await vi.waitFor(() => expect(seen).toBeDefined())
+    // What the engine's own SIGTERM handler does (SwarmEngine.run()).
+    const internals = engine as unknown as { shutdownSignal?: NodeJS.Signals; sleepAbort?: AbortController }
+    internals.shutdownSignal = 'SIGTERM'
+    internals.sleepAbort?.abort()
+    await expect(cycle).rejects.toThrow()
+    expect(seen?.aborted).toBe(true)
+    expect(spawnProcess).not.toHaveBeenCalled()
+    expect(log.mock.calls.flat().join('\n')).not.toContain('Model catalog')
+  })
+
+  it('builds its own maintainer from the data directory the CLI passes', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+    const { root, platform } = fixture(true)
+    vi.mocked(platform.json).mockImplementation(async (args: string[]) =>
+      (args[0] === 'issue' && args[1] === 'list' ? [novaIssue] : []) as never)
+    fs.writeFileSync(path.join(root, 'model-catalog.json'), JSON.stringify({ version: 1, providers: novaView.providers }))
+    const engine = new SwarmEngine(root, { dryRun: true, once: true, modelCatalogDir: root }, platform)
+    expect(engine.modelCatalog).toBeDefined()
+    expect(new SwarmEngine(root, { dryRun: true }, platform).modelCatalog).toBeUndefined()
+    await engine.cycle()
+    expect(log.mock.calls.flat().join('\n')).toContain('using codex (gpt-7-nova, ultra)')
+  })
+
+  describe('when the cache file refuses the refresh (PR #141 review)', () => {
+    /** A real maintainer whose data directory is a file, and a fake `codex debug models` that lists gpt-7-nova. */
+    function refusingMaintainer() {
+      const blocker = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'mao-unsaved-catalog-')), 'not-a-directory')
+      fs.writeFileSync(blocker, '')
+      const run = vi.fn<DiscoveryCommandRunner>(async (command) => {
+        if (command !== 'codex') throw new ModelDiscoveryError('command-not-found')
+        return JSON.stringify({ models: [{ slug: 'gpt-7-nova', visibility: 'list', priority: 1,
+          supported_reasoning_levels: [{ effort: 'low' }, { effort: 'high' }] }] })
+      })
+      const maintainer = createModelCatalogMaintainer({ dataDir: blocker, ttlMs: 86_400_000, deps: { run, env: {} } })
+      return { maintainer, run, cleanup: () => fs.rmSync(path.dirname(blocker), { recursive: true, force: true }) }
+    }
+    const dispatchedArgs = (spawnProcess: { mock: { calls: unknown[][] } }) => (spawnProcess.mock.calls[0] as [string, string[]])[1]
+
+    it('dispatches with the list it just fetched, as its log says, not the file it could not write', async () => {
+      const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+      const { maintainer, cleanup } = refusingMaintainer()
+      const { engine, spawnProcess } = catalogFixture(false, maintainer)
+      try {
+        await engine.cycle(true)
+        expect(log.mock.calls.flat().join('\n')).toContain('Model catalog: the refreshed lists could not be saved; this process still uses them')
+        expect(dispatchedArgs(spawnProcess)).toEqual(expect.arrayContaining(['--model', 'gpt-7-nova', 'model_reasoning_effort=high']))
+      } finally {
+        await engine.tracker.killAll()
+        cleanup()
+      }
+    })
+
+    it('keeps dispatching with it in later cycles, without asking the CLI again', async () => {
+      vi.spyOn(console, 'log').mockImplementation(() => {})
+      const { maintainer, run, cleanup } = refusingMaintainer()
+      const issues: SwarmIssue[] = []
+      const { engine, spawnProcess } = catalogFixture(false, maintainer, issues)
+      try {
+        await engine.cycle(true)
+        expect(spawnProcess).not.toHaveBeenCalled()
+        issues.push(novaIssue)
+        await engine.cycle(true)
+        expect(run.mock.calls.filter(([command]) => command === 'codex')).toHaveLength(1)
+        expect(dispatchedArgs(spawnProcess)).toEqual(expect.arrayContaining(['--model', 'gpt-7-nova', 'model_reasoning_effort=high']))
+      } finally {
+        await engine.tracker.killAll()
+        cleanup()
+      }
+    })
   })
 })

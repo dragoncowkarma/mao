@@ -2,6 +2,7 @@ import { vi } from 'vitest'
 import { setElectronApi, type ElectronApi } from '../electron-api'
 import type { AppUpdateCheck } from '../electron'
 import type { AiProviderConfig } from '../../core/ai/types'
+import type { ModelCatalogView } from '../../core/ai/provider-options'
 import type { GithubTask } from '../../core/github-service'
 import type { RepoWorkflowCapability } from '../../core/repo-capabilities'
 import { applyRepoListEdit } from '../../core/repo-registry'
@@ -81,6 +82,10 @@ export function createElectronApiStub(initialRepos: RepoRef[] = [], initialProbl
   )
   const fetchTasks = vi.fn(async (): Promise<GithubTask[]> => [])
   const listProviders = vi.fn(async (): Promise<AiProviderConfig[]> => [])
+  // Global settings reads the cached catalog on mount. A never-refreshed cache is the honest default: the
+  // pane then offers exactly the built-in tables, as it does on a fresh install. `ai.refreshModelCatalog`
+  // only runs on a click, so it stays unstubbed — a test that clicks programs it.
+  const getModelCatalog = vi.fn(async (): Promise<ModelCatalogView> => ({ providers: {}, attempts: {}, ttlMs: 86_400_000 }))
   const listWorkflowTasks = vi.fn(async (): Promise<QueuedTask[]> => [])
 
   // Modelled on the real latch rather than taken as a separate input: the engine derives it at boot from
@@ -127,6 +132,8 @@ export function createElectronApiStub(initialRepos: RepoRef[] = [], initialProbl
       list: listProviders,
       save: notStubbed('ai.save'),
       run: notStubbed('ai.run'),
+      getModelCatalog,
+      refreshModelCatalog: notStubbed('ai.refreshModelCatalog'),
     },
     github: {
       setToken: notStubbed('github.setToken'),
@@ -172,6 +179,7 @@ export function createElectronApiStub(initialRepos: RepoRef[] = [], initialProbl
     storeProblems,
     fetchTasks,
     listProviders,
+    getModelCatalog,
     listWorkflowTasks,
     /** What the fake store holds right now — the assertion target for "did the write land". */
     storedRepos: () => stored.map((repo) => ({ ...repo })),

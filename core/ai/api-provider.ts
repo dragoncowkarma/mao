@@ -3,6 +3,19 @@ import type { AiProvider, AiProviderConfig, AiRunOptions } from './types.ts'
 /** Same rationale as CliProvider's timeout: one hung call would otherwise stall the whole queue. */
 const RUN_TIMEOUT_MS = 5 * 60 * 1000
 
+/** Where an Anthropic-format provider with no `baseUrl` sends its requests. */
+export const ANTHROPIC_MESSAGES_URL = 'https://api.anthropic.com/v1/messages'
+
+/**
+ * The messages endpoint an Anthropic-format provider posts to: its `baseUrl` exactly as saved, or the
+ * public API when none is saved. An empty or blank `baseUrl` is not "none": the request fails before it
+ * leaves the process. Model discovery (`anthropicModelsUrl()` in `core/ai/model-discovery.ts`) derives its
+ * URL from this same answer, so listing models can never send a key where inference would not.
+ */
+export function anthropicMessagesUrl(baseUrl: string | undefined): string {
+  return baseUrl ?? ANTHROPIC_MESSAGES_URL
+}
+
 export class ApiProvider implements AiProvider {
   readonly id: string
   readonly name: string
@@ -28,7 +41,7 @@ export class ApiProvider implements AiProvider {
         messages: [{ role: 'user', content: prompt }],
       }
 
-      const res = await fetch(baseUrl ?? 'https://api.anthropic.com/v1/messages', {
+      const res = await fetch(anthropicMessagesUrl(baseUrl), {
         method: 'POST',
         headers: {
           'content-type': 'application/json',

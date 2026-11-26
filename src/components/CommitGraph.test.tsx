@@ -81,6 +81,33 @@ describe('CommitGraph', () => {
     expect(await screen.findByText(/at least 5 more not drawn/)).toBeInTheDocument()
   })
 
+  it('keeps a dashed stub for a merge parent outside the window visible beside its solid first-parent line', async () => {
+    // Near the edge of the 100-commit window a PR merge often has its first parent loaded and its second not.
+    const stub = createElectronApiStub()
+    stub.fetchCommitGraph.mockResolvedValue({
+      ...graph,
+      branches: [{ name: 'main', sha: 'merge000' }],
+      commits: [commit('base0000', [], 'Initial commit', 1), commit('merge000', ['base0000', 'outside0'], 'Merge pull request #9', 3)],
+    })
+    render(<CommitGraph repo={repo} />)
+    const row = (await screen.findByText('Merge pull request #9')).closest('li')!
+    const paths = [...row.querySelectorAll('svg path')]
+    const dashed = paths.filter((path) => path.getAttribute('stroke-dasharray'))
+    const solid = paths.filter((path) => !path.getAttribute('stroke-dasharray'))
+    expect(dashed).toHaveLength(1)
+    expect(solid.map((path) => path.getAttribute('d'))).not.toContain(dashed[0].getAttribute('d'))
+    expect(screen.getByText('Dashed lines continue beyond the loaded history.')).toBeInTheDocument()
+    expect(screen.queryByText(/more not drawn/)).toBeNull()
+  })
+
+  it('does not claim dashed lines when branches were left out but every root was loaded', async () => {
+    const stub = createElectronApiStub()
+    stub.fetchCommitGraph.mockResolvedValue({ ...graph, omittedBranches: 3 })
+    render(<CommitGraph repo={repo} />)
+    expect(await screen.findByText(/3 more not drawn/)).toBeInTheDocument()
+    expect(screen.queryByText(/Dashed lines/)).toBeNull()
+  })
+
   it('reloads on Refresh', async () => {
     const stub = createElectronApiStub()
     stub.fetchCommitGraph.mockResolvedValueOnce({ ...graph, commits: graph.commits.slice(0, 1) })
@@ -124,7 +151,10 @@ describe('App Graph tab', () => {
         <App />
       </StrictMode>,
     )
-    await user.click(await screen.findByRole('button', { name: 'Graph' }))
+    const graphTab = await screen.findByRole('button', { name: 'Graph' })
+    // The board is the default tab; the graph is up to 22 REST calls and must not load until asked for.
+    expect(stub.fetchCommitGraph).not.toHaveBeenCalled()
+    await user.click(graphTab)
     expect(await screen.findByRole('list', { name: 'Commit graph for acme/widgets' })).toBeInTheDocument()
     expect(stub.fetchCommitGraph).toHaveBeenCalledWith('acme', 'widgets')
   })

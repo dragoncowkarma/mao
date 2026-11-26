@@ -82,15 +82,12 @@ export function createElectronApiStub(initialRepos: RepoRef[] = [], initialProbl
     }),
   )
   const fetchTasks = vi.fn(async (): Promise<GithubTask[]> => [])
-  const fetchCommitGraph = vi.fn(
-    async (): Promise<CommitGraphData> => ({
-      defaultBranch: 'main',
-      branches: [],
-      commits: [],
-      omittedBranches: 0,
-      branchListComplete: true,
-    }),
-  )
+  // Not on any mount path, so it throws like `notStubbed`: a change that started loading the graph (up to
+  // 22 REST calls) on mount shows up as a named call in the mock instead of a quiet empty graph. Typed with
+  // the real answer, unlike `notStubbed`, so a test can still `mockResolvedValue` it.
+  const fetchCommitGraph = vi.fn(async (_owner: string, _repo: string): Promise<CommitGraphData> => {
+    throw new Error('electronAPI.github.fetchCommitGraph was called, but this test did not stub it')
+  })
   const listProviders = vi.fn(async (): Promise<AiProviderConfig[]> => [])
   // Global settings reads the cached catalog on mount. A never-refreshed cache is the honest default: the
   // pane then offers exactly the built-in tables, as it does on a fresh install. `ai.refreshModelCatalog`

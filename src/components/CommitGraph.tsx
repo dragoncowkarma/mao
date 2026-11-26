@@ -30,6 +30,14 @@ function edgePath(fromLane: number, fromY: number, toLane: number, toY: number):
   return `M ${x1} ${fromY} C ${x1} ${midY}, ${x2} ${midY}, ${x2} ${toY}`
 }
 
+/** The dashed stub for a parent outside the fetched window. */
+function truncatedStubPath(row: GraphRow): string {
+  const mid = ROW_HEIGHT / 2
+  const x = laneX(row.column)
+  const toX = row.outgoing.includes(row.column) ? x + LANE_WIDTH / 2 : x
+  return toX === x ? `M ${x} ${mid} L ${x} ${ROW_HEIGHT}` : `M ${x} ${mid} C ${x} ${ROW_HEIGHT}, ${toX} ${mid}, ${toX} ${ROW_HEIGHT}`
+}
+
 function shortDate(iso: string): string {
   const time = Date.parse(iso)
   return Number.isNaN(time) ? '' : new Date(time).toLocaleDateString()
@@ -50,8 +58,11 @@ function LaneStrip({ row, width }: { row: GraphRow; width: number }) {
         <path key={`o${lane}`} d={edgePath(row.column, mid, lane, ROW_HEIGHT)} stroke={laneColor(lane)} strokeWidth={2} fill="none" />
       ))}
       {row.truncated && (
+        // Straight down when nothing else leaves that way; otherwise half a lane aside. A merge whose first
+        // parent is loaded and whose second is not would draw this dash exactly over the solid first-parent
+        // line in the same colour, hiding the one mark that says the history continues.
         <path
-          d={edgePath(row.column, mid, row.column, ROW_HEIGHT)}
+          d={truncatedStubPath(row)}
           stroke={laneColor(row.column)}
           strokeWidth={2}
           strokeDasharray="2 3"
@@ -128,13 +139,19 @@ export default function CommitGraph({ repo }: CommitGraphProps) {
         </div>
       </div>
 
-      {error && <p className="mt-2 text-xs" style={{ color: 'var(--color-accent-700)' }}>{error}</p>}
+      {error && <p className="text-danger mt-2 text-xs">{error}</p>}
 
       {data && (data.omittedBranches > 0 || !data.branchListComplete) && (
         <p className="text-muted mt-2 text-xs">
           Showing {data.branches.length} branches; {data.branchListComplete ? '' : 'at least '}
-          {data.omittedBranches} more not drawn. Dashed lines continue beyond the loaded history.
+          {data.omittedBranches} more not drawn.
         </p>
+      )}
+
+      {/* Separate from the branch notice: a short-branched repo with long history truncates without
+          omitting a branch, and a many-branched repo can omit branches with every root loaded. */}
+      {layout?.rows.some((row) => row.truncated) && (
+        <p className="text-muted mt-2 text-xs">Dashed lines continue beyond the loaded history.</p>
       )}
 
       {layout && layout.rows.length === 0 && <p className="text-muted mt-4 text-sm">No commits</p>}
@@ -156,7 +173,7 @@ export default function CommitGraph({ repo }: CommitGraphProps) {
               <a href={row.commit.url} target="_blank" rel="noreferrer" className="graph-message">
                 {row.commit.message}
               </a>
-              <span className="graph-meta">
+              <span className="graph-meta text-muted">
                 <code>{row.commit.sha.slice(0, 7)}</code> · {row.commit.author} · {shortDate(row.commit.date)}
               </span>
             </li>

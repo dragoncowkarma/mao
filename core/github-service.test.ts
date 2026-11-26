@@ -692,8 +692,13 @@ describe('GithubService.fetchCommitGraph', () => {
     return { name, commit: { sha } }
   }
 
+  /** `pages` is keyed by whatever ref the service asks for — a head SHA, or a branch name. */
   function makeGraphService(branches: ReturnType<typeof branch>[], pages: Record<string, ReturnType<typeof apiCommit>[]>) {
-    const listCommits = vi.fn(async ({ sha }: { sha: string }) => ({ data: pages[sha] ?? [] }))
+    const listCommits = vi.fn(async ({ sha }: { sha: string }) => {
+      const page = pages[sha]
+      if (!page) throw Object.assign(new Error('Not Found'), { status: 404 })
+      return { data: page }
+    })
     const listBranches = vi.fn(async () => ({ data: branches }))
     const { service, octokit } = makeServiceWithFakeOctokit({ repos: { listCommits, listBranches } })
     return { service, octokit, listCommits, listBranches }
@@ -707,8 +712,8 @@ describe('GithubService.fetchCommitGraph', () => {
     const { service, listCommits } = makeGraphService(
       [branch('feature', 'f1'), branch('main', 'm2')],
       {
-        main: [apiCommit('m2', ['m1']), apiCommit('m1', [])],
-        feature: [apiCommit('f1', ['m1']), apiCommit('m1', [])],
+        m2: [apiCommit('m2', ['m1']), apiCommit('m1', [])],
+        f1: [apiCommit('f1', ['m1']), apiCommit('m1', [])],
       },
     )
     const graph = await service.fetchCommitGraph('acme', 'widgets')
@@ -724,24 +729,56 @@ describe('GithubService.fetchCommitGraph', () => {
       date: '2026-01-02T00:00:00Z',
       url: 'https://github.com/acme/widgets/commit/m2',
     })
-    expect(listCommits).toHaveBeenCalledWith(expect.objectContaining({ sha: 'main', per_page: 100 }))
-    expect(listCommits).toHaveBeenCalledWith(expect.objectContaining({ sha: 'feature', per_page: 30 }))
+    expect(listCommits).toHaveBeenCalledWith(expect.objectContaining({ sha: 'm2', per_page: 100 }))
+    expect(listCommits).toHaveBeenCalledWith(expect.objectContaining({ sha: 'f1', per_page: 30 }))
     expect(graph).toMatchObject({ omittedBranches: 0, branchListComplete: true })
+  })
+
+  it('cuts a CRLF commit message at its first line', async () => {
+    const { service } = makeGraphService([branch('main', 'm')], { m: [apiCommit('m', [], 'Subject\r\n\r\nBody')] })
+    const graph = await service.fetchCommitGraph('acme', 'widgets')
+    expect(graph.commits[0].message).toBe('Subject')
+  })
+
+  it('reads each branch by the head SHA the listing returned, so a branch deleted since cannot 404 the graph', async () => {
+    // Only the SHA is servable: asking for the name `workflow/7-gone` would 404 here, as it does on GitHub
+    // once a merged workflow branch is deleted between the listing and the read.
+    const { service, listCommits } = makeGraphService(
+      [branch('main', 'm1'), branch('workflow/7-gone', 'w1')],
+      { m1: [apiCommit('m1', [])], w1: [apiCommit('w1', ['m1'])] },
+    )
+    const graph = await service.fetchCommitGraph('acme', 'widgets')
+    expect(graph.commits.map((c) => c.sha).sort()).toEqual(['m1', 'w1'])
+    expect(listCommits).not.toHaveBeenCalledWith(expect.objectContaining({ sha: 'workflow/7-gone' }))
   })
 
   it('does not fetch a branch whose head is already among the commits read', async () => {
     const { service, listCommits } = makeGraphService(
       [branch('main', 'm2'), branch('workflow/7-merged', 'm1')],
-      { main: [apiCommit('m2', ['m1']), apiCommit('m1', [])] },
+      { m2: [apiCommit('m2', ['m1']), apiCommit('m1', [])] },
     )
     const graph = await service.fetchCommitGraph('acme', 'widgets')
     expect(listCommits).toHaveBeenCalledTimes(1)
     expect(graph.branches.map((b) => b.name)).toEqual(['main', 'workflow/7-merged'])
   })
 
+  it('reads two branches on the same unread head once', async () => {
+    const { service, listCommits } = makeGraphService(
+      [branch('a', 'x1'), branch('b', 'x1'), branch('main', 'm1')],
+      { m1: [apiCommit('m1', [])], x1: [apiCommit('x1', ['m1'])] },
+    )
+    const graph = await service.fetchCommitGraph('acme', 'widgets')
+    expect(listCommits).toHaveBeenCalledTimes(2)
+    expect(graph.branches.map((b) => b.name)).toEqual(['main', 'a', 'b'])
+  })
+
   it('caps the branches it reads and reports the ones it left out', async () => {
     const others = Array.from({ length: 30 }, (_, i) => branch(`b${String(i).padStart(2, '0')}`, `h${i}`))
-    const { service, listCommits } = makeGraphService([...others, branch('main', 'm')], {})
+    const pages = Object.fromEntries(others.map((b) => [b.commit.sha, [apiCommit(b.commit.sha, [])]]))
+    const { service, listCommits } = makeGraphService([...others, branch('main', 'm')], {
+      ...pages,
+      m: [apiCommit('m', [])],
+    })
     const graph = await service.fetchCommitGraph('acme', 'widgets')
 
     expect(graph.branches).toHaveLength(20)
@@ -751,15 +788,35 @@ describe('GithubService.fetchCommitGraph', () => {
     expect(listCommits).toHaveBeenCalledTimes(20)
   })
 
-  it('flags a full branch-list page as possibly incomplete', async () => {
-    const full = Array.from({ length: 100 }, (_, i) => branch(`b${i}`, `h${i}`))
-    const { service } = makeGraphService(full, {})
+  it('still draws the default branch first when the listing page does not reach it', async () => {
+    // GitHub lists branches alphabetically, so 100 `feat/*` branches push `main` off the only page read.
+    const full = Array.from({ length: 100 }, (_, i) => branch(`feat/${String(i).padStart(3, '0')}`, `h${i}`))
+    const pages = Object.fromEntries(full.map((b) => [b.commit.sha, [apiCommit(b.commit.sha, ['m1'])]]))
+    const { service, listCommits, octokit } = makeGraphService(full, {
+      ...pages,
+      main: [apiCommit('m2', ['m1']), apiCommit('m1', [])],
+    })
     const graph = await service.fetchCommitGraph('acme', 'widgets')
-    expect(graph.branchListComplete).toBe(false)
+
+    expect(graph.branches[0]).toEqual({ name: 'main', sha: 'm2' })
+    expect(graph.branches).toHaveLength(20)
+    expect(listCommits).toHaveBeenCalledWith(expect.objectContaining({ sha: 'main', per_page: 100 }))
+    expect(graph.commits.map((c) => c.sha)).toEqual(expect.arrayContaining(['m1', 'm2']))
+    expect(graph).toMatchObject({ omittedBranches: 81, branchListComplete: false })
+    // Still inside the 2 + maxBranches budget: repo, branch list, the default page, 19 others.
+    expect(octokit.rest.repos.get).toHaveBeenCalledTimes(1)
+    expect(listCommits).toHaveBeenCalledTimes(20)
+  })
+
+  it('draws nothing for an empty repository without asking for a default branch that has no commits', async () => {
+    const { service, listCommits } = makeGraphService([], {})
+    const graph = await service.fetchCommitGraph('acme', 'widgets')
+    expect(graph).toMatchObject({ branches: [], commits: [], omittedBranches: 0, branchListComplete: true })
+    expect(listCommits).not.toHaveBeenCalled()
   })
 
   it('performs no write', async () => {
-    const { service, octokit } = makeGraphService([branch('main', 'm')], { main: [apiCommit('m', [])] })
+    const { service, octokit } = makeGraphService([branch('main', 'm')], { m: [apiCommit('m', [])] })
     await service.fetchCommitGraph('acme', 'widgets')
     expect(octokit.rest.repos.createOrUpdateFileContents).not.toHaveBeenCalled()
     expect(octokit.rest.git.createRef).not.toHaveBeenCalled()

@@ -359,8 +359,17 @@ export class GithubService {
    * class's per-attempt deadline, and none of them a write, a clone or a label change.
    *
    * REST has no "every commit on every branch" endpoint, so each branch's recent history is read from its
-   * own head and the pages are merged by SHA. A branch whose head is already among the commits read is
-   * not fetched again: a merged or freshly created `workflow/*` branch costs nothing.
+   * own head and the pages are merged by SHA. A head already among the commits read — a merged or freshly
+   * created `workflow/*` branch, or two branches on one commit — costs no further call.
+   *
+   * The default branch is always drawn, even when it is not on the one branch page read: the listing is
+   * alphabetical, so a repository with a hundred `claude/*` or `feat/*` branches pushes `main` to page
+   * two. Without it every other branch loses the line it forked from and is drawn as loose fragments.
+   * Its page is then read by name — the only handle there is — and its first commit is the head.
+   *
+   * Every other branch is read by the head SHA the listing returned, not by name: a `workflow/*` branch
+   * merged and deleted between the two calls would otherwise 404 and fail the whole graph, and one that
+   * moved would be drawn against commits its label does not point at.
    */
   async fetchCommitGraph(owner: string, repo: string): Promise<CommitGraphData> {
     const octokit = this.octokit
@@ -372,42 +381,44 @@ export class GithubService {
     ])
     const defaultBranch = repoData.default_branch
     const all: GraphBranch[] = listed.map((branch) => ({ name: branch.name, sha: branch.commit.sha }))
-    const defaultEntry = all.find((branch) => branch.name === defaultBranch)
-    const others = all.filter((branch) => branch.name !== defaultBranch)
-    const branches = [
-      ...(defaultEntry ? [defaultEntry] : []),
-      ...others.slice(0, COMMIT_GRAPH_LIMITS.maxBranches - (defaultEntry ? 1 : 0)),
-    ]
 
     const commits = new Map<string, GraphCommit>()
-    const readBranch = async (branch: GraphBranch, perPage: number) => {
-      const { data } = await octokit.rest.repos.listCommits({ owner, repo, sha: branch.name, per_page: perPage })
+    const readCommits = async (ref: string, perPage: number) => {
+      const { data } = await octokit.rest.repos.listCommits({ owner, repo, sha: ref, per_page: perPage })
       for (const item of data) {
         if (commits.has(item.sha)) continue
         commits.set(item.sha, {
           sha: item.sha,
           parents: item.parents.map((parent) => parent.sha),
-          message: item.commit.message.split('\n', 1)[0],
+          message: item.commit.message.split(/\r?\n/, 1)[0],
           author: item.commit.author?.name ?? item.author?.login ?? 'unknown',
           date: item.commit.committer?.date ?? item.commit.author?.date ?? '',
           url: item.html_url,
         })
       }
+      return data
     }
 
-    // The default branch first, so its page can make the other branches' heads already known.
-    if (defaultEntry) await readBranch(defaultEntry, COMMIT_GRAPH_LIMITS.defaultBranchCommits)
-    await Promise.all(
-      branches
-        .filter((branch) => branch !== defaultEntry && !commits.has(branch.sha))
-        .map((branch) => readBranch(branch, COMMIT_GRAPH_LIMITS.branchCommits)),
-    )
+    // The default branch first, so its page can make the other branches' heads already known. An empty
+    // listing is an empty repository: there is no default branch head to read.
+    let defaultEntry = all.find((branch) => branch.name === defaultBranch)
+    if (defaultEntry) {
+      await readCommits(defaultEntry.sha, COMMIT_GRAPH_LIMITS.defaultBranchCommits)
+    } else if (all.length > 0) {
+      const page = await readCommits(defaultBranch, COMMIT_GRAPH_LIMITS.defaultBranchCommits)
+      if (page.length > 0) defaultEntry = { name: defaultBranch, sha: page[0].sha }
+    }
+
+    const others = all.filter((branch) => branch.name !== defaultBranch)
+    const drawnOthers = others.slice(0, COMMIT_GRAPH_LIMITS.maxBranches - 1)
+    const unread = new Set(drawnOthers.map((branch) => branch.sha).filter((sha) => !commits.has(sha)))
+    await Promise.all([...unread].map((sha) => readCommits(sha, COMMIT_GRAPH_LIMITS.branchCommits)))
 
     return {
       defaultBranch,
-      branches,
+      branches: [...(defaultEntry ? [defaultEntry] : []), ...drawnOthers],
       commits: [...commits.values()],
-      omittedBranches: all.length - branches.length,
+      omittedBranches: others.length - drawnOthers.length,
       branchListComplete: listed.length < COMMIT_GRAPH_LIMITS.branchListPage,
     }
   }

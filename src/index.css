@@ -76,13 +76,17 @@
   --radius-md: 0px;
   --shadow-sm: 0 1px 2px rgb(45 43 43 / 0.14);
 
-  /* Commit-graph lane colors (CommitGraph.tsx cycles through them by lane index). */
-  --graph-lane-0: #ec3013;
-  --graph-lane-1: #2f6fdb;
-  --graph-lane-2: #1f9d55;
-  --graph-lane-3: #b7791f;
-  --graph-lane-4: #8e44ad;
-  --graph-lane-5: #0f8b8d;
+  /*
+   * Commit-graph lane colors (CommitGraph.tsx cycles through them by lane index). Defined only here and
+   * in the Classic dark block: every other preset inherits them through the cascade, so
+   * core/design-system.test.ts checks them as text (branch labels) against every preset's surfaces.
+   */
+  --graph-lane-0: #a8220c;
+  --graph-lane-1: #2457b3;
+  --graph-lane-2: #12693a;
+  --graph-lane-3: #7a4f0f;
+  --graph-lane-4: #7b3a98;
+  --graph-lane-5: #0a6365;
 }
 
 /*
@@ -966,7 +970,7 @@ a:focus-visible {
   flex: none;
   margin-left: auto;
   font-size: 11px;
-  color: rgb(var(--color-text-rgb) / 0.55);
+  font-variant-numeric: tabular-nums;
 }
 
 .graph-ref {

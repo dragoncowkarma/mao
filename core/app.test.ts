@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { createMaoApp } from './app.ts'
+import { createMaoApp, describeQueueWriteConflict } from './app.ts'
 import {
   FileStore,
   STORE_RESTART_REQUIRED,
@@ -11,7 +11,8 @@ import {
 } from './store.ts'
 import { hasPersistenceBrokenMarker, writePersistenceBrokenMarker } from './persistence-guard.ts'
 import type { AiProviderConfig } from './ai/types.ts'
-import { QUEUE_PERSISTENCE_BROKEN, type QueuedTask } from './workflow-engine.ts'
+import { QUEUE_PERSISTENCE_BROKEN, QueuePersistenceError, type QueuedTask } from './workflow-engine.ts'
+import { createStoreWriteLock } from './store-file.ts'
 
 const tmpDirs: string[] = []
 
@@ -98,15 +99,25 @@ describe('createMaoApp', () => {
     // broken (e.g. disk full, permissions), but the marker file — a separate, independent
     // writeFileSync call to a different path — is not, because the underlying disk can still take
     // a few bytes even when it can't take the full task-list blob.
+    //
+    // The data write goes to a temporary file beside config.json and is renamed over it (issue #73), so
+    // the failure is injected there, the way a full disk fails: the file is created, then the write of its
+    // bytes runs out of space — which leaves a partial temporary file for the cleanup to remove.
     const realWriteFileSync = fs.writeFileSync
     vi.spyOn(fs, 'writeFileSync').mockImplementation((file, ...rest) => {
-      if (String(file).endsWith('config.json')) throw new Error('ENOSPC: no space left on device')
+      const name = String(file)
+      if (name.includes('config.json')) {
+        realWriteFileSync(file, '', ...(rest.slice(1) as [never]))
+        throw new Error('ENOSPC: no space left on device')
+      }
       return realWriteFileSync(file, ...(rest as [never]))
     })
 
     expect(() => store.set('workflowTasks', [])).toThrow(/ENOSPC/)
     expect(() => workflowEngine.emit('persistence-broken', new Error('disk full'))).not.toThrow()
     expect(hasPersistenceBrokenMarker(dataDir)).toBe(true)
+    // The failed write leaves neither its lock nor its temporary file behind.
+    expect(fs.readdirSync(dataDir).filter((name) => name.includes('config.json'))).toEqual([])
   })
 
   it('an also-broken marker write does not crash the persistence-broken handler', () => {
@@ -165,7 +176,10 @@ describe('createMaoApp', () => {
       {
         get: <K extends keyof MaoStoreSchema>(key: K) => data[key],
         set: <K extends keyof MaoStoreSchema>(key: K, value: MaoStoreSchema[K]) => {
-          data[key] = value
+          // A copy, as both real backends store one (they serialize). Holding the engine's live array
+          // instead would make the stage's in-place status change look like another writer's edit to the
+          // conditional queue write (issue #73), which then refuses it.
+          data[key] = structuredClone(value)
           if (key !== 'workflowTasks') return
           workflowTaskWrites += 1
           if (failWorkflowTaskWrites) {
@@ -1211,5 +1225,423 @@ describe('MaoApp.resaveStoredQueue', () => {
 
     expect(booted.app.resaveStoredQueue()).toEqual({ kind: 'already-readable' })
     expect(booted.writes).toEqual([])
+  })
+})
+
+/**
+ * The real `mao run` queue-persistence path against a second process on the same `config.json` — issue
+ * #73 end to end.
+ *
+ * `mao run` is `createMaoApp` over one `FileStore` kept for the life of the process, and its `'change'`
+ * listener writes the queue on every transition. These drive that listener through a real engine
+ * mutation (`setAutoAdvance`, which persists without starting a stage) while another `FileStore` — a
+ * one-shot command in another terminal — changes the same file.
+ */
+describe('mao run queue persistence beside another process (issue #73)', () => {
+  function pausedTask(id = 'task-1'): QueuedTask {
+    return { ...makePendingTask(id), status: 'paused' }
+  }
+
+  /** A long-running host booted the way `mao run` boots, over `contents`. */
+  function bootLongRunning(contents: Record<string, unknown>) {
+    const { dataDir, store, filePath } = makeRealDataDirHolding(contents)
+    const app = createMaoApp({ store, workspaceRoot: path.join(dataDir, 'workspaces'), dataDir, resume: false })
+    return { dataDir, filePath, app }
+  }
+
+  /** A one-shot command opened afterwards on the same file, as `loadApp()` opens one. */
+  function oneShot(dataDir: string, filePath: string) {
+    return createMaoApp({ store: new FileStore(filePath), workspaceRoot: path.join(dataDir, 'workspaces'), dataDir, resume: false })
+  }
+
+  const onDisk = (filePath: string) => JSON.parse(fs.readFileSync(filePath, 'utf-8'))
+
+  it("does not revert another process's settings when it persists its queue", () => {
+    const { dataDir, filePath, app } = bootLongRunning({
+      githubToken: 'ghp_original',
+      githubRepos: [{ owner: 'acme', repo: 'gadgets' }],
+      workflowTasks: [pausedTask()],
+    })
+    const other = new FileStore(filePath)
+
+    other.set('githubToken', 'ghp_rotated')
+    other.set('githubRepos', [])
+    other.set('aiProviders', [claudeProvider])
+    other.set('theme', 'dark')
+    app.workflowEngine.setAutoAdvance('task-1', true)
+
+    const stored = onDisk(filePath)
+    expect(stored.githubToken).toBe('ghp_rotated')
+    expect(stored.githubRepos).toEqual([])
+    expect(stored.aiProviders).toEqual([claudeProvider])
+    expect(stored.theme).toBe('dark')
+    expect(stored.workflowTasks[0].autoAdvance).toBe(true)
+    expect(hasPersistenceBrokenMarker(dataDir)).toBe(false)
+  })
+
+  it('keeps a `mao repos remove` recovery of an unusable githubRepos (PR #66)', async () => {
+    // The issue's second reproduction: the long-running host booted holding the object-shaped list; the
+    // recovery its own report recommends runs in another terminal and says it worked; the host's next
+    // queue change used to put the object straight back.
+    captureWarnings()
+    const { dataDir, filePath, app } = bootLongRunning({
+      githubRepos: { 'acme/widgets': { owner: 'acme', repo: 'widgets' } },
+      workflowTasks: [pausedTask()],
+    })
+
+    await oneShot(dataDir, filePath).updateRepos((previous) => previous.filter((r) => r.repo !== 'widgets'))
+    expect(onDisk(filePath).githubRepos).toEqual([])
+
+    app.workflowEngine.setAutoAdvance('task-1', true)
+
+    expect(onDisk(filePath).githubRepos).toEqual([])
+    expect(new FileStore(filePath).problems()).toEqual([])
+  })
+
+  it('chains its own writes without mistaking them for another process', () => {
+    const { dataDir, filePath, app } = bootLongRunning({ workflowTasks: [pausedTask()] })
+
+    app.workflowEngine.setAutoAdvance('task-1', true)
+    app.workflowEngine.setAutoAdvance('task-1', false)
+    app.workflowEngine.setAutoAdvance('task-1', true)
+
+    expect(onDisk(filePath).workflowTasks[0].autoAdvance).toBe(true)
+    expect(hasPersistenceBrokenMarker(dataDir)).toBe(false)
+  })
+
+  it('refuses to overwrite a queue another process changed, and writes nothing', () => {
+    // Same key, two writers: the one-shot advanced the queue after the host loaded it. Writing the host's
+    // queue would silently drop that change — the lost update the issue asks to make explicit.
+    const { filePath, app } = bootLongRunning({ githubToken: 'ghp_SENTINEL_SECRET', workflowTasks: [pausedTask()] })
+    // Written straight through another store rather than via an enqueue, which would also start that
+    // process's queue running in the background of the test.
+    new FileStore(filePath).set('workflowTasks', [pausedTask(), pausedTask('added-elsewhere')])
+    const theirs = onDisk(filePath).workflowTasks
+
+    let message = ''
+    try {
+      app.workflowEngine.setAutoAdvance('task-1', true)
+    } catch (err) {
+      message = (err as Error).message
+    }
+
+    expect(message).toBe(describeQueueWriteConflict())
+    expect(message).not.toContain('ghp_SENTINEL_SECRET')
+    expect(onDisk(filePath).workflowTasks).toEqual(theirs)
+  })
+
+  it('stops running stages — via the existing persistence-broken safeguard — before any GitHub call', async () => {
+    // What a refused write costs in practice: the stage's entry notify is the refused write, so the task
+    // parks in 'error', the retry is refused too, and persistenceBroken plus its durable marker stop this
+    // engine. A second engine on the same queue is two engines able to repeat the same GitHub work.
+    const { dataDir, filePath, app } = bootLongRunning({ workflowTasks: [makePendingTask('task-1')] })
+    const preflight = vi.spyOn(app.githubService, 'assertRepoWorkflowWritable')
+    oneShot(dataDir, filePath).workflowEngine.setAutoAdvance('task-1', true)
+    const theirs = onDisk(filePath).workflowTasks
+
+    app.workflowEngine.resumeProcessing()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(app.workflowEngine.isPersistenceBroken()).toBe(true)
+    expect(app.workflowEngine.getPersistenceError()?.message).toBe(describeQueueWriteConflict())
+    expect(hasPersistenceBrokenMarker(dataDir)).toBe(true)
+    expect(preflight).not.toHaveBeenCalled()
+    expect(onDisk(filePath).workflowTasks).toEqual(theirs)
+  })
+
+  it('still restores a queue that went unusable after a clean boot, as the late-corruption card promises', () => {
+    // An unusable value is not another writer's queue: this session holds the real one, and its next
+    // write is documented to restore the file from it. Other keys survive that repair too.
+    captureWarnings()
+    const { dataDir, filePath, app } = bootLongRunning({ githubToken: 'ghp_original', workflowTasks: [pausedTask()] })
+    fs.writeFileSync(filePath, JSON.stringify({ ...onDisk(filePath), workflowTasks: { broken: true } }))
+
+    app.workflowEngine.setAutoAdvance('task-1', true)
+
+    expect(onDisk(filePath).workflowTasks).toEqual([{ ...pausedTask(), autoAdvance: true }])
+    expect(onDisk(filePath).githubToken).toBe('ghp_original')
+    expect(hasPersistenceBrokenMarker(dataDir)).toBe(false)
+  })
+
+  it('still repairs a mixed value whose only readable tasks are its own', () => {
+    captureWarnings()
+    const { dataDir, filePath, app } = bootLongRunning({ workflowTasks: [pausedTask()] })
+    fs.writeFileSync(filePath, JSON.stringify({ ...onDisk(filePath), workflowTasks: [pausedTask(), null] }))
+
+    app.workflowEngine.setAutoAdvance('task-1', true)
+
+    expect(onDisk(filePath).workflowTasks).toEqual([{ ...pausedTask(), autoAdvance: true }])
+    expect(hasPersistenceBrokenMarker(dataDir)).toBe(false)
+  })
+
+  it("refuses to 'repair' a mixed value that holds another process's readable task", () => {
+    // Another host wrote [task-1, added-elsewhere] — which this host would refuse — and then the value went
+    // mixed (a hand-edit, or a build whose task shape this one rejects). Treating that as a late
+    // corruption of this session's own queue would delete added-elsewhere.
+    captureWarnings()
+    const { filePath, app } = bootLongRunning({ workflowTasks: [pausedTask()] })
+    const theirs = [pausedTask(), pausedTask('added-elsewhere'), null]
+    fs.writeFileSync(filePath, JSON.stringify({ ...onDisk(filePath), workflowTasks: theirs }))
+
+    expect(() => app.workflowEngine.setAutoAdvance('task-1', true)).toThrow(describeQueueWriteConflict())
+    expect(onDisk(filePath).workflowTasks).toEqual(theirs)
+  })
+
+  it('recognizes its own boot tasks in an older build\'s form, so a late corruption is still repaired', () => {
+    // Stored before #77: the task's repo still carries registry settings. The guard normalizes it on read,
+    // so it never matched its own raw boot serialization and the repair read it as another host's task.
+    captureWarnings()
+    const legacy = { ...pausedTask(), repo: { owner: 'acme', repo: 'widgets', autoTrigger: true } }
+    const { dataDir, filePath, app } = bootLongRunning({ workflowTasks: [legacy] })
+    fs.writeFileSync(filePath, JSON.stringify({ ...onDisk(filePath), workflowTasks: [legacy, null] }))
+
+    app.workflowEngine.setAutoAdvance('task-1', true)
+
+    expect(onDisk(filePath).workflowTasks).toEqual([{ ...pausedTask(), autoAdvance: true }])
+    expect(hasPersistenceBrokenMarker(dataDir)).toBe(false)
+  })
+
+  it("refuses to re-save this session's queue over another host's readable task", () => {
+    // "Save this session's queue now" writes this session's queue over the unusable value — the same
+    // deletion the automatic repair refuses, so it refuses too, and says why.
+    captureWarnings()
+    const { filePath, app } = bootLongRunning({ workflowTasks: [pausedTask()] })
+    const theirs = [pausedTask(), pausedTask('added-elsewhere'), null]
+    fs.writeFileSync(filePath, JSON.stringify({ ...onDisk(filePath), workflowTasks: theirs }))
+
+    const outcome = app.resaveStoredQueue()
+
+    expect(outcome.kind).toBe('unverified')
+    expect(outcome.kind === 'unverified' && outcome.reason).toMatch(/readable tasks this session never loaded or wrote/)
+    // And it does not send the operator to the discard while this session is still live.
+    expect(outcome.kind === 'unverified' && outcome.reason).toMatch(/with no MAO host running/)
+    expect(onDisk(filePath).workflowTasks).toEqual(theirs)
+  })
+
+  it("recognizes a stale copy of its own task — an editor buffer saved late — as its own", () => {
+    // The third review's reproduction. The session wrote a change, then an editor holding the file from
+    // before that write saved it with a typo: [task-1 in its boot form, null]. That is this session's own
+    // past state, so the re-save repairs it and later writes go through — where recognising only the last
+    // write refused it as "another MAO host's" and left the session unable to persist at all.
+    captureWarnings()
+    const { dataDir, filePath, app } = bootLongRunning({ workflowTasks: [pausedTask()] })
+    app.workflowEngine.setAutoAdvance('task-1', true)
+    fs.writeFileSync(filePath, JSON.stringify({ ...onDisk(filePath), workflowTasks: [pausedTask(), null] }))
+
+    expect(app.resaveStoredQueue()).toEqual({ kind: 'replaced' })
+    app.workflowEngine.setAutoAdvance('task-1', false)
+
+    expect(onDisk(filePath).workflowTasks).toEqual([pausedTask()])
+    expect(hasPersistenceBrokenMarker(dataDir)).toBe(false)
+  })
+
+  it('still recognizes a task it cleared itself, when a stale copy of it comes back', () => {
+    // An editor read the file, then "Clear completed" ran, then the editor saved late with a typo. The done
+    // task in that buffer is this session's own past state; forgetting it at removal refused the re-save
+    // as another host's work and left the session unable to persist.
+    captureWarnings()
+    const done = { ...pausedTask('task-2'), status: 'done' as const }
+    const { filePath, app } = bootLongRunning({ workflowTasks: [pausedTask(), done] })
+    app.workflowEngine.clearCompleted()
+    fs.writeFileSync(filePath, JSON.stringify({ ...onDisk(filePath), workflowTasks: [pausedTask(), done, null] }))
+
+    expect(app.resaveStoredQueue()).toEqual({ kind: 'replaced' })
+    expect(onDisk(filePath).workflowTasks).toEqual([pausedTask()])
+  })
+
+  it('never forgets a task still in the queue, however many there are', () => {
+    // The fifth review's reproduction: a busy repo can queue more than the bound. Evicting live tasks made
+    // this process's own late-corrupted queue read as another host's, refusing both the re-save and the
+    // automatic repair.
+    captureWarnings()
+    const tasks = Array.from({ length: 1_001 }, (_, i) => pausedTask(`task-${i}`))
+    const { filePath, app } = bootLongRunning({ workflowTasks: tasks })
+    fs.writeFileSync(filePath, JSON.stringify({ workflowTasks: [...tasks, null] }))
+
+    expect(app.resaveStoredQueue()).toEqual({ kind: 'replaced' })
+  })
+
+  it('forgets only the least-recently-removed tasks once past its bound', () => {
+    // Bounded so a host that runs for months does not keep every form of every task it ever removed: with
+    // one removed id past the bound, the earliest removed is forgotten and the rest still count as its own.
+    captureWarnings()
+    const done = Array.from({ length: 1_001 }, (_, i) => ({ ...pausedTask(`done-${i}`), status: 'done' as const }))
+    const { filePath, app } = bootLongRunning({ workflowTasks: [pausedTask(), ...done] })
+    app.workflowEngine.clearCompleted()
+
+    fs.writeFileSync(filePath, JSON.stringify({ workflowTasks: [pausedTask(), done[0], null] }))
+    expect(app.resaveStoredQueue().kind).toBe('unverified')
+    fs.writeFileSync(filePath, JSON.stringify({ workflowTasks: [pausedTask(), done[1_000], null] }))
+    expect(app.resaveStoredQueue()).toEqual({ kind: 'replaced' })
+  })
+
+  it('repairs the same stale own copy automatically on its next queue write', () => {
+    captureWarnings()
+    const { filePath, app } = bootLongRunning({ workflowTasks: [pausedTask()] })
+    app.workflowEngine.setAutoAdvance('task-1', true)
+    fs.writeFileSync(filePath, JSON.stringify({ ...onDisk(filePath), workflowTasks: [pausedTask(), null] }))
+
+    app.workflowEngine.setAutoAdvance('task-1', false)
+
+    expect(onDisk(filePath).workflowTasks).toEqual([pausedTask()])
+  })
+
+  it('rolls back a task whose enqueue write was refused, so it cannot be persisted twice later', () => {
+    const { filePath, app } = bootLongRunning({ workflowTasks: [pausedTask()] })
+    new FileStore(filePath).set('workflowTasks', [pausedTask(), pausedTask('added-elsewhere')])
+
+    expect(() => app.workflowEngine.enqueue('Refused', { owner: 'acme', repo: 'widgets' }, false)).toThrow(
+      describeQueueWriteConflict(),
+    )
+    expect(app.workflowEngine.getTasks().map((t) => t.id)).toEqual(['task-1'])
+  })
+
+  it('reports a queue write blocked by another writer\'s lock as nothing written, so the change rolls back', () => {
+    // The lock was never taken, so nothing reached the file — a stronger statement than "unknown", which
+    // would trip persistenceBroken and the durable marker over another process merely being slow.
+    captureWarnings()
+    const { dataDir, filePath } = makeRealDataDirHolding({ workflowTasks: [pausedTask()] })
+    const store = new FileStore(filePath, { lock: { timeoutMs: 20 } })
+    const app = createMaoApp({ store, workspaceRoot: path.join(dataDir, 'workspaces'), dataDir, resume: false })
+
+    let refused: unknown
+    createStoreWriteLock(filePath)(() => {
+      try {
+        app.workflowEngine.setAutoAdvance('task-1', true)
+      } catch (err) {
+        refused = err
+      }
+    })
+
+    expect(refused).toBeInstanceOf(QueuePersistenceError)
+    expect((refused as QueuePersistenceError).writeState).toBe('not-written')
+    expect((refused as Error).message).toMatch(/Another MAO process is writing/)
+    expect(app.workflowEngine.getTasks()[0]?.autoAdvance).toBe(false)
+    expect(app.workflowEngine.isPersistenceBroken()).toBe(false)
+    expect(hasPersistenceBrokenMarker(dataDir)).toBe(false)
+    // Once the other writer is done, the same change goes through on the same base.
+    app.workflowEngine.setAutoAdvance('task-1', true)
+    expect(onDisk(filePath).workflowTasks).toEqual([{ ...pausedTask(), autoAdvance: true }])
+  })
+
+  it('halts until restart when the queue write cannot read the stored queue to compare it', () => {
+    // The readiness probe ran just before and saw a readable file, so this is the file failing in the
+    // interval — the same whole-file outage the probe and `healStoredQueue()` treat as restart-required.
+    captureWarnings()
+    const { dataDir, filePath, app } = bootLongRunning({ workflowTasks: [pausedTask()] })
+    vi.spyOn(app.store, 'setIfUnchanged').mockReturnValueOnce('unverifiable')
+
+    let refused: unknown
+    try {
+      app.workflowEngine.setAutoAdvance('task-1', true)
+    } catch (err) {
+      refused = err
+    }
+
+    expect((refused as QueuePersistenceError).writeState).toBe('not-written')
+    expect((refused as Error).message).toBe(STORE_RESTART_REQUIRED)
+    expect(app.workflowEngine.isQueueRecoveryRestartRequired()).toBe(true)
+    expect(app.workflowEngine.getTasks()[0]?.autoAdvance).toBe(false)
+    expect(onDisk(filePath).workflowTasks).toEqual([pausedTask()])
+    expect(hasPersistenceBrokenMarker(dataDir)).toBe(false)
+  })
+
+  it('reports a lockless replacement landing inside a recovery as restart-required, writing nothing', () => {
+    // The compare passed, then a writer that takes no lock replaced the file before the write's own merge
+    // read. FileStore refuses that read before writing anything, so this is a whole-file outage — not an
+    // unknown outcome to record as persistence-broken.
+    captureWarnings()
+    const { dataDir, filePath, app } = bootLongRunning({ githubToken: 'ghp_keep', workflowTasks: [pausedTask(), null] })
+    expect(app.workflowEngine.isQueueRecoveryLatched()).toBe(true)
+    let reads = 0
+    const realReadFileSync = fs.readFileSync
+    vi.spyOn(fs, 'readFileSync').mockImplementation(((file: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+      // 1: healStoredQueue's observation; 2: setIfUnchanged's compare; 3: FileStore.writeKey's merge read.
+      if (String(file) === filePath && ++reads === 3) fs.writeFileSync(filePath, '{ truncated')
+      return (realReadFileSync as (...args: unknown[]) => unknown)(file, ...rest)
+    }) as typeof fs.readFileSync)
+
+    const outcome = app.confirmQueueRecovery()
+    vi.restoreAllMocks()
+
+    expect(reads).toBe(3)
+    expect(outcome).toEqual({ kind: 'restart-required' })
+    expect(fs.readFileSync(filePath, 'utf-8')).toBe('{ truncated')
+    expect(app.workflowEngine.isQueueRecoveryRestartRequired()).toBe(true)
+    expect(hasPersistenceBrokenMarker(dataDir)).toBe(false)
+  })
+
+  it("refuses to overwrite a healthy queue another process changed, even when it holds only this one's tasks", () => {
+    // Another terminal ran `clear-completed` on this host's queue. Every task left in the file is one
+    // this process wrote, but the value is healthy — the repair exception is for an unusable value only —
+    // so writing over it would bring back the tasks the other process cleared.
+    captureWarnings()
+    const done: QueuedTask = { ...pausedTask('task-2'), status: 'done' }
+    const { filePath, app } = bootLongRunning({ workflowTasks: [pausedTask(), done] })
+    app.workflowEngine.setAutoAdvance('task-1', true)
+    const cleared = [{ ...pausedTask(), autoAdvance: true }]
+    new FileStore(filePath).set('workflowTasks', cleared)
+
+    expect(() => app.workflowEngine.setAutoAdvance('task-1', false)).toThrow(describeQueueWriteConflict())
+    expect(onDisk(filePath).workflowTasks).toEqual(cleared)
+  })
+
+  it('treats its own queue recovery as the base of its next write', () => {
+    // Without recording the recovery's write as this process's own, the very next queue change would see
+    // a queue it did not write and refuse — wedging the host the moment it was released.
+    captureWarnings()
+    const { dataDir, filePath, app } = bootLongRunning({ workflowTasks: [pausedTask(), null] })
+    expect(app.workflowEngine.isQueueRecoveryLatched()).toBe(true)
+
+    expect(app.confirmQueueRecovery()).toEqual({ kind: 'replaced' })
+    app.workflowEngine.setAutoAdvance('task-1', true)
+
+    expect(onDisk(filePath).workflowTasks).toEqual([{ ...pausedTask(), autoAdvance: true }])
+    expect(hasPersistenceBrokenMarker(dataDir)).toBe(false)
+  })
+})
+
+/**
+ * `MaoApp.saveProviders` with the list Global settings loaded (issue #73). The save-time observation
+ * only covers the instant of the save; what the editor's list was derived from is the load, so a
+ * provider import from a terminal in between must not be deleted — API keys and all — by the next Save.
+ */
+describe('MaoApp.saveProviders against the list the editor loaded', () => {
+  const imported: AiProviderConfig = { id: 'imported', name: 'Imported', kind: 'api', apiKey: 'sk-test-imported' }
+
+  function bootWithProviders() {
+    const { dataDir, store, filePath } = makeRealDataDirHolding({ aiProviders: [claudeProvider] })
+    const app = createMaoApp({ store, workspaceRoot: path.join(dataDir, 'workspaces'), dataDir, resume: false })
+    return { app, filePath }
+  }
+
+  it('refuses a save over a list another process changed after the editor loaded it, writing nothing', () => {
+    const { app, filePath } = bootWithProviders()
+    const loaded = [claudeProvider]
+    // `mao config import-providers` in a terminal while Global settings is open.
+    new FileStore(filePath).set('aiProviders', [claudeProvider, imported])
+
+    expect(() => app.saveProviders([{ ...claudeProvider, name: 'Renamed' }], loaded)).toThrow(
+      /changed after Global settings loaded it/,
+    )
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).aiProviders).toEqual([claudeProvider, imported])
+  })
+
+  it('saves when the stored list is still the one the editor loaded', () => {
+    const { app, filePath } = bootWithProviders()
+
+    expect(app.saveProviders([{ ...claudeProvider, name: 'Renamed' }], [claudeProvider])).toEqual([
+      { ...claudeProvider, name: 'Renamed' },
+    ])
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).aiProviders).toEqual([{ ...claudeProvider, name: 'Renamed' }])
+  })
+
+  it('keeps the save-time check alone for a caller with no editor load to compare against', () => {
+    const { app, filePath } = bootWithProviders()
+    new FileStore(filePath).set('aiProviders', [claudeProvider, imported])
+
+    app.saveProviders([claudeProvider])
+
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).aiProviders).toEqual([claudeProvider])
   })
 })

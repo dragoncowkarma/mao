@@ -46,13 +46,16 @@ const configPath = path.join(app.getPath('userData'), 'config.json')
  *
  * This still throws at module load for a file it cannot use, and `electron/main.ts` imports this module
  * through `electron/ipc.ts`, so the app exits before a window exists and the operator sees no dialog. The
- * bytes survive, which is the point, and `mao config show` reports the cause against the same file — the
- * CLI's data directory is this one. Showing it in the GUI needs the construction moved off module scope
- * and is left to its own change.
+ * bytes survive, which is the point. Do not count on `mao config show` to report the cause: a packaged
+ * GUI does not ship the CLI, and the CLI's default data directory need not be this one. Showing it in the
+ * GUI needs the construction moved off module scope and is left to its own change (issue #91).
  *
  * Typed as `MaoStore` rather than as the electron-store instance, and the instance is deliberately not
  * exported: the only thing the main process may do with persistence is the core contract, and a handler
  * that reached past it would read unvalidated values with nothing to flag it.
+ *
+ * `openGuardedStoreFile` also gives it the cross-process write lock `FileStore` takes for the same path
+ * (issue #73), so the desktop app and a `mao` CLI pointed at one `config.json` serialize their writes.
  */
 export const store: MaoStore = openGuardedStoreFile(configPath, () =>
   new Store<MaoStoreSchema>({

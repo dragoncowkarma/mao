@@ -104,7 +104,7 @@ const CASES = [
   { name: 'no origin remote', want: 1, setup: () => {} },
   {
     // remote.pushDefault redirects a bare `git push` elsewhere; the helper
-    // only vouches for origin, which is why SKILL.md requires pinning
+    // only vouches for origin, which is why shipping-and-git.md requires pinning
     // `git push --set-upstream origin <branch>`. The helper itself must
     // still pass here — and still not print the attacker remote.
     name: 'pushDefault to other remote (origin itself ok)',
@@ -141,7 +141,7 @@ for (const c of CASES) {
 // Branch-conditional config: an `includeIf "onbranch:feature/**"` section can
 // swap origin.pushurl the moment the branch exists, so a pre-branch preflight
 // is stale evidence. The guard must pass on main and fail after the switch —
-// which is exactly why SKILL.md requires re-running it right before push.
+// which is exactly why shipping-and-git.md requires re-running it right before push.
 {
   const dir = mkdtempSync(join(tmpdir(), 'origin-test-'))
   try {

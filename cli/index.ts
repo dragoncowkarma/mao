@@ -3,7 +3,15 @@ import path from 'node:path'
 import { Command } from 'commander'
 import { createMaoApp, type MaoApp } from '../core/app.ts'
 import { startAutoTrigger } from '../core/auto-trigger.ts'
-import { FileStore } from '../core/store.ts'
+import {
+  describeHealedStoredValue,
+  DESIGN_IDS,
+  FileStore,
+  isDesignId,
+  type DesignId,
+  type StoredValueProblem,
+  type ThemePreference,
+} from '../core/store.ts'
 import { defaultDataDir } from '../core/paths.ts'
 import { clearPersistenceBrokenMarker, hasPersistenceBrokenMarker } from '../core/persistence-guard.ts'
 import { runSwarm, SwarmRepositoryPathError } from '../core/swarm-runner.ts'
@@ -12,12 +20,23 @@ import { sameRepoRef } from '../core/repo-registry.ts'
 import { importProvidersFromFile } from '../core/provider-import.ts'
 import type { AiEffort } from '../core/ai/types.ts'
 import {
+  createModelCatalogMaintainer,
+  describeModelCatalog,
+  describeModelCatalogRefresh,
+  readModelCatalog,
+  startModelCatalogRefresher,
+} from '../core/model-catalog.ts'
+import {
+  DISCOVERABLE_PROVIDER_KINDS,
+  parseDiscoverableKind,
+  providerOptionsWithCatalog,
+} from '../core/ai/provider-options.ts'
+import {
   QUEUE_PERSISTENCE_BROKEN,
   type QueuedTask,
   type RepoRef,
   type RunOverride,
 } from '../core/workflow-engine.ts'
-import type { ThemePreference } from '../core/store.ts'
 
 function log(...args: unknown[]) {
   console.log('[mao]', ...args)
@@ -52,7 +71,7 @@ function resolveDataDir(): string {
  * Every command boots a fresh app instance against the on-disk store — the CLI is stateless between
  * invocations. `resume` defaults to false so that inspecting or reconfiguring state (e.g. `mao config
  * show`) never has the side effect of resuming real GitHub/AI-provider calls left over from a
- * previous `mao run`; only `run` itself opts in.
+ * previous `mao run`. `run` passes false too: it resumes by itself, after attaching its stdout listener.
  */
 function loadApp(resume = false): MaoApp {
   const dataDir = resolveDataDir()
@@ -103,6 +122,20 @@ config
   })
 
 config
+  .command('set-design <design>')
+  .description(`Set the UI design preset (${DESIGN_IDS.join(', ')}) — read by the Electron GUI`)
+  .action((design: string) => {
+    if (!isDesignId(design)) {
+      throw new Error(`Invalid design "${design}" — expected one of: ${DESIGN_IDS.join(', ')}`)
+    }
+    const { store } = loadApp()
+    const priorProblem = store.problems().find((problem) => problem.field === 'design')
+    store.set('design', design as DesignId)
+    log(`Design preset set to ${design}`)
+    if (priorProblem !== undefined) log(describeHealedStoredValue(priorProblem))
+  })
+
+config
   .command('show')
   .description('Print the current stored config (secrets redacted)')
   .action(() => {
@@ -112,6 +145,7 @@ config
       githubRepos: store.get('githubRepos'),
       aiProviders: store.get('aiProviders').map((p) => ({ ...p, apiKey: p.apiKey ? '[set]' : undefined })),
       theme: store.get('theme'),
+      design: store.get('design'),
       workflowPersistenceBroken: hasPersistenceBrokenMarker(resolveDataDir()),
       // A separate fact from the line above, never folded into it: that one means a prior process could
       // no longer *write* the queue, this one that this process cannot *read* it. Reporting a read-shape
@@ -153,6 +187,82 @@ config
     log('Cleared workflowPersistenceBroken. Restart MAO to reload and resume the verified queue.')
   })
 
+/**
+ * Says what a repository-list write healed, for the two commands that perform one.
+ *
+ * `mao repos remove` against an unusable stored value matches nothing, so `No tracked repo matches …`
+ * was all it said — while the write it had just performed was the recovery the store's own report told
+ * the operator to run. Left there, the one command that always heals reads like a no-op.
+ *
+ * What it healed comes from core (`describeHealedStoredValue`) rather than being spelled here, because
+ * the kinds are not the same event: a wrong container was *replaced*, while an array's unusable entries
+ * were *dropped* and its readable repositories kept. Calling the second a replacement describes a
+ * destructive write that did not happen, to an operator who has no other way to find out.
+ *
+ * Scoped to the one field these commands write. Walking every prior problem credited this command with
+ * an `aiProviders` or `workflowTasks` value that another process repaired during its `await`.
+ *
+ * It reports only a wrong-shaped *field* in a file that LOADED. When the file itself could not be read,
+ * the write is refused before it happens (issue #67), the command exits non-zero with that report, and
+ * nothing here runs — which is the point, because the write would have destroyed the token along with
+ * the list. Such a problem is also carried on the queue field, so the scoping above skips it anyway.
+ */
+function reportHealedFields(store: MaoApp['store'], before: StoredValueProblem[]): void {
+  const remaining = store.problems()
+  for (const problem of before.filter((candidate) => candidate.field === 'githubRepos')) {
+    if (!remaining.some((still) => still.field === problem.field)) log(describeHealedStoredValue(problem))
+  }
+}
+
+// --- providers ----------------------------------------------------------------
+
+const providers = program
+  .command('providers')
+  .description('Inspect and refresh the model lists MAO offers for each AI CLI (agy, claude, codex)')
+
+providers
+  .command('models')
+  .description('Print each AI CLI\'s model list: the built-in catalog merged with the last refresh')
+  .option('--json', 'print the cached catalog and the merged model options as JSON')
+  .action((opts: { json?: boolean }) => {
+    // A read of the separate cache file (core/model-catalog.ts) — no store, no network, no CLI run.
+    const catalog = readModelCatalog(resolveDataDir())
+    if (opts.json) {
+      const options = providerOptionsWithCatalog(catalog)
+      printJson({ catalog, models: Object.fromEntries(DISCOVERABLE_PROVIDER_KINDS.map((kind) => [kind, options[kind]])) })
+      return
+    }
+    for (const line of describeModelCatalog(catalog)) console.log(line)
+  })
+
+providers
+  .command('refresh-models')
+  .description(
+    'Ask agy (`agy models`), codex (`codex debug models`) and Claude (the Anthropic Models API with a saved ' +
+      'API key, else Claude Code\'s model settings) for their current model lists and cache them. Read-only ' +
+      'and billing-free; a provider that cannot answer keeps its cached or built-in list.',
+  )
+  .option('--provider <kind>', 'refresh only this provider (agy or antigravity, claude, codex); repeatable',
+    (value: string, previous: string[] = []) => [...previous, value])
+  .action(async (opts: { provider?: string[] }) => {
+    // Checked before booting the app: a typo must not run a partial refresh, or none, and exit 0.
+    const requested = (opts.provider ?? []).map((name) => {
+      const kind = parseDiscoverableKind(name)
+      if (!kind) throw new Error(`Unknown provider "${name}" — expected one of: agy (antigravity), claude, codex`)
+      return kind
+    })
+    const { store } = loadApp()
+    const report = await createModelCatalogMaintainer({
+      dataDir: resolveDataDir(),
+      // An Anthropic-format API provider's saved key is what lists Claude models; the store's read guard
+      // already filters entries it cannot use.
+      listProviders: () => store.get('aiProviders'),
+    }).refreshNow(requested)
+    for (const line of describeModelCatalogRefresh(report)) log(line)
+    // Scriptable: non-zero when any requested provider could not be refreshed or the cache was not saved.
+    if (!report.persisted || report.results.some((result) => result.outcome === 'failed')) process.exitCode = 1
+  })
+
 // --- repos ------------------------------------------------------------------
 
 const repos = program.command('repos').description('Manage GitHub repositories tracked by auto-trigger')
@@ -168,6 +278,10 @@ repos
   .action(async (owner: string, repo: string, opts: { autoTrigger: boolean; pollIntervalMs?: number }) => {
     const { store, updateRepos } = loadApp()
     const ref: RepoRef = { owner, repo, autoTrigger: opts.autoTrigger, pollIntervalMs: opts.pollIntervalMs }
+    // Read before the write, like `repos remove` below and for the same reason: this is a repository-list
+    // write, so it drops whatever the stored list held that cannot name a repository. An add that healed
+    // the file while saying only `Tracking …` leaves the operator to notice the loss on their own.
+    const problemsBefore = store.problems()
     // Same serialized core path the GUI's github:setRepos uses, so the two shells agree on what counts
     // as a new registration and on read/preflight/write being one unit. `repos add` doubles as this
     // CLI's only settings editor, so re-adding an already-tracked repo to flip --no-auto-trigger stays
@@ -187,6 +301,7 @@ repos
       const caveat = describeUnverifiedGrants(capability)
       if (caveat) log(caveat)
     }
+    reportHealedFields(store, problemsBefore)
   })
 
 repos
@@ -206,18 +321,7 @@ repos
     await updateRepos((previous) => previous.filter((r) => !sameRepoRef(r, target)))
     if (tracked.length === 0) log(`No tracked repo matches ${owner}/${repo}`)
     else for (const r of tracked) log(`Stopped tracking ${r.owner}/${r.repo}`)
-    // A removal against an unusable stored value matches nothing, so `No tracked repo matches …` was all
-    // it said — while the write it had just performed was the recovery the store's own report told the
-    // operator to run. Left there, the command that heals a wrong-shaped *field* reads like a no-op.
-    // It heals only a file that LOADED: when the file itself could not be read, the write is refused
-    // before it happens (issue #67), this command exits non-zero with that report, and nothing below
-    // runs — which is the point, because the write would have destroyed the token along with the list.
-    const remaining = store.problems()
-    for (const before of problemsBefore) {
-      if (!remaining.some((problem) => problem.field === before.field)) {
-        log(`Replaced the unusable "${before.field}" value in ${before.source}.`)
-      }
-    }
+    reportHealedFields(store, problemsBefore)
   })
 
 repos
@@ -474,6 +578,13 @@ program
     }
 
     const autoTrigger = startAutoTrigger(githubService, workflowEngine, () => store.inspect('githubRepos'))
+    // Long-running host, so it keeps the model catalog fresh too (architecture rule 5: never createMaoApp()).
+    // A fresh observation, not the boot snapshot, so an API key saved while this runs is used.
+    const modelCatalog = startModelCatalogRefresher({
+      dataDir: resolveDataDir(),
+      listProviders: () => store.inspect('aiProviders').value,
+      log: (message) => log(`model catalog: ${message}`),
+    })
     log('engine started — press Ctrl+C to stop')
 
     workflowEngine.on('change', (tasks: QueuedTask[]) => {
@@ -491,10 +602,21 @@ program
       }
     })
 
+    // The one way this engine stops on its own, so it must not stop silently. A queue write that keeps
+    // failing — most often another MAO host writing the same queue (issue #73), which the store now
+    // refuses rather than overwrites — trips persistenceBroken, and the `'change'` log above never sees
+    // that change: the persisting listener that threw runs first. The message is the store's own,
+    // value-free report.
+    workflowEngine.on('persistence-broken', (err: Error) => {
+      logErr(`queue persistence failed — this process will run no further stages: ${err.message}`)
+      logErr('Recorded as workflowPersistenceBroken (see `mao config show` and `mao config clear-persistence-broken`).')
+    })
+
     workflowEngine.resumeProcessing()
 
     process.on('SIGINT', () => {
       clearInterval(autoTrigger.handle)
+      modelCatalog.stop()
       log('shutting down')
       process.exit(0)
     })
@@ -524,7 +646,8 @@ program
       reset?: boolean
     }) => {
       try {
-        const exitCode = await runSwarm(opts)
+        // The CLI's own data directory: dispatch merges its refreshed model catalog over the built-in tables.
+        const exitCode = await runSwarm({ ...opts, modelCatalogDir: resolveDataDir() })
         process.exitCode = exitCode
       } catch (error) {
         if (error instanceof SwarmRepositoryPathError) {

@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from 'react'
-import Sidebar from './components/Sidebar'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import Sidebar, { type RepoListResetOutcome } from './components/Sidebar'
 import KanbanBoard from './components/KanbanBoard'
 import WorkflowQueue from './components/WorkflowQueue'
 import CommitGraph from './components/CommitGraph'
@@ -7,9 +7,18 @@ import ProjectSettings from './components/ProjectSettings'
 import GlobalSettings from './components/GlobalSettings'
 import UpdateBanner from './components/UpdateBanner'
 import { electronApi } from './electron-api'
+import {
+  applyEffectiveTheme,
+  normalizeThemePreference,
+  readCachedDesign,
+  readCachedTheme,
+  writeCachedDesign,
+  writeCachedTheme,
+} from './appearance-cache'
 import type { QueueRecoveryState, RepoRef } from '../core/workflow-engine'
 import type { RepoWorkflowCapability } from '../core/repo-capabilities'
 import { sameRepoRef } from '../core/repo-registry'
+import { DEFAULT_DESIGN_ID, normalizeDesignId, type DesignId } from '../core/design-system'
 import type { StoredValueProblem, ThemePreference } from '../core/store'
 import type { AppUpdateCheck } from './electron'
 
@@ -28,12 +37,38 @@ function selectedRepoIndex(repos: RepoRef[], selected: RepoRef): number {
   return exact === -1 ? repos.findIndex((repo) => sameRepoRef(repo, selected)) : exact
 }
 
+/**
+ * Electron re-wraps anything thrown inside `ipcMain.handle` as
+ * `Error invoking remote method '<channel>': <ErrorName>: <message>`. Strip the plumbing while
+ * leaving normal error messages verbatim.
+ */
+function appearanceErrorMessage(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err)
+  const match = raw.match(/^Error invoking remote method '[^']*':\s*(?:\w*Error:\s*)?(.*)$/s)
+  return match && match[1] ? match[1] : raw
+}
+
 export default function App() {
   const [repos, setRepos] = useState<RepoRef[]>([])
   const [selectedRepo, setSelectedRepo] = useState<RepoRef | null>(null)
   const [view, setView] = useState<View>('project')
   const [projectTab, setProjectTab] = useState<ProjectTab>('board')
-  const [theme, setThemeState] = useState<ThemePreference>('system')
+  const [theme, setThemeState] = useState<ThemePreference>(readCachedTheme)
+  const [design, setDesignState] = useState<DesignId>(readCachedDesign)
+  const [themeError, setThemeError] = useState('')
+  const [designError, setDesignError] = useState('')
+  const appearanceError = [designError, themeError].filter(Boolean).join(' ')
+  /**
+   * Per-axis request/settlement generations and last-confirmed values so an initial mount read or an
+   * out-of-order settlement cannot overwrite a newer user selection, and a double failure falls back
+   * to the last persisted state rather than an unpersisted optimistic pick.
+   */
+  const themeRequestGen = useRef(0)
+  const designRequestGen = useRef(0)
+  const lastSettledThemeGen = useRef(0)
+  const lastSettledDesignGen = useRef(0)
+  const lastConfirmedTheme = useRef<ThemePreference>(theme)
+  const lastConfirmedDesign = useRef<DesignId>(design)
   const [update, setUpdate] = useState<AppUpdateCheck | null>(null)
   const [dismissedUpdateSha, setDismissedUpdateSha] = useState<string | null>(null)
   /** Surfaces a failed settings edit or removal, which are otherwise silent (no preflight, no form). */
@@ -64,15 +99,16 @@ export default function App() {
    * read to decide what to do with the value being stored, and a render is not what has to happen in
    * between.
    *
-   * - `lastUnusable` — what the previous report said, so the next one can be recognised as a repair
-   *   rather than merely a quiet answer.
-   * - `repairOwed` — a repair has been seen but its list has not been adopted yet. Survives a failed
-   *   read so the next poll tries again.
+   * - `lastReport` — the previous report's text, or `undefined` for none, so any change in what the
+   *   store says about the list can be recognised. Not `nothingUsable`, and not "was there a report":
+   *   see `applyStoreProblems()`.
+   * - `rereadOwed` — the store's answer about the list has changed and the renderer has not taken the
+   *   new list yet. Survives a failed read so the next poll retries.
    * - `generation` — bumped whenever something invalidates a list read already in flight: the observed
    *   state changing, or this window starting a write. Repairs are observed on a 30s poll
    *   but adopted through a read that takes its own time, so the two interleave; without this, a read
    *   started for one repair could land after the store had broken and been repaired again, show the
-   *   list from before that second repair, and spend `repairOwed` so nothing ever read the current one.
+   *   list from before that second repair, and spend `rereadOwed` so nothing ever read the current one.
    * - `writesInFlight` — writes from this window that have not settled. A read taken across one answers
    *   with a list the write is about to replace, and a generation captured *after* the write began looks
    *   current, so the read is not started at all; the write's own completion re-enters and retries.
@@ -80,8 +116,8 @@ export default function App() {
    *   of order, and only the newest may apply, or a late older answer rolls the sidebar back.
    */
   const repoListWatch = useRef({
-    lastUnusable: false,
-    repairOwed: false,
+    lastReport: undefined as string | undefined,
+    rereadOwed: false,
     generation: 0,
     writesInFlight: 0,
     adoption: 0,
@@ -111,13 +147,20 @@ export default function App() {
     selectRepo(index === null ? null : candidates[index] ?? null)
   }
 
+  function clearAppearanceErrors() {
+    setDesignError('')
+    setThemeError('')
+  }
+
   function selectView(next: View) {
     navigationGeneration.current += 1
+    clearAppearanceErrors()
     setView(next)
   }
 
   function selectProjectTab(next: ProjectTab) {
     navigationGeneration.current += 1
+    clearAppearanceErrors()
     setProjectTab(next)
   }
 
@@ -132,43 +175,59 @@ export default function App() {
    * place, which is precisely when the notice has to stay up.
    */
   /**
-   * Stores a report and answers whether the repository list still has to be re-read because it was
-   * repaired since the last one.
+   * Stores a report and answers whether the repository list still has to be re-read because what the
+   * store holds has changed shape since the last one.
    *
-   * That transition is the only thing worth acting on. While the list is unusable the renderer holds
-   * `[]` — the guard's answer, not a list — so it is not stale, it is correct; and once a repair has
-   * been adopted there is nothing further to take. Re-reading on *every* poll instead would reintroduce
-   * the hazard `persistRepos`' success path avoids: a round trip landing mid-typing stomps newer
-   * keystrokes in the settings pane.
+   * That transition is the only thing worth acting on, and it is watched in **both** directions. While
+   * the stored list holds nothing usable the renderer holds `[]` — the guard's answer, not a list — and
+   * the moment that answer changes either way the rows on screen are describing a store that no longer
+   * exists: a repair puts repositories there that nothing else would read, and a corruption leaves live
+   * rows sitting under a card saying nothing is tracked, with `github:refreshRepo` still able to poll
+   * them. Re-reading on *every* poll instead would reintroduce the hazard `persistRepos`' success path
+   * avoids: a round trip landing mid-typing stomps newer keystrokes in the settings pane.
+   *
+   * The watched fact is the **report itself**, not whether one exists and not `nothingUsable`. Those
+   * two coarser keys each miss a transition, and issue #72 made both reachable by adding a reported
+   * state (`'some-entries'`) in which the renderer holds real rows:
+   *
+   * - "does a report exist" misses an all-invalid list hand-repaired into a partly usable one — still
+   *   reported either side, while rows appear for the first time.
+   * - `nothingUsable` misses the reverse, `'some-entries'` repaired to healthy — `false` either side,
+   *   so the warning vanishes and the rescued repository shows no row until the next list edit
+   *   re-reads. (`applyRepoListEdit` keeps that edit from deleting it, so the cost is a stale mirror.)
+   *
+   * Any change in the report is a change in what the store holds for this field (the text carries the
+   * counts), so it is the key that catches every one of those. Whether a whole-list *reset* may be
+   * offered stays a separate question, answered by `nothingUsable` in the sidebar — conflating the two
+   * is what produced the bug above.
    *
    * Deliberately does **not** clear the flag when it answers `true`: the transition is observable once,
-   * and clearing it here would spend it on a read that has not happened yet. `adoptRepairedRepoList()`
-   * clears it, and only once the list is in hand — so a transient failure leaves the repair pending and
-   * the next poll tries again, instead of stranding the sidebar on "No projects yet" until a restart.
+   * and clearing it here would spend it on a read that has not happened yet. `adoptStoredRepoList()`
+   * clears it, and only once the list is in hand — so a transient failure leaves it pending and the next
+   * poll tries again, instead of stranding the sidebar on "No projects yet" until a restart.
    */
   function applyStoreProblems(next: StoredValueProblem[]): boolean {
     const watch = repoListWatch.current
-    const unusable = next.some((problem) => problem.field === 'githubRepos')
-    if (unusable !== watch.lastUnusable) {
-      watch.lastUnusable = unusable
+    const report = next.find((problem) => problem.field === 'githubRepos')?.message
+    if (report !== watch.lastReport) {
+      watch.lastReport = report
       watch.generation += 1
+      watch.rereadOwed = true
     }
-    const healed = watch.repairOwed && !unusable
-    if (!healed) watch.repairOwed = unusable
     setStoreProblems(next)
     setStoreProblemsRead(true)
-    return healed
+    return watch.rereadOwed
   }
 
   /**
-   * Takes the repaired list, and only then treats the repair as done.
+   * Takes the list the store holds now, and only then treats the change as handled.
    *
    * Throws if the read fails, which every caller swallows — on purpose. The renderer's current list is
    * left exactly as it was rather than replaced with an empty one, and because the flag is still set the
    * next poll re-enters here. Adopting `[]` on failure would look identical to "there really are no
    * projects", which is the one thing this whole path exists to stop the operator being told.
    */
-  async function adoptRepairedRepoList(): Promise<void> {
+  async function adoptStoredRepoList(): Promise<void> {
     const watch = repoListWatch.current
     // Not while this window is writing: the store is about to hold whatever the write is sending, so a
     // read now can only produce a list to be discarded — and its generation, captured after the write
@@ -176,13 +235,13 @@ export default function App() {
     if (watch.writesInFlight > 0) return
     const startedAt = watch.generation
     const request = (watch.adoption += 1)
-    const repaired = await electronApi().github.getRepos()
+    const stored = await electronApi().github.getRepos()
     // Superseded while this read was in flight — by a newer report, by a write from this window, or by a
     // later adoption that has already answered. The list is dropped rather than applied, and
-    // `repairOwed` is left standing so the next report reads whatever exists then.
+    // `rereadOwed` is left standing so the next report reads whatever exists then.
     if (watch.generation !== startedAt || watch.adoption !== request) return
-    watch.repairOwed = false
-    setRepos(repaired)
+    watch.rereadOwed = false
+    setRepos(stored)
   }
 
   function refreshStoreProblems(): Promise<void> {
@@ -198,7 +257,7 @@ export default function App() {
         // ever re-read the list. Taking only the diagnostic down would leave the card gone and the
         // sidebar still insisting there are no projects, which is worse than either alone. Selection
         // reconciles itself: the identity effect above adopts the first entry once one exists.
-        if (applyStoreProblems(next)) await adoptRepairedRepoList()
+        if (applyStoreProblems(next)) await adoptStoredRepoList()
       })
       .catch(() => {})
   }
@@ -245,35 +304,119 @@ export default function App() {
   }, [])
 
   useEffect(() => {
-    electronApi().ui.getTheme().then(setThemeState)
+    let cancelled = false
+    Promise.resolve()
+      .then(() => electronApi().ui.getTheme())
+      .then((saved) => {
+        if (cancelled || themeRequestGen.current !== 0) return
+        const normalized = normalizeThemePreference(saved)
+        lastConfirmedTheme.current = normalized
+        writeCachedTheme(normalized)
+        setThemeState(normalized)
+      })
+      .catch((err) => {
+        if (cancelled || themeRequestGen.current !== 0) return
+        // Reset localStorage alongside the fallback state so cache, lastConfirmedTheme, and DOM stay aligned.
+        lastConfirmedTheme.current = 'system'
+        writeCachedTheme('system')
+        setThemeState('system')
+        setThemeError(appearanceErrorMessage(err))
+      })
+    Promise.resolve()
+      .then(() => electronApi().ui.getDesign())
+      .then((saved) => {
+        if (cancelled || designRequestGen.current !== 0) return
+        const normalized = normalizeDesignId(saved)
+        lastConfirmedDesign.current = normalized
+        writeCachedDesign(normalized)
+        setDesignState(normalized)
+      })
+      .catch((err) => {
+        if (cancelled || designRequestGen.current !== 0) return
+        // Reset localStorage alongside the fallback state so cache, lastConfirmedDesign, and DOM stay aligned.
+        lastConfirmedDesign.current = DEFAULT_DESIGN_ID
+        writeCachedDesign(DEFAULT_DESIGN_ID)
+        setDesignState(DEFAULT_DESIGN_ID)
+        setDesignError(appearanceErrorMessage(err))
+      })
+    return () => {
+      cancelled = true
+    }
   }, [])
+
+  useLayoutEffect(() => {
+    document.documentElement.setAttribute('data-design', design)
+  }, [design])
 
   // Applies the effective light/dark scheme to <html data-theme>, which src/index.css keys its dark
   // token overrides off of. 'system' has no fixed effective value, so it tracks the OS-level media
   // query live instead of resolving once — the app should flip immediately if the OS theme changes
   // while it's open, without requiring a restart or a settings round-trip.
-  useEffect(() => {
+  useLayoutEffect(() => {
     const media = window.matchMedia('(prefers-color-scheme: dark)')
+    const syncEffectiveTheme = () => applyEffectiveTheme(theme, media.matches)
 
-    function applyEffectiveTheme() {
-      const effective = theme === 'system' ? (media.matches ? 'dark' : 'light') : theme
-      if (effective === 'dark') {
-        document.documentElement.setAttribute('data-theme', 'dark')
-      } else {
-        document.documentElement.removeAttribute('data-theme')
-      }
-    }
-
-    applyEffectiveTheme()
+    syncEffectiveTheme()
 
     if (theme !== 'system') return
-    media.addEventListener('change', applyEffectiveTheme)
-    return () => media.removeEventListener('change', applyEffectiveTheme)
+    media.addEventListener('change', syncEffectiveTheme)
+    return () => media.removeEventListener('change', syncEffectiveTheme)
   }, [theme])
 
   async function setTheme(next: ThemePreference) {
+    setThemeError('')
+    const request = (themeRequestGen.current += 1)
     setThemeState(next)
-    await electronApi().ui.setTheme(next)
+    try {
+      await electronApi().ui.setTheme(next)
+      if (request > lastSettledThemeGen.current) {
+        lastSettledThemeGen.current = request
+        lastConfirmedTheme.current = next
+      }
+      if (themeRequestGen.current === request) {
+        writeCachedTheme(next)
+      }
+    } catch (err) {
+      const actual = await Promise.resolve()
+        .then(() => electronApi().ui.getTheme())
+        .then(normalizeThemePreference)
+        .catch(() => lastConfirmedTheme.current)
+      if (themeRequestGen.current !== request) return
+      lastSettledThemeGen.current = request
+      lastConfirmedTheme.current = actual
+      writeCachedTheme(actual)
+      setThemeState(actual)
+      setThemeError(appearanceErrorMessage(err))
+    }
+  }
+
+  async function setDesign(next: DesignId) {
+    setDesignError('')
+    const request = (designRequestGen.current += 1)
+    setDesignState(next)
+    try {
+      await electronApi().ui.setDesign(next)
+      if (request > lastSettledDesignGen.current) {
+        lastSettledDesignGen.current = request
+        lastConfirmedDesign.current = next
+      }
+      if (designRequestGen.current === request) {
+        writeCachedDesign(next)
+      }
+    } catch (err) {
+      const actual = await Promise.resolve()
+        .then(() => electronApi().ui.getDesign())
+        .then(normalizeDesignId)
+        .catch(() => lastConfirmedDesign.current)
+      if (designRequestGen.current !== request) return
+      lastSettledDesignGen.current = request
+      lastConfirmedDesign.current = actual
+      writeCachedDesign(actual)
+      setDesignState(actual)
+      setDesignError(appearanceErrorMessage(err))
+    } finally {
+      void refreshStoreProblems()
+    }
   }
 
   useEffect(() => {
@@ -339,15 +482,22 @@ export default function App() {
    * round trip that lands mid-typing would stomp newer keystrokes with the value it persisted.)
    *
    * Rolling back to a captured `previous` is wrong, though: that snapshot is this render's optimistic
-   * mirror, not the store, and `setRepos` writes the whole list, so several writes can be in flight at
+   * mirror, not the store, and several writes can be in flight at
    * once — an add's preflight is a multi-second network call during which the settings panel stays
    * live. Restoring a stale snapshot can then resurrect an entry the store refused, or erase one a
    * concurrent write just persisted, and since the renderer reads the list only once at mount that
    * divergence never heals. `github:getRepos` is a pure `store.get`, so asking it what actually
    * survived is both cheap and authoritative — and it is the re-fetch-after-mutation model AGENTS.md
    * prescribes for the renderer.
+   *
+   * `base` is the list `next` was computed from, and it is sent along with it. This window's list is a
+   * mirror, so it can be behind the store — a `mao repos remove` or `mao repos add` run in a terminal since
+   * the mirror was read is not in it — and sending only the result made that staleness permanent: the next
+   * settings toggle or Remove wrote the removed repository back (re-preflighted as new, then polled again)
+   * or dropped the added one. Core applies only what changed between `base` and `next` to the list stored
+   * now (`applyRepoListEdit`, issue #73), so every caller passes exactly the list it edited.
    */
-  async function persistRepos(next: RepoRef[]): Promise<RepoWorkflowCapability[]> {
+  async function persistRepos(next: RepoRef[], base: RepoRef[]): Promise<RepoWorkflowCapability[]> {
     const previous = repos
     // This window is now the newest thing to have touched the list, so any repair read already in flight
     // is describing a store that predates it — and until this settles, no new one should start.
@@ -355,7 +505,7 @@ export default function App() {
     repoListWatch.current.writesInFlight += 1
     setRepos(next)
     try {
-      return await electronApi().github.setRepos(next)
+      return await electronApi().github.setRepos(next, base)
     } catch (err) {
       // Fall back to the snapshot only if even the read fails; showing a stale list beats showing one
       // built from a write we know was refused.
@@ -419,7 +569,7 @@ export default function App() {
       }
       return []
     }
-    const checked = await persistRepos([...current, repo])
+    const checked = await persistRepos([...current, repo], current)
     // Re-read instead of deriving the selection from the optimistic copy: the fold means the stored
     // list can be shorter than the one just sent, and selecting into a list the store does not have
     // would leave the sidebar showing a row that is not there. This is the re-fetch-after-mutation
@@ -454,7 +604,7 @@ export default function App() {
     const next = repos.map((r, i) => (i === selectedIndex ? { ...r, ...patch } : r))
     setRepoError('')
     try {
-      await persistRepos(next)
+      await persistRepos(next, repos)
     } catch (err) {
       setRepoError(err instanceof Error ? err.message : String(err))
       return
@@ -594,7 +744,7 @@ export default function App() {
    * write-permission preflight, which is what an operator with a missing or revoked token is left
    * with. Sidebar confirms first, and shows the report naming the file to salvage from.
    */
-  async function resetRepoList() {
+  async function resetRepoList(): Promise<RepoListResetOutcome> {
     setRepoError('')
     // Re-read before destroying anything. This store is not this window's alone: the report itself tells
     // the operator to go to `config.json`, and `mao repos add` in a terminal heals it — while this card,
@@ -602,17 +752,32 @@ export default function App() {
     // deletes the healthy list they just built. Fail closed: a read that throws aborts the reset.
     const current = await electronApi().app.storeProblems()
     applyStoreProblems(current)
-    if (!current.some((problem) => problem.field === 'githubRepos')) {
-      await adoptRepairedRepoList().catch(() => {})
-      return
+    // Not "is it still unusable?" but "is any of it still usable?" — the two answers diverged once an
+    // array with some usable entries became a reported state of its own (issue #72). A hand-edit, or a
+    // `mao repos add` in a terminal, can rescue entries after this card rendered, and writing an empty
+    // list then deletes exactly what was rescued. Both ways out lead here: adopt whatever the store
+    // holds now and write nothing. The operator is not left guessing — the rows appear, the button goes
+    // (the report's own `nothingUsable` is what renders it), and the message changes under them.
+    const problem = current.find((candidate) => candidate.field === 'githubRepos')
+    if (problem === undefined || !problem.nothingUsable) {
+      await adoptStoredRepoList().catch(() => {})
+      // Which of the two no-write cases it was, because they call for different things from the
+      // operator: a list that reads normally again needs nothing, while a partly usable one still holds
+      // entries the next list write will drop.
+      return problem === undefined ? 'already-readable' : 'partly-usable'
     }
-    await persistRepos([])
+    // An edit of this window's mirror like any other: remove what it lists, add nothing. Against the
+    // unusable value (which reads as no repositories) that writes the empty list that heals it. If a
+    // terminal repaired the store in the instant since the re-check above, only rows this window itself
+    // lists are removed, so a repository registered there survives instead of being wiped blind.
+    await persistRepos([], repos)
     // Adopt what the store now holds, for the same reason removal does: the write is the authority.
     // Deliberately nothing else. Selection reconciles itself — the effect above clears `selectedRepo`
     // when the list empties — and forcing a view/tab here would be a navigation decision made after
     // two awaits, which is exactly what `navigationGeneration` exists to stop: the sidebar is visible
     // from Global settings too, so a reset started there would otherwise yank the operator away from it.
-    await adoptRepairedRepoList().catch(() => {})
+    await adoptStoredRepoList().catch(() => {})
+    return 'replaced'
   }
 
   async function removeSelectedRepo() {
@@ -632,7 +797,7 @@ export default function App() {
     setProjectTab('board')
     const fallbackGeneration = navigationGeneration.current
     try {
-      await persistRepos(next)
+      await persistRepos(next, repos)
     } catch (err) {
       setRepoError(err instanceof Error ? err.message : String(err))
       // If nothing else was selected while the write was pending, return to the repository whose
@@ -653,6 +818,7 @@ export default function App() {
   }
 
   function selectProject(index: number) {
+    clearAppearanceErrors()
     selectIndex(index, repos)
     setView('project')
     setProjectTab('board')
@@ -688,8 +854,28 @@ export default function App() {
           />
         )}
 
+        {appearanceError && view !== 'global-settings' && (
+          <div className="mb-3 flex items-center gap-2" role="alert">
+            <p className="text-xs text-danger">{appearanceError}</p>
+            <button
+              type="button"
+              className="btn btn-secondary text-xs"
+              onClick={clearAppearanceErrors}
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
+
         {view === 'global-settings' ? (
-          <GlobalSettings theme={theme} onThemeChange={setTheme} />
+          <GlobalSettings
+            theme={theme}
+            onThemeChange={setTheme}
+            design={design}
+            onDesignChange={setDesign}
+            appearanceError={appearanceError}
+            onDismissAppearanceError={clearAppearanceErrors}
+          />
         ) : !selected ? (
           <div>
             <h2>Welcome to MAO</h2>
@@ -705,11 +891,7 @@ export default function App() {
               </h2>
             </div>
 
-            {repoError && (
-              <p className="mb-3 text-xs" style={{ color: 'var(--color-accent-700)' }}>
-                {repoError}
-              </p>
-            )}
+            {repoError && <p className="mb-3 text-xs text-danger">{repoError}</p>}
 
             <div className="tabs">
               <button

@@ -1,7 +1,19 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { electronApi } from '../electron-api'
 import type { AgentStage, AiProviderConfig, ModelEffortPreset, ProviderKindId } from '../../core/ai/types'
-import { PROVIDER_OPTIONS } from '../../core/ai/provider-options'
+import {
+  DISCOVERABLE_PROVIDER_KINDS,
+  MODEL_CATALOG_FAILURE_TEXT,
+  catalogModelRows,
+  effortOptionsForModel,
+  providerOptionsWithCatalog,
+  type DiscoverableProviderKind,
+  type EffortOption,
+  type ModelCatalogView,
+  type ModelOption,
+  type ProviderOptions,
+} from '../../core/ai/provider-options'
+import { DEFAULT_DESIGN_ID, DESIGN_PRESETS, type DesignId } from '../../core/design-system'
 import type { ThemePreference } from '../../core/store'
 
 const ALL_STAGES: AgentStage[] = ['issue', 'pr', 'review', 'merge']
@@ -9,7 +21,11 @@ const STAGE_LABELS: Record<AgentStage, string> = { issue: 'Issue', pr: 'PR', rev
 
 interface GlobalSettingsProps {
   theme: ThemePreference
-  onThemeChange: (theme: ThemePreference) => void
+  onThemeChange: (theme: ThemePreference) => void | Promise<void>
+  design?: DesignId
+  onDesignChange?: (design: DesignId) => void | Promise<void>
+  appearanceError?: string
+  onDismissAppearanceError?: () => void
 }
 
 const THEME_OPTIONS: { value: ThemePreference; label: string }[] = [
@@ -56,28 +72,63 @@ const PROVIDER_KIND_LABELS: Record<ProviderKindId, string> = {
   custom: 'Custom',
 }
 
+/**
+ * The catalog's models plus the one already saved when the catalog does not list it. A `<select>` whose
+ * value matches no option shows its first option instead, so a stored model a refresh no longer lists, or
+ * an earlier generation the built-in list retired, would read as "Model: default" — and a save made for any
+ * other reason would look like it kept a setting it could not even show.
+ */
+function withSelectedModel(models: readonly ModelOption[], selected: string | undefined): ModelOption[] {
+  if (!selected || models.some((model) => model.value === selected)) return [...models]
+  return [...models, { value: selected, label: `${selected} (not in catalog)` }]
+}
+
+/**
+ * The same guard for a preset's effort. The choices narrow to the chosen model's levels, so a preset saved
+ * before that (Luna with `ultra`) would otherwise read "Effort: —" while the saved level is still sent —
+ * and rejected by the CLI. Shown as what it is, it can be seen and changed.
+ */
+function withSelectedEffort(efforts: readonly EffortOption[], selected: string | undefined): EffortOption[] {
+  if (!selected || efforts.length === 0 || efforts.some((effort) => effort.value === selected)) return [...efforts]
+  return [...efforts, { value: selected as EffortOption['value'], label: `${selected} (not supported by this model)` }]
+}
+
+/** One line per provider: where its list came from and when, and why the last refresh did not help. */
+function catalogStatus(kind: DiscoverableProviderKind, catalog: ModelCatalogView | undefined): string {
+  const label = PROVIDER_KIND_LABELS[kind]
+  const entry = catalog?.providers[kind]
+  const attempt = catalog?.attempts[kind]
+  const base = entry
+    ? `${label}: ${entry.models.length} model(s), refreshed ${new Date(entry.updatedAt).toLocaleString()}`
+    : `${label}: built-in list`
+  if (!attempt || attempt.outcome === 'updated') return base
+  const reason = MODEL_CATALOG_FAILURE_TEXT[attempt.reason ?? 'unexpected-error']
+  return attempt.outcome === 'failed' ? `${base} — last refresh failed: ${reason}` : `${base} — ${reason}`
+}
+
 // ─── Preset row ────────────────────────────────────────────────────────────────
 
 interface PresetRowProps {
   preset: ModelEffortPreset
-  kindId?: ProviderKindId
+  /** The kind's options with the refreshed catalog merged in; absent for a provider with no kind. */
+  kindOptions?: ProviderOptions
   isSelected: boolean
   onSelect: () => void
   onChange: (patch: Partial<ModelEffortPreset>) => void
   onRemove: () => void
 }
 
-function PresetRow({ preset, kindId, isSelected, onSelect, onChange, onRemove }: PresetRowProps) {
-  const opts = kindId ? PROVIDER_OPTIONS[kindId] : null
-  const modelOpts = opts?.models ?? []
-  const effortOpts = opts?.efforts ?? []
+function PresetRow({ preset, kindOptions, isSelected, onSelect, onChange, onRemove }: PresetRowProps) {
+  const catalogModels = kindOptions?.models ?? []
+  const modelOpts = catalogModels.length > 0 ? withSelectedModel(catalogModels, preset.model) : []
+  const effortOpts = withSelectedEffort(kindOptions ? effortOptionsForModel(kindOptions, preset.model) : [], preset.effort)
 
   const selectedModelOpt = modelOpts.find((m) => m.value === preset.model)
   const noEffort = selectedModelOpt?.noEffort ?? false
   const showEffort = effortOpts.length > 0 && !noEffort
 
   return (
-    <div className={`flex items-center gap-2 rounded border px-3 py-2 ${isSelected ? 'border-[var(--color-accent)] bg-[var(--color-bg)]' : 'border-[var(--color-border)] bg-[var(--color-bg-subtle)]'}`}>
+    <div className={`preset-row ${isSelected ? 'preset-row-active' : ''}`}>
       <input
         type="radio"
         checked={isSelected}
@@ -141,11 +192,13 @@ function PresetRow({ preset, kindId, isSelected, onSelect, onChange, onRemove }:
 
 interface ProviderCardProps {
   provider: AiProviderConfig
+  /** Every kind's options, refreshed catalog merged in (`providerOptionsWithCatalog`). */
+  options: Record<ProviderKindId, ProviderOptions>
   onUpdate: (patch: Partial<AiProviderConfig>) => void
   onRemove: () => void
 }
 
-function ProviderCard({ provider: p, onUpdate, onRemove }: ProviderCardProps) {
+function ProviderCard({ provider: p, options, onUpdate, onRemove }: ProviderCardProps) {
   const [presetsExpanded, setPresetsExpanded] = useState(false)
 
   function updatePreset(presetId: string, patch: Partial<ModelEffortPreset>) {
@@ -196,7 +249,7 @@ function ProviderCard({ provider: p, onUpdate, onRemove }: ProviderCardProps) {
   }
 
   const presetCount = p.presets?.length ?? 0
-  const kindOpts = p.providerKindId ? PROVIDER_OPTIONS[p.providerKindId] : PROVIDER_OPTIONS.custom
+  const kindOpts = p.providerKindId ? options[p.providerKindId] : options.custom
 
   return (
     <div className="card flex flex-col gap-3">
@@ -269,7 +322,7 @@ function ProviderCard({ provider: p, onUpdate, onRemove }: ProviderCardProps) {
             onChange={(e) => onUpdate({ model: e.target.value })}
           >
             <option value="">Model: default</option>
-            {kindOpts.models.map((m) => (
+            {withSelectedModel(kindOpts.models, p.model).map((m) => (
               <option key={m.value} value={m.value}>
                 {m.label}
               </option>
@@ -338,16 +391,13 @@ function ProviderCard({ provider: p, onUpdate, onRemove }: ProviderCardProps) {
       <div>
         <div className="flex items-center justify-between gap-2 mb-2">
           <button
-            className="flex items-center gap-1 text-xs text-muted hover:text-[var(--color-text)] transition-colors"
+            type="button"
+            className="btn-disclosure flex items-center gap-1 text-xs text-muted hover:text-[var(--color-text)] transition-colors"
             onClick={() => setPresetsExpanded((v) => !v)}
           >
             <span style={{ display: 'inline-block', transform: presetsExpanded ? 'rotate(90deg)' : 'none', transition: 'transform 0.15s' }}>▶</span>
             Model / Effort presets
-            {presetCount > 0 && (
-              <span className="ml-1 rounded-full bg-[var(--color-accent)] px-1.5 py-0.5 text-[10px] text-white">
-                {presetCount}
-              </span>
-            )}
+            {presetCount > 0 && <span className="badge-count">{presetCount}</span>}
           </button>
           <button onClick={addPreset} className="btn btn-secondary text-xs">
             + Add preset
@@ -363,7 +413,7 @@ function ProviderCard({ provider: p, onUpdate, onRemove }: ProviderCardProps) {
                 <PresetRow
                   key={pr.id}
                   preset={pr}
-                  kindId={p.providerKindId}
+                  kindOptions={p.providerKindId ? options[p.providerKindId] : undefined}
                   isSelected={p.selectedPresetId === pr.id}
                   onSelect={() => selectPreset(pr.id)}
                   onChange={(patch) => updatePreset(pr.id, patch)}
@@ -380,44 +430,188 @@ function ProviderCard({ provider: p, onUpdate, onRemove }: ProviderCardProps) {
 
 // ─── GlobalSettings ────────────────────────────────────────────────────────────
 
-export default function GlobalSettings({ theme, onThemeChange }: GlobalSettingsProps) {
+export default function GlobalSettings({
+  theme,
+  onThemeChange,
+  design = DEFAULT_DESIGN_ID,
+  onDesignChange,
+  appearanceError,
+  onDismissAppearanceError,
+}: GlobalSettingsProps) {
   const [githubToken, setGithubToken] = useState('')
   const [providers, setProviders] = useState<AiProviderConfig[]>([])
+  /**
+   * The provider list as stored when this pane last loaded or saved it — what the edits in `providers` are
+   * derived from. Sent with every save so core refuses one that would land over a list another process
+   * changed meanwhile (a `mao config import-providers` in a terminal, say), instead of deleting it and its
+   * API keys (issue #73). A JSON copy, never a shared reference, so no edit can reach it, and so it
+   * compares the way core compares stored values.
+   */
+  const [loadedProviders, setLoadedProviders] = useState<AiProviderConfig[] | undefined>(undefined)
   const [savedMessage, setSavedMessage] = useState('')
   const [saveError, setSaveError] = useState('')
+  /**
+   * A save is in flight. Both clicks of a double-click would otherwise carry the same base, and the second
+   * would be refused as "another process changed the list" — by the first click's own write.
+   */
+  const [saving, setSaving] = useState(false)
+  /**
+   * The provider list could not be loaded. Its own state rather than `saveError`, which every Save clears:
+   * a token-only Save used to wipe the warning and leave "Saved" beside an empty pane — exactly the "no
+   * providers yet" misreading the warning exists to prevent.
+   */
+  const [loadFailed, setLoadFailed] = useState(false)
+  /**
+   * Ids of providers the operator added in this pane and has not saved yet — the only editor entries a
+   * reload may carry over. Anything else the editor holds came from a load, and keeping it across a newer
+   * load would resurrect a provider deleted elsewhere in between, API key and all.
+   */
+  const unsavedAdditions = useRef(new Set<string>())
+  /** Bumped per load; only the most recently started load's answer is applied (Retry clicks, StrictMode). */
+  const loadGeneration = useRef(0)
+  /** Whether the save error on screen is the never-loaded refusal — the one a successful load makes moot. */
+  const saveErrorIsBlindRefusal = useRef(false)
+  /**
+   * The cached model catalog (`core/model-catalog.ts`), merged over the built-in tables below. Undefined
+   * until it loads — and for good if it cannot: the built-in tables are a complete answer on their own, so
+   * a failed read changes nothing but freshness and is not worth an alert.
+   */
+  const [catalog, setCatalog] = useState<ModelCatalogView | undefined>(undefined)
+  const [catalogRefreshing, setCatalogRefreshing] = useState(false)
+  const [catalogMessage, setCatalogMessage] = useState('')
+  const [catalogError, setCatalogError] = useState('')
+  const providerOptions = useMemo(() => providerOptionsWithCatalog(catalog), [catalog])
 
   useEffect(() => {
-    electronApi().ai.list().then(setProviders)
+    let cancelled = false
+    electronApi()
+      .ai.getModelCatalog()
+      .then(
+        (view) => {
+          if (!cancelled) setCatalog(view)
+        },
+        () => { /* The built-in tables stay in use; see `catalog`. */ },
+      )
+    return () => {
+      cancelled = true
+    }
   }, [])
+
+  async function refreshCatalog() {
+    if (catalogRefreshing) return
+    setCatalogRefreshing(true)
+    setCatalogMessage('')
+    setCatalogError('')
+    try {
+      const report = await electronApi().ai.refreshModelCatalog()
+      setCatalog(report.catalog)
+      const failed = report.results.some((result) => result.outcome === 'failed')
+      setCatalogMessage(
+        (failed ? 'Model lists refreshed with problems — see each provider above.' : 'Model lists refreshed.') +
+          // Nothing above can say this: the lines describe what was fetched, which did arrive.
+          (report.persisted ? '' : ' They could not be saved, so the rest of MAO keeps the previous lists.'),
+      )
+    } catch {
+      // Fixed wording: a rejection could quote a command line or an API response.
+      setCatalogError('Could not refresh the model lists. The cached and built-in lists stay in use.')
+    } finally {
+      setCatalogRefreshing(false)
+    }
+  }
+
+  function showSaveError(message: string, blindRefusal = false) {
+    setSaveError(message)
+    saveErrorIsBlindRefusal.current = blindRefusal
+  }
+
+  function loadProviders() {
+    const generation = (loadGeneration.current += 1)
+    electronApi()
+      .ai.list()
+      .then(
+        (list) => {
+          if (generation !== loadGeneration.current) return
+          // A provider the operator added while the load had failed is kept as an unsaved edit on top of
+          // the list now loaded, rather than silently discarded with its API key; the next Save writes both
+          // against this load.
+          setProviders((current) => [
+            ...list,
+            ...current.filter((p) => unsavedAdditions.current.has(p.id) && !list.some((loaded) => loaded.id === p.id)),
+          ])
+          setLoadedProviders(JSON.parse(JSON.stringify(list)) as AiProviderConfig[])
+          setLoadFailed(false)
+          // The refusal a Save gave while the list was missing no longer applies once it is here. Any other
+          // error — a token write that failed, say — still does, and stays.
+          if (saveErrorIsBlindRefusal.current) showSaveError('')
+        },
+        // Said, not swallowed: an empty pane after a failed load reads exactly like "no providers yet",
+        // and saving from it would replace the real list blind. The error text is not shown — a parse
+        // failure can quote the config file, and the GitHub token is stored in it in plain text.
+        () => {
+          if (generation === loadGeneration.current) setLoadFailed(true)
+        },
+      )
+  }
+
+  useEffect(loadProviders, [])
 
   function updateProvider(id: string, patch: Partial<AiProviderConfig>) {
     setProviders((prev) => prev.map((p) => (p.id === id ? { ...p, ...patch } : p)))
   }
 
   function addProvider() {
-    setProviders((prev) => [...prev, emptyProvider()])
+    const added = emptyProvider()
+    unsavedAdditions.current.add(added.id)
+    setProviders((prev) => [...prev, added])
   }
 
   function removeProvider(id: string) {
+    unsavedAdditions.current.delete(id)
     setProviders((prev) => prev.filter((p) => p.id !== id))
   }
 
   async function saveAll() {
-    setSaveError('')
+    if (saving) return
+    showSaveError('')
 
     const errors = validateProviders(providers)
     if (errors.length > 0) {
-      setSaveError(errors.join(' '))
+      showSaveError(errors.join(' '))
       return
     }
 
+    // Only a provider list that was edited is written. An unchanged one has nothing to say, and writing it
+    // anyway let an unrelated change made elsewhere (an import in a terminal) refuse a token-only save.
+    const providersChanged =
+      loadedProviders === undefined
+        ? providers.length > 0
+        : JSON.stringify(providers) !== JSON.stringify(loadedProviders)
+    if (providersChanged && loadedProviders === undefined) {
+      showSaveError(
+        'The stored AI provider list was never loaded, so saving these providers would replace it blind. ' +
+          'Nothing was saved. Retry loading providers, then save again.',
+        true,
+      )
+      return
+    }
+
+    setSaving(true)
     try {
-      await electronApi().ai.save(providers)
+      if (providersChanged) {
+        await electronApi().ai.save(providers, loadedProviders)
+        // What is stored now is what was just saved, so it is the base the next save is derived from — and
+        // nothing in the editor is an unsaved addition any more.
+        setLoadedProviders(JSON.parse(JSON.stringify(providers)) as AiProviderConfig[])
+        unsavedAdditions.current.clear()
+      }
       if (githubToken) await electronApi().github.setToken(githubToken)
-      setSavedMessage('Saved')
+      // Only claim a save that happened.
+      setSavedMessage(providersChanged || githubToken ? 'Saved' : 'Nothing to save')
       setTimeout(() => setSavedMessage(''), 1500)
     } catch (err) {
-      setSaveError(err instanceof Error ? err.message : String(err))
+      showSaveError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setSaving(false)
     }
   }
 
@@ -428,6 +622,42 @@ export default function GlobalSettings({ theme, onThemeChange }: GlobalSettingsP
 
       <div className="mb-4">
         <h3 className="!mb-2">Appearance</h3>
+        <div className="design-grid mb-4" role="group" aria-label="Design system">
+          {DESIGN_PRESETS.map((preset) => (
+            <button
+              type="button"
+              key={preset.id}
+              className={`design-option ${design === preset.id ? 'design-option-active' : ''}`}
+              aria-pressed={design === preset.id}
+              onClick={() => onDesignChange?.(preset.id)}
+            >
+              <div className="w-full flex items-center justify-between gap-2">
+                <div className="flex flex-wrap items-center gap-1.5 min-w-0">
+                  <span className="font-bold text-sm">{preset.name}</span>
+                  {preset.badge && <span className="tag tag-neutral">{preset.badge}</span>}
+                </div>
+                {design === preset.id && <span className="tag tag-success">Active</span>}
+              </div>
+              <span className="text-muted text-xs">{preset.summary}</span>
+              <div className="w-full flex flex-col gap-1 mt-1" aria-hidden="true">
+                <div className="design-swatch-bar" title={`${preset.name} light palette`}>
+                  <span className="flex-1" style={{ background: preset.swatches.light.bg }} />
+                  <span className="flex-1" style={{ background: preset.swatches.light.surface }} />
+                  <span className="flex-1" style={{ background: preset.swatches.light.text }} />
+                  <span className="flex-1" style={{ background: preset.swatches.light.accent }} />
+                  <span className="flex-1" style={{ background: preset.swatches.light.highlight }} />
+                </div>
+                <div className="design-swatch-bar" title={`${preset.name} dark palette`}>
+                  <span className="flex-1" style={{ background: preset.swatches.dark.bg }} />
+                  <span className="flex-1" style={{ background: preset.swatches.dark.surface }} />
+                  <span className="flex-1" style={{ background: preset.swatches.dark.text }} />
+                  <span className="flex-1" style={{ background: preset.swatches.dark.accent }} />
+                  <span className="flex-1" style={{ background: preset.swatches.dark.highlight }} />
+                </div>
+              </div>
+            </button>
+          ))}
+        </div>
         <div className="tabs">
           {THEME_OPTIONS.map((opt) => (
             <button
@@ -442,6 +672,20 @@ export default function GlobalSettings({ theme, onThemeChange }: GlobalSettingsP
         <p className="text-muted -mt-2 text-xs">
           "System" follows your OS light/dark setting and updates automatically if it changes.
         </p>
+        {appearanceError && (
+          <div className="mt-2 flex items-center gap-2" role="alert">
+            <span className="text-xs text-danger">{appearanceError}</span>
+            {onDismissAppearanceError && (
+              <button
+                type="button"
+                className="btn btn-secondary text-xs"
+                onClick={onDismissAppearanceError}
+              >
+                Dismiss
+              </button>
+            )}
+          </div>
+        )}
       </div>
 
       <div className="field mb-4 max-w-[420px]">
@@ -467,28 +711,81 @@ export default function GlobalSettings({ theme, onThemeChange }: GlobalSettingsP
           <ProviderCard
             key={p.id}
             provider={p}
+            options={providerOptions}
             onUpdate={(patch) => updateProvider(p.id, patch)}
             onRemove={() => removeProvider(p.id)}
           />
         ))}
-        {providers.length === 0 && <p className="text-muted">No AI providers registered yet.</p>}
+        {loadFailed ? (
+          <div className="flex flex-col items-start gap-2">
+            <p className="text-xs text-danger">
+              The AI provider list could not be loaded, so providers cannot be saved from this pane until it
+              is. Fix the config file, then retry.
+            </p>
+            <button onClick={loadProviders} className="btn btn-secondary text-xs">
+              Retry loading providers
+            </button>
+          </div>
+        ) : (
+          providers.length === 0 && <p className="text-muted">No AI providers registered yet.</p>
+        )}
       </div>
 
       <div className="flex items-center gap-3">
-        <button onClick={saveAll} className="btn btn-primary">
+        <button onClick={saveAll} className="btn btn-primary" disabled={saving}>
           Save changes
         </button>
-        {savedMessage && (
-          <span className="text-xs" style={{ color: 'var(--color-accent)' }}>
-            {savedMessage}
-          </span>
-        )}
+        {savedMessage && <span className="text-xs text-accent">{savedMessage}</span>}
       </div>
-      {saveError && (
-        <p className="mt-2 text-xs" style={{ color: 'var(--color-accent-700)' }}>
-          {saveError}
+      {saveError && <p className="mt-2 text-xs text-danger">{saveError}</p>}
+
+      <section className="mt-6" aria-labelledby="model-catalog-heading">
+        <div className="mb-2 flex items-center justify-between">
+          <h3 id="model-catalog-heading" className="!m-0">Model catalog</h3>
+          <button onClick={refreshCatalog} className="btn btn-secondary" disabled={catalogRefreshing}>
+            {catalogRefreshing ? 'Refreshing…' : 'Refresh model lists'}
+          </button>
+        </div>
+        <p className="text-muted mb-2 text-xs">
+          The model pickers above combine the built-in list with what each CLI last reported; refreshing lists
+          models without running or billing any.
+          {/* Only once known: the main process refreshes on its own whether or not this read succeeded. */}
+          {catalog &&
+            (catalog.ttlMs === null
+              ? ' Automatic refresh is off, so the lists change only when refreshed here or from the CLI.'
+              : ` MAO also refreshes them every ${Math.round((catalog.ttlMs / 3_600_000) * 100) / 100} h.`)}
         </p>
-      )}
+        <ul className="flex flex-col gap-1 text-xs">
+          {DISCOVERABLE_PROVIDER_KINDS.map((kind) => (
+            <li key={kind}>
+              {/* The models themselves, so a kind no provider uses yet is still visible — the GUI half of
+                  `mao providers models`, from the same rows (`catalogModelRows`). */}
+              <details>
+                <summary className="cursor-pointer">{catalogStatus(kind, catalog)}</summary>
+                <ul className="mt-1 flex flex-col gap-0.5 pl-4" aria-label={`${PROVIDER_KIND_LABELS[kind]} models`}>
+                  {catalogModelRows(kind, catalog).map((row) => (
+                    <li key={row.id}>
+                      <span className="font-mono">{row.id}</span>{' '}
+                      <span className="text-muted">
+                        {row.efforts.length > 0 ? row.efforts.join(', ') : 'no effort flag'}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              </details>
+            </li>
+          ))}
+        </ul>
+        {/* Always mounted, so a screen reader announces each change, the busy state included. */}
+        <p className="mt-2 text-xs text-accent" role="status">
+          {catalogRefreshing ? 'Refreshing model lists…' : catalogMessage}
+        </p>
+        {catalogError && (
+          <p className="mt-2 text-xs text-danger" role="alert">
+            {catalogError}
+          </p>
+        )}
+      </section>
     </div>
   )
 }

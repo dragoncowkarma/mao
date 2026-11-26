@@ -1,5 +1,7 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import type { AiProviderConfig } from '../core/ai/types.ts'
+import type { DiscoverableProviderKind, ModelCatalogView } from '../core/ai/provider-options.ts'
+import type { ModelCatalogRefreshReport } from '../core/model-catalog.ts'
 import type { GithubTask, GithubTaskDetail } from '../core/github-service.ts'
 import type { CommitGraphData } from '../core/commit-graph.ts'
 import type { RepoWorkflowCapability } from '../core/repo-capabilities.ts'
@@ -11,7 +13,7 @@ import type {
   RunOverride,
 } from '../core/workflow-engine.ts'
 import type { AutoTriggerStatus } from '../core/auto-trigger.ts'
-import type { StoredValueProblem, ThemePreference } from '../core/store.ts'
+import type { DesignId, StoredValueProblem, ThemePreference } from '../core/store.ts'
 import type { SelfUpdateCheck } from '../core/self-update.ts'
 
 export interface AppUpdateCheck extends SelfUpdateCheck {
@@ -24,14 +26,14 @@ export interface AppUpdateCheck extends SelfUpdateCheck {
  * `contextBridge.exposeInMainWorld` takes `any`, so for as long as this object was unannotated tsc
  * checked it only against `core/` types — never against `src/electron.d.ts`, the file whose whole job
  * is to describe it. The three-file IPC lockstep (AGENTS.md) was therefore maintained entirely by eye,
- * and SKILL.md said so: a channel added here and forgotten there, a renamed method, or a signature
+ * and the playbook said so: a channel added here and forgotten there, a renamed method, or a signature
  * that drifted all compiled cleanly and failed only when an operator clicked the thing.
  *
  * `satisfies` closes that, and in both directions — a method this object omits is TS2741, one it adds
- * that the declaration does not have is TS2353 (object-literal excess property check), and a
- * parameter or return type that disagrees is TS2322. It is `satisfies` rather than a type annotation
- * on purpose: an annotation would widen each function to the declared type and let the real
- * `ipcRenderer.invoke` return type stop being checked against it.
+ * that the declaration does not have is TS2353 (object-literal excess property check), and a written
+ * parameter or return type that disagrees is TS2322. A method with fewer parameters or no written return
+ * type still passes, because `ipcRenderer.invoke` returns `Promise<any>`: write the return type and
+ * forward every argument. `src/electron-ipc-surface.test.ts` pins the annotation on the install's argument.
  *
  * Pointing at the ambient `Window['electronAPI']` introduces no import, so nothing here depends on a
  * module under `src/` and the `electron/* -> core/*` direction is untouched. The arrow is deliberate:
@@ -52,10 +54,15 @@ contextBridge.exposeInMainWorld('electronAPI', {
   },
   ai: {
     list: (): Promise<AiProviderConfig[]> => ipcRenderer.invoke('ai:list'),
-    save: (providers: AiProviderConfig[]): Promise<AiProviderConfig[]> =>
-      ipcRenderer.invoke('ai:save', providers),
+    save: (providers: AiProviderConfig[], base?: AiProviderConfig[]): Promise<AiProviderConfig[]> =>
+      ipcRenderer.invoke('ai:save', providers, base),
     run: (providerId: string, prompt: string): Promise<string> =>
       ipcRenderer.invoke('ai:run', providerId, prompt),
+    /** The cached model catalog (`core/model-catalog.ts`); merge it with `providerOptionsWithCatalog()`. */
+    getModelCatalog: (): Promise<ModelCatalogView> => ipcRenderer.invoke('ai:getModelCatalog'),
+    /** Refreshes the given providers' model lists now (all when omitted). Resolves with fixed-category results. */
+    refreshModelCatalog: (kinds?: DiscoverableProviderKind[]): Promise<ModelCatalogRefreshReport> =>
+      ipcRenderer.invoke('ai:refreshModelCatalog', kinds),
   },
   github: {
     setToken: (token: string): Promise<void> => ipcRenderer.invoke('github:setToken', token),
@@ -70,8 +77,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
      * preflight. Resolves with the verdict for each newly registered repo, whose `unverified` grants
      * the caller should surface — a pass is not proof of write access.
      */
-    setRepos: (repos: RepoRef[]): Promise<RepoWorkflowCapability[]> =>
-      ipcRenderer.invoke('github:setRepos', repos),
+    setRepos: (repos: RepoRef[], base?: RepoRef[]): Promise<RepoWorkflowCapability[]> =>
+      ipcRenderer.invoke('github:setRepos', repos, base),
     getRepos: (): Promise<RepoRef[]> => ipcRenderer.invoke('github:getRepos'),
     autoTriggerStatus: (owner: string, repo: string): Promise<AutoTriggerStatus> =>
       ipcRenderer.invoke('github:autoTriggerStatus', owner, repo),
@@ -105,5 +112,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   ui: {
     getTheme: (): Promise<ThemePreference> => ipcRenderer.invoke('ui:getTheme'),
     setTheme: (theme: ThemePreference): Promise<void> => ipcRenderer.invoke('ui:setTheme', theme),
+    getDesign: (): Promise<DesignId> => ipcRenderer.invoke('ui:getDesign'),
+    setDesign: (design: DesignId): Promise<void> => ipcRenderer.invoke('ui:setDesign', design),
   },
 } satisfies Window['electronAPI'])

@@ -7,12 +7,16 @@ import {
   MAO_STORE_DEFAULTS,
   createStoredReadGuard,
   describeStoredProblems,
+  describeUnusableDesign,
   describeUnusableRepoList,
   describeUnusableProviderList,
   describeUnusableTaskQueue,
   describeUninspectableStore,
+  describeHealedStoredValue,
   findStoredQueueProblem,
   createGuardedStore,
+  describeRefusedStoredWrite,
+  storedValueWitness,
   classifyStoreReadFailure,
   UnreadableStoreError,
   openGuardedStoreFile,
@@ -20,9 +24,11 @@ import {
   parseStoredSettings,
   createStoredFileParser,
   operatorSafeStoreMessage,
+  storeWriteRequiresRestart,
   type MaoStoreSchema,
   type StoredValueBackend,
 } from './store.ts'
+import { StoreLockError, createStoreWriteLock } from './store-file.ts'
 import { canonicalRepoList } from './repo-registry.ts'
 import { importProvidersFromFile } from './provider-import.ts'
 import type { AiProviderConfig } from './ai/types.ts'
@@ -225,14 +231,103 @@ describe('FileStore githubRepos read guard', () => {
     expect(MAO_STORE_DEFAULTS.githubRepos).toEqual([])
   })
 
-  it('leaves element-level validity to repo-registry', () => {
-    // The boundary PR #57 drew: `isRepoRef`/`canonicalRepoList` own which *entries* are usable, and they
-    // need to see the junk to drop it. This guard owns the *container* only — the gap issue #60 found.
-    captureWarnings()
+  it('hands a mixed list through untouched, and reports what the next write will drop', () => {
+    // The boundary PR #57 drew, with the half issue #72 moved. `isRepoRef`/`canonicalRepoList` still own
+    // which *entries* are usable and still need to see the junk to drop it — so the read corrects
+    // nothing here. What changed is that it is no longer silent: the drop was safe and invisible, and an
+    // operator learned about it only by noticing a repository had vanished.
+    const warn = captureWarnings()
     const { store } = storeHolding({ githubRepos: [null, widgets] })
 
     expect(store.get('githubRepos')).toEqual([null, widgets])
     expect(canonicalRepoList(store.get('githubRepos'), store.get('githubRepos'))).toEqual([widgets])
+    expect(store.problems().map((problem) => problem.field)).toEqual(['githubRepos'])
+    expect(warn).toHaveBeenCalledTimes(1)
+  })
+
+  it('reports an array in which no entry can name a repository', () => {
+    // The state that read as a plain "No projects yet": every entry dropped, nothing to show, nothing
+    // said. Both halves of the count are asserted because only the total tells the operator whether one
+    // entry or twelve are about to be overwritten.
+    const warn = captureWarnings()
+    const { store, filePath } = storeHolding({ githubRepos: [null, 'acme/widgets'] })
+
+    expect(store.get('githubRepos')).toEqual([null, 'acme/widgets'])
+    expect(warn).toHaveBeenCalledTimes(1)
+    const message = warn.mock.calls[0]![0] as string
+    expect(message).toContain('"githubRepos"')
+    expect(message).toContain('2 entries of 2 do not name a repository')
+    expect(message).toContain('null, a string')
+    expect(message).toContain(filePath)
+    // Nothing is usable, so the whole-list recovery loses nothing and is named.
+    expect(message).toContain('Reset stored list')
+    expect(store.problems()).toHaveLength(1)
+    expect(store.problems()[0]!.defect).toBe('every-entry')
+    expect(store.problems()[0]!.nothingUsable).toBe(true)
+  })
+
+  it('reports a mixed list by count and type, and does not offer to replace it', () => {
+    // The opposite recovery, for the same field, decided by whether anything survived: with rows on
+    // screen a whole-list write deletes repositories the operator can see working, so neither the
+    // message nor (see Sidebar.test.tsx) the button offers one.
+    const warn = captureWarnings()
+    const { store, filePath } = storeHolding({ githubRepos: [widgets, null, { owner: 'acme' }] })
+
+    expect(store.get('githubRepos')).toEqual([widgets, null, { owner: 'acme' }])
+    const message = warn.mock.calls[0]![0] as string
+    expect(message).toContain('2 entries of 3 do not name a repository')
+    // Deduplicated: two unusable entries, two distinct types.
+    expect(message).toContain('null, an object')
+    expect(message).toContain('tracking the 1 readable repository normally')
+    expect(message).toContain(filePath)
+    expect(message).not.toContain('Reset stored list')
+    expect(store.problems()[0]!.defect).toBe('some-entries')
+    expect(store.problems()[0]!.nothingUsable).toBe(false)
+  })
+
+  it('counts a half-written entry by what it cannot do, not by its type', () => {
+    // `{ owner: '', repo: 'widgets' }` is an object with both declared keys, so a `typeof`-level check
+    // would call it usable — and `startAutoTrigger` cannot poll it, `repos remove` cannot name it, and
+    // `canonicalRepoList` drops it. The report has to agree with the predicate that actually drops.
+    const warn = captureWarnings()
+    const { store } = storeHolding({ githubRepos: [{ owner: '', repo: 'widgets' }] })
+
+    store.get('githubRepos')
+    const message = warn.mock.calls[0]![0] as string
+    expect(message).toContain('1 entry of 1 does not name a repository')
+    expect(message).toContain('an object')
+    expect(message).not.toContain('widgets')
+    expect(store.problems()[0]!.defect).toBe('every-entry')
+  })
+
+  it('counts a sparse hole as an entry that cannot name a repository', () => {
+    // A hole cannot reach the guard from the *file* — JSON has no hole, so a parsed list carries a real
+    // `null` — but it can reach a report before the file is read back. `store.set` takes a `githubRepos`
+    // list verbatim (that write is deliberately unvalidated; see below) and `problems()` answers from the
+    // same snapshot, while `persist()` turns the hole into `null` on the way to disk. So a counter with
+    // hole-skipping `filter`/`every` semantics would report a healthy list and then hand the next reader
+    // a `null` it never mentioned.
+    captureWarnings()
+    const { store } = storeHolding({ githubRepos: [widgets] })
+
+    store.set('githubRepos', [widgets, , gadgets] as unknown as RepoRef[])
+
+    const problems = store.problems()
+    expect(problems).toHaveLength(1)
+    expect(problems[0]!.message).toContain('1 entry of 3 does not name a repository')
+    expect(problems[0]!.defect).toBe('some-entries')
+  })
+
+  it('accepts an invalid entry on write, unlike the two fields that reject one', () => {
+    // Deliberate asymmetry, and the reason `describeInvalidStoredWrite` is keyed on its own two fields
+    // rather than on the read table's predicates. `createRepoRegistrar` is the only writer and it writes
+    // `canonicalRepoList`'s output, so rejecting entries here would buy nothing — while making a store
+    // an older build wrote unrecoverable through the one API that can replace it.
+    captureWarnings()
+    const { store } = storeHolding({ githubRepos: [widgets] })
+
+    expect(() => store.set('githubRepos', [null] as unknown as RepoRef[])).not.toThrow()
+    expect(store.validateWrite('githubRepos', [null] as unknown as RepoRef[])).toBeUndefined()
   })
 
   it('returns a value the expression auto-trigger runs per tick can consume', () => {
@@ -546,6 +641,22 @@ describe('FileStore workflowTasks read guard', () => {
       expect(message).not.toContain('ghp_liveSecretValue')
       expect(message).not.toContain('ghp_anotherSecret')
     }
+
+    // And inside an array, which is where the temptation is: naming the half-written entry would
+    // genuinely help, and is exactly what must not be printed. `githubRepos` is the only field whose
+    // entry report is reachable this way — the other two already had theirs pinned above.
+    for (const value of [[{ owner: 'ghp_liveSecretValue', repo: '' }], [{ token: 'ghp_anotherSecret' }, null]]) {
+      const message = describeUnusableRepoList(value, '/tmp/config.json')!
+      expect(message).toContain('an object')
+      expect(message).not.toContain('ghp_liveSecretValue')
+      expect(message).not.toContain('ghp_anotherSecret')
+    }
+
+    // A legitimate value is no less private than a secret-shaped one: this text reaches piped output,
+    // agent logs, an IPC payload and a screen-shared window.
+    const named = describeUnusableRepoList([widgets, null], '/tmp/config.json')!
+    expect(named).not.toContain('acme')
+    expect(named).not.toContain('widgets')
   })
 
   it('survives a write to an unrelated field, which is what lets the next boot latch again', () => {
@@ -702,6 +813,119 @@ describe('describeStoredProblems', () => {
     expect(problems.map((problem) => problem.field)).toEqual(['githubRepos'])
     expect(problems[0]!.source).toBe('/tmp/config.json')
     expect(describeStoredProblems((key) => structuredClone(MAO_STORE_DEFAULTS)[key], '/tmp/c.json')).toEqual([])
+  })
+})
+
+/**
+ * Every guarded field, with one usable and one unusable entry each, so the classification table below
+ * can be driven over all three rather than over the one this change was about.
+ */
+const GUARDED_ENTRY_FIXTURES: Array<{
+  field: 'githubRepos' | 'aiProviders' | 'workflowTasks'
+  describe_: (value: unknown, source: string) => string | null
+  valid: unknown
+  invalid: unknown
+}> = [
+  { field: 'githubRepos', describe_: describeUnusableRepoList, valid: widgets, invalid: null },
+  { field: 'aiProviders', describe_: describeUnusableProviderList, valid: claude, invalid: { id: 'x' } },
+  { field: 'workflowTasks', describe_: describeUnusableTaskQueue, valid: pendingTask, invalid: { id: 'task-2' } },
+]
+
+describe('stored shape classification', () => {
+  /** The raw reader `describeStoredProblems` takes, with one field overridden and the rest healthy. */
+  function problemsFor(field: keyof MaoStoreSchema, raw: unknown, source = '/tmp/config.json') {
+    const values = { ...structuredClone(MAO_STORE_DEFAULTS), [field]: raw } as unknown as MaoStoreSchema
+    return describeStoredProblems((key) => values[key], source)
+  }
+
+  it('reports exactly when it classifies a defect, for every field and every shape', () => {
+    // The invariant the flattened `nothingUsable` rests on, and the one thing nothing in the compiler
+    // can check. `storedValueProblem()` derives the defect and the message from the same raw value by
+    // the same predicate and treats a disagreement as "nothing to report" rather than throwing — so a
+    // describer whose non-null range drifted from the classifier would go silent on both surfaces at
+    // once, which is precisely the silence issue #72 is about. The mixed row is what makes this
+    // non-vacuous: with only wrong containers and clean arrays it passes against a describer that
+    // ignores entries entirely.
+    for (const { field, describe_, valid, invalid } of GUARDED_ENTRY_FIXTURES) {
+      const shapes: Array<[unknown, string | null]> = [
+        [[], null],
+        [[valid], null],
+        [[invalid], 'every-entry'],
+        [[valid, invalid], 'some-entries'],
+        ...DISCARDED_SHAPES.map(([shape]) => [shape, 'value'] as [unknown, string | null]),
+      ]
+
+      for (const [raw, expectedDefect] of shapes) {
+        const problems = problemsFor(field, raw)
+        const message = describe_(raw, '/tmp/config.json')
+
+        expect([field, raw, problems.length === 1]).toEqual([field, raw, message !== null])
+        expect([field, raw, problems[0]?.defect ?? null]).toEqual([field, raw, expectedDefect])
+      }
+    }
+  })
+
+  it('answers nothingUsable false only for a list some of whose entries survive', () => {
+    // What gates the sidebar's whole-list reset. True for a wrong container and for an array with
+    // nothing usable in it — both leave no row, so replacing the value loses nothing a caller could have
+    // used — and false the moment one entry names something, because a reset would then delete it.
+    for (const { field, valid, invalid } of GUARDED_ENTRY_FIXTURES) {
+      expect(problemsFor(field, { keyed: valid })[0]!.nothingUsable).toBe(true)
+      expect(problemsFor(field, [invalid])[0]!.nothingUsable).toBe(true)
+      expect(problemsFor(field, [valid, invalid])[0]!.nothingUsable).toBe(false)
+      expect(problemsFor(field, [valid])).toEqual([])
+    }
+  })
+})
+
+describe('an unloadable file answers the permission question too', () => {
+  it('names no defect and refuses a whole-value replacement', () => {
+    // Issue #67's whole-file problem observed no value, so it has no shape to name — but it still has to
+    // answer whether replacing a whole value is lossless, and the only safe answer for a state that
+    // established nothing is "no". `StoredValueProblem.nothingUsable` is required for exactly that
+    // reason; `defect` is not.
+    captureWarnings()
+    const { store, filePath } = storeHolding({ githubRepos: [widgets] })
+    fs.writeFileSync(filePath, '{ not json')
+
+    const problems = store.problems()
+
+    expect(problems).toHaveLength(1)
+    expect(problems[0]!.wholeFile).toBe(true)
+    expect(problems[0]!.defect).toBeUndefined()
+    expect(problems[0]!.nothingUsable).toBe(false)
+  })
+})
+
+describe('describeHealedStoredValue', () => {
+  it('says which kind of write happened, because the two are not the same event', () => {
+    // `mao repos remove` prints this after a write that made a reported problem go away. Calling a
+    // dropped-entries write a replacement tells an operator whose readable repositories were *kept*
+    // that their stored value is gone.
+    const problem = { field: 'githubRepos' as const, source: '/tmp/config.json', message: 'ignored' }
+
+    expect(describeHealedStoredValue({ ...problem, defect: 'value', nothingUsable: true })).toBe(
+      'Replaced the unusable "githubRepos" value in /tmp/config.json.',
+    )
+    expect(describeHealedStoredValue({ ...problem, defect: 'every-entry', nothingUsable: true })).toBe(
+      'Dropped the unusable "githubRepos" entries from /tmp/config.json.',
+    )
+    expect(describeHealedStoredValue({ ...problem, defect: 'some-entries', nothingUsable: false })).toBe(
+      'Dropped the unusable "githubRepos" entries from /tmp/config.json, keeping the readable ones.',
+    )
+  })
+
+  it('names the field and the file and nothing else', () => {
+    const healed = describeHealedStoredValue({
+      field: 'githubRepos',
+      source: '/tmp/config.json',
+      message: describeUnusableRepoList([widgets, null], '/tmp/config.json')!,
+      defect: 'some-entries',
+      nothingUsable: false,
+    })
+
+    expect(healed).not.toContain('acme')
+    expect(healed).not.toContain('widgets')
   })
 })
 
@@ -1443,12 +1667,14 @@ describe('MaoStore.setIfUnchanged', () => {
 /**
  * The limit of `setIfUnchanged()`, pinned so it lives in the suite rather than only in a comment.
  *
- * Two revisions of this PR claimed the read-then-clobber window was closed. It is not: the comparison
- * narrows it to the compare -> write interval, and a repair landing *inside* that interval is still
- * overwritten. Asserting the real behaviour is what stops the claim drifting back — if someone later adds
- * a lock and genuinely closes it, this test fails and has to be rewritten deliberately.
+ * Two revisions of PR #69 claimed the read-then-clobber window was closed when it was only narrowed to
+ * the compare -> write interval. This suite said that if a lock ever genuinely closed it, the suite would
+ * have to be rewritten deliberately — and issue #73 added that lock, so this is the rewrite. What it now
+ * pins is the exact boundary: against another **MAO** process the interval is closed (both backends take
+ * the config file's write lock around it), and against a writer that takes no lock — a hand-edit, another
+ * tool — it is still open. Both halves are executable so neither claim can drift.
  */
-describe('setIfUnchanged — what it does not close', () => {
+describe('setIfUnchanged — what it does and does not close', () => {
   it('is atomic against other callers in this process', () => {
     // The half that IS guaranteed, and the reason: nothing may be inserted between the compare and the
     // write, so no other JavaScript here can interleave. A backend that counts reads proves the pair runs
@@ -1478,13 +1704,51 @@ describe('setIfUnchanged — what it does not close', () => {
     expect(reads).toEqual(['workflowTasks'])
   })
 
-  it('does NOT close the window against another OS process, and must not claim to', () => {
-    // The honest residue. This backend repairs the value *after* the compare read has answered, which is
-    // what another process doing it between our compare and our writeFileSync looks like from here. The
-    // repair is overwritten and the result is still 'written'.
+  it('closes the window against another MAO process: its write cannot land inside the interval', () => {
+    // The scenario the residue test below reproduces, but with the writer being another real `FileStore`
+    // on the same file — i.e. another MAO process. It tries to write while A sits between its compare
+    // and its rename; it has to take the lock A holds, so it waits and is refused instead of landing.
+    captureWarnings()
+    const { store: a, filePath } = storeHolding({ workflowTasks: { 'task-1': pendingTask } })
+    const b = new FileStore(filePath, { lock: { timeoutMs: 20 } })
+    const observedByA = a.inspect('workflowTasks')
+    const observedByB = b.inspect('workflowTasks')
+
+    let competing: unknown = 'never attempted'
+    let armed = true
+    const realReadFileSync = fs.readFileSync
+    vi.spyOn(fs, 'readFileSync').mockImplementation(((file: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+      const text = (realReadFileSync as (...args: unknown[]) => unknown)(file, ...rest)
+      if (armed && String(file) === filePath) {
+        // A's compare read has just answered. B's repair, attempted right here, is the interleaving.
+        armed = false
+        try {
+          b.set('workflowTasks', [pendingTask])
+          competing = 'landed'
+        } catch (err) {
+          competing = err
+        }
+      }
+      return text
+    }) as typeof fs.readFileSync)
+
+    expect(a.setIfUnchanged('workflowTasks', observedByA.witness, [])).toBe('written')
+    vi.restoreAllMocks()
+
+    expect(competing).toBeInstanceOf(StoreLockError)
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).workflowTasks).toEqual([])
+    // And B, retrying the conditional form of its write, is told the value moved rather than clobbering A.
+    expect(b.setIfUnchanged('workflowTasks', observedByB.witness, [pendingTask])).toBe('superseded')
+  })
+
+  it('does NOT close the window against a writer that takes no lock, and must not claim to', () => {
+    // The honest residue that remains. This backend has no `exclusive`, and repairs the value *after* the
+    // compare read has answered — which is what a hand-edit, or any tool that does not take MAO's lock,
+    // landing between our compare and our rename looks like from here. The repair is overwritten and the
+    // result is still 'written'.
     //
     // Keeping this as an executable assertion rather than prose is the point: it is the exact scenario
-    // review reproduced, and recording it stops the "window closed" wording coming back.
+    // review reproduced, and recording it stops "atomic" wording coming back.
     const data: Record<string, unknown> = { workflowTasks: { 'task-1': pendingTask } }
     let repairAfterNextRead = false
     const store = createGuardedStore(
@@ -1510,9 +1774,163 @@ describe('setIfUnchanged — what it does not close', () => {
     repairAfterNextRead = true
 
     expect(store.setIfUnchanged('workflowTasks', observed.witness, [])).toBe('written')
-    // The repair is gone. Closing this needs an advisory lock both writers take, or O_EXCL + rename
-    // keyed on a stored version — a primitive neither backend has. Tracked as issue #73.
+    // The repair is gone. The lock closes this only for writers that take it — see the test above.
     expect(data.workflowTasks).toEqual([])
+  })
+})
+
+/**
+ * Two `FileStore`s on one `config.json` — a long-running `mao run` (A, opened first and kept) beside a
+ * one-shot command in another terminal (B). Issue #73's reproduction, step for step.
+ *
+ * Before the fix A's every write rewrote the whole file from the snapshot it took at construction, so
+ * the moment its queue persisted, everything B had changed in the meantime was put back.
+ */
+describe('FileStore across processes (issue #73)', () => {
+  const changes: Array<[keyof MaoStoreSchema, unknown]> = [
+    ['githubRepos', [widgets]],
+    ['githubToken', 'ghp_changed_elsewhere'],
+    ['aiProviders', [claude]],
+    ['theme', 'dark'],
+    ['design', 'crimson'],
+    ['buildSha', 'abc123'],
+  ]
+
+  it.each(changes)('a stale writer of workflowTasks keeps another process\'s %s', (field, value) => {
+    const { store: a, filePath } = storeHolding({ githubRepos: [gadgets], githubToken: 'ghp_original' })
+    const b = new FileStore(filePath)
+
+    b.set(field, value as never)
+    a.set('workflowTasks', [pendingTask])
+
+    const onDisk = JSON.parse(fs.readFileSync(filePath, 'utf-8'))
+    expect(onDisk[field]).toEqual(value)
+    expect(onDisk.workflowTasks).toEqual([pendingTask])
+    // A fresh process reads both, which is what every later command sees.
+    expect(new FileStore(filePath).get(field)).toEqual(value)
+  })
+
+  it('does not put back an unusable githubRepos another process already repaired (PR #66)', () => {
+    // A boots holding the object-shaped list; B runs the recovery the store's own report names. Before
+    // the fix, A's next queue write restored the object and the recovery silently undid itself.
+    captureWarnings()
+    const unusable = { 'acme/widgets': widgets }
+    const { store: a, filePath } = storeHolding({ githubRepos: unusable })
+    const b = new FileStore(filePath)
+
+    b.set('githubRepos', [])
+    a.set('workflowTasks', [pendingTask])
+
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).githubRepos).toEqual([])
+    expect(new FileStore(filePath).problems()).toEqual([])
+  })
+
+  it('updates its own snapshot for the key it wrote', () => {
+    const { store, filePath } = storeHolding({})
+
+    store.set('theme', 'dark')
+
+    expect(store.get('theme')).toBe('dark')
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).theme).toBe('dark')
+  })
+
+  it('keeps keys it does not know about, as a newer build might have written them', () => {
+    const { store, filePath } = storeHolding({ futureSetting: { enabled: true } })
+
+    store.set('theme', 'dark')
+
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).futureSetting).toEqual({ enabled: true })
+  })
+
+  it('still creates a missing file, as a fresh install does', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mao-store-test-'))
+    tmpDirs.push(dir)
+    const filePath = path.join(dir, 'config.json')
+    const store = new FileStore(filePath)
+
+    store.set('theme', 'dark')
+
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8'))).toEqual({ ...MAO_STORE_DEFAULTS, theme: 'dark' })
+  })
+
+  it.each([
+    ['{"githubToken": "ghp_SENTINEL_SECRET", ', 'unparseable'],
+    ['null', 'not-an-object'],
+    ['[1, 2]', 'not-an-object'],
+    ['"ghp_SENTINEL_SECRET"', 'not-an-object'],
+  ] as const)(
+    'refuses to merge into %s when a lockless writer replaces the file after the write gate passed',
+    (unreadable, failure) => {
+      // The gate in `createGuardedStore.set()` reads the file under the write lock first, so only a writer
+      // that takes no lock — a hand-edit, another tool — can make the merge's own read fail. Merging into
+      // that read as `{}` would replace everything in the file with defaults, the token included, which
+      // exists nowhere else. So the merge refuses too, in the gate's own words: restart-required, and
+      // value-free, because a V8 parse error embeds the file's opening bytes.
+      const { store, filePath } = storeHolding({ githubToken: 'ghp_original' })
+      let reads = 0
+      const realReadFileSync = fs.readFileSync
+      vi.spyOn(fs, 'readFileSync').mockImplementation(((file: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+        // Read 1 is the gate's; read 2 is the merge's. The replacement lands between them.
+        if (String(file) === filePath && ++reads === 2) fs.writeFileSync(filePath, unreadable)
+        return (realReadFileSync as (...args: unknown[]) => unknown)(file, ...rest)
+      }) as typeof fs.readFileSync)
+
+      let refused: unknown
+      try {
+        store.set('theme', 'dark')
+      } catch (err) {
+        refused = err
+      }
+      vi.restoreAllMocks()
+
+      expect(reads).toBe(2)
+      expect(operatorSafeStoreMessage(refused)).toBe(describeRefusedStoredWrite('theme', filePath, failure))
+      expect(storeWriteRequiresRestart(refused)).toBe(true)
+      expect((refused as Error).message).not.toContain('ghp_SENTINEL_SECRET')
+      expect(fs.readFileSync(filePath, 'utf-8')).toBe(unreadable)
+      // A failed write does not claim the value either.
+      expect(store.get('theme')).toBe('system')
+    },
+  )
+
+  it('refuses the same way when it booted on the unreadable file', () => {
+    const { filePath } = storeHolding({})
+    fs.writeFileSync(filePath, 'not json at all')
+    const store = new FileStore(filePath)
+
+    expect(() => store.set('githubToken', 'ghp_x')).toThrow(/Refusing to write "githubToken"/)
+    expect(fs.readFileSync(filePath, 'utf-8')).toBe('not json at all')
+  })
+
+  it('writes only while it holds the file\'s write lock', () => {
+    // A second process mid-write holds the lock; this write waits for it and then refuses rather than
+    // landing beside it. Nothing is written.
+    const { store, filePath } = storeHolding({ theme: 'light' })
+    const waiting = new FileStore(filePath, { lock: { timeoutMs: 20 } })
+
+    let refused: unknown
+    createStoreWriteLock(filePath)(() => {
+      try {
+        waiting.set('theme', 'dark')
+      } catch (err) {
+        refused = err
+      }
+    })
+
+    expect(refused).toBeInstanceOf(StoreLockError)
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).theme).toBe('light')
+    expect(store.get('theme')).toBe('light')
+  })
+
+  it("predicts the witness a fresh read reports after a real write", () => {
+    // What lets the queue writer key each write on its own previous one without a read after every
+    // write. Optional members left undefined are the case that matters: JSON drops them on both sides.
+    const { store } = storeHolding({})
+    const task: QueuedTask = { ...pendingTask, error: undefined, providerOverride: undefined }
+
+    store.set('workflowTasks', [task])
+
+    expect(store.inspect('workflowTasks').witness).toBe(storedValueWitness([task]))
   })
 })
 
@@ -2005,6 +2423,37 @@ describe('openGuardedStoreFile — the backend reads again after the pre-check',
     expect(store.problems()).toEqual([])
   })
 
+  it("writes only while it holds the file's write lock, as a CLI FileStore on the same path does", () => {
+    // Issue #73: the desktop app and a `mao` CLI pointed at one config.json must serialize against each
+    // other, so the composition `electron/store.ts` goes through takes the same lock `FileStore` does —
+    // without it a CLI write could land between this backend's compare and its write.
+    captureWarnings()
+    const filePath = rawConfigFile(JSON.stringify({ theme: 'light' }))
+    const store = openGuardedStoreFile(filePath, strictConfLike(filePath), undefined, { timeoutMs: 20 })
+    const observed = store.inspect('theme')
+
+    const refused: unknown[] = []
+    createStoreWriteLock(filePath)(() => {
+      for (const write of [
+        () => store.set('theme', 'dark'),
+        () => store.setIfUnchanged('theme', observed.witness, 'dark'),
+      ]) {
+        try {
+          write()
+        } catch (err) {
+          refused.push(err)
+        }
+      }
+    })
+
+    expect(refused).toHaveLength(2)
+    expect(refused.every((err) => err instanceof StoreLockError)).toBe(true)
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).theme).toBe('light')
+    // And once the other writer is done, the same write lands.
+    store.set('theme', 'dark')
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).theme).toBe('dark')
+  })
+
   it('converts a parse failure raised by the backend while writing', () => {
     // conf's setter re-reads to merge, so a replacement landing after the write gate's own fresh read
     // surfaces from inside `backing.set` — and before this it surfaced as V8's error, which quotes the
@@ -2090,6 +2539,196 @@ describe('parseStoredSettings', () => {
       parse('[]')
     } catch (error) {
       expect((error as UnreadableStoreError).source).toBe('/tmp/mine.json')
+    }
+  })
+})
+
+describe('FileStore and createGuardedStore design preset setting', () => {
+  it('defaults to classic when config.json has no design field', () => {
+    const warn = captureWarnings()
+    const { store } = storeHolding({ githubToken: 'ghp_x', theme: 'dark' })
+
+    expect(store.get('design')).toBe('classic')
+    expect(store.inspect('design')).toMatchObject({
+      value: 'classic',
+      problem: undefined,
+      readable: true,
+    })
+    expect(store.problems()).toEqual([])
+    expect(warn).not.toHaveBeenCalled()
+  })
+
+  it('falls back to classic on unknown or non-string design values AND reports the unusable value in storeProblems and warnings', () => {
+    for (const invalid of [
+      'unknown-design',
+      'minimal',
+      'editorial',
+      'ghp_SECRET_DESIGN',
+      '',
+      42,
+      true,
+      false,
+      null,
+      {},
+      ['crimson'],
+      { secret: 'ghp_SECRET_KEY' },
+      ['ghp_SECRET_ITEM'],
+    ]) {
+      const warn = captureWarnings()
+      const { store, filePath } = storeHolding({ design: invalid })
+
+      expect(store.get('design'), String(invalid)).toBe('classic')
+      expect(warn).toHaveBeenCalledTimes(1)
+      const warnedMessage = warn.mock.calls[0]![0] as string
+      expect(warnedMessage, String(invalid)).toContain('"design"')
+      expect(warnedMessage, String(invalid)).toContain(filePath)
+      expect(warnedMessage, String(invalid)).toContain('classic')
+      if (typeof invalid === 'string' && invalid.length > 0) {
+        expect(warnedMessage, invalid).not.toContain(invalid)
+      }
+      expect(warnedMessage, String(invalid)).not.toContain('ghp_SECRET')
+
+      const problems = store.problems()
+      expect(problems, String(invalid)).toHaveLength(1)
+      expect(problems[0], String(invalid)).toMatchObject({
+        field: 'design',
+        defect: 'value',
+        nothingUsable: true,
+        source: filePath,
+      })
+
+      const observed = store.inspect('design')
+      expect(observed, String(invalid)).toMatchObject({
+        value: 'classic',
+        defect: 'value',
+        readable: true,
+        problem: problems[0]!.message,
+      })
+      // Once-per-field warning deduplication holds across get() + inspect().
+      expect(warn).toHaveBeenCalledTimes(1)
+
+      store.set('design', 'crimson')
+      expect(store.problems(), String(invalid)).toEqual([])
+      expect(store.get('design'), String(invalid)).toBe('crimson')
+      expect(store.inspect('design'), String(invalid)).toMatchObject({
+        value: 'crimson',
+        defect: undefined,
+        problem: undefined,
+        readable: true,
+      })
+
+      warn.mockRestore()
+    }
+
+    expect(describeUnusableDesign('ghp_SECRET_DESIGN', '/tmp/config.json')).not.toContain('ghp_SECRET_DESIGN')
+    expect(describeUnusableDesign('classic', '/tmp/config.json')).toBeNull()
+  })
+
+  it('persists each valid design preset and preserves all other settings across processes (issue #73)', () => {
+    const { store: a, filePath } = storeHolding({
+      githubToken: 'ghp_keep',
+      theme: 'dark',
+      githubRepos: [widgets],
+      aiProviders: [claude],
+      workflowTasks: [pendingTask],
+    })
+    const b = new FileStore(filePath)
+
+    for (const preset of ['crimson', 'console', 'classic'] as const) {
+      b.set('design', preset)
+      expect(b.get('design')).toBe(preset)
+      expect(new FileStore(filePath).get('design')).toBe(preset)
+    }
+
+    b.set('githubToken', 'ghp_updated_by_b')
+    a.set('design', 'crimson')
+
+    const onDisk = JSON.parse(fs.readFileSync(filePath, 'utf-8'))
+    expect(onDisk.design).toBe('crimson')
+    expect(onDisk.githubToken).toBe('ghp_updated_by_b')
+    expect(onDisk.theme).toBe('dark')
+    expect(onDisk.githubRepos).toEqual([widgets])
+    expect(onDisk.aiProviders).toEqual([claude])
+    expect(onDisk.workflowTasks).toEqual([pendingTask])
+  })
+
+  it('refuses invalid design writes via set and setIfUnchanged before touching disk', () => {
+    const { store, filePath } = storeHolding({ design: 'crimson', githubToken: 'ghp_keep' })
+    const beforeBytes = fs.readFileSync(filePath, 'utf-8')
+    const observed = store.inspect('design')
+
+    expect(store.validateWrite('design', 'minimal' as never)).toContain(
+      'expected one of classic, crimson, console, received a string. Nothing was written.',
+    )
+    expect(() => store.set('design', 'invalid' as never)).toThrow(
+      /Refusing to write "design".*expected one of classic, crimson, console, received a string\. Nothing was written\./,
+    )
+    expect(store.setIfUnchanged('design', observed.witness, 'invalid' as never)).toBe('invalid')
+
+    expect(fs.readFileSync(filePath, 'utf-8')).toBe(beforeBytes)
+    expect(store.get('design')).toBe('crimson')
+  })
+
+  it('refuses to write design to an unreadable or corrupt config.json so credentials survive (issue #67)', () => {
+    captureWarnings()
+    const corrupt = '{\n  "githubToken": "ghp_SENTINEL",\n}\n'
+    const filePath = rawConfigFile(corrupt)
+    const store = new FileStore(filePath)
+
+    let refused: unknown
+    try {
+      store.set('design', 'crimson')
+    } catch (error) {
+      refused = error
+    }
+
+    expect(operatorSafeStoreMessage(refused)).toBe(
+      describeRefusedStoredWrite('design', filePath, 'unparseable'),
+    )
+    expect(storeWriteRequiresRestart(refused)).toBe(true)
+    expect(String((refused as Error).message)).not.toContain('ghp_SENTINEL')
+    expect(fs.readFileSync(filePath, 'utf-8')).toBe(corrupt)
+  })
+
+  it('defaults absent design key from electron-store-style backend to classic while reporting invalid raw values', () => {
+    const { backend: emptyBackend } = fakeBackend()
+    expect(emptyBackend.get('design')).toBeUndefined()
+    const cleanWarnings: string[] = []
+    const cleanStore = createGuardedStore(emptyBackend, '/data/config.json', (message) =>
+      cleanWarnings.push(message),
+    )
+
+    expect(cleanStore.get('design')).toBe('classic')
+    expect(cleanStore.inspect('design')).toMatchObject({
+      value: 'classic',
+      defect: undefined,
+      problem: undefined,
+      readable: true,
+    })
+    expect(cleanStore.problems()).toEqual([])
+    expect(cleanWarnings).toEqual([])
+
+    for (const invalid of [null, true, 'invalid'] as const) {
+      const { backend } = fakeBackend({ design: invalid })
+      const warnings: string[] = []
+      const store = createGuardedStore(backend, '/data/config.json', (message) => warnings.push(message))
+
+      expect(store.get('design'), String(invalid)).toBe('classic')
+      const problems = store.problems()
+      expect(problems, String(invalid)).toHaveLength(1)
+      expect(problems[0], String(invalid)).toMatchObject({
+        field: 'design',
+        defect: 'value',
+        nothingUsable: true,
+        source: '/data/config.json',
+      })
+      expect(store.inspect('design'), String(invalid)).toMatchObject({
+        value: 'classic',
+        defect: 'value',
+        readable: true,
+        problem: problems[0]!.message,
+      })
+      expect(warnings).toHaveLength(1)
     }
   })
 })

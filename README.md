@@ -49,13 +49,33 @@ node dist-cli/index.cjs swarm --repo-root /path/to/repo --status
 node dist-cli/index.cjs swarm --repo-root /path/to/repo --dry-run --once
 ```
 
-The Swarm command requires Python 3, `git`, an authenticated `gh` CLI, and the AI CLIs named by
-the repository's role tags. It can perform real Git/GitHub writes unless `--dry-run` or `--status`
+The Swarm command requires `git`, an authenticated `gh` CLI, and the AI CLIs named by
+the repository's role tags. The native TypeScript engine is included in `dist-cli/index.cjs`;
+Python and separate script assets are unnecessary. Dispatch requires POSIX process groups.
+Existing `.agents/.process_registry.json` records migrate on read, including provider cooldowns;
+`--reset` explicitly discards that dispatch history. It can perform real Git/GitHub writes unless `--dry-run` or `--status`
 is supplied. Runtime worktrees, logs, prompts, and the process registry stay inside the target
 repository's ignored `.worktrees/` and `.agents/` paths.
 The first real run records those runtime patterns only in the target checkout's local
 `.git/info/exclude`; it does not edit the repository's shared `.gitignore`. `--status`
-and `--dry-run` leave both the checkout and its Git metadata unchanged.
+and `--dry-run` leave both the checkout and its Git metadata unchanged. `--once` polls once
+and waits up to 50 minutes for its dispatched agents to complete. At the limit it stops owned
+groups and exits non-zero; SIGINT/SIGTERM also terminate owned groups.
+
+### Model catalog
+
+The model pickers and Swarm's role tags start from a built-in model list and merge in what each CLI
+reports itself: `agy models`, `codex debug models`, and for Claude the Anthropic Models API (with a saved
+Anthropic-format API key) or Claude Code's model settings. The result is cached in `model-catalog.json`
+in the data directory, never in `config.json`, and the GUI, `mao run` and `mao swarm` refresh it every 24
+hours (`MAO_MODEL_CATALOG_TTL_HOURS`; `0` leaves refreshing to you). A refresh only lists models — it runs
+and bills none — and a missing CLI, an offline machine or an unreadable answer keeps the cached and
+built-in lists in use. **Settings → Model catalog → Refresh model lists** refreshes on demand, as does:
+
+```bash
+node dist-cli/index.cjs providers models          # what the pickers and Swarm accept now
+node dist-cli/index.cjs providers refresh-models  # ask every CLI again (--provider codex for one)
+```
 
 ### Settings
 
@@ -77,7 +97,8 @@ core/
   github-service.ts GitHub REST calls: issue/PR fetch, branch/commit/review/merge/CI-status
   git-workspace.ts  Local git clone/branch/commit/push (child_process, no Electron dep)
   workflow-engine.ts Core state machine: queue, stage progression, agent routing, CI gate
-  swarm-runner.ts   Shell-free launcher for the autonomous Swarm CLI asset
+  swarm-runner.ts   Native autonomous Swarm entrypoint
+  swarm/            Lifecycle, supervision, registry, transport/worktrees and provider resolution
   auto-trigger.ts   Per-repo polling scheduler
   store.ts          Shared persistence schema and FileStore
 electron/
@@ -85,8 +106,6 @@ electron/
   main.ts / preload.ts  Electron entry points
 cli/
   index.ts          Headless `mao` commands backed by core services
-.agents/workflows/
-  swarm_orchestrator.py  Autonomous role lifecycle, worktrees, process tracking, retry/cooldown
 src/
   App.tsx           Sidebar + project tabs (Board / Queue / Settings) shell
   components/
@@ -105,7 +124,7 @@ scripts/
 ## Unit tests
 
 ```bash
-npm run test        # one vitest run per project, then the Python Swarm matrix:
+npm run test        # one vitest run per project, including native Swarm regressions:
                     #   core     — WorkflowEngine stage progression, maker-checker, retry,
                     #              CI gating and manual pause/advance, all against fakes
                     #   renderer — src/ mounted in jsdom (Testing Library) against a fake
@@ -142,6 +161,12 @@ node --experimental-strip-types --env-file=.env.test scripts/test-workflow.ts
 ```
 
 This drives one task through the full pipeline and prints its final state as JSON.
+
+## Direction and roadmap
+
+The 2026-11 project review, the proposed long-term roadmap, a benchmark of similar tools and a
+user-needs analysis live in [`docs/strategy/`](docs/strategy/README.md) (written in Korean). They are
+proposals until the maintainer adopts them.
 
 ## Known limitations
 

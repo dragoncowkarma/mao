@@ -3,11 +3,12 @@ import path from 'node:path'
 import { store } from './store.ts'
 import { createMaoApp } from '../core/app.ts'
 import { startAutoTrigger } from '../core/auto-trigger.ts'
-import { isRepoRef } from '../core/repo-registry.ts'
+import { applyRepoListEdit, isRepoRef } from '../core/repo-registry.ts'
 import { assertCanRelaunchForUpdate, checkForUpdates, countRunningWorkflowTasks } from '../core/self-update.ts'
-import { createAiProvider, type AiProviderConfig } from '../core/ai/index.ts'
+import { createAiProvider, type AiProviderConfig, type DiscoverableProviderKind } from '../core/ai/index.ts'
+import { startModelCatalogRefresher } from '../core/model-catalog.ts'
 import { QUEUE_PERSISTENCE_BROKEN, type RepoRef, type RunOverride } from '../core/workflow-engine.ts'
-import type { ThemePreference } from '../core/store.ts'
+import type { DesignId, ThemePreference } from '../core/store.ts'
 import {
   assertCanClearPersistenceBroken,
   clearPersistenceBrokenMarker,
@@ -31,6 +32,14 @@ export function registerIpcHandlers() {
     resume: true,
   })
   const autoTrigger = startAutoTrigger(githubService, workflowEngine, () => store.inspect('githubRepos'))
+  // The long-running host keeps the model catalog fresh (architecture rule 5: started here, never in
+  // createMaoApp()). Its own file in userData, beside — never inside — the store. Providers are re-read at
+  // each refresh, so an Anthropic API key saved later is used; the timer is unref'd and stopped on quit.
+  const modelCatalog = startModelCatalogRefresher({
+    dataDir: app.getPath('userData'),
+    listProviders: () => store.inspect('aiProviders').value,
+  })
+  app.once('will-quit', () => modelCatalog.stop())
 
   ipcMain.handle('app:checkUpdate', async () => {
     const update = await checkForUpdates(githubService, store.get('buildSha'))
@@ -55,7 +64,10 @@ export function registerIpcHandlers() {
 
   ipcMain.handle('ai:list', () => store.get('aiProviders'))
 
-  ipcMain.handle('ai:save', (_event, providers: AiProviderConfig[]) => saveProviders(providers))
+  // `base` is the list Global settings loaded, so the save refuses if the stored list moved since (#73).
+  ipcMain.handle('ai:save', (_event, providers: AiProviderConfig[], base?: AiProviderConfig[]) =>
+    saveProviders(providers, base),
+  )
 
   ipcMain.handle('ai:run', async (_event, providerId: string, prompt: string) => {
     const providers = store.get('aiProviders')
@@ -63,6 +75,15 @@ export function registerIpcHandlers() {
     if (!config) throw new Error(`Unknown AI provider: ${providerId}`)
     return createAiProvider(config).run(prompt)
   })
+
+  // A pure read of the cached catalog; the renderer merges it over the built-in tables itself.
+  ipcMain.handle('ai:getModelCatalog', () => modelCatalog.read())
+
+  // Global settings' manual refresh — read-only CLI listings and `GET /v1/models`, never a GitHub write.
+  // Resolves with fixed-category results only; core never lets command output or an API body through.
+  ipcMain.handle('ai:refreshModelCatalog', (_event, kinds?: DiscoverableProviderKind[]) =>
+    modelCatalog.refreshNow(kinds),
+  )
 
   ipcMain.handle('github:setToken', (_event, token: string) => {
     store.set('githubToken', token)
@@ -91,7 +112,13 @@ export function registerIpcHandlers() {
   // Returns the passing verdicts so the renderer can show the same "these grants are unverified"
   // caveat `mao repos add` prints. Dropping them would make a passing preflight look in the GUI like
   // proof of write access, which is exactly what core/repo-capabilities.ts exists to avoid.
-  ipcMain.handle('github:setRepos', (_event, repos: RepoRef[]) => updateRepos(() => repos))
+  //
+  // `base` is the list the renderer's edit was computed from. Core re-applies only what changed between
+  // the two to the list stored now (applyRepoListEdit), so a stale window mirror cannot put back a
+  // repository a terminal removed, or drop one it added (issue #73).
+  ipcMain.handle('github:setRepos', (_event, repos: RepoRef[], base?: RepoRef[]) =>
+    updateRepos((previous, stored) => applyRepoListEdit(previous, base, repos, stored.usable)),
+  )
 
   // Filtered, not raw. `config.json` is unvalidated JSON, and the renderer draws each row as
   // `{r.owner}/{r.repo}` with no guard and no error boundary above it — so a single `null` element
@@ -187,5 +214,11 @@ export function registerIpcHandlers() {
 
   ipcMain.handle('ui:setTheme', (_event, theme: ThemePreference) => {
     store.set('theme', theme)
+  })
+
+  ipcMain.handle('ui:getDesign', () => store.get('design'))
+
+  ipcMain.handle('ui:setDesign', (_event, design: DesignId) => {
+    store.set('design', design)
   })
 }

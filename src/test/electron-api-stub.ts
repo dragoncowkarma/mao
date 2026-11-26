@@ -2,10 +2,12 @@ import { vi } from 'vitest'
 import { setElectronApi, type ElectronApi } from '../electron-api'
 import type { AppUpdateCheck } from '../electron'
 import type { AiProviderConfig } from '../../core/ai/types'
+import type { ModelCatalogView } from '../../core/ai/provider-options'
 import type { GithubTask } from '../../core/github-service'
 import type { CommitGraphData } from '../../core/commit-graph'
 import type { RepoWorkflowCapability } from '../../core/repo-capabilities'
-import type { StoredValueProblem, ThemePreference } from '../../core/store'
+import { applyRepoListEdit } from '../../core/repo-registry'
+import type { DesignId, StoredValueProblem, ThemePreference } from '../../core/store'
 import type {
   QueuedTask,
   QueueRecoveryOutcome,
@@ -44,8 +46,16 @@ export function createElectronApiStub(initialRepos: RepoRef[] = [], initialProbl
   // Copies on the way out as well as in: the renderer holds this list in state and spreads it into new
   // arrays, and a shared reference would let a component mutation silently rewrite the "store".
   const getRepos = vi.fn(async (): Promise<RepoRef[]> => stored.map((repo) => ({ ...repo })))
-  const setRepos = vi.fn(async (next: RepoRef[]): Promise<RepoWorkflowCapability[]> => {
-    stored = next.map((repo) => ({ ...repo }))
+  const setRepos = vi.fn(async (next: RepoRef[], base?: RepoRef[]): Promise<RepoWorkflowCapability[]> => {
+    // Applied the way `github:setRepos` applies it — core's own edit rule against what is stored now — so
+    // a test that changes the "store" behind the window's back sees what the real stack would keep. A
+    // seeded `githubRepos` problem whose defect is `'value'` stands for a stored value that is not a list,
+    // which the real store's read guard answers as an unusable `[]`; the stub models that rather than
+    // diffing against `stored`. A mixed or all-invalid *array* is still the list as stored, exactly as the
+    // registrar reads it (`observed.defect !== 'value'`), so it keeps the diff. A mirror of that rule, not a
+    // test of it: no renderer test tells the two apart, and `core/repo-registry.test.ts` is what pins it.
+    const usable = problems.find((problem) => problem.field === 'githubRepos')?.defect !== 'value'
+    stored = applyRepoListEdit(usable ? stored : [], base, next, usable).map((repo) => ({ ...repo }))
     // A repository-list write replaces `githubRepos` and nothing else — `store.set` writes one key, and
     // `describeStoredProblems` re-evaluates the rest — so a stub that healed every field would make the
     // natural mixed-state test fail against a *correct* renderer once a second field is guarded.
@@ -53,8 +63,16 @@ export function createElectronApiStub(initialRepos: RepoRef[] = [], initialProbl
     return []
   })
   const storeProblems = vi.fn(async (): Promise<StoredValueProblem[]> => problems.map((p) => ({ ...p })))
-  const getTheme = vi.fn(async (): Promise<ThemePreference> => 'system')
-  const setTheme = vi.fn(async (): Promise<void> => {})
+  let currentTheme: ThemePreference = 'system'
+  const getTheme = vi.fn(async (): Promise<ThemePreference> => currentTheme)
+  const setTheme = vi.fn(async (next: ThemePreference): Promise<void> => {
+    currentTheme = next
+  })
+  let currentDesign: DesignId = 'classic'
+  const getDesign = vi.fn(async (): Promise<DesignId> => currentDesign)
+  const setDesign = vi.fn(async (next: DesignId): Promise<void> => {
+    currentDesign = next
+  })
   const checkUpdate = vi.fn(
     async (): Promise<AppUpdateCheck> => ({
       currentSha: 'test-sha',
@@ -74,6 +92,10 @@ export function createElectronApiStub(initialRepos: RepoRef[] = [], initialProbl
     }),
   )
   const listProviders = vi.fn(async (): Promise<AiProviderConfig[]> => [])
+  // Global settings reads the cached catalog on mount. A never-refreshed cache is the honest default: the
+  // pane then offers exactly the built-in tables, as it does on a fresh install. `ai.refreshModelCatalog`
+  // only runs on a click, so it stays unstubbed — a test that clicks programs it.
+  const getModelCatalog = vi.fn(async (): Promise<ModelCatalogView> => ({ providers: {}, attempts: {}, ttlMs: 86_400_000 }))
   const listWorkflowTasks = vi.fn(async (): Promise<QueuedTask[]> => [])
 
   // Modelled on the real latch rather than taken as a separate input: the engine derives it at boot from
@@ -120,6 +142,8 @@ export function createElectronApiStub(initialRepos: RepoRef[] = [], initialProbl
       list: listProviders,
       save: notStubbed('ai.save'),
       run: notStubbed('ai.run'),
+      getModelCatalog,
+      refreshModelCatalog: notStubbed('ai.refreshModelCatalog'),
     },
     github: {
       setToken: notStubbed('github.setToken'),
@@ -147,6 +171,8 @@ export function createElectronApiStub(initialRepos: RepoRef[] = [], initialProbl
     ui: {
       getTheme,
       setTheme,
+      getDesign,
+      setDesign,
     },
   } satisfies ElectronApi
 
@@ -156,17 +182,29 @@ export function createElectronApiStub(initialRepos: RepoRef[] = [], initialProbl
     api,
     getRepos,
     setRepos,
+    getTheme,
+    setTheme,
+    getDesign,
+    setDesign,
     checkUpdate,
     storeProblems,
     fetchTasks,
     fetchCommitGraph,
     listProviders,
+    getModelCatalog,
     listWorkflowTasks,
     /** What the fake store holds right now — the assertion target for "did the write land". */
     storedRepos: () => stored.map((repo) => ({ ...repo })),
-    /** For a `setRepos` override that defers: apply the write the default implementation would have. */
+    /**
+     * For a `setRepos` override that defers: store `next` wholesale — the write the default implementation
+     * makes when nothing changed the store since the edit's base, which is the case those tests stage.
+     */
     applyRepos: (next: RepoRef[]) => {
       stored = next.map((repo) => ({ ...repo }))
+    },
+    /** Replaces what the fake store reports as unusable, as a hand-edit made while the window is open would. */
+    setStoreProblems: (next: StoredValueProblem[]) => {
+      problems = next
     },
     recoveryRequired,
     confirmQueueRecovery,

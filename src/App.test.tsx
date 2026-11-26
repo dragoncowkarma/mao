@@ -3,9 +3,11 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 import App from './App'
+import { primeDocumentAppearance } from './appearance-cache'
 import { createElectronApiStub } from './test/electron-api-stub'
 import type { RepoRef } from '../core/workflow-engine'
-import type { StoredValueProblem } from '../core/store'
+import type { DesignId, StoredValueProblem, ThemePreference } from '../core/store'
+import { storedValueProblem } from './test/store-problem'
 import type { QueueRecoveryOutcome } from '../core/workflow-engine'
 
 const ONE: RepoRef = { owner: 'acme', repo: 'one' }
@@ -30,24 +32,52 @@ const OTHER_TWO: RepoRef = { owner: 'other', repo: 'two' }
  * Node module the renderer may not import, and the renderer's job here is to render what it is handed,
  * whatever the wording turns out to be.
  */
-const UNUSABLE_REPO_LIST: StoredValueProblem = {
-  field: 'githubRepos',
-  source: '/data/config.json',
-  message:
-    '[store] "githubRepos" in /data/config.json is an object, not a JSON array of { owner, repo } ' +
+const UNUSABLE_REPO_LIST = storedValueProblem(
+  'githubRepos',
+  'value',
+  '[store] "githubRepos" in /data/config.json is an object, not a JSON array of { owner, repo } ' +
     'entries — ignoring it, so no repositories are tracked until it is replaced.',
-}
+)
+
+/**
+ * The same field, reported because some of its *entries* cannot name a repository while others can
+ * (issue #72).
+ *
+ * `nothingUsable: false` is the whole fixture: core answers it so a renderer never has to decide whether
+ * replacing a value loses anything, and here it is what must stop the reset from emptying a list whose
+ * readable rows the operator can already see.
+ */
+const PARTLY_USABLE_REPO_LIST = storedValueProblem(
+  'githubRepos',
+  'some-entries',
+  '[store] "githubRepos" in /data/config.json is a JSON array in which 1 entry of 2 does not name ' +
+    'a repository ({ owner, repo }, both non-empty): null.',
+)
+
+/**
+ * The same defect at a different count — two unusable entries of three rather than one of two.
+ *
+ * A *partial* hand-repair lands here: `some-entries` on both sides, so nothing coarser than the report
+ * text distinguishes them. Core puts the counts in the message for the operator's sake, and that is
+ * what makes the transition observable at all; this pair is the fixture that holds the renderer to it.
+ */
+const MOSTLY_UNUSABLE_REPO_LIST = storedValueProblem(
+  'githubRepos',
+  'some-entries',
+  '[store] "githubRepos" in /data/config.json is a JSON array in which 2 entries of 3 do not name ' +
+    'a repository ({ owner, repo }, both non-empty): null.',
+)
 
 /**
  * A report about a field this sidebar's reset does not touch. The reset deletes `githubRepos` and
  * nothing else, and `describeStoredProblems` is written to grow to the other array-typed fields
  * (issue #68) — so the card has to tell the difference before it offers a destructive button.
  */
-const UNUSABLE_PROVIDERS: StoredValueProblem = {
-  field: 'aiProviders',
-  source: '/data/config.json',
-  message: '[store] "aiProviders" in /data/config.json is an object, not a JSON array of providers.',
-}
+const UNUSABLE_PROVIDERS = storedValueProblem(
+  'aiProviders',
+  'value',
+  '[store] "aiProviders" in /data/config.json is an object, not a JSON array of providers.',
+)
 
 /**
  * What the main process answers for a `config.json` whose `workflowTasks` the schema cannot use.
@@ -63,19 +93,18 @@ const UNUSABLE_PROVIDERS: StoredValueProblem = {
  * late-case test cannot use `UNUSABLE_QUEUE` directly: it would arrive latched. This one is injected
  * after mount through `storeProblems`, which is exactly how the 30s poll surfaces it in production.
  */
-const UNUSABLE_QUEUE_LATE: StoredValueProblem = {
-  field: 'workflowTasks',
-  source: '/data/config.json',
-  message: '[store] "workflowTasks" in /data/config.json is an object, not a JSON array.',
-}
+const UNUSABLE_QUEUE_LATE = storedValueProblem(
+  'workflowTasks',
+  'value',
+  '[store] "workflowTasks" in /data/config.json is an object, not a JSON array.',
+)
 
-const UNUSABLE_QUEUE: StoredValueProblem = {
-  field: 'workflowTasks',
-  source: '/data/config.json',
-  message:
-    '[store] "workflowTasks" in /data/config.json is an object, not a JSON array of queued workflow ' +
+const UNUSABLE_QUEUE = storedValueProblem(
+  'workflowTasks',
+  'value',
+  '[store] "workflowTasks" in /data/config.json is an object, not a JSON array of queued workflow ' +
     'tasks — ignoring it, so the queue is empty and MAO will not start unattended work.',
-}
+)
 
 /**
  * Mounts the real App against a fake bridge, inside StrictMode because that is what `src/main.tsx`
@@ -169,7 +198,7 @@ describe('App unusable stored settings', () => {
     await user.click(screen.getByRole('button', { name: 'Confirm reset' }))
 
     await waitFor(() => expect(screen.queryByText(/is an object, not a JSON array/)).toBeNull())
-    expect(stub.setRepos).toHaveBeenCalledWith([])
+    expect(stub.setRepos).toHaveBeenCalledWith([], [])
     expect(stub.storedRepos()).toEqual([])
     expect(screen.getByText(/No projects yet/)).toBeInTheDocument()
   })
@@ -220,6 +249,216 @@ describe('App unusable stored settings', () => {
     await waitFor(() => expect(screen.queryByText(/is an object, not a JSON array/)).toBeNull())
     expect(stub.setRepos).not.toHaveBeenCalled()
     expect(await screen.findByRole('button', { name: 'acme/one' })).toBeInTheDocument()
+  })
+
+  it('refuses to reset a list that has become partly usable, and adopts it instead', async () => {
+    // The sibling of the test above, for the state issue #72 made reachable. A hand-edit — or a `mao
+    // repos add` in a terminal — can rescue *some* entries after this card rendered, and the card goes
+    // on offering a button that writes an empty list. Blind, that deletes exactly what was rescued, and
+    // it is the one recovery an operator with no working token has left.
+    const { stub, user } = await renderApp([], [UNUSABLE_REPO_LIST])
+    await screen.findByText(/is an object, not a JSON array/)
+    stub.applyRepos([ONE])
+    stub.storeProblems.mockResolvedValue([PARTLY_USABLE_REPO_LIST])
+
+    await user.click(screen.getByRole('button', { name: 'Reset stored list' }))
+    await user.click(screen.getByRole('button', { name: 'Confirm reset' }))
+
+    // The signal that the pre-write re-read's continuation actually ran, rather than a bare wait on the
+    // assertion itself: the fresh report replaced the stale one, and a partly usable list offers no
+    // reset at all, so the control the operator just confirmed is gone.
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Confirm reset' })).toBeNull())
+    expect(stub.setRepos).not.toHaveBeenCalled()
+    expect(stub.storedRepos()).toEqual([ONE])
+    // And the rescued row is on screen rather than the sidebar going quiet: the abort adopts the list it
+    // just refused to delete.
+    expect(await screen.findByRole('button', { name: 'acme/one' })).toBeInTheDocument()
+    expect(screen.getByText(/1 entry of 2 does not name a repository/)).toBeInTheDocument()
+    // And it says so: a confirmed destructive click that quietly wrote nothing is indistinguishable
+    // from one that worked, and this is the case where the operator most needs to know which it was.
+    expect(screen.getByText(/would have deleted them/)).toBeInTheDocument()
+  })
+
+  it('drops rows that the store no longer holds, so the card and the list agree', async () => {
+    // The other direction of the same watch. Rows read before the corruption are not inert: the board's
+    // Refresh drives `github:refreshRepo`, which falls back to `{owner, repo}` when the stored list no
+    // longer matches and then preflights and polls it for real. Leaving them on screen under a card
+    // saying no repositories are tracked also arms the reset above a list the operator can still see.
+    vi.useFakeTimers()
+    try {
+      const stub = createElectronApiStub([ONE])
+      render(
+        <StrictMode>
+          <App />
+        </StrictMode>,
+      )
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(screen.getByRole('button', { name: 'acme/one' })).toBeInTheDocument()
+
+      stub.applyRepos([])
+      stub.storeProblems.mockResolvedValue([UNUSABLE_REPO_LIST])
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+
+      expect(screen.getByText(/is an object, not a JSON array/)).toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'acme/one' })).toBeNull()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('takes the repaired list when a partly usable one reads normally again', async () => {
+    // Review finding on this PR. `some-entries` and healthy are both `nothingUsable: false`, so a watch
+    // keyed on that flag saw no transition: the warning vanished and the rescued repository never
+    // arrived. The report is what sent the operator to `config.json` in the first place, so the repair
+    // it asks for has to be the one case that cannot be missed.
+    vi.useFakeTimers()
+    try {
+      const stub = createElectronApiStub([ONE], [PARTLY_USABLE_REPO_LIST])
+      render(
+        <StrictMode>
+          <App />
+        </StrictMode>,
+      )
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(screen.getByText(/1 entry of 2 does not name a repository/)).toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'acme/two' })).toBeNull()
+
+      stub.applyRepos([ONE, TWO])
+      stub.storeProblems.mockResolvedValue([])
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+
+      expect(screen.getByRole('button', { name: 'acme/two' })).toBeInTheDocument()
+      expect(screen.queryByText(/does not name a repository/)).toBeNull()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('takes a partial repair that leaves the list still unusable', async () => {
+    // Raised by the follow-up review, which verified this by hand: repairing *one* of two unusable
+    // entries leaves the defect at `'some-entries'`, so a watch keyed on the defect kind — the coarser
+    // key this fix was first sketched with — sees no transition and never re-reads. The report's counts
+    // are what change, which is why the key is the report text; and the consequence of missing it is
+    // the same one that made the original finding more than cosmetic, so the settings save is asserted
+    // here too.
+    vi.useFakeTimers()
+    try {
+      const stub = createElectronApiStub([ONE], [MOSTLY_UNUSABLE_REPO_LIST])
+      render(
+        <StrictMode>
+          <App />
+        </StrictMode>,
+      )
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(screen.queryByRole('button', { name: 'acme/two' })).toBeNull()
+
+      stub.applyRepos([ONE, TWO])
+      stub.storeProblems.mockResolvedValue([PARTLY_USABLE_REPO_LIST])
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+
+      expect(screen.getByRole('button', { name: 'acme/two' })).toBeInTheDocument()
+      // Still reported, and the whole-list reset still withheld: one entry is still unusable.
+      expect(screen.getByText(/1 entry of 2 does not name a repository/)).toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'Reset stored list' })).toBeNull()
+
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+      })
+      await act(async () => {
+        fireEvent.click(screen.getByRole('checkbox'))
+      })
+
+      // The base pins that the repaired row was re-read: with this PR's delta write (issue #73) a stale
+      // `[ONE]` mirror would no longer delete `TWO` from the store, so the stored list alone cannot tell.
+      expect(stub.setRepos).toHaveBeenCalledWith([{ ...ONE, autoTrigger: false }, TWO], [ONE, TWO])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not delete a repaired repository with the next settings save', async () => {
+    // A stale mirror would hide the repaired row until this save; the base asserted below pins that it
+    // was re-read first.
+    vi.useFakeTimers()
+    try {
+      const stub = createElectronApiStub([ONE], [PARTLY_USABLE_REPO_LIST])
+      render(
+        <StrictMode>
+          <App />
+        </StrictMode>,
+      )
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+
+      stub.applyRepos([ONE, TWO])
+      stub.storeProblems.mockResolvedValue([])
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+      })
+      await act(async () => {
+        fireEvent.click(screen.getByRole('checkbox'))
+      })
+
+      // The base pins that the repaired row was re-read: with this PR's delta write (issue #73) a stale
+      // `[ONE]` mirror would no longer delete `TWO` from the store, so the stored list alone cannot tell.
+      expect(stub.setRepos).toHaveBeenCalledWith([{ ...ONE, autoTrigger: false }, TWO], [ONE, TWO])
+      expect(stub.storedRepos()).toEqual([{ ...ONE, autoTrigger: false }, TWO])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('shows the repositories a partial hand-repair rescued, without waiting for a write', async () => {
+    // The transition `nothingUsable` exists to catch, and the one a report-presence watch misses: an
+    // all-invalid list hand-edited into a partly usable one still reports, so nothing else would re-read
+    // the list — and the rescued rows would stay off screen until the next repository-list write or a
+    // restart, under a card telling the operator to go and edit the file they just edited.
+    //
+    // Fake timers and no `userEvent`: the two deadlock (ipc-and-renderer-testing.md), so this drives
+    // the interval directly.
+    vi.useFakeTimers()
+    try {
+      const stub = createElectronApiStub([], [UNUSABLE_REPO_LIST])
+      render(
+        <StrictMode>
+          <App />
+        </StrictMode>,
+      )
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(screen.queryByRole('button', { name: 'acme/one' })).toBeNull()
+
+      stub.applyRepos([ONE])
+      stub.storeProblems.mockResolvedValue([PARTLY_USABLE_REPO_LIST])
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+
+      expect(screen.getByRole('button', { name: 'acme/one' })).toBeInTheDocument()
+      // The report stays up — those entries are still in the file — but the destructive recovery goes,
+      // because it would now delete the row that just appeared.
+      expect(screen.getByText(/1 entry of 2 does not name a repository/)).toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'Reset stored list' })).toBeNull()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('offers no reset for a report about a field the reset does not touch', async () => {
@@ -297,7 +536,7 @@ describe('App unusable stored settings', () => {
     await addSettled()
 
     await waitFor(() => expect(screen.queryByText(/is an object, not a JSON array/)).toBeNull())
-    expect(stub.setRepos).toHaveBeenCalledWith([ONE])
+    expect(stub.setRepos).toHaveBeenCalledWith([ONE], [])
   })
 
   it('reports the write failure even when the diagnostic read throws', async () => {
@@ -329,7 +568,7 @@ describe('App unusable stored settings', () => {
     await user.click(screen.getByRole('button', { name: 'Reset stored list' }))
     await user.click(screen.getByRole('button', { name: 'Confirm reset' }))
 
-    await waitFor(() => expect(stub.setRepos).toHaveBeenCalledWith([]))
+    await waitFor(() => expect(stub.setRepos).toHaveBeenCalledWith([], []))
     expect(tokenField()).toBeInTheDocument()
   })
 
@@ -338,8 +577,8 @@ describe('App unusable stored settings', () => {
     // hand-edit made there is invisible until the next repository-list write — which is the thing that
     // destroys the value. Reading it only after a write cannot warn anyone in time.
     //
-    // Fake timers here and no `userEvent`: the two deadlock (SKILL.md), so this drives the interval
-    // directly and asserts on what the operator sees.
+    // Fake timers here and no `userEvent`: the two deadlock (ipc-and-renderer-testing.md), so this
+    // drives the interval directly and asserts on what the operator sees.
     vi.useFakeTimers()
     try {
       const stub = createElectronApiStub([ONE])
@@ -503,7 +742,7 @@ describe('App unusable stored settings', () => {
   it("discards a repaired list this window's own write has superseded", async () => {
     // The other half of the same race: the newer information is not a report but a write from here.
     // `fireEvent` rather than `userEvent` because fake timers are needed to drive the poll and the two
-    // deadlock (SKILL.md).
+    // deadlock (ipc-and-renderer-testing.md).
     vi.useFakeTimers()
     try {
       const stub = createElectronApiStub([], [UNUSABLE_REPO_LIST])
@@ -537,7 +776,7 @@ describe('App unusable stored settings', () => {
         fireEvent.click(screen.getByRole('button', { name: 'Add' }))
         await vi.advanceTimersByTimeAsync(0)
       })
-      expect(stub.setRepos).toHaveBeenCalledWith([ONE])
+      expect(stub.setRepos).toHaveBeenCalledWith([ONE], [])
 
       // The held read answers with the list from before that write.
       await act(async () => {
@@ -686,7 +925,7 @@ describe('App unusable stored settings', () => {
         fireEvent.change(screen.getByRole('spinbutton'), { target: { value: '45' } })
         await vi.advanceTimersByTimeAsync(0)
       })
-      expect(stub.setRepos).toHaveBeenCalledWith([{ ...ONE, pollIntervalMs: 45_000 }])
+      expect(stub.setRepos).toHaveBeenCalledWith([{ ...ONE, pollIntervalMs: 45_000 }], [ONE])
 
       // Only afterwards does the store break, and then get repaired to a different list.
       stub.storeProblems.mockResolvedValue([UNUSABLE_REPO_LIST])
@@ -731,7 +970,7 @@ describe('App project selection', () => {
     await submitAdd(user, TWO)
 
     expect(await projectHeading(TWO)).toBeInTheDocument()
-    expect(stub.setRepos).toHaveBeenCalledWith([ONE, TWO])
+    expect(stub.setRepos).toHaveBeenCalledWith([ONE, TWO], [ONE])
     expect(stub.storedRepos()).toEqual([ONE, TWO])
   })
 
@@ -777,7 +1016,7 @@ describe('App project selection', () => {
 
     expect(await projectHeading(ONE)).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'acme/two' })).toBeNull()
-    expect(stub.setRepos).toHaveBeenCalledWith([ONE])
+    expect(stub.setRepos).toHaveBeenCalledWith([ONE], [ONE, TWO])
   })
 
   /**
@@ -802,7 +1041,7 @@ describe('App project selection', () => {
     expect(await projectHeading(ONE)).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'acme/two' })).toBeNull()
     expect(sidebarProject(THREE)).toBeInTheDocument()
-    expect(stub.setRepos).toHaveBeenCalledWith([ONE, THREE])
+    expect(stub.setRepos).toHaveBeenCalledWith([ONE, THREE], [ONE, TWO, THREE])
   })
 
   /**
@@ -830,7 +1069,7 @@ describe('App project selection', () => {
     await user.click(screen.getByRole('button', { name: 'Confirm remove' }))
 
     expect(await projectHeading(ONE)).toBeInTheDocument()
-    expect(stub.setRepos).toHaveBeenCalledWith([ONE, OTHER_TWO, THREE])
+    expect(stub.setRepos).toHaveBeenCalledWith([ONE, OTHER_TWO, THREE], [ONE, TWO, TWO_SHOUTED, OTHER_TWO, THREE])
     expect(stub.storedRepos()).toEqual([ONE, OTHER_TWO, THREE])
     expect(screen.queryByRole('button', { name: 'acme/two' })).toBeNull()
     expect(screen.queryByRole('button', { name: /ACME\/TWO/ })).toBeNull()
@@ -910,7 +1149,7 @@ describe('App project selection', () => {
 
     expect(screen.getByRole('heading', { name: 'acme/three' })).toBeInTheDocument()
     expect(screen.queryByRole('heading', { name: 'acme/one' })).toBeNull()
-    expect(stub.setRepos).toHaveBeenCalledWith([ONE, THREE])
+    expect(stub.setRepos).toHaveBeenCalledWith([ONE, THREE], [ONE, TWO, THREE])
   })
 })
 
@@ -927,6 +1166,55 @@ describe('App project selection', () => {
  * the starting view sees an add submitted from a sidebar form that is visible from the settings pane
  * too, where nobody moves at all.
  */
+/**
+ * Issue #73's GUI half. This window's repository list is a mirror read at mount and after its own writes,
+ * so it falls behind whenever a terminal changes the list. Each edit therefore sends the list it was
+ * computed from, and the stub applies it the way `github:setRepos` does (core's `applyRepoListEdit`), so
+ * these assert what the real stack keeps. Before the base was sent, a Remove dropped a repository added
+ * in a terminal and a settings toggle put back one removed there — re-preflighted, then polled again.
+ */
+describe('App repository edits beside another process', () => {
+  it('keeps a repository a terminal added when the window removes another one', async () => {
+    const { stub, user } = await renderApp([ONE, TWO])
+    // `mao repos add acme three` in a terminal — this window has not re-read the list since mount.
+    stub.applyRepos([ONE, TWO, THREE])
+
+    await user.click(sidebarProject(TWO))
+    await projectHeading(TWO)
+    await openSettings(user)
+    await user.click(screen.getByRole('button', { name: 'Remove acme/two' }))
+    await user.click(screen.getByRole('button', { name: 'Confirm remove' }))
+
+    expect(await screen.findByRole('button', { name: 'acme/three' })).toBeInTheDocument()
+    expect(stub.storedRepos()).toEqual([ONE, THREE])
+  })
+
+  it('keeps the window list when a settings edit lands on a stored list that has gone unusable', async () => {
+    // The store's report may already be on screen beside rows the window loaded earlier. The edit must
+    // rewrite those rows, not be diffed against the read guard's empty stand-in and write [] over them.
+    const { stub, user } = await renderApp([ONE, TWO])
+    stub.setStoreProblems([UNUSABLE_REPO_LIST])
+
+    await openSettings(user)
+    fireEvent.change(screen.getByRole('spinbutton'), { target: { value: '45' } })
+
+    await waitFor(() => expect(stub.setRepos).toHaveBeenCalled())
+    expect(stub.storedRepos()).toEqual([{ ...ONE, pollIntervalMs: 45_000 }, TWO])
+  })
+
+  it('does not put back a repository a terminal removed when the window edits another one', async () => {
+    const { stub, user } = await renderApp([ONE, TWO])
+    // `mao repos remove acme two` in a terminal; the window still lists it.
+    stub.applyRepos([ONE])
+
+    await openSettings(user)
+    fireEvent.change(screen.getByRole('spinbutton'), { target: { value: '45' } })
+
+    await waitFor(() => expect(stub.setRepos).toHaveBeenCalled())
+    expect(stub.storedRepos()).toEqual([{ ...ONE, pollIntervalMs: 45_000 }])
+  })
+})
+
 describe('App repository add and unsaved global settings', () => {
   /** Not token-shaped on purpose: a fixture should never look like a credential to a secret scanner. */
   const DRAFT_TOKEN = 'pasted-but-not-yet-saved'
@@ -1200,5 +1488,854 @@ describe('App halted workflow queue', () => {
 
     expect(screen.queryByText('Workflow automation is halted')).toBeNull()
     expect(screen.queryByRole('button', { name: 'Recover readable tasks' })).toBeNull()
+  })
+})
+
+describe('Selectable design system and color mode', () => {
+  function deferred<T = void>() {
+    let resolve!: (value: T | PromiseLike<T>) => void
+    let reject!: (reason?: unknown) => void
+    const promise = new Promise<T>((res, rej) => {
+      resolve = res
+      reject = rej
+    })
+    return { promise, resolve, reject }
+  }
+
+  it('applies classic by default, restores saved crimson or console on mount, and falls back on unknown or rejected reads', async () => {
+    await renderApp([ONE])
+    expect(document.documentElement.getAttribute('data-design')).toBe('classic')
+    expect(document.documentElement.getAttribute('data-theme')).toBeNull()
+    cleanup()
+
+    const stubCrimson = createElectronApiStub([ONE])
+    stubCrimson.getDesign.mockResolvedValue('crimson')
+    render(
+      <StrictMode>
+        <App />
+      </StrictMode>,
+    )
+    await projectHeading(ONE)
+    await waitFor(() => expect(document.documentElement.getAttribute('data-design')).toBe('crimson'))
+    cleanup()
+
+    const stubConsole = createElectronApiStub([ONE])
+    stubConsole.getDesign.mockResolvedValue('console')
+    render(
+      <StrictMode>
+        <App />
+      </StrictMode>,
+    )
+    await projectHeading(ONE)
+    await waitFor(() => expect(document.documentElement.getAttribute('data-design')).toBe('console'))
+    cleanup()
+
+    window.localStorage.setItem('mao:design', 'crimson')
+    window.localStorage.setItem('mao:theme', 'dark')
+    const unknownDesign = deferred<DesignId>()
+    const unknownTheme = deferred<ThemePreference>()
+    const userUnknown = userEvent.setup()
+    const stubUnknown = createElectronApiStub([ONE])
+    stubUnknown.getDesign.mockImplementation(() => unknownDesign.promise)
+    stubUnknown.getTheme.mockImplementation(() => unknownTheme.promise)
+    render(
+      <StrictMode>
+        <App />
+      </StrictMode>,
+    )
+    expect(document.documentElement.getAttribute('data-design')).toBe('crimson')
+    expect(document.documentElement.getAttribute('data-theme')).toBe('dark')
+    await projectHeading(ONE)
+    await act(async () => {
+      unknownDesign.resolve('unknown-theme' as never)
+      unknownTheme.resolve('sepia' as never)
+      await Promise.all([unknownDesign.promise, unknownTheme.promise])
+    })
+    expect(document.documentElement.getAttribute('data-design')).toBe('classic')
+    expect(document.documentElement.getAttribute('data-theme')).toBeNull()
+    expect(window.localStorage.getItem('mao:design')).toBe('classic')
+    expect(window.localStorage.getItem('mao:theme')).toBe('system')
+    await userUnknown.click(globalSettingsNav())
+    expect(screen.getByRole('button', { name: 'System' })).toHaveClass('active')
+    cleanup()
+
+    window.localStorage.setItem('mao:design', 'crimson')
+    window.localStorage.setItem('mao:theme', 'dark')
+    const rejectedDesign = deferred<DesignId>()
+    const rejectedTheme = deferred<ThemePreference>()
+    const userRejected = userEvent.setup()
+    const stubRejected = createElectronApiStub([ONE])
+    stubRejected.getDesign.mockImplementation(() => rejectedDesign.promise)
+    stubRejected.getTheme.mockImplementation(() => rejectedTheme.promise)
+    render(
+      <StrictMode>
+        <App />
+      </StrictMode>,
+    )
+    expect(document.documentElement.getAttribute('data-design')).toBe('crimson')
+    expect(document.documentElement.getAttribute('data-theme')).toBe('dark')
+    await projectHeading(ONE)
+    await act(async () => {
+      rejectedDesign.reject(new Error('Failed to read design'))
+      rejectedTheme.reject(new Error('Failed to read theme'))
+      await Promise.allSettled([rejectedDesign.promise, rejectedTheme.promise])
+    })
+    await waitFor(() => {
+      expect(screen.getByRole('alert')).toHaveTextContent('Failed to read design Failed to read theme')
+    })
+    expect(document.documentElement.getAttribute('data-design')).toBe('classic')
+    expect(document.documentElement.getAttribute('data-theme')).toBeNull()
+    expect(window.localStorage.getItem('mao:design')).toBe('classic')
+    expect(window.localStorage.getItem('mao:theme')).toBe('system')
+    await userRejected.click(screen.getByRole('button', { name: 'Dismiss' }))
+    await waitFor(() => expect(screen.queryByRole('alert')).toBeNull())
+    await userRejected.click(globalSettingsNav())
+    expect(screen.getByRole('button', { name: /Classic/ })).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByRole('button', { name: 'System' })).toHaveClass('active')
+    expect(screen.queryByRole('alert')).toBeNull()
+
+    // Subsequent double failure must roll back to reset default ('classic'), not the stale 'crimson' cache.
+    stubRejected.setDesign.mockRejectedValueOnce(new Error('Cannot write design: EIO'))
+    stubRejected.getDesign.mockRejectedValueOnce(new Error('Cannot read design: EIO'))
+    await userRejected.click(screen.getByRole('button', { name: /Developer Console/ }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Cannot write design: EIO')
+    expect(document.documentElement.getAttribute('data-design')).toBe('classic')
+    expect(window.localStorage.getItem('mao:design')).toBe('classic')
+    expect(screen.getByRole('button', { name: /Classic/ })).toHaveAttribute('aria-pressed', 'true')
+  })
+
+  it('primes document appearance from cached design and theme before mount', () => {
+    const originalMatchMedia = window.matchMedia
+    let osDark = false
+    window.matchMedia = (query: string): MediaQueryList => ({
+      get matches() {
+        return osDark
+      },
+      media: query,
+      onchange: null,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      addListener: () => {},
+      removeListener: () => {},
+      dispatchEvent: () => false,
+    })
+
+    try {
+      window.localStorage.setItem('mao:design', 'crimson')
+      window.localStorage.setItem('mao:theme', 'dark')
+      primeDocumentAppearance()
+      expect(document.documentElement.getAttribute('data-design')).toBe('crimson')
+      expect(document.documentElement.getAttribute('data-theme')).toBe('dark')
+
+      window.localStorage.setItem('mao:design', 'console')
+      window.localStorage.setItem('mao:theme', 'system')
+      osDark = true
+      primeDocumentAppearance()
+      expect(document.documentElement.getAttribute('data-design')).toBe('console')
+      expect(document.documentElement.getAttribute('data-theme')).toBe('dark')
+
+      window.localStorage.setItem('mao:theme', 'light')
+      primeDocumentAppearance()
+      expect(document.documentElement.getAttribute('data-design')).toBe('console')
+      expect(document.documentElement.getAttribute('data-theme')).toBeNull()
+    } finally {
+      window.matchMedia = originalMatchMedia
+    }
+  })
+
+  it('applies cached design and theme synchronously on initial commit before IPC reads settle, then reconciles with store', async () => {
+    window.localStorage.setItem('mao:design', 'crimson')
+    window.localStorage.setItem('mao:theme', 'dark')
+
+    const initialDesign = deferred<DesignId>()
+    const initialTheme = deferred<ThemePreference>()
+    const stub = createElectronApiStub([ONE])
+    stub.getDesign.mockImplementation(() => initialDesign.promise)
+    stub.getTheme.mockImplementation(() => initialTheme.promise)
+
+    render(
+      <StrictMode>
+        <App />
+      </StrictMode>,
+    )
+
+    expect(document.documentElement.getAttribute('data-design')).toBe('crimson')
+    expect(document.documentElement.getAttribute('data-theme')).toBe('dark')
+
+    await projectHeading(ONE)
+    expect(document.documentElement.getAttribute('data-design')).toBe('crimson')
+    expect(document.documentElement.getAttribute('data-theme')).toBe('dark')
+
+    await act(async () => {
+      initialDesign.resolve('console')
+      initialTheme.resolve('light')
+      await Promise.all([initialDesign.promise, initialTheme.promise])
+    })
+
+    expect(document.documentElement.getAttribute('data-design')).toBe('console')
+    expect(document.documentElement.getAttribute('data-theme')).toBeNull()
+    expect(window.localStorage.getItem('mao:design')).toBe('console')
+    expect(window.localStorage.getItem('mao:theme')).toBe('light')
+  })
+
+  it('ignores late initial mount reads after the operator already chose a design or theme', async () => {
+    const initialDesign = deferred<DesignId>()
+    const initialTheme = deferred<ThemePreference>()
+    const user = userEvent.setup()
+    const stub = createElectronApiStub([ONE])
+    stub.getDesign.mockImplementation(() => initialDesign.promise)
+    stub.getTheme.mockImplementation(() => initialTheme.promise)
+
+    render(
+      <StrictMode>
+        <App />
+      </StrictMode>,
+    )
+    await projectHeading(ONE)
+
+    await user.click(globalSettingsNav())
+    await user.click(screen.getByRole('button', { name: /Crimson Signal/ }))
+    await user.click(screen.getByRole('button', { name: 'Light' }))
+    expect(document.documentElement.getAttribute('data-design')).toBe('crimson')
+    expect(document.documentElement.getAttribute('data-theme')).toBeNull()
+    expect(screen.getByRole('button', { name: 'Light' })).toHaveClass('active')
+
+    await act(async () => {
+      initialDesign.resolve('console')
+      initialTheme.resolve('dark')
+      await Promise.all([initialDesign.promise, initialTheme.promise])
+    })
+
+    expect(document.documentElement.getAttribute('data-design')).toBe('crimson')
+    expect(screen.getByRole('button', { name: /Crimson Signal/ })).toHaveAttribute('aria-pressed', 'true')
+    expect(document.documentElement.getAttribute('data-theme')).toBeNull()
+    expect(screen.getByRole('button', { name: 'Light' })).toHaveClass('active')
+  })
+
+  it('ignores late initial mount read rejections after the operator already chose a design or theme', async () => {
+    const initialDesign = deferred<DesignId>()
+    const initialTheme = deferred<ThemePreference>()
+    const user = userEvent.setup()
+    const stub = createElectronApiStub([ONE])
+    stub.getDesign.mockImplementation(() => initialDesign.promise)
+    stub.getTheme.mockImplementation(() => initialTheme.promise)
+
+    render(
+      <StrictMode>
+        <App />
+      </StrictMode>,
+    )
+    await projectHeading(ONE)
+
+    await user.click(globalSettingsNav())
+    await user.click(screen.getByRole('button', { name: /Crimson Signal/ }))
+    await user.click(screen.getByRole('button', { name: 'Light' }))
+    expect(document.documentElement.getAttribute('data-design')).toBe('crimson')
+    expect(document.documentElement.getAttribute('data-theme')).toBeNull()
+    expect(screen.getByRole('button', { name: 'Light' })).toHaveClass('active')
+
+    await act(async () => {
+      initialDesign.reject(new Error('Late design read failed'))
+      initialTheme.reject(new Error('Late theme read failed'))
+      await Promise.allSettled([initialDesign.promise, initialTheme.promise])
+    })
+
+    expect(document.documentElement.getAttribute('data-design')).toBe('crimson')
+    expect(screen.getByRole('button', { name: /Crimson Signal/ })).toHaveAttribute('aria-pressed', 'true')
+    expect(document.documentElement.getAttribute('data-theme')).toBeNull()
+    expect(screen.getByRole('button', { name: 'Light' })).toHaveClass('active')
+    expect(screen.queryByRole('alert')).toBeNull()
+
+    // Late mount rejections must not reset lastConfirmedDesign/lastConfirmedTheme back to defaults.
+    stub.setDesign.mockRejectedValueOnce(new Error('Cannot write design: EIO'))
+    stub.getDesign.mockRejectedValueOnce(new Error('Cannot read design: EIO'))
+    await user.click(screen.getByRole('button', { name: /Developer Console/ }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Cannot write design: EIO')
+    expect(document.documentElement.getAttribute('data-design')).toBe('crimson')
+
+    stub.setTheme.mockRejectedValueOnce(new Error('Cannot write theme: EIO'))
+    stub.getTheme.mockRejectedValueOnce(new Error('Cannot read theme: EIO'))
+    await user.click(screen.getByRole('button', { name: 'Dark' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Cannot write theme: EIO')
+    expect(document.documentElement.getAttribute('data-theme')).toBeNull()
+    expect(screen.getByRole('button', { name: 'Light' })).toHaveClass('active')
+  })
+
+  it('clears an invalid stored design problem from Sidebar once setDesign heals the store', async () => {
+    const invalidDesignProblem = storedValueProblem('design', 'value', 'Invalid design')
+    const { stub, user } = await renderApp([ONE], [invalidDesignProblem])
+
+    expect(await screen.findByText('Stored settings could not be read')).toBeInTheDocument()
+    expect(screen.getByText('Invalid design')).toBeInTheDocument()
+
+    await user.click(globalSettingsNav())
+
+    // A failed write leaves the invalid value in place, so the sidebar warning remains.
+    stub.setDesign.mockRejectedValueOnce(new Error('Cannot write design: EACCES'))
+    await user.click(screen.getByRole('button', { name: /Crimson Signal/ }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Cannot write design: EACCES')
+    expect(screen.getByText('Stored settings could not be read')).toBeInTheDocument()
+
+    // Once setDesign succeeds and storeProblems reports [], refreshStoreProblems() clears the card.
+    stub.setDesign.mockImplementationOnce(async () => {
+      stub.setStoreProblems([])
+    })
+    await user.click(screen.getByRole('button', { name: /Crimson Signal/ }))
+
+    await waitFor(() => expect(screen.queryByText('Stored settings could not be read')).toBeNull())
+    expect(screen.queryByText('Invalid design')).toBeNull()
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('switches immediately across Crimson Signal, Developer Console, and back to Classic', async () => {
+    const { stub, user } = await renderApp([ONE])
+
+    await user.click(globalSettingsNav())
+    expect(document.documentElement.getAttribute('data-design')).toBe('classic')
+
+    await user.click(screen.getByRole('button', { name: /Crimson Signal/ }))
+    expect(document.documentElement.getAttribute('data-design')).toBe('crimson')
+    expect(stub.setDesign).toHaveBeenLastCalledWith('crimson')
+
+    await user.click(screen.getByRole('button', { name: /Developer Console/ }))
+    expect(document.documentElement.getAttribute('data-design')).toBe('console')
+    expect(stub.setDesign).toHaveBeenLastCalledWith('console')
+
+    await user.click(screen.getByRole('button', { name: /Classic/ }))
+    expect(document.documentElement.getAttribute('data-design')).toBe('classic')
+    expect(stub.setDesign).toHaveBeenLastCalledWith('classic')
+  })
+
+  it('keeps design and color mode orthogonal across light, dark, and live system media changes', async () => {
+    const originalMatchMedia = window.matchMedia
+    let osDark = false
+    const listeners = new Set<() => void>()
+    window.matchMedia = (query: string): MediaQueryList => ({
+      get matches() {
+        return osDark
+      },
+      media: query,
+      onchange: null,
+      addEventListener: (_type: string, cb: EventListenerOrEventListenerObject) => {
+        if (typeof cb === 'function') listeners.add(cb as () => void)
+      },
+      removeEventListener: (_type: string, cb: EventListenerOrEventListenerObject) => {
+        if (typeof cb === 'function') listeners.delete(cb as () => void)
+      },
+      addListener: () => {},
+      removeListener: () => {},
+      dispatchEvent: () => false,
+    })
+
+    try {
+      const { user } = await renderApp([ONE])
+      await user.click(globalSettingsNav())
+
+      await user.click(screen.getByRole('button', { name: /Crimson Signal/ }))
+      expect(document.documentElement.getAttribute('data-design')).toBe('crimson')
+      expect(document.documentElement.getAttribute('data-theme')).toBeNull()
+
+      await user.click(screen.getByRole('button', { name: 'Dark' }))
+      expect(document.documentElement.getAttribute('data-design')).toBe('crimson')
+      expect(document.documentElement.getAttribute('data-theme')).toBe('dark')
+
+      await user.click(screen.getByRole('button', { name: /Developer Console/ }))
+      expect(document.documentElement.getAttribute('data-design')).toBe('console')
+      expect(document.documentElement.getAttribute('data-theme')).toBe('dark')
+
+      await user.click(screen.getByRole('button', { name: 'Light' }))
+      expect(document.documentElement.getAttribute('data-design')).toBe('console')
+      expect(document.documentElement.getAttribute('data-theme')).toBeNull()
+
+      await user.click(screen.getByRole('button', { name: 'System' }))
+      expect(document.documentElement.getAttribute('data-design')).toBe('console')
+      expect(document.documentElement.getAttribute('data-theme')).toBeNull()
+
+      act(() => {
+        osDark = true
+        listeners.forEach((cb) => cb())
+      })
+      expect(document.documentElement.getAttribute('data-design')).toBe('console')
+      expect(document.documentElement.getAttribute('data-theme')).toBe('dark')
+
+      act(() => {
+        osDark = false
+        listeners.forEach((cb) => cb())
+      })
+      expect(document.documentElement.getAttribute('data-design')).toBe('console')
+      expect(document.documentElement.getAttribute('data-theme')).toBeNull()
+    } finally {
+      window.matchMedia = originalMatchMedia
+    }
+  })
+
+  it('preserves unsaved GlobalSettings inputs, keeps the selected repo, and triggers zero mutation channels', async () => {
+    const { stub, user } = await renderApp([ONE, TWO])
+    await user.click(sidebarProject(TWO))
+    await projectHeading(TWO)
+
+    await user.click(globalSettingsNav())
+    expect(sidebarProject(TWO)).toHaveAttribute('data-selected', 'true')
+    expect(sidebarProject(ONE)).not.toHaveAttribute('data-selected')
+
+    await user.type(tokenField(), 'ghp_unsaved_token')
+    await user.click(screen.getByRole('button', { name: '+ Add provider' }))
+    await user.type(screen.getByPlaceholderText('Name'), 'Unsaved Agent')
+
+    await user.click(screen.getByRole('button', { name: /Crimson Signal/ }))
+    await user.click(screen.getByRole('button', { name: /Developer Console/ }))
+    await user.click(screen.getByRole('button', { name: /Classic/ }))
+
+    // Verify selected project identity and unsaved form state while STILL in Global settings, before
+    // clicking back into the project view.
+    expect(sidebarProject(TWO)).toHaveAttribute('data-selected', 'true')
+    expect(sidebarProject(ONE)).not.toHaveAttribute('data-selected')
+    expect(tokenField()).toHaveValue('ghp_unsaved_token')
+    expect(screen.getByDisplayValue('Unsaved Agent')).toBeInTheDocument()
+
+    expect(stub.setRepos).not.toHaveBeenCalled()
+    expect(stub.api.github.refreshRepo).not.toHaveBeenCalled()
+    expect(stub.api.github.setToken).not.toHaveBeenCalled()
+    expect(stub.api.ai.save).not.toHaveBeenCalled()
+    expect(stub.api.workflow.enqueue).not.toHaveBeenCalled()
+    expect(stub.api.workflow.enqueueFromIssue).not.toHaveBeenCalled()
+    expect(stub.api.workflow.retry).not.toHaveBeenCalled()
+    expect(stub.api.workflow.advance).not.toHaveBeenCalled()
+    expect(stub.api.workflow.setAutoAdvance).not.toHaveBeenCalled()
+    expect(stub.api.workflow.clearCompleted).not.toHaveBeenCalled()
+
+    await user.click(sidebarProject(TWO))
+    expect(await projectHeading(TWO)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Board' })).toHaveClass('active')
+    expect(screen.getByRole('button', { name: 'Queue' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Settings' })).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Queue' }))
+    expect(screen.getByRole('button', { name: 'Queue' })).toHaveClass('active')
+  })
+
+  it('rolls back setDesign via re-read when available, falls back to lastConfirmedDesign on double failure, and clears alert on recovery', async () => {
+    const { stub, user } = await renderApp([ONE])
+    await user.click(globalSettingsNav())
+    await waitFor(() => expect(stub.getDesign).toHaveBeenCalled())
+
+    const classicBtn = screen.getByRole('button', { name: /Classic/ })
+    const crimsonBtn = screen.getByRole('button', { name: /Crimson Signal/ })
+    const consoleBtn = screen.getByRole('button', { name: /Developer Console/ })
+
+    // Re-read answers a value distinct from previous ('classic') to prove the authoritative read ran.
+    stub.setDesign.mockRejectedValueOnce(
+      new Error("Error invoking remote method 'ui:setDesign': Error: Cannot write config.json: EACCES"),
+    )
+    stub.getDesign.mockResolvedValueOnce('console')
+    await user.click(crimsonBtn)
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Cannot write config.json: EACCES')
+    expect(screen.getByRole('alert').textContent).not.toContain('Error invoking remote method')
+    expect(document.documentElement.getAttribute('data-design')).toBe('console')
+    expect(window.localStorage.getItem('mao:design')).toBe('console')
+    expect(consoleBtn).toHaveAttribute('aria-pressed', 'true')
+    expect(crimsonBtn).toHaveAttribute('aria-pressed', 'false')
+    expect(classicBtn).toHaveAttribute('aria-pressed', 'false')
+
+    await user.click(classicBtn)
+    await waitFor(() => expect(screen.queryByRole('alert')).toBeNull())
+    expect(document.documentElement.getAttribute('data-design')).toBe('classic')
+
+    // Switch cleanly to 'console' (not DEFAULT_DESIGN_ID) before staging a double failure,
+    // proving fallback restores lastConfirmedDesign rather than blindly substituting 'classic'.
+    await user.click(consoleBtn)
+    expect(document.documentElement.getAttribute('data-design')).toBe('console')
+    expect(window.localStorage.getItem('mao:design')).toBe('console')
+    expect(consoleBtn).toHaveAttribute('aria-pressed', 'true')
+
+    stub.setDesign.mockRejectedValueOnce(new Error('Cannot write config.json: EIO'))
+    stub.getDesign.mockRejectedValueOnce(new Error('Cannot read config.json: EIO'))
+    await user.click(crimsonBtn)
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Cannot write config.json: EIO')
+    expect(document.documentElement.getAttribute('data-design')).toBe('console')
+    expect(window.localStorage.getItem('mao:design')).toBe('console')
+    expect(consoleBtn).toHaveAttribute('aria-pressed', 'true')
+    expect(crimsonBtn).toHaveAttribute('aria-pressed', 'false')
+
+    // Rollback getDesign returning an unknown preset normalizes to DEFAULT_DESIGN_ID ('classic').
+    stub.setDesign.mockRejectedValueOnce(new Error('Cannot write config.json: EROFS'))
+    stub.getDesign.mockResolvedValueOnce('bogus-preset' as never)
+    await user.click(crimsonBtn)
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Cannot write config.json: EROFS')
+    expect(document.documentElement.getAttribute('data-design')).toBe('classic')
+    expect(classicBtn).toHaveAttribute('aria-pressed', 'true')
+    expect(crimsonBtn).toHaveAttribute('aria-pressed', 'false')
+
+    await user.click(crimsonBtn)
+    await waitFor(() => expect(screen.queryByRole('alert')).toBeNull())
+    expect(document.documentElement.getAttribute('data-design')).toBe('crimson')
+    expect(crimsonBtn).toHaveAttribute('aria-pressed', 'true')
+    expect(classicBtn).toHaveAttribute('aria-pressed', 'false')
+  })
+
+  it('ignores an older setDesign failure after a newer selection succeeds', async () => {
+    const { stub, user } = await renderApp([ONE])
+    await user.click(globalSettingsNav())
+    await waitFor(() => expect(stub.getDesign).toHaveBeenCalled())
+
+    const pendingFirst = deferred<void>()
+    stub.setDesign.mockImplementationOnce(() => pendingFirst.promise)
+
+    await user.click(screen.getByRole('button', { name: /Crimson Signal/ }))
+    expect(document.documentElement.getAttribute('data-design')).toBe('crimson')
+
+    const storeProblemsBeforeSecond = stub.storeProblems.mock.calls.length
+    await user.click(screen.getByRole('button', { name: /Developer Console/ }))
+    expect(document.documentElement.getAttribute('data-design')).toBe('console')
+    await waitFor(() => expect(stub.storeProblems.mock.calls.length).toBeGreaterThan(storeProblemsBeforeSecond))
+
+    const getDesignBeforeReject = stub.getDesign.mock.calls.length
+    const storeProblemsBeforeReject = stub.storeProblems.mock.calls.length
+    const rollbackRead = deferred<DesignId>()
+    stub.getDesign.mockImplementationOnce(() => rollbackRead.promise)
+
+    pendingFirst.reject(new Error('Stale design write failed'))
+    await waitFor(() => expect(stub.getDesign.mock.calls.length).toBeGreaterThan(getDesignBeforeReject))
+    await act(async () => {
+      rollbackRead.resolve('classic')
+      await rollbackRead.promise
+    })
+    await waitFor(() => expect(stub.storeProblems.mock.calls.length).toBeGreaterThan(storeProblemsBeforeReject))
+
+    expect(document.documentElement.getAttribute('data-design')).toBe('console')
+    expect(window.localStorage.getItem('mao:design')).toBe('console')
+    expect(screen.getByRole('button', { name: /Developer Console/ })).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('ignores out-of-order setDesign and setTheme settlements after newer selections already succeeded', async () => {
+    const { stub, user } = await renderApp([ONE])
+    await user.click(globalSettingsNav())
+    await waitFor(() => expect(stub.getDesign).toHaveBeenCalled())
+    await waitFor(() => expect(stub.getTheme).toHaveBeenCalled())
+
+    const pendingDesign1 = deferred<void>()
+    stub.setDesign.mockImplementationOnce(() => pendingDesign1.promise)
+    await user.click(screen.getByRole('button', { name: /Crimson Signal/ }))
+    await user.click(screen.getByRole('button', { name: /Developer Console/ }))
+    await waitFor(() => expect(window.localStorage.getItem('mao:design')).toBe('console'))
+
+    const pendingTheme1 = deferred<void>()
+    stub.setTheme.mockImplementationOnce(() => pendingTheme1.promise)
+    await user.click(screen.getByRole('button', { name: 'Dark' }))
+    await user.click(screen.getByRole('button', { name: 'Light' }))
+    await waitFor(() => expect(window.localStorage.getItem('mao:theme')).toBe('light'))
+
+    // Older request 1 resolves AFTER request 2 already settled: must not clobber localStorage or lastConfirmed*.
+    await act(async () => {
+      pendingDesign1.resolve()
+      pendingTheme1.resolve()
+      await Promise.all([pendingDesign1.promise, pendingTheme1.promise])
+    })
+
+    expect(document.documentElement.getAttribute('data-design')).toBe('console')
+    expect(window.localStorage.getItem('mao:design')).toBe('console')
+    expect(document.documentElement.getAttribute('data-theme')).toBeNull()
+    expect(window.localStorage.getItem('mao:theme')).toBe('light')
+
+    // Subsequent double failure must roll back to 'console' / 'light', NOT the stale 'crimson' / 'dark' settlement.
+    stub.setDesign.mockRejectedValueOnce(new Error('Cannot write design: EIO'))
+    stub.getDesign.mockRejectedValueOnce(new Error('Cannot read design: EIO'))
+    await user.click(screen.getByRole('button', { name: /Classic/ }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Cannot write design: EIO')
+    expect(document.documentElement.getAttribute('data-design')).toBe('console')
+    expect(window.localStorage.getItem('mao:design')).toBe('console')
+    expect(screen.getByRole('button', { name: /Developer Console/ })).toHaveAttribute('aria-pressed', 'true')
+
+    stub.setTheme.mockRejectedValueOnce(new Error('Cannot write theme: EIO'))
+    stub.getTheme.mockRejectedValueOnce(new Error('Cannot read theme: EIO'))
+    await user.click(screen.getByRole('button', { name: 'Dark' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Cannot write theme: EIO')
+    expect(document.documentElement.getAttribute('data-theme')).toBeNull()
+    expect(window.localStorage.getItem('mao:theme')).toBe('light')
+    expect(screen.getByRole('button', { name: 'Light' })).toHaveClass('active')
+  })
+
+  it('surfaces in-flight setDesign and setTheme failures after leaving Global settings and clears via Dismiss or navigation', async () => {
+    const { stub, user } = await renderApp([ONE, TWO])
+    await user.click(globalSettingsNav())
+
+    const pendingSave = deferred<void>()
+    stub.setDesign.mockImplementationOnce(() => pendingSave.promise)
+
+    await user.click(screen.getByRole('button', { name: /Crimson Signal/ }))
+    await user.click(sidebarProject(ONE))
+    await projectHeading(ONE)
+
+    pendingSave.reject(new Error('Cannot write config.json: EROFS'))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Cannot write config.json: EROFS')
+    expect(document.documentElement.getAttribute('data-design')).toBe('classic')
+
+    // Dismiss button clears the project-view alert in place without navigating away.
+    await user.click(screen.getByRole('button', { name: 'Dismiss' }))
+    await waitFor(() => expect(screen.queryByRole('alert')).toBeNull())
+
+    // Navigating back to Global settings also clears a pending project-view design error.
+    await user.click(globalSettingsNav())
+    const pendingSecondSave = deferred<void>()
+    stub.setDesign.mockImplementationOnce(() => pendingSecondSave.promise)
+    await user.click(screen.getByRole('button', { name: /Crimson Signal/ }))
+    await user.click(sidebarProject(ONE))
+    await projectHeading(ONE)
+    pendingSecondSave.reject(new Error('Cannot write config.json: EROFS'))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Cannot write config.json: EROFS')
+
+    await user.click(globalSettingsNav())
+    await waitFor(() => expect(screen.queryByRole('alert')).toBeNull())
+    expect(screen.getByRole('heading', { name: 'Global settings' })).toBeInTheDocument()
+
+    // Explicit tab and project switches also clear stale appearance errors.
+    const pendingThirdSave = deferred<void>()
+    stub.setDesign.mockImplementationOnce(() => pendingThirdSave.promise)
+    await user.click(screen.getByRole('button', { name: /Crimson Signal/ }))
+    await user.click(sidebarProject(ONE))
+    await projectHeading(ONE)
+    pendingThirdSave.reject(new Error('Cannot write config.json: EROFS'))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Cannot write config.json: EROFS')
+
+    await user.click(screen.getByRole('button', { name: 'Queue' }))
+    await waitFor(() => expect(screen.queryByRole('alert')).toBeNull())
+
+    // In-flight setTheme failure after leaving Global settings surfaces on project view and clears via Dismiss/navigation.
+    await user.click(globalSettingsNav())
+    const pendingThemeSave = deferred<void>()
+    stub.setTheme.mockImplementationOnce(() => pendingThemeSave.promise)
+    await user.click(screen.getByRole('button', { name: 'Dark' }))
+    await user.click(sidebarProject(ONE))
+    await projectHeading(ONE)
+
+    pendingThemeSave.reject(
+      new Error("Error invoking remote method 'ui:setTheme': Error: Cannot write theme: EROFS"),
+    )
+    expect(await screen.findByRole('alert')).toHaveTextContent('Cannot write theme: EROFS')
+    expect(document.documentElement.getAttribute('data-theme')).toBeNull()
+
+    await user.click(screen.getByRole('button', { name: 'Dismiss' }))
+    await waitFor(() => expect(screen.queryByRole('alert')).toBeNull())
+
+    await user.click(globalSettingsNav())
+    const pendingSecondThemeSave = deferred<void>()
+    stub.setTheme.mockImplementationOnce(() => pendingSecondThemeSave.promise)
+    await user.click(screen.getByRole('button', { name: 'Dark' }))
+    await user.click(sidebarProject(ONE))
+    await projectHeading(ONE)
+    pendingSecondThemeSave.reject(new Error('Cannot write theme: EROFS'))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Cannot write theme: EROFS')
+
+    await user.click(sidebarProject(TWO))
+    await projectHeading(TWO)
+    await waitFor(() => expect(screen.queryByRole('alert')).toBeNull())
+  })
+
+  it('rolls back setTheme via re-read, falls back to lastConfirmedTheme on double failure, ignores stale failure, and keeps designError independent', async () => {
+    const { stub, user } = await renderApp([ONE])
+    await user.click(globalSettingsNav())
+    await waitFor(() => expect(stub.getTheme).toHaveBeenCalled())
+
+    // Re-read answers 'dark' (distinct from initial 'system').
+    stub.setTheme.mockRejectedValueOnce(new Error('Cannot write theme: EACCES'))
+    stub.getTheme.mockResolvedValueOnce('dark')
+    await user.click(screen.getByRole('button', { name: 'Light' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Cannot write theme: EACCES')
+    expect(document.documentElement.getAttribute('data-theme')).toBe('dark')
+    expect(screen.getByRole('button', { name: 'Dark' })).toHaveClass('active')
+
+    await user.click(screen.getByRole('button', { name: 'System' }))
+    await waitFor(() => expect(screen.queryByRole('alert')).toBeNull())
+    expect(document.documentElement.getAttribute('data-theme')).toBeNull()
+    expect(screen.getByRole('button', { name: 'System' })).toHaveClass('active')
+
+    // Switch cleanly to 'dark' (not 'system') before staging a double failure,
+    // proving fallback restores lastConfirmedTheme ('dark') rather than 'system'.
+    await user.click(screen.getByRole('button', { name: 'Dark' }))
+    expect(document.documentElement.getAttribute('data-theme')).toBe('dark')
+    expect(screen.getByRole('button', { name: 'Dark' })).toHaveClass('active')
+
+    stub.setTheme.mockRejectedValueOnce(new Error('Cannot write theme: EIO'))
+    stub.getTheme.mockRejectedValueOnce(new Error('Cannot read theme: EIO'))
+    await user.click(screen.getByRole('button', { name: 'Light' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Cannot write theme: EIO')
+    expect(document.documentElement.getAttribute('data-theme')).toBe('dark')
+    expect(screen.getByRole('button', { name: 'Dark' })).toHaveClass('active')
+
+    // Overlapping double-failure race: first write ('system') is in flight and fails, second ('light')
+    // also fails alongside getTheme rejection; must roll back to lastConfirmedTheme ('dark'), NOT
+    // the unpersisted optimistic pick ('system').
+    const pendingFirstTheme = deferred<void>()
+    stub.setTheme.mockImplementationOnce(() => pendingFirstTheme.promise)
+    await user.click(screen.getByRole('button', { name: 'System' }))
+    expect(document.documentElement.getAttribute('data-theme')).toBeNull()
+
+    const pendingSecondTheme = deferred<void>()
+    stub.setTheme.mockImplementationOnce(() => pendingSecondTheme.promise)
+    await user.click(screen.getByRole('button', { name: 'Light' }))
+    expect(document.documentElement.getAttribute('data-theme')).toBeNull()
+
+    const getThemeBeforeFirstReject = stub.getTheme.mock.calls.length
+    stub.getTheme.mockRejectedValueOnce(new Error('Cannot read theme after first reject'))
+    pendingFirstTheme.reject(new Error('First theme write failed'))
+    await waitFor(() => expect(stub.getTheme.mock.calls.length).toBeGreaterThan(getThemeBeforeFirstReject))
+    await act(async () => {})
+    expect(screen.queryByRole('alert')).toBeNull()
+
+    stub.getTheme.mockRejectedValueOnce(new Error('Cannot read theme after second reject'))
+    pendingSecondTheme.reject(new Error('Second theme write failed'))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Second theme write failed')
+    expect(document.documentElement.getAttribute('data-theme')).toBe('dark')
+    expect(screen.getByRole('button', { name: 'Dark' })).toHaveClass('active')
+
+    await user.click(screen.getByRole('button', { name: 'Light' }))
+    await waitFor(() => expect(screen.queryByRole('alert')).toBeNull())
+    expect(document.documentElement.getAttribute('data-theme')).toBeNull()
+    expect(screen.getByRole('button', { name: 'Light' })).toHaveClass('active')
+    expect(stub.setTheme).toHaveBeenLastCalledWith('light')
+
+    // Overlapping failure race: older failed setTheme must not overwrite newer Light selection.
+    const pendingTheme = deferred<void>()
+    stub.setTheme.mockImplementationOnce(() => pendingTheme.promise)
+    await user.click(screen.getByRole('button', { name: 'Dark' }))
+    expect(document.documentElement.getAttribute('data-theme')).toBe('dark')
+
+    await user.click(screen.getByRole('button', { name: 'Light' }))
+    expect(document.documentElement.getAttribute('data-theme')).toBeNull()
+
+    const getThemeBeforeReject = stub.getTheme.mock.calls.length
+    const rollbackRead = deferred<ThemePreference>()
+    stub.getTheme.mockImplementationOnce(() => rollbackRead.promise)
+
+    pendingTheme.reject(new Error('Stale theme write failed'))
+    await waitFor(() => expect(stub.getTheme.mock.calls.length).toBeGreaterThan(getThemeBeforeReject))
+    await act(async () => {
+      rollbackRead.resolve('dark')
+      await rollbackRead.promise
+    })
+
+    expect(document.documentElement.getAttribute('data-theme')).toBeNull()
+    expect(screen.getByRole('button', { name: 'Light' })).toHaveClass('active')
+    expect(screen.queryByRole('alert')).toBeNull()
+
+    // Axis error independence: theme actions/failures must not wipe an active designError until design succeeds.
+    stub.setDesign.mockRejectedValueOnce(new Error('Design write failed'))
+    await user.click(screen.getByRole('button', { name: /Crimson Signal/ }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Design write failed')
+
+    await user.click(screen.getByRole('button', { name: 'Dark' }))
+    expect(screen.getByRole('alert')).toHaveTextContent('Design write failed')
+
+    stub.setTheme.mockRejectedValueOnce(new Error('Theme write failed'))
+    await user.click(screen.getByRole('button', { name: 'Light' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Design write failed Theme write failed')
+
+    await user.click(screen.getByRole('button', { name: /Crimson Signal/ }))
+    await waitFor(() => {
+      const alert = screen.getByRole('alert')
+      expect(alert).toHaveTextContent('Theme write failed')
+      expect(alert).not.toHaveTextContent('Design write failed')
+    })
+
+    await user.click(screen.getByRole('button', { name: 'Light' }))
+    await waitFor(() => expect(screen.queryByRole('alert')).toBeNull())
+
+    // GlobalSettings Dismiss button invokes App's onDismissAppearanceError and clears both axes.
+    stub.setDesign.mockRejectedValueOnce(new Error('Design write failed'))
+    await user.click(screen.getByRole('button', { name: /Classic/ }))
+    stub.setTheme.mockRejectedValueOnce(new Error('Theme write failed'))
+    await user.click(screen.getByRole('button', { name: 'Dark' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Design write failed Theme write failed')
+
+    await user.click(screen.getByRole('button', { name: 'Dismiss' }))
+    await waitFor(() => expect(screen.queryByRole('alert')).toBeNull())
+  })
+
+  it('bootstraps via src/main.tsx by priming cached appearance before createRoot and reconciling once IPC resolves', async () => {
+    const rootEl = document.createElement('div')
+    rootEl.id = 'root'
+    document.body.appendChild(rootEl)
+
+    const hadElectronApi = Object.prototype.hasOwnProperty.call(window, 'electronAPI')
+    const previousElectronApi = window.electronAPI
+    let createdRoot: { unmount: () => void } | undefined
+    let createRootSpy: { mockRestore: () => void } | undefined
+    let freshElectronApi: typeof import('./electron-api') | undefined
+    let designAtCreateRoot: string | null = null
+    let themeAtCreateRoot: string | null = null
+
+    try {
+      window.localStorage.setItem('mao:design', 'crimson')
+      window.localStorage.setItem('mao:theme', 'dark')
+
+      const initialDesign = deferred<DesignId>()
+      const initialTheme = deferred<ThemePreference>()
+      const user = userEvent.setup()
+      const stub = createElectronApiStub([ONE])
+      stub.getDesign.mockImplementation(() => initialDesign.promise)
+      stub.getTheme.mockImplementation(() => initialTheme.promise)
+      window.electronAPI = stub.api
+
+      vi.resetModules()
+      const reactDomClient = await import('react-dom/client')
+      freshElectronApi = await import('./electron-api')
+      const realCreateRoot = reactDomClient.default.createRoot
+      createRootSpy = vi.spyOn(reactDomClient.default, 'createRoot').mockImplementation((...args) => {
+        designAtCreateRoot = document.documentElement.getAttribute('data-design')
+        themeAtCreateRoot = document.documentElement.getAttribute('data-theme')
+        const root = realCreateRoot(...args)
+        createdRoot = root
+        return root
+      })
+
+      await act(async () => {
+        await import('./main')
+      })
+
+      expect(createRootSpy).toHaveBeenCalledWith(rootEl)
+      expect(designAtCreateRoot).toBe('crimson')
+      expect(themeAtCreateRoot).toBe('dark')
+      expect(document.documentElement.getAttribute('data-design')).toBe('crimson')
+      expect(document.documentElement.getAttribute('data-theme')).toBe('dark')
+
+      const initialHeading = await projectHeading(ONE)
+      expect(rootEl.contains(initialHeading)).toBe(true)
+
+      await act(async () => {
+        initialDesign.resolve('console')
+        initialTheme.resolve('light')
+        await Promise.all([initialDesign.promise, initialTheme.promise])
+      })
+
+      expect(document.documentElement.getAttribute('data-design')).toBe('console')
+      expect(document.documentElement.getAttribute('data-theme')).toBeNull()
+      expect(window.localStorage.getItem('mao:design')).toBe('console')
+      expect(window.localStorage.getItem('mao:theme')).toBe('light')
+      expect(rootEl.contains(await projectHeading(ONE))).toBe(true)
+
+      await user.click(globalSettingsNav())
+      expect(screen.getByRole('button', { name: /Developer Console/ })).toHaveAttribute('aria-pressed', 'true')
+      expect(screen.getByRole('button', { name: 'Light' })).toHaveClass('active')
+    } finally {
+      if (createdRoot) {
+        await act(async () => {
+          createdRoot!.unmount()
+        })
+      }
+      createRootSpy?.mockRestore()
+      freshElectronApi?.setElectronApi(null)
+      rootEl.remove()
+      if (hadElectronApi) {
+        window.electronAPI = previousElectronApi
+      } else {
+        Reflect.deleteProperty(window, 'electronAPI')
+      }
+      vi.resetModules()
+    }
   })
 })

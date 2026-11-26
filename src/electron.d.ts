@@ -1,10 +1,12 @@
 import type { AiProviderConfig } from '../core/ai/types'
+import type { DiscoverableProviderKind, ModelCatalogView } from '../core/ai/provider-options'
+import type { ModelCatalogRefreshReport } from '../core/model-catalog'
 import type { GithubTask, GithubTaskDetail } from '../core/github-service'
 import type { CommitGraphData } from '../core/commit-graph'
 import type { RepoWorkflowCapability } from '../core/repo-capabilities'
 import type { QueueRecoveryOutcome, QueueRecoveryState, QueuedTask, RepoRef, RunOverride } from '../core/workflow-engine'
 import type { AutoTriggerStatus } from '../core/auto-trigger'
-import type { StoredValueProblem, ThemePreference } from '../core/store'
+import type { DesignId, StoredValueProblem, ThemePreference } from '../core/store'
 import type { SelfUpdateCheck } from '../core/self-update'
 
 export interface AppUpdateCheck extends SelfUpdateCheck {
@@ -23,8 +25,13 @@ declare global {
       }
       ai: {
         list: () => Promise<AiProviderConfig[]>
-        save: (providers: AiProviderConfig[]) => Promise<AiProviderConfig[]>
+        /** `base` is the list the editor loaded: the save is refused if the stored list moved since. */
+        save: (providers: AiProviderConfig[], base?: AiProviderConfig[]) => Promise<AiProviderConfig[]>
         run: (providerId: string, prompt: string) => Promise<string>
+        /** The cached model catalog; merge it over the built-in tables with `providerOptionsWithCatalog()`. */
+        getModelCatalog: () => Promise<ModelCatalogView>
+        /** Refreshes the given providers' model lists now (all when omitted); fixed-category results only. */
+        refreshModelCatalog: (kinds?: DiscoverableProviderKind[]) => Promise<ModelCatalogRefreshReport>
       }
       github: {
         setToken: (token: string) => Promise<void>
@@ -36,8 +43,11 @@ declare global {
          * Rejects (leaving the stored list untouched) when a newly added repo fails the write-permission
          * preflight. Resolves with the verdict for each newly registered repo, whose `unverified` grants
          * the caller should surface — a pass is not proof of write access.
+         *
+         * `base` is the list the edit was computed from; core applies only what changed between the two to
+         * the list stored now, so a stale mirror cannot revert another process's change (issue #73).
          */
-        setRepos: (repos: RepoRef[]) => Promise<RepoWorkflowCapability[]>
+        setRepos: (repos: RepoRef[], base?: RepoRef[]) => Promise<RepoWorkflowCapability[]>
         getRepos: () => Promise<RepoRef[]>
         autoTriggerStatus: (owner: string, repo: string) => Promise<AutoTriggerStatus>
         refreshRepo: (owner: string, repo: string) => Promise<GithubTask[]>
@@ -67,6 +77,8 @@ declare global {
       ui: {
         getTheme: () => Promise<ThemePreference>
         setTheme: (theme: ThemePreference) => Promise<void>
+        getDesign: () => Promise<DesignId>
+        setDesign: (design: DesignId) => Promise<void>
       }
     }
   }

@@ -808,6 +808,35 @@ describe('GithubService.fetchCommitGraph', () => {
     expect(listCommits).toHaveBeenCalledTimes(20)
   })
 
+  it('does not read the default branch by name when the listing is complete and lacks it', async () => {
+    // A short listing is every branch: a default missing from it was renamed mid-flight, and its name
+    // could 404 or match a same-named tag. `main` is servable here only so that reading it would show.
+    const { service, listCommits } = makeGraphService([branch('feature', 'f1')], {
+      f1: [apiCommit('f1', [])],
+      main: [apiCommit('m1', [])],
+    })
+    const graph = await service.fetchCommitGraph('acme', 'widgets')
+    expect(listCommits).not.toHaveBeenCalledWith(expect.objectContaining({ sha: 'main' }))
+    expect(graph.branches.map((b) => b.name)).toEqual(['feature'])
+    expect(graph.commits.map((c) => c.sha)).toEqual(['f1'])
+  })
+
+  it('returns commits in drawing order whatever order the branch pages arrive in', async () => {
+    // Every fixture commit shares one committer second, so only input position breaks the sort's ties;
+    // branch `a`'s page answering last must not move `a1` behind `b1`.
+    const { service, listCommits } = makeGraphService(
+      [branch('a', 'a1'), branch('b', 'b1'), branch('main', 'm1')],
+      { m1: [apiCommit('m1', [])], a1: [apiCommit('a1', ['m1'])], b1: [apiCommit('b1', ['m1'])] },
+    )
+    const serve = listCommits.getMockImplementation()!
+    listCommits.mockImplementation(async (args: { sha: string }) => {
+      if (args.sha === 'a1') await new Promise((resolve) => setTimeout(resolve, 20))
+      return serve(args)
+    })
+    const graph = await service.fetchCommitGraph('acme', 'widgets')
+    expect(graph.commits.map((c) => c.sha)).toEqual(['a1', 'b1', 'm1'])
+  })
+
   it('draws nothing for an empty repository without asking for a default branch that has no commits', async () => {
     const { service, listCommits } = makeGraphService([], {})
     const graph = await service.fetchCommitGraph('acme', 'widgets')

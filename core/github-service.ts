@@ -11,6 +11,7 @@ import {
   type CommitGraphData,
   type GraphBranch,
   type GraphCommit,
+  sortCommitsTopologically,
 } from './commit-graph.ts'
 
 /**
@@ -383,41 +384,46 @@ export class GithubService {
     const all: GraphBranch[] = listed.map((branch) => ({ name: branch.name, sha: branch.commit.sha }))
 
     const commits = new Map<string, GraphCommit>()
-    const readCommits = async (ref: string, perPage: number) => {
+    const merge = (page: GraphCommit[]) => {
+      for (const commit of page) if (!commits.has(commit.sha)) commits.set(commit.sha, commit)
+    }
+    const readCommits = async (ref: string, perPage: number): Promise<GraphCommit[]> => {
       const { data } = await octokit.rest.repos.listCommits({ owner, repo, sha: ref, per_page: perPage })
-      for (const item of data) {
-        if (commits.has(item.sha)) continue
-        commits.set(item.sha, {
-          sha: item.sha,
-          parents: item.parents.map((parent) => parent.sha),
-          message: item.commit.message.split(/\r?\n/, 1)[0],
-          author: item.commit.author?.name ?? item.author?.login ?? 'unknown',
-          date: item.commit.committer?.date ?? item.commit.author?.date ?? '',
-          url: item.html_url,
-        })
-      }
-      return data
+      return data.map((item) => ({
+        sha: item.sha,
+        parents: item.parents.map((parent) => parent.sha),
+        message: item.commit.message.split(/\r?\n/, 1)[0],
+        author: item.commit.author?.name ?? item.author?.login ?? 'unknown',
+        date: item.commit.committer?.date ?? item.commit.author?.date ?? '',
+        url: item.html_url,
+      }))
     }
 
-    // The default branch first, so its page can make the other branches' heads already known. An empty
-    // listing is an empty repository: there is no default branch head to read.
+    // The default branch first, so its page can make the other branches' heads already known. Read it by
+    // name only when the listing stopped at a full page and so may have cut it off: a shorter listing is
+    // every branch, and one without the default is an empty repository or a rename caught mid-flight,
+    // where the name would 404 or match a same-named tag.
     let defaultEntry = all.find((branch) => branch.name === defaultBranch)
     if (defaultEntry) {
-      await readCommits(defaultEntry.sha, COMMIT_GRAPH_LIMITS.defaultBranchCommits)
-    } else if (all.length > 0) {
+      merge(await readCommits(defaultEntry.sha, COMMIT_GRAPH_LIMITS.defaultBranchCommits))
+    } else if (listed.length >= COMMIT_GRAPH_LIMITS.branchListPage) {
       const page = await readCommits(defaultBranch, COMMIT_GRAPH_LIMITS.defaultBranchCommits)
+      merge(page)
       if (page.length > 0) defaultEntry = { name: defaultBranch, sha: page[0].sha }
     }
 
     const others = all.filter((branch) => branch.name !== defaultBranch)
     const drawnOthers = others.slice(0, COMMIT_GRAPH_LIMITS.maxBranches - 1)
     const unread = new Set(drawnOthers.map((branch) => branch.sha).filter((sha) => !commits.has(sha)))
-    await Promise.all([...unread].map((sha) => readCommits(sha, COMMIT_GRAPH_LIMITS.branchCommits)))
+    const pages = await Promise.all([...unread].map((sha) => readCommits(sha, COMMIT_GRAPH_LIMITS.branchCommits)))
+    // Merge in listing order, not arrival order, and return the order the graph draws: the CLI prints this
+    // array as-is, and the sort breaks same-second ties by input position.
+    for (const page of pages) merge(page)
 
     return {
       defaultBranch,
       branches: [...(defaultEntry ? [defaultEntry] : []), ...drawnOthers],
-      commits: [...commits.values()],
+      commits: sortCommitsTopologically([...commits.values()]),
       omittedBranches: others.length - drawnOthers.length,
       branchListComplete: listed.length < COMMIT_GRAPH_LIMITS.branchListPage,
     }

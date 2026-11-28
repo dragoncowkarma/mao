@@ -11,6 +11,7 @@ import {
   type CommitGraphData,
   type GraphBranch,
   type GraphCommit,
+  findTruncatedCommits,
   sortCommitsTopologically,
 } from './commit-graph.ts'
 
@@ -419,13 +420,17 @@ export class GithubService {
     // Merge in listing order, not arrival order, and return the order the graph draws: the CLI prints this
     // array as-is, and the sort breaks same-second ties by input position.
     for (const page of pages) merge(page)
+    const ordered = sortCommitsTopologically([...commits.values()])
+    const truncatedCommits = findTruncatedCommits(ordered)
 
     return {
       defaultBranch,
       branches: [...(defaultEntry ? [defaultEntry] : []), ...drawnOthers],
-      commits: sortCommitsTopologically([...commits.values()]),
+      commits: ordered,
       omittedBranches: others.length - drawnOthers.length,
       branchListComplete: listed.length < COMMIT_GRAPH_LIMITS.branchListPage,
+      historyTruncated: truncatedCommits.length > 0,
+      truncatedCommits,
     }
   }
 

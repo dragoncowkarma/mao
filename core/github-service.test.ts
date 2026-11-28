@@ -837,10 +837,39 @@ describe('GithubService.fetchCommitGraph', () => {
     expect(graph.commits.map((c) => c.sha)).toEqual(['a1', 'b1', 'm1'])
   })
 
+  it('names the commits whose parents fall outside the window, in the result and its CLI JSON', async () => {
+    // A full 100-commit default page whose oldest commit's parent `c100` was not read.
+    const page = Array.from({ length: 100 }, (_, i) => apiCommit(`c${i}`, [`c${i + 1}`]))
+    const { service } = makeGraphService([branch('main', 'c0')], { c0: page })
+    const graph = await service.fetchCommitGraph('acme', 'widgets')
+
+    expect(graph.commits).toHaveLength(100)
+    expect(graph.historyTruncated).toBe(true)
+    expect(graph.truncatedCommits).toEqual([{ sha: 'c99', missingParents: ['c100'] }])
+    // `mao github graph` prints the result through JSON.stringify, so the fact has to survive it.
+    expect(JSON.parse(JSON.stringify(graph))).toMatchObject({
+      historyTruncated: true,
+      truncatedCommits: [{ sha: 'c99', missingParents: ['c100'] }],
+    })
+  })
+
+  it('reports no truncation when the commits read reach the root', async () => {
+    const { service } = makeGraphService([branch('main', 'm2')], { m2: [apiCommit('m2', ['m1']), apiCommit('m1', [])] })
+    const graph = await service.fetchCommitGraph('acme', 'widgets')
+    expect(graph).toMatchObject({ historyTruncated: false, truncatedCommits: [] })
+  })
+
   it('draws nothing for an empty repository without asking for a default branch that has no commits', async () => {
     const { service, listCommits } = makeGraphService([], {})
     const graph = await service.fetchCommitGraph('acme', 'widgets')
-    expect(graph).toMatchObject({ branches: [], commits: [], omittedBranches: 0, branchListComplete: true })
+    expect(graph).toMatchObject({
+      branches: [],
+      commits: [],
+      omittedBranches: 0,
+      branchListComplete: true,
+      historyTruncated: false,
+      truncatedCommits: [],
+    })
     expect(listCommits).not.toHaveBeenCalled()
   })
 

@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { layoutCommitGraph, sortCommitsTopologically, type GraphBranch, type GraphCommit } from './commit-graph.ts'
+import {
+  findTruncatedCommits,
+  layoutCommitGraph,
+  sortCommitsTopologically,
+  type GraphBranch,
+  type GraphCommit,
+} from './commit-graph.ts'
 
 let clock = 0
 /** Each call is one minute newer than the last, so declaration order is date order unless overridden. */
@@ -22,6 +28,24 @@ function layout(commits: GraphCommit[], branches: GraphBranch[] = []) {
 function order(commits: GraphCommit[]) {
   return layout(commits).rows.map((row) => row.commit.sha)
 }
+
+describe('findTruncatedCommits', () => {
+  it('names each commit with an unread parent and only the parents that were not read', () => {
+    const root = commit('root')
+    const edge = commit('edge', ['outside'])
+    const merge = commit('merge', ['edge', 'gone'])
+    expect(findTruncatedCommits([merge, edge, root])).toEqual([
+      { sha: 'merge', missingParents: ['gone'] },
+      { sha: 'edge', missingParents: ['outside'] },
+    ])
+  })
+
+  it('reports nothing for a history that reaches its root', () => {
+    const a = commit('a')
+    const b = commit('b', ['a'])
+    expect(findTruncatedCommits([b, a])).toEqual([])
+  })
+})
 
 describe('sortCommitsTopologically', () => {
   it('orders newest first for a linear history', () => {

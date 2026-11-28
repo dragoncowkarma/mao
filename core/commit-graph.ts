@@ -25,6 +25,13 @@ export interface GraphBranch {
   sha: string
 }
 
+/** A commit whose line the window cuts off: it has parents that were not among the commits read. */
+export interface TruncatedCommit {
+  sha: string
+  /** The parent SHAs outside the window, in git order. Each is a real commit, just not a loaded one. */
+  missingParents: string[]
+}
+
 /**
  * A bounded window onto a repository's history, never the whole of it.
  *
@@ -44,6 +51,14 @@ export interface CommitGraphData {
    * `omittedBranches` is then a lower bound.
    */
   branchListComplete: boolean
+  /**
+   * True when `truncatedCommits` is non-empty: the history goes on below the oldest commits read. Carried
+   * so a consumer of `mao github graph` JSON need not cross-check every parent against `commits` to learn
+   * that the window is not where the repository begins — the GUI draws the same fact as dashed lines.
+   */
+  historyTruncated: boolean
+  /** Every loaded commit with a parent outside the window, in `commits` order (`findTruncatedCommits`). */
+  truncatedCommits: TruncatedCommit[]
 }
 
 /**
@@ -87,6 +102,21 @@ export interface CommitGraphLayout {
 function timeOf(commit: GraphCommit): number {
   const time = Date.parse(commit.date)
   return Number.isNaN(time) ? 0 : time
+}
+
+/**
+ * The commits whose parents were not all read, in input order. A parent counts as read only when it is one
+ * of `commits`, the same test the layout uses to draw a row's line as cut off rather than finished; a root
+ * commit has no parents and is never truncated.
+ */
+export function findTruncatedCommits(commits: GraphCommit[]): TruncatedCommit[] {
+  const known = new Set(commits.map((commit) => commit.sha))
+  const truncated: TruncatedCommit[] = []
+  for (const commit of commits) {
+    const missingParents = commit.parents.filter((parent) => !known.has(parent))
+    if (missingParents.length > 0) truncated.push({ sha: commit.sha, missingParents })
+  }
+  return truncated
 }
 
 /**

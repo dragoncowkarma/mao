@@ -38,9 +38,22 @@ function truncatedStubPath(row: GraphRow): string {
   return toX === x ? `M ${x} ${mid} L ${x} ${ROW_HEIGHT}` : `M ${x} ${mid} C ${x} ${ROW_HEIGHT}, ${toX} ${mid}, ${toX} ${ROW_HEIGHT}`
 }
 
-function shortDate(iso: string): string {
+/**
+ * Date and minute, 24-hour so every row's stamp is the same width under `tabular-nums`. A date alone made a
+ * morning commit and the evening merge after it read as one moment.
+ */
+const COMMIT_TIME = new Intl.DateTimeFormat(undefined, {
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  hourCycle: 'h23',
+})
+
+function commitTime(iso: string): string {
   const time = Date.parse(iso)
-  return Number.isNaN(time) ? '' : new Date(time).toLocaleDateString()
+  return Number.isNaN(time) ? '' : COMMIT_TIME.format(time)
 }
 
 /** One row's slice of the graph. Rows are equal height, so each strip continues the one above it. */
@@ -174,7 +187,7 @@ export default function CommitGraph({ repo }: CommitGraphProps) {
                 {row.commit.message}
               </a>
               <span className="graph-meta text-muted">
-                <code>{row.commit.sha.slice(0, 7)}</code> · {row.commit.author} · {shortDate(row.commit.date)}
+                <code>{row.commit.sha.slice(0, 7)}</code> · {row.commit.author} · {commitTime(row.commit.date)}
               </span>
             </li>
           ))}

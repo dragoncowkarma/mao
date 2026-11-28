@@ -34,6 +34,8 @@ const graph: CommitGraphData = {
   ],
   omittedBranches: 0,
   branchListComplete: true,
+  historyTruncated: false,
+  truncatedCommits: [],
 }
 
 function deferred<T>() {
@@ -65,6 +67,25 @@ describe('CommitGraph', () => {
     )
     expect(screen.getByText('3 commits · 2 branches')).toBeInTheDocument()
     expect(stub.fetchCommitGraph).toHaveBeenCalledWith('acme', 'widgets')
+  })
+
+  it('stamps each commit with its time of day, not only its date', async () => {
+    // Local-time ISO strings, so both commits fall on one calendar day in whatever zone the test runs.
+    const stub = createElectronApiStub()
+    stub.fetchCommitGraph.mockResolvedValue({
+      ...graph,
+      branches: [{ name: 'main', sha: 'late0000' }],
+      commits: [
+        { ...commit('early000', [], 'Morning fix', 0), date: '2026-03-04T10:05:00' },
+        { ...commit('late0000', ['early000'], 'Evening merge', 0), date: '2026-03-04T17:45:00' },
+      ],
+    })
+    render(<CommitGraph repo={repo} />)
+
+    const list = await screen.findByRole('list', { name: 'Commit graph for acme/widgets' })
+    const [late, early] = within(list).getAllByRole('listitem')
+    expect(late.textContent).toMatch(/17:45/)
+    expect(early.textContent).toMatch(/10:05/)
   })
 
   it('shows the error when the graph cannot be loaded', async () => {

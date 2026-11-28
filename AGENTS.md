@@ -29,7 +29,8 @@ AI agents drive GitHub issue → PR → review → merge, with a maker-checker s
 | `core/assignment.ts` | Issue-body tags → `ProviderOverride` |
 | `core/auto-trigger.ts` | Per-repo poller; enqueues new open issues |
 | `core/model-catalog.ts` | Model-list cache file, TTL refresher for long-lived hosts |
-| `core/github-service.ts` | Octokit wrapper + read-only write preflight |
+| `core/commit-graph.ts` | Pure commit-graph model, call budget, lane layout (renderer-importable) |
+| `core/github-service.ts` | Octokit wrapper + read-only write preflight, bounded `fetchCommitGraph()` |
 | `core/repo-capabilities.ts` | Pure write-capability verdict |
 | `core/repo-registry.ts` | Pure repo identity + `updateRepos` registrar |
 | `core/store.ts` | `MaoStore`, schema, read guard, write refusal |
@@ -61,7 +62,7 @@ Code comments cite these numbers: never renumber (`core/agent-docs.test.ts`).
 3. **`createMaoApp()` (`core/app.ts`) is the only boot path.** Mutate through `WorkflowEngine` so persistence is automatic. Partial proof: `core/app.test.ts`.
 4. **The `resume` flag is deliberately required (no default).** One-shot commands pass `false`; `electron/ipc.ts` passes `true`; `mao run` passes `false`, then calls `resumeProcessing()` after attaching its listener. Proof: `npm run lint` (flag required); shell values and order: review.
 5. **Never start the auto-trigger poller inside `createMaoApp()`**, nor the model-catalog refresher. The poller's `setInterval` keeps the process alive; the refresher's first tick runs the AI CLIs and writes a cache file, from every one-shot command. Only `electron/ipc.ts` and `mao run` start them. Refresher: `core/shell-model-catalog.test.ts`. Poller, no test: `git grep "auto-trigger.ts'" -- core/app.ts` must print nothing.
-6. **Renderer isolation.** `src/` reaches main only through `electronApi()`. Outside tests, from `core/` it imports types, plus values from `core/agent-selection.ts`, `core/ai/provider-options.ts`, `core/design-system.ts`, `core/repo-registry.ts` only. No IPC push: the UI polls and re-fetches after each mutation. Partial proof: `src/electron-api.test.ts` (bridge door only).
+6. **Renderer isolation.** `src/` reaches main only through `electronApi()`. Outside tests, from `core/` it imports types, plus values from `core/agent-selection.ts`, `core/ai/provider-options.ts`, `core/commit-graph.ts`, `core/design-system.ts`, `core/repo-registry.ts` only. No IPC push: the UI polls and re-fetches after each mutation. Partial proof: `src/electron-api.test.ts` (bridge door only).
 7. **Electron security posture.** `webPreferences` sets only `preload`; never weaken Electron 33 defaults. `setWindowOpenHandler` keeps `{ action: 'deny' }`, routing http/https to `shell.openExternal`. No test: review `electron/main.ts`.
 8. **`core/` tests must stay runnable under plain Node.** `vitest.config.ts` keeps two projects: `core` (node, zero plugins, no `extends`) and `renderer` (jsdom). `npm run test` runs them separately: combined, an empty project exits 0. Partial proof: `core/node-environment.test.ts`.
 

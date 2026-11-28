@@ -6,6 +6,14 @@ import {
   type RepoCapabilitySnapshot,
   type RepoWorkflowCapability,
 } from './repo-capabilities.ts'
+import {
+  COMMIT_GRAPH_LIMITS,
+  type CommitGraphData,
+  type GraphBranch,
+  type GraphCommit,
+  findTruncatedCommits,
+  sortCommitsTopologically,
+} from './commit-graph.ts'
 
 /**
  * A stalled GitHub socket would otherwise block every repository behind the single-flight queue.
@@ -344,6 +352,86 @@ export class GithubService {
     if (!this.octokit) throw new Error('GitHub token is not set')
     const { data } = await this.octokit.rest.repos.get({ owner, repo })
     return data.default_branch
+  }
+
+  /**
+   * A bounded, read-only window onto the repository's branch history for the Graph tab and
+   * `mao github graph`. Only GETs: `repos.get`, one page of `repos.listBranches`, and one
+   * `repos.listCommits` page per drawn branch — so at most `2 + maxBranches` calls, each under this
+   * class's per-attempt deadline, and none of them a write, a clone or a label change.
+   *
+   * REST has no "every commit on every branch" endpoint, so each branch's recent history is read from its
+   * own head and the pages are merged by SHA. A head already among the commits read — a merged or freshly
+   * created `workflow/*` branch, or two branches on one commit — costs no further call.
+   *
+   * The default branch is always drawn, even when it is not on the one branch page read: the listing is
+   * alphabetical, so a repository with a hundred `claude/*` or `feat/*` branches pushes `main` to page
+   * two. Without it every other branch loses the line it forked from and is drawn as loose fragments.
+   * Its page is then read by name — the only handle there is — and its first commit is the head.
+   *
+   * Every other branch is read by the head SHA the listing returned, not by name: a `workflow/*` branch
+   * merged and deleted between the two calls would otherwise 404 and fail the whole graph, and one that
+   * moved would be drawn against commits its label does not point at.
+   */
+  async fetchCommitGraph(owner: string, repo: string): Promise<CommitGraphData> {
+    const octokit = this.octokit
+    if (!octokit) throw new Error('GitHub token is not set')
+
+    const [{ data: repoData }, { data: listed }] = await Promise.all([
+      octokit.rest.repos.get({ owner, repo }),
+      octokit.rest.repos.listBranches({ owner, repo, per_page: COMMIT_GRAPH_LIMITS.branchListPage }),
+    ])
+    const defaultBranch = repoData.default_branch
+    const all: GraphBranch[] = listed.map((branch) => ({ name: branch.name, sha: branch.commit.sha }))
+
+    const commits = new Map<string, GraphCommit>()
+    const merge = (page: GraphCommit[]) => {
+      for (const commit of page) if (!commits.has(commit.sha)) commits.set(commit.sha, commit)
+    }
+    const readCommits = async (ref: string, perPage: number): Promise<GraphCommit[]> => {
+      const { data } = await octokit.rest.repos.listCommits({ owner, repo, sha: ref, per_page: perPage })
+      return data.map((item) => ({
+        sha: item.sha,
+        parents: item.parents.map((parent) => parent.sha),
+        message: item.commit.message.split(/\r?\n/, 1)[0],
+        author: item.commit.author?.name ?? item.author?.login ?? 'unknown',
+        date: item.commit.committer?.date ?? item.commit.author?.date ?? '',
+        url: item.html_url,
+      }))
+    }
+
+    // The default branch first, so its page can make the other branches' heads already known. Read it by
+    // name only when the listing stopped at a full page and so may have cut it off: a shorter listing is
+    // every branch, and one without the default is an empty repository or a rename caught mid-flight,
+    // where the name would 404 or match a same-named tag.
+    let defaultEntry = all.find((branch) => branch.name === defaultBranch)
+    if (defaultEntry) {
+      merge(await readCommits(defaultEntry.sha, COMMIT_GRAPH_LIMITS.defaultBranchCommits))
+    } else if (listed.length >= COMMIT_GRAPH_LIMITS.branchListPage) {
+      const page = await readCommits(defaultBranch, COMMIT_GRAPH_LIMITS.defaultBranchCommits)
+      merge(page)
+      if (page.length > 0) defaultEntry = { name: defaultBranch, sha: page[0].sha }
+    }
+
+    const others = all.filter((branch) => branch.name !== defaultBranch)
+    const drawnOthers = others.slice(0, COMMIT_GRAPH_LIMITS.maxBranches - 1)
+    const unread = new Set(drawnOthers.map((branch) => branch.sha).filter((sha) => !commits.has(sha)))
+    const pages = await Promise.all([...unread].map((sha) => readCommits(sha, COMMIT_GRAPH_LIMITS.branchCommits)))
+    // Merge in listing order, not arrival order, and return the order the graph draws: the CLI prints this
+    // array as-is, and the sort breaks same-second ties by input position.
+    for (const page of pages) merge(page)
+    const ordered = sortCommitsTopologically([...commits.values()])
+    const truncatedCommits = findTruncatedCommits(ordered)
+
+    return {
+      defaultBranch,
+      branches: [...(defaultEntry ? [defaultEntry] : []), ...drawnOthers],
+      commits: ordered,
+      omittedBranches: others.length - drawnOthers.length,
+      branchListComplete: listed.length < COMMIT_GRAPH_LIMITS.branchListPage,
+      historyTruncated: truncatedCommits.length > 0,
+      truncatedCommits,
+    }
   }
 
   /** Fetches the commit SHA currently pointed to by a branch ref. */

@@ -264,6 +264,32 @@ describe('CSS token parity and contrast verification against src/index.css', () 
     }
   })
 
+  it('keeps every commit-graph lane color readable as branch-label text on every preset surface', () => {
+    // The lanes are defined only in the two Classic blocks and inherited by every other preset, so each
+    // mode's palette has to clear AA (11px regular labels) against every block of that mode.
+    const lanes = (selector: string) => {
+      const decl = blockFor(selector).declarations
+      return Array.from({ length: 6 }, (_, i) => resolveCssToken(decl, `--graph-lane-${i}`))
+    }
+    const palettes = {
+      light: lanes(TOKEN_BLOCK_SELECTORS[0].selector),
+      dark: lanes(TOKEN_BLOCK_SELECTORS[1].selector),
+    }
+    for (const entry of TOKEN_BLOCK_SELECTORS) {
+      const decl = blockFor(entry.selector).declarations
+      for (const surface of ['--color-bg', '--color-surface', '--color-bg-subtle']) {
+        const surfaceHex = resolveCssToken(decl, surface)
+        palettes[entry.mode].forEach((lane, i) => {
+          expect(lane, `--graph-lane-${i}`).toMatch(HEX_COLOR_RE)
+          expect(
+            contrastRatio(lane, surfaceHex),
+            `${entry.id}:${entry.mode} --graph-lane-${i} vs ${surface}`,
+          ).toBeGreaterThanOrEqual(4.5)
+        })
+      }
+    }
+  })
+
   it('meets WCAG contrast requirements across all parsed CSS token blocks', () => {
     for (const entry of TOKEN_BLOCK_SELECTORS) {
       const decl = blockFor(entry.selector).declarations

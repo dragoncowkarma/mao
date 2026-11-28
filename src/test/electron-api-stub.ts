@@ -4,6 +4,7 @@ import type { AppUpdateCheck } from '../electron'
 import type { AiProviderConfig } from '../../core/ai/types'
 import type { ModelCatalogView } from '../../core/ai/provider-options'
 import type { GithubTask } from '../../core/github-service'
+import type { CommitGraphData } from '../../core/commit-graph'
 import type { RepoWorkflowCapability } from '../../core/repo-capabilities'
 import { applyRepoListEdit } from '../../core/repo-registry'
 import type { DesignId, StoredValueProblem, ThemePreference } from '../../core/store'
@@ -81,6 +82,12 @@ export function createElectronApiStub(initialRepos: RepoRef[] = [], initialProbl
     }),
   )
   const fetchTasks = vi.fn(async (): Promise<GithubTask[]> => [])
+  // Not on any mount path, so it throws like `notStubbed`: a change that started loading the graph (up to
+  // 22 REST calls) on mount shows up as a named call in the mock instead of a quiet empty graph. Typed with
+  // the real answer, unlike `notStubbed`, so a test can still `mockResolvedValue` it.
+  const fetchCommitGraph = vi.fn(async (_owner: string, _repo: string): Promise<CommitGraphData> => {
+    throw new Error('electronAPI.github.fetchCommitGraph was called, but this test did not stub it')
+  })
   const listProviders = vi.fn(async (): Promise<AiProviderConfig[]> => [])
   // Global settings reads the cached catalog on mount. A never-refreshed cache is the honest default: the
   // pane then offers exactly the built-in tables, as it does on a fresh install. `ai.refreshModelCatalog`
@@ -139,6 +146,7 @@ export function createElectronApiStub(initialRepos: RepoRef[] = [], initialProbl
       setToken: notStubbed('github.setToken'),
       fetchTasks,
       fetchTaskDetail: notStubbed('github.fetchTaskDetail'),
+      fetchCommitGraph,
       setRepos,
       getRepos,
       autoTriggerStatus: notStubbed('github.autoTriggerStatus'),
@@ -178,6 +186,7 @@ export function createElectronApiStub(initialRepos: RepoRef[] = [], initialProbl
     checkUpdate,
     storeProblems,
     fetchTasks,
+    fetchCommitGraph,
     listProviders,
     getModelCatalog,
     listWorkflowTasks,

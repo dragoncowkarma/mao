@@ -277,6 +277,8 @@ repos remove <owner> <repo>
 repos list
 github check <owner> <repo>  # open issues/PRs as JSON
 github view <owner> <repo> <number>  # body + comments
+github graph <owner> <repo>  # recent commits across branches as JSON (read-only, bounded; cut-off
+  # history in historyTruncated/truncatedCommits, skipped branches in omittedBranches)
 workflow enqueue "<title>" --owner <o> --repo <r> [--no-auto-advance] [--provider <id>] \
   [--model <model>] [--effort <level>] [--worker <id>] [--reviewer <id>] [--maintainer <id>]
 workflow enqueue-existing <issueNumber> --owner <o> --repo <r> [--no-auto-advance]
